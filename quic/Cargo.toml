@@ -1,0 +1,11 @@
+[package]
+name = "quic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quiche = "0.22"
+bytes = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+log = "0.4"

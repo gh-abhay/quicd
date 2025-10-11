@@ -1,9 +1,0 @@
-[package]
-name = "transport"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-core = { path = "../core" }
-tokio.workspace = true
-quiche.workspace = true
