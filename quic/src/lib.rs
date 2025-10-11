@@ -101,42 +101,43 @@ impl QuicEngine {
         })
     }
 
-    /// Process incoming packets, return events (zero-copy where possible)
-    pub fn process_packets(&mut self, packets: Vec<PacketIn>) -> Result<Vec<QuicEvent>> {
-        let mut events = Vec::with_capacity(packets.len() * 2); // Pre-allocate events
+    /// Process a single incoming packet, return events (zero-copy where possible)
+    pub fn process_packet(&mut self, packet: PacketIn) -> Result<Vec<QuicEvent>> {
+        let mut events = Vec::with_capacity(2); // Pre-allocate for typical case
 
-        for packet in packets {
-            // Extract connection ID from packet header
-            let scid = self.extract_scid(&packet.data)?;
+        // Extract connection ID from packet header
+        let scid = self.extract_scid(&packet.data)?;
 
-            if let Some(&conn_id) = self.scid_to_conn_id.get(&scid) {
-                // Existing connection
-                if let Some(conn_state) = self.connections.get_mut(&conn_id) {
-                    // Process packet directly here to avoid double borrow
-                    conn_state.read_buf.clear();
-                    conn_state.read_buf.extend_from_slice(&packet.data);
+        if let Some(&conn_id) = self.scid_to_conn_id.get(&scid) {
+            // Existing connection
+            if let Some(conn_state) = self.connections.get_mut(&conn_id) {
+                // Process packet directly here to avoid double borrow
+                conn_state.read_buf.clear();
+                conn_state.read_buf.extend_from_slice(&packet.data);
 
-                    // Feed packet to quiche
-                    match conn_state.conn.recv(&mut conn_state.read_buf, RecvInfo {
-                        from: packet.from,
-                        to: self.local_addr,
-                    }) {
-                        Ok(len) => {
-                            // Packet processed successfully
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to process packet for connection {}: {:?}", conn_id, e);
-                            continue;
-                        }
+                // Feed packet to quiche
+                match conn_state.conn.recv(&mut conn_state.read_buf, RecvInfo {
+                    from: packet.from,
+                    to: self.local_addr,
+                }) {
+                    Ok(len) => {
+                        // Packet processed successfully
                     }
-
-                    // Extract events from connection
-                    Self::extract_connection_events(&mut conn_state.conn, conn_id, &mut events)?;
+                    Err(quiche::Error::Done) => {
+                        // No more data to process
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to process packet for connection {}: {:?}", conn_id, e);
+                        return Ok(events);
+                    }
                 }
-            } else {
-                // New connection attempt
-                self.process_new_connection(packet, &mut events)?;
+
+                // Extract events from connection
+                Self::extract_connection_events(&mut conn_state.conn, conn_id, &mut events)?;
             }
+        } else {
+            // New connection attempt
+            self.process_new_connection(packet, &mut events)?;
         }
 
         Ok(events)
@@ -244,19 +245,26 @@ impl QuicEngine {
         Ok(scid)
     }
 
-    /// Get outgoing packets to send (batched for performance)
-    pub fn get_outgoing_packets(&mut self) -> Result<Vec<PacketOut>> {
-        // Process all connections for outgoing packets
+    /// Get next outgoing packet to send immediately (for low latency)
+    pub fn get_next_outgoing_packet(&mut self) -> Result<Option<PacketOut>> {
+        // Check if we have any queued packets
+        if let Some(packet) = self.output_queue.pop_front() {
+            return Ok(Some(packet));
+        }
+
+        // Generate packets from connections that have data to send
         let conn_ids: Vec<u64> = self.connections.keys().cloned().collect();
         for conn_id in conn_ids {
             if let Some(conn_state) = self.connections.get_mut(&conn_id) {
                 Self::generate_outgoing_packets_for_connection(conn_state, conn_id, &mut self.output_queue)?;
+                // Return the first packet if any were generated
+                if let Some(packet) = self.output_queue.pop_front() {
+                    return Ok(Some(packet));
+                }
             }
         }
 
-        // Return all queued packets
-        let packets = self.output_queue.drain(..).collect();
-        Ok(packets)
+        Ok(None)
     }
 
     /// Generate outgoing packets for a specific connection
