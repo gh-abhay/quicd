@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "core",
+    "transport",
+    "signaling",
+    "message-relay",
+    "sfu",
+    "cdn",
+    "daemon",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1.0", features = ["full"] }
+quiche = "0.22"
+# Add other common deps here
