@@ -60,6 +60,18 @@ pub struct Config {
     /// Cloudflare-inspired large buffers prevent packet loss at high throughput
     pub socket_recv_buffer_size: usize,
     pub socket_send_buffer_size: usize,
+    
+    /// Number of dedicated network I/O threads
+    ///
+    /// Default: Number of CPU cores (up to 8)
+    /// Each thread gets its own socket with SO_REUSEPORT for kernel-level load balancing
+    pub network_threads: usize,
+    
+    /// Enable SO_REUSEPORT for multi-threaded network I/O
+    ///
+    /// Default: true
+    /// Allows multiple threads to bind to the same port, with kernel load balancing
+    pub reuse_port: bool,
 }
 
 impl Config {
@@ -83,6 +95,10 @@ impl Config {
     /// custom_config.debug_mode = true;
     /// ```
     pub fn new(listen_addr: SocketAddr) -> Self {
+        // Determine optimal number of network threads
+        // Use min(num_cpus, 8) - more threads don't help for UDP
+        let network_threads = num_cpus::get().min(8).max(1);
+        
         Self {
             listen_addr,
             // Best-of-the-best defaults for maximum performance
@@ -93,6 +109,8 @@ impl Config {
             debug_mode: false,
             socket_recv_buffer_size: 8 * 1024 * 1024, // 8MB
             socket_send_buffer_size: 8 * 1024 * 1024, // 8MB
+            network_threads,
+            reuse_port: true,
         }
     }
     

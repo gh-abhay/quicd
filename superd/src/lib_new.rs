@@ -1,100 +1,63 @@
 //! # superd - High-Performance QUIC Multi-Service Daemon
 //!
 //! superd is a production-ready QUIC daemon optimized for **ultra-low latency**
-//! and **maximum throughput** based on proven architectures from Cloudflare, Kafka, and Discord.
+//! and **maximum throughput** based on expert recommendations from high-performance
+//! networking systems.
 //!
-//! ## Architecture V2 (Production-Ready, Three-Layer Design)
+//! ## Architecture (Expert-Recommended)
 //!
-//! ### Layer 1: Network I/O Threads (Dedicated OS Threads)
+//! ### Network Layer (Dedicated OS Threads)
 //! - **Dedicated OS threads** with single-threaded Tokio runtimes
-//! - **SO_REUSEPORT** for kernel-level load balancing
-//! - **CPU-pinned** for hot L1/L2 cache
-//! - **NUMA-aware** placement for memory locality
-//! - Capacity: ~500K pps per thread (Cloudflare proven)
+//! - **SO_REUSEPORT** for kernel-level load balancing across cores
+//! - **Lock-free buffer pools** for zero-allocation receives
+//! - **Non-blocking sends** with backpressure via try_send
 //!
-//! ### Layer 2: QUIC Protocol Handlers (Dedicated OS Threads)
-//! - **1:1 mapping** with I/O threads (dedicated channels)
-//! - **CPU-pinned** adjacent to I/O threads
-//! - **Zero channel contention** (single reader per channel)
-//! - QUIC packet processing: decrypt, parse, state management
-//! - Capacity: ~500K pps per handler
+//! ### Application Layer (Multi-threaded Tokio)
+//! - **Worker thread pool** for QUIC processing
+//! - **Zero-copy** message passing via flume channels
+//! - **Bytes cloning** for multi-recipient forwarding
 //!
-//! ### Layer 3: Connection Management (Tokio Async Tasks)
-//! - **Lightweight tasks** (one per connection)
-//! - **Work-stealing scheduler** for load balancing
-//! - **Spawn on-demand** (scales to millions)
-//! - Per-connection application logic
+//! ### Key Optimizations
+//! 1. **Zero-copy buffers**: `BytesMut` → `.freeze()` → `Bytes`
+//! 2. **Lock-free channels**: `flume` for sync/async bridging
+//! 3. **Pinned network threads**: Dedicated OS threads reduce jitter
+//! 4. **Buffer pooling**: Reuse `BytesMut` to avoid allocations
 //!
-//! ### Tokio Runtime Configuration
-//! - **Dedicated mode** (default): Workers use only unpinned CPUs
-//! - **Shared mode** (experimental): Workers can use all CPUs
-//! - Auto-detected optimal worker count
+//! ## Expert Recommendations Applied
 //!
-//! ## Performance Targets
+//! > "Run network IO pinned to dedicated OS threads with a single-threaded
+//! > Tokio runtime for low and deterministic latency."
 //!
-//! - **100,000+** concurrent connections
-//! - **1,000,000+** packets per second
-//! - **Sub-millisecond** latency (p99 < 1ms)
+//! > "Use BytesMut → .freeze() → Bytes and pass Bytes through bounded
+//! > flume channels so transfers are zero-copy."
 //!
-//! ## Example (V2 API)
+//! > "Use SO_REUSEPORT + one socket per network thread so kernel spreads
+//! > UDP load across threads."
+//!
+//! ## Example
 //!
 //! ```no_run
-//! use superd::{ConfigV2, SuperdV2};
+//! use superd::{Superd, Config};
+//! use std::net::SocketAddr;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     env_logger::init();
 //!     
-//!     // Auto-detect optimal settings
-//!     let config = ConfigV2::default();
+//!     let addr: SocketAddr = "0.0.0.0:4433".parse()?;
+//!     let config = Config::new(addr);
 //!     
-//!     let daemon = SuperdV2::new(config)?;
-//!     daemon.run()?;
-//!     
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Example (Custom Configuration)
-//!
-//! ```no_run
-//! use superd::{ConfigV2, SuperdV2};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut config = ConfigV2::default();
-//!     config.network_io.threads = 4;
-//!     config.quic_protocol.threads = 4;
-//!     
-//!     let daemon = SuperdV2::new(config)?;
-//!     daemon.run()?;
+//!     let server = Superd::new(config).await?;
+//!     server.run().await?;
 //!     
 //!     Ok(())
 //! }
 //! ```
 
-use std::net::SocketAddr;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::thread;
 
-// V2 Architecture modules
-pub mod config_v2;
-pub mod thread_mgmt;
-pub mod network_io_thread;
-pub mod quic_protocol_thread;
-
-// V2 Public exports
-pub use config_v2::{
-    ConfigV2, NetworkIoConfig, QuicProtocolConfig, TokioRuntimeConfig,
-    ServerConfig, MonitoringConfig, ThreadPriority, CpuAffinityStrategy,
-    TokioCpuMode,
-};
-
-// Re-export V2 daemon as the main API
-mod lib_v2;
-pub use lib_v2::SuperdV2;
-
-// Legacy V1 modules (for backward compatibility)
+// Internal modules
 mod config;
 mod error;
 mod metrics;
@@ -102,7 +65,7 @@ mod tasks;
 mod buffer_pool;
 mod network_thread;
 
-// Legacy V1 exports
+// Public exports
 pub use config::Config;
 pub use error::{SuperdError, Result, ErrorContext};
 pub use metrics::{Metrics, MetricsSnapshot};
@@ -185,7 +148,7 @@ impl Superd {
     ///   ┌─────────┐
     ///   │ Thread 0├──┐
     ///   └─────────┘  │
-    ///   ┌─────────┐  │   crossbeam  ┌──────────────┐
+    ///   ┌─────────┐  │   flume      ┌──────────────┐
     ///   │ Thread 1├──┼──────────────►│ QUIC Engine  │
     ///   └─────────┘  │   (bounded)  └──────┬───────┘
     ///   ┌─────────┐  │                     │
@@ -207,11 +170,11 @@ impl Superd {
         let buffer_pool = BufferPool::with_capacity(pool_size, 65536);
         
         // Create channels for network <-> app communication
-        // Using crossbeam::channel for efficient sync/async bridging (Tokio-recommended)
-        let (rx_tx, rx_rx) = crossbeam::channel::bounded::<RxPacket>(config.channel_buffer_size);
-        let (tx_tx, tx_rx) = crossbeam::channel::bounded::<TxPacket>(config.channel_buffer_size);
+        // Using flume for efficient sync/async bridging
+        let (rx_tx, rx_rx) = flume::bounded::<RxPacket>(config.channel_buffer_size);
+        let (tx_tx, tx_rx) = flume::bounded::<TxPacket>(config.channel_buffer_size);
         
-        log::info!("Using crossbeam channels for zero-copy message passing");
+        log::info!("Using flume channels for zero-copy message passing");
         
         // Spawn dedicated network I/O threads
         let mut network_handles = Vec::new();
@@ -249,8 +212,8 @@ impl Superd {
             tokio::sync::mpsc::channel(config.channel_buffer_size);
         
         // Wrap components for shared access
-        let quic_engine = Arc::new(tokio::sync::Mutex::new(self.quic_engine));
-        let service_registry = Arc::new(tokio::sync::Mutex::new(self.service_registry));
+        let quic_engine = Arc::new(parking_lot::Mutex::new(self.quic_engine));
+        let service_registry = Arc::new(parking_lot::Mutex::new(self.service_registry));
         
         // Spawn QUIC processing worker task
         let quic_task = {
@@ -264,7 +227,7 @@ impl Superd {
                     tx_tx,
                     events_tx,
                     responses_rx,
-                ).run_with_crossbeam().await
+                ).run_with_flume().await
             })
         };
         
@@ -293,9 +256,10 @@ impl Superd {
         
         let cleanup_task = {
             let engine = quic_engine.clone();
+            let metrics = self.metrics.clone();
             let interval = config.cleanup_interval;
             tokio::spawn(async move {
-                tasks::monitoring::run_connection_cleanup(engine, interval).await
+                tasks::monitoring::run_connection_cleanup(engine, metrics, interval).await
             })
         };
         

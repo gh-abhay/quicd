@@ -17,5 +17,12 @@ env_logger = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 clap = { version = "4.0", features = ["derive"] }
-# For sharding
+
+# For high-performance networking
 num_cpus = "1.0"
+crossbeam = "0.8"        # Lock-free data structures and sync/async channels (Tokio-recommended)
+socket2 = "0.5"          # Fine-grained socket control (SO_REUSEPORT, etc)
+parking_lot = "0.12"     # Faster mutexes (for single-threaded contexts)
+libc = "0.2"             # For SO_REUSEPORT on Unix
+core_affinity = "0.8"    # CPU pinning for threads
+toml = "0.8"             # TOML config file support
