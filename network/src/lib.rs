@@ -13,10 +13,10 @@
 //! - CPU usage per thread: ~30% @ 500K pps
 //! - Latency: <1µs (direct kernel path)
 
+pub mod config;
 pub mod io_thread;
 pub mod thread_mgmt;
-pub mod config;
 
+pub use config::{CpuAffinityStrategy, NetworkConfig, ThreadPriority};
 pub use io_thread::{IoThread, ReceivedPacket};
-pub use thread_mgmt::{ThreadPlacement, pin_to_core, set_thread_priority};
-pub use config::{NetworkConfig, ThreadPriority, CpuAffinityStrategy};
+pub use thread_mgmt::{pin_to_core, set_thread_priority, ThreadPlacement};

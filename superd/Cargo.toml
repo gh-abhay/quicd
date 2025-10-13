@@ -19,6 +19,19 @@ quic = { path = "../quic" }
 # Async runtime
 tokio = { version = "1.42", features = ["full"] }
 
+# Async trait support
+async-trait = "0.1"
+
+# Data structures
+bytes = "1.8"
+
+# Error handling
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 # CLI and configuration
 clap = { version = "4.0", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }

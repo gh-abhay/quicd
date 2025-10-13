@@ -7,12 +7,12 @@
 //!
 //! All settings follow production-proven patterns from Cloudflare, Kafka, and Discord.
 
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Duration;
-use serde::{Deserialize, Serialize};
 
 // Re-export types from network crate for backwards compatibility
-pub use network::{ThreadPriority, CpuAffinityStrategy};
+pub use network::{CpuAffinityStrategy, ThreadPriority};
 
 /// Main configuration for superd daemon
 ///
@@ -54,16 +54,16 @@ pub use network::{ThreadPriority, CpuAffinityStrategy};
 pub struct Config {
     /// Network I/O layer configuration
     pub network_io: NetworkIoConfig,
-    
+
     /// QUIC protocol handler configuration
     pub quic_protocol: QuicProtocolConfig,
-    
+
     /// Tokio runtime configuration
     pub tokio_runtime: TokioRuntimeConfig,
-    
+
     /// Server configuration
     pub server: ServerConfig,
-    
+
     /// Monitoring and metrics configuration
     pub monitoring: MonitoringConfig,
 }
@@ -99,7 +99,7 @@ pub struct NetworkIoConfig {
     ///
     /// Formula: `min(max(cpu_count / 4, 1), 8)`
     pub threads: usize,
-    
+
     /// Enable CPU pinning for network I/O threads
     ///
     /// Default: true
@@ -114,7 +114,7 @@ pub struct NetworkIoConfig {
     /// - Containerized environments without CPU affinity support
     /// - Testing/debugging
     pub enable_cpu_pinning: bool,
-    
+
     /// Enable NUMA-aware thread placement
     ///
     /// Default: true (if system supports NUMA)
@@ -126,7 +126,7 @@ pub struct NetworkIoConfig {
     ///
     /// Automatically disabled on non-NUMA systems.
     pub enable_numa_awareness: bool,
-    
+
     /// Thread priority
     ///
     /// Default: High
@@ -134,7 +134,7 @@ pub struct NetworkIoConfig {
     /// Network I/O threads get high priority to minimize packet loss.
     /// They preempt other threads when packets arrive.
     pub thread_priority: ThreadPriority,
-    
+
     /// CPU core affinity strategy
     ///
     /// Default: Interleaved
@@ -181,7 +181,7 @@ pub struct QuicProtocolConfig {
     /// - Spawns Tokio tasks for connection management
     /// - Pinned to CPU core (interleaved with I/O thread)
     pub threads: usize,
-    
+
     /// Enable CPU pinning for QUIC handlers
     ///
     /// Default: true
@@ -191,7 +191,7 @@ pub struct QuicProtocolConfig {
     /// - Placed adjacent to its corresponding I/O thread (cache locality)
     /// - Zero context switches during processing
     pub enable_cpu_pinning: bool,
-    
+
     /// Thread priority
     ///
     /// Default: Normal (High for low-latency mode)
@@ -199,7 +199,7 @@ pub struct QuicProtocolConfig {
     /// QUIC handlers run at normal priority by default.
     /// For ultra-low latency (<100µs), use High priority.
     pub thread_priority: ThreadPriority,
-    
+
     /// Channel buffer size per handler
     ///
     /// Default: 8192 packets
@@ -248,7 +248,7 @@ pub struct TokioRuntimeConfig {
     ///
     /// Set to `None` to use default, or specify explicit count.
     pub worker_threads: Option<usize>,
-    
+
     /// CPU allocation mode
     ///
     /// Default: Dedicated (safe, predictable)
@@ -258,7 +258,7 @@ pub struct TokioRuntimeConfig {
     ///
     /// After profiling, switch to Shared if I/O+QUIC < 50% CPU.
     pub cpu_mode: TokioCpuMode,
-    
+
     /// Enable thread pinning for Tokio workers
     ///
     /// Default: false (let work-stealing scheduler decide)
@@ -268,7 +268,7 @@ pub struct TokioRuntimeConfig {
     /// - Reduces cache misses but prevents work-stealing benefits
     /// - Only useful for specialized workloads
     pub enable_cpu_pinning: bool,
-    
+
     /// Thread stack size for Tokio workers
     ///
     /// Default: 2MB (Tokio default)
@@ -282,7 +282,7 @@ pub struct TokioRuntimeConfig {
 pub struct ServerConfig {
     /// UDP socket address to bind to
     pub listen_addr: SocketAddr,
-    
+
     /// Maximum concurrent QUIC connections
     ///
     /// Default: 100,000
@@ -292,7 +292,7 @@ pub struct ServerConfig {
     /// - 100K connections: ~850 MB
     /// - 1M connections: ~8.5 GB
     pub max_connections: usize,
-    
+
     /// Socket receive buffer size (SO_RCVBUF)
     ///
     /// Default: 8 MB
@@ -300,12 +300,12 @@ pub struct ServerConfig {
     /// Cloudflare-proven large buffers prevent packet loss.
     /// Kernel allocates this much memory per socket.
     pub socket_recv_buffer_size: usize,
-    
+
     /// Socket send buffer size (SO_SNDBUF)
     ///
     /// Default: 8 MB
     pub socket_send_buffer_size: usize,
-    
+
     /// Enable SO_REUSEPORT
     ///
     /// Default: true
@@ -313,14 +313,14 @@ pub struct ServerConfig {
     /// Required for multi-threaded network I/O.
     /// Kernel load-balances incoming packets across threads.
     pub enable_reuseport: bool,
-    
+
     /// Connection idle timeout
     ///
     /// Default: 30 seconds
     ///
     /// Connections without activity are closed after this duration.
     pub idle_timeout: Duration,
-    
+
     /// Connection cleanup interval
     ///
     /// Default: 60 seconds
@@ -336,19 +336,19 @@ pub struct MonitoringConfig {
     ///
     /// Default: true
     pub enable_metrics: bool,
-    
+
     /// Metrics logging interval
     ///
     /// Default: 10 seconds
     pub metrics_interval: Duration,
-    
+
     /// Enable detailed debug logging
     ///
     /// Default: false
     ///
     /// Only enable for troubleshooting (impacts performance).
     pub debug_mode: bool,
-    
+
     /// Enable performance profiling hooks
     ///
     /// Default: false
@@ -372,7 +372,7 @@ impl Default for Config {
         let cpu_count = num_cpus::get();
         let io_threads = Self::calculate_io_threads(cpu_count);
         let quic_threads = io_threads; // Always 1:1
-        
+
         Self {
             network_io: NetworkIoConfig {
                 threads: io_threads,
@@ -433,13 +433,13 @@ impl Config {
             _ => 8,
         }
     }
-    
+
     /// Calculate number of Tokio worker threads based on CPU mode
     pub fn tokio_worker_count(&self) -> usize {
         if let Some(count) = self.tokio_runtime.worker_threads {
             return count;
         }
-        
+
         let cpu_count = num_cpus::get();
         match self.tokio_runtime.cpu_mode {
             TokioCpuMode::Dedicated => {
@@ -453,14 +453,14 @@ impl Config {
             }
         }
     }
-    
+
     /// Check if NUMA is available on this system
     fn is_numa_available() -> bool {
         // TODO: Implement actual NUMA detection
         // For now, assume single-node systems
         false
     }
-    
+
     /// Validate configuration
     pub fn validate(&self) -> Result<(), String> {
         // Network I/O validation
@@ -470,7 +470,7 @@ impl Config {
         if self.network_io.threads > 128 {
             return Err("network_io.threads too large (max 128)".to_string());
         }
-        
+
         // QUIC protocol validation
         if self.quic_protocol.threads == 0 {
             return Err("quic_protocol.threads must be > 0".to_string());
@@ -478,13 +478,13 @@ impl Config {
         if self.quic_protocol.threads != self.network_io.threads {
             return Err(
                 "quic_protocol.threads must equal network_io.threads (1:1 mapping required)"
-                    .to_string()
+                    .to_string(),
             );
         }
         if self.quic_protocol.channel_buffer_size == 0 {
             return Err("quic_protocol.channel_buffer_size must be > 0".to_string());
         }
-        
+
         // Server validation
         if self.server.max_connections == 0 {
             return Err("server.max_connections must be > 0".to_string());
@@ -495,7 +495,7 @@ impl Config {
         if self.server.socket_send_buffer_size < 64 * 1024 {
             return Err("server.socket_send_buffer_size should be >= 64KB".to_string());
         }
-        
+
         // Tokio validation
         let cpu_count = num_cpus::get();
         let tokio_workers = self.tokio_worker_count();
@@ -509,46 +509,87 @@ impl Config {
                 cpu_count
             );
         }
-        
+
         Ok(())
     }
-    
+
     /// Display configuration summary
     pub fn display_summary(&self) {
         let cpu_count = num_cpus::get();
         let tokio_workers = self.tokio_worker_count();
-        
+
         log::info!("╔═══════════════════════════════════════════════════════════════╗");
         log::info!("║         superd - Production-Ready Architecture               ║");
         log::info!("╠═══════════════════════════════════════════════════════════════╣");
         log::info!("║ CPU Configuration                                             ║");
-        log::info!("║   Total CPUs: {}                                             ║", cpu_count);
-        log::info!("║   Network I/O threads: {} ({}%)                            ║",
+        log::info!(
+            "║   Total CPUs: {}                                             ║",
+            cpu_count
+        );
+        log::info!(
+            "║   Network I/O threads: {} ({}%)                            ║",
             self.network_io.threads,
-            (self.network_io.threads * 100) / cpu_count);
-        log::info!("║   QUIC Protocol handlers: {} ({}%)                         ║",
+            (self.network_io.threads * 100) / cpu_count
+        );
+        log::info!(
+            "║   QUIC Protocol handlers: {} ({}%)                         ║",
             self.quic_protocol.threads,
-            (self.quic_protocol.threads * 100) / cpu_count);
-        log::info!("║   Tokio workers: {} ({}%)                                  ║",
+            (self.quic_protocol.threads * 100) / cpu_count
+        );
+        log::info!(
+            "║   Tokio workers: {} ({}%)                                  ║",
             tokio_workers,
-            (tokio_workers * 100) / cpu_count);
+            (tokio_workers * 100) / cpu_count
+        );
         log::info!("║                                                               ║");
         log::info!("║ Performance Settings                                          ║");
-        log::info!("║   Max connections: {}                                    ║", self.server.max_connections);
-        log::info!("║   Channel buffer: {} packets                             ║", self.quic_protocol.channel_buffer_size);
-        log::info!("║   Socket buffers: {}MB / {}MB (RX/TX)                     ║",
+        log::info!(
+            "║   Max connections: {}                                    ║",
+            self.server.max_connections
+        );
+        log::info!(
+            "║   Channel buffer: {} packets                             ║",
+            self.quic_protocol.channel_buffer_size
+        );
+        log::info!(
+            "║   Socket buffers: {}MB / {}MB (RX/TX)                     ║",
             self.server.socket_recv_buffer_size / (1024 * 1024),
-            self.server.socket_send_buffer_size / (1024 * 1024));
+            self.server.socket_send_buffer_size / (1024 * 1024)
+        );
         log::info!("║                                                               ║");
         log::info!("║ Thread Placement                                              ║");
-        log::info!("║   Network I/O pinning: {}                                   ║",
-            if self.network_io.enable_cpu_pinning { "enabled" } else { "disabled" });
-        log::info!("║   QUIC handler pinning: {}                                  ║",
-            if self.quic_protocol.enable_cpu_pinning { "enabled" } else { "disabled" });
-        log::info!("║   NUMA awareness: {}                                        ║",
-            if self.network_io.enable_numa_awareness { "enabled" } else { "disabled" });
-        log::info!("║   CPU affinity: {:?}                                   ║", self.network_io.cpu_affinity_strategy);
-        log::info!("║   Tokio CPU mode: {:?}                                 ║", self.tokio_runtime.cpu_mode);
+        log::info!(
+            "║   Network I/O pinning: {}                                   ║",
+            if self.network_io.enable_cpu_pinning {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        log::info!(
+            "║   QUIC handler pinning: {}                                  ║",
+            if self.quic_protocol.enable_cpu_pinning {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        log::info!(
+            "║   NUMA awareness: {}                                        ║",
+            if self.network_io.enable_numa_awareness {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        log::info!(
+            "║   CPU affinity: {:?}                                   ║",
+            self.network_io.cpu_affinity_strategy
+        );
+        log::info!(
+            "║   Tokio CPU mode: {:?}                                 ║",
+            self.tokio_runtime.cpu_mode
+        );
         log::info!("╚═══════════════════════════════════════════════════════════════╝");
     }
 }
@@ -556,13 +597,13 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_default_config_valid() {
         let config = Config::default();
         assert!(config.validate().is_ok());
     }
-    
+
     #[test]
     fn test_io_thread_calculation() {
         assert_eq!(Config::calculate_io_threads(1), 1);
@@ -573,34 +614,34 @@ mod tests {
         assert_eq!(Config::calculate_io_threads(32), 8);
         assert_eq!(Config::calculate_io_threads(64), 8);
     }
-    
+
     #[test]
     fn test_tokio_worker_count_dedicated() {
         let mut config = Config::default();
         config.tokio_runtime.cpu_mode = TokioCpuMode::Dedicated;
         config.network_io.threads = 2;
         config.quic_protocol.threads = 2;
-        
+
         // On 8-core: 8 - (2+2) = 4 workers
         if num_cpus::get() >= 8 {
             assert_eq!(config.tokio_worker_count(), num_cpus::get() - 4);
         }
     }
-    
+
     #[test]
     fn test_tokio_worker_count_shared() {
         let mut config = Config::default();
         config.tokio_runtime.cpu_mode = TokioCpuMode::Shared;
-        
+
         assert_eq!(config.tokio_worker_count(), num_cpus::get());
     }
-    
+
     #[test]
     fn test_validation_quic_threads_mismatch() {
         let mut config = Config::default();
         config.network_io.threads = 4;
         config.quic_protocol.threads = 2; // Mismatch!
-        
+
         assert!(config.validate().is_err());
     }
 }

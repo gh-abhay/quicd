@@ -5,8 +5,8 @@
 //! - Thread priority management
 //! - NUMA-aware thread placement
 
+use crate::config::{CpuAffinityStrategy, ThreadPriority};
 use core_affinity::CoreId;
-use crate::config::{ThreadPriority, CpuAffinityStrategy};
 
 /// Thread placement manager
 ///
@@ -33,15 +33,15 @@ impl ThreadPlacement {
             },
         }
     }
-    
+
     /// Get the next CPU core for a network I/O thread
     pub fn next_io_core(&mut self) -> Option<CoreId> {
         if self.strategy == CpuAffinityStrategy::Auto {
             return None;
         }
-        
+
         let core_id = self.next_io_cpu;
-        
+
         match self.strategy {
             CpuAffinityStrategy::Interleaved => {
                 // I/O threads on even cores: 0, 2, 4, 6, ...
@@ -53,20 +53,20 @@ impl ThreadPlacement {
             }
             CpuAffinityStrategy::Auto => unreachable!(),
         }
-        
+
         if core_id < self.cpu_count {
             Some(CoreId { id: core_id })
         } else {
             None
         }
     }
-    
+
     /// Get the next CPU core for a QUIC protocol handler thread
     pub fn next_quic_core(&mut self, io_thread_index: usize) -> Option<CoreId> {
         if self.strategy == CpuAffinityStrategy::Auto {
             return None;
         }
-        
+
         let core_id = match self.strategy {
             CpuAffinityStrategy::Interleaved => {
                 // QUIC threads on odd cores, adjacent to their I/O thread
@@ -81,11 +81,11 @@ impl ThreadPlacement {
             }
             CpuAffinityStrategy::Auto => unreachable!(),
         };
-        
+
         if self.strategy == CpuAffinityStrategy::Sequential {
             self.next_quic_cpu += 1;
         }
-        
+
         if core_id < self.cpu_count {
             Some(CoreId { id: core_id })
         } else {
@@ -145,13 +145,9 @@ pub fn set_thread_priority(priority: ThreadPriority) -> Result<(), String> {
                 unsafe {
                     let mut param: sched_param = std::mem::zeroed();
                     param.sched_priority = 10; // Mid-range real-time priority
-                    
-                    let ret = pthread_setschedparam(
-                        pthread_self(),
-                        SCHED_RR,
-                        &param as *const _,
-                    );
-                    
+
+                    let ret = pthread_setschedparam(pthread_self(), SCHED_RR, &param as *const _);
+
                     if ret != 0 {
                         log::warn!(
                             "Failed to set high thread priority (SCHED_RR). \
@@ -170,13 +166,9 @@ pub fn set_thread_priority(priority: ThreadPriority) -> Result<(), String> {
                 unsafe {
                     let mut param: sched_param = std::mem::zeroed();
                     param.sched_priority = 99; // Maximum real-time priority
-                    
-                    let ret = pthread_setschedparam(
-                        pthread_self(),
-                        SCHED_FIFO,
-                        &param as *const _,
-                    );
-                    
+
+                    let ret = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param as *const _);
+
                     if ret != 0 {
                         log::warn!(
                             "Failed to set max thread priority (SCHED_FIFO). \
@@ -188,44 +180,44 @@ pub fn set_thread_priority(priority: ThreadPriority) -> Result<(), String> {
             }
         }
     }
-    
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_thread_placement_interleaved() {
         let mut placement = ThreadPlacement::new(CpuAffinityStrategy::Interleaved);
-        
+
         // I/O threads on even cores
         assert_eq!(placement.next_io_core().unwrap().id, 0);
         assert_eq!(placement.next_io_core().unwrap().id, 2);
-        
+
         // QUIC threads on odd cores
         assert_eq!(placement.next_quic_core(0).unwrap().id, 1); // After I/O 0
         assert_eq!(placement.next_quic_core(1).unwrap().id, 3); // After I/O 1
     }
-    
+
     #[test]
     fn test_thread_placement_sequential() {
         let mut placement = ThreadPlacement::new(CpuAffinityStrategy::Sequential);
-        
+
         // I/O threads sequential
         assert_eq!(placement.next_io_core().unwrap().id, 0);
         assert_eq!(placement.next_io_core().unwrap().id, 1);
-        
+
         // QUIC threads sequential after I/O
         assert_eq!(placement.next_quic_core(0).unwrap().id, 0);
         assert_eq!(placement.next_quic_core(1).unwrap().id, 1);
     }
-    
+
     #[test]
     fn test_thread_placement_auto() {
         let mut placement = ThreadPlacement::new(CpuAffinityStrategy::Auto);
-        
+
         // Auto mode returns None (no pinning)
         assert!(placement.next_io_core().is_none());
         assert!(placement.next_quic_core(0).is_none());

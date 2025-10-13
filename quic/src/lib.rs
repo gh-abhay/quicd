@@ -2,15 +2,15 @@
 //!
 //! This crate provides QUIC connection management and packet processing.
 
-use quiche::{Config, Connection, RecvInfo};
 use bytes::{Bytes, BytesMut};
+use quiche::{Config, Connection, RecvInfo};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use thiserror::Error;
 
 pub mod protocol_handler;
 
-pub use protocol_handler::{ProtocolThread, ProtocolConfig, Engine};
+pub use protocol_handler::{Engine, ProtocolConfig, ProtocolThread};
 
 #[derive(Error, Debug)]
 pub enum QuicError {
@@ -42,10 +42,22 @@ pub struct PacketOut {
 /// QUIC event
 #[derive(Debug)]
 pub enum QuicEvent {
-    NewConnection { conn_id: u64 },
-    StreamData { conn_id: u64, stream_id: u64, data: Bytes, fin: bool },
-    Datagram { conn_id: u64, data: Bytes },
-    ConnectionClosed { conn_id: u64 },
+    NewConnection {
+        conn_id: u64,
+    },
+    StreamData {
+        conn_id: u64,
+        stream_id: u64,
+        data: Bytes,
+        fin: bool,
+    },
+    Datagram {
+        conn_id: u64,
+        data: Bytes,
+    },
+    ConnectionClosed {
+        conn_id: u64,
+    },
 }
 
 /// Connection state
@@ -92,7 +104,7 @@ impl QuicEngine {
         config.set_initial_max_streams_bidi(100);
         config.set_initial_max_streams_uni(100);
         config.enable_dgram(true, 1000, 1000); // Enable datagrams
-        // Additional performance settings
+                                               // Additional performance settings
         config.set_max_connection_window(10_000_000);
         config.set_max_stream_window(1_000_000);
         config.set_active_connection_id_limit(4); // Multiple CIDs for migration
@@ -124,10 +136,13 @@ impl QuicEngine {
                 conn_state.read_buf.extend_from_slice(&packet.data);
 
                 // Feed packet to quiche
-                match conn_state.conn.recv(&mut conn_state.read_buf, RecvInfo {
-                    from: packet.from,
-                    to: self.local_addr,
-                }) {
+                match conn_state.conn.recv(
+                    &mut conn_state.read_buf,
+                    RecvInfo {
+                        from: packet.from,
+                        to: self.local_addr,
+                    },
+                ) {
                     Ok(len) => {
                         // Packet processed successfully
                     }
@@ -135,7 +150,11 @@ impl QuicEngine {
                         // No more data to process
                     }
                     Err(e) => {
-                        log::warn!("Failed to process packet for connection {}: {:?}", conn_id, e);
+                        log::warn!(
+                            "Failed to process packet for connection {}: {:?}",
+                            conn_id,
+                            e
+                        );
                         return Ok(events);
                     }
                 }
@@ -151,7 +170,11 @@ impl QuicEngine {
         Ok(events)
     }
 
-    fn process_new_connection(&mut self, packet: PacketIn, events: &mut Vec<QuicEvent>) -> Result<()> {
+    fn process_new_connection(
+        &mut self,
+        packet: PacketIn,
+        events: &mut Vec<QuicEvent>,
+    ) -> Result<()> {
         // Try to accept the connection
         let info = quiche::RecvInfo {
             from: packet.from,
@@ -192,10 +215,14 @@ impl QuicEngine {
     }
 
     /// Extract events from a connection
-    fn extract_connection_events(conn: &mut Connection, conn_id: u64, events: &mut Vec<QuicEvent>) -> Result<()> {
+    fn extract_connection_events(
+        conn: &mut Connection,
+        conn_id: u64,
+        events: &mut Vec<QuicEvent>,
+    ) -> Result<()> {
         // Process readable streams
         for stream_id in conn.readable() {
-                        Self::process_stream_data(conn, conn_id, stream_id, events)?;
+            Self::process_stream_data(conn, conn_id, stream_id, events)?;
         }
 
         // Process datagrams
@@ -210,14 +237,24 @@ impl QuicEngine {
     }
 
     /// Process data from a readable stream
-    fn process_stream_data(conn: &mut Connection, conn_id: u64, stream_id: u64, events: &mut Vec<QuicEvent>) -> Result<()> {
+    fn process_stream_data(
+        conn: &mut Connection,
+        conn_id: u64,
+        stream_id: u64,
+        events: &mut Vec<QuicEvent>,
+    ) -> Result<()> {
         // Use a temporary buffer for reading
         let mut buf = [0u8; 65536]; // 64KB buffer
 
         match conn.stream_recv(stream_id, &mut buf) {
             Ok((len, fin)) => {
                 let data = Bytes::copy_from_slice(&buf[..len]);
-                events.push(QuicEvent::StreamData { conn_id, stream_id, data, fin });
+                events.push(QuicEvent::StreamData {
+                    conn_id,
+                    stream_id,
+                    data,
+                    fin,
+                });
             }
             Err(quiche::Error::Done) => {
                 // No more data available
@@ -229,7 +266,11 @@ impl QuicEngine {
     }
 
     /// Process datagrams
-    fn process_datagrams(conn: &mut Connection, conn_id: u64, events: &mut Vec<QuicEvent>) -> Result<()> {
+    fn process_datagrams(
+        conn: &mut Connection,
+        conn_id: u64,
+        events: &mut Vec<QuicEvent>,
+    ) -> Result<()> {
         let mut buf = [0u8; 65536];
 
         while let Ok(len) = conn.dgram_recv(&mut buf) {
@@ -264,7 +305,11 @@ impl QuicEngine {
         let conn_ids: Vec<u64> = self.connections.keys().cloned().collect();
         for conn_id in conn_ids {
             if let Some(conn_state) = self.connections.get_mut(&conn_id) {
-                Self::generate_outgoing_packets_for_connection(conn_state, conn_id, &mut self.output_queue)?;
+                Self::generate_outgoing_packets_for_connection(
+                    conn_state,
+                    conn_id,
+                    &mut self.output_queue,
+                )?;
                 // Return the first packet if any were generated
                 if let Some(packet) = self.output_queue.pop_front() {
                     return Ok(Some(packet));
@@ -276,7 +321,11 @@ impl QuicEngine {
     }
 
     /// Generate outgoing packets for a specific connection
-    fn generate_outgoing_packets_for_connection(conn_state: &mut ConnectionState, _conn_id: u64, output_queue: &mut VecDeque<PacketOut>) -> Result<()> {
+    fn generate_outgoing_packets_for_connection(
+        conn_state: &mut ConnectionState,
+        _conn_id: u64,
+        output_queue: &mut VecDeque<PacketOut>,
+    ) -> Result<()> {
         // Clear write buffer
         conn_state.write_buf.clear();
 
@@ -297,11 +346,21 @@ impl QuicEngine {
     }
 
     /// Send data on a stream (zero-copy)
-    pub fn send_stream_data(&mut self, conn_id: u64, stream_id: u64, data: &[u8], fin: bool) -> Result<()> {
+    pub fn send_stream_data(
+        &mut self,
+        conn_id: u64,
+        stream_id: u64,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<()> {
         if let Some(conn_state) = self.connections.get_mut(&conn_id) {
             conn_state.conn.stream_send(stream_id, data, fin)?;
             // Immediately generate outgoing packets for low latency
-            Self::generate_outgoing_packets_for_connection(conn_state, conn_id, &mut self.output_queue)?;
+            Self::generate_outgoing_packets_for_connection(
+                conn_state,
+                conn_id,
+                &mut self.output_queue,
+            )?;
         }
         Ok(())
     }
@@ -311,7 +370,11 @@ impl QuicEngine {
         if let Some(conn_state) = self.connections.get_mut(&conn_id) {
             conn_state.conn.dgram_send(data)?;
             // Immediately generate outgoing packets for low latency
-            Self::generate_outgoing_packets_for_connection(conn_state, conn_id, &mut self.output_queue)?;
+            Self::generate_outgoing_packets_for_connection(
+                conn_state,
+                conn_id,
+                &mut self.output_queue,
+            )?;
         }
         Ok(())
     }
@@ -321,20 +384,26 @@ impl QuicEngine {
         if let Some(conn_state) = self.connections.get_mut(&conn_id) {
             conn_state.conn.close(false, error, reason)?;
             // Generate final packets
-            Self::generate_outgoing_packets_for_connection(conn_state, conn_id, &mut self.output_queue)?;
+            Self::generate_outgoing_packets_for_connection(
+                conn_state,
+                conn_id,
+                &mut self.output_queue,
+            )?;
         }
         Ok(())
     }
 
     /// Get connection statistics for monitoring
     pub fn get_connection_stats(&self, conn_id: u64) -> Option<quiche::Stats> {
-        self.connections.get(&conn_id)
+        self.connections
+            .get(&conn_id)
             .map(|conn_state| conn_state.conn.stats())
     }
 
     /// Check if connection is established
     pub fn is_connection_established(&self, conn_id: u64) -> bool {
-        self.connections.get(&conn_id)
+        self.connections
+            .get(&conn_id)
             .map(|conn_state| conn_state.conn.is_established())
             .unwrap_or(false)
     }
@@ -346,7 +415,9 @@ impl QuicEngine {
 
     /// Cleanup closed connections (call periodically)
     pub fn cleanup_closed_connections(&mut self) {
-        let closed_ids: Vec<u64> = self.connections.iter()
+        let closed_ids: Vec<u64> = self
+            .connections
+            .iter()
             .filter_map(|(id, conn_state)| {
                 if conn_state.conn.is_closed() {
                     Some(*id)
@@ -365,5 +436,4 @@ impl QuicEngine {
             }
         }
     }
-
 }

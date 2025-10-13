@@ -12,25 +12,25 @@
 //! - Latency: 1-3µs per packet (QUIC processing)
 //! - CPU usage: ~40-85% @ 500K pps (depends on crypto workload)
 
+use crossbeam::channel::Receiver;
+use network::{pin_to_core, set_thread_priority, ReceivedPacket, ThreadPlacement, ThreadPriority};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::thread;
-use crossbeam::channel::Receiver;
 use tokio::sync::Mutex;
-use network::{ReceivedPacket, ThreadPlacement, ThreadPriority, pin_to_core, set_thread_priority};
-use serde::{Deserialize, Serialize};
 
 /// QUIC protocol handler configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolConfig {
     /// Number of QUIC protocol handler threads
     pub threads: usize,
-    
+
     /// Enable CPU pinning for QUIC threads
     pub enable_cpu_pinning: bool,
-    
+
     /// Thread priority
     pub thread_priority: ThreadPriority,
-    
+
     /// Channel buffer size (per I/O thread → QUIC handler)
     pub channel_buffer_size: usize,
 }
@@ -57,11 +57,9 @@ pub struct Engine {
 impl Engine {
     /// Create a new QUIC engine
     pub fn new() -> Self {
-        Self {
-            _placeholder: (),
-        }
+        Self { _placeholder: () }
     }
-    
+
     /// Process a received packet
     ///
     /// This is where QUIC packet processing happens:
@@ -72,8 +70,11 @@ impl Engine {
     pub fn process_packet(&mut self, packet: ReceivedPacket) -> Result<(), String> {
         // TODO: Implement actual QUIC processing
         // For now, just log
-        log::trace!("Processing packet from {} ({} bytes)", 
-            packet.src_addr, packet.data.len());
+        log::trace!(
+            "Processing packet from {} ({} bytes)",
+            packet.src_addr,
+            packet.data.len()
+        );
         Ok(())
     }
 }
@@ -118,10 +119,10 @@ impl ProtocolThread {
         } else {
             None
         };
-        
+
         let thread_priority = config.thread_priority;
         let thread_name = format!("quic-handler-{}", thread_id);
-        
+
         let handle = thread::Builder::new()
             .name(thread_name.clone())
             .spawn(move || {
@@ -129,36 +130,40 @@ impl ProtocolThread {
                 if let Err(e) = set_thread_priority(thread_priority) {
                     log::warn!("Thread {}: Failed to set priority: {}", thread_name, e);
                 }
-                
+
                 // Pin to CPU core
                 if let Some(core) = core_id {
                     if let Err(e) = pin_to_core(core) {
-                        log::warn!("Thread {}: Failed to pin to CPU {}: {}", 
-                            thread_name, core.id, e);
+                        log::warn!(
+                            "Thread {}: Failed to pin to CPU {}: {}",
+                            thread_name,
+                            core.id,
+                            e
+                        );
                     } else {
                         log::info!("Thread {} pinned to CPU core {}", thread_name, core.id);
                     }
                 }
-                
+
                 // Create single-threaded Tokio runtime for this handler
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| format!("Failed to create runtime: {}", e))?;
-                
+
                 // Run the processing loop
                 runtime.block_on(async {
                     Self::run_processing_loop(thread_id, packet_rx, quic_engine).await
                 })
             })
             .map_err(|e| format!("Failed to spawn thread: {}", e))?;
-        
+
         Ok(Self {
             handle: Some(handle),
             thread_id,
         })
     }
-    
+
     /// Main processing loop
     ///
     /// Runs on a single-threaded Tokio runtime.
@@ -169,10 +174,10 @@ impl ProtocolThread {
         quic_engine: Arc<Mutex<Engine>>,
     ) -> Result<(), String> {
         log::info!("QUIC protocol handler {} started", thread_id);
-        
+
         let mut packets_processed = 0u64;
         let mut last_log = std::time::Instant::now();
-        
+
         loop {
             // Poll channel for packets (with yielding to allow Tokio to run)
             let packet = tokio::select! {
@@ -193,19 +198,19 @@ impl ProtocolThread {
                     }
                 }
             };
-            
+
             // Lock QUIC engine and process packet
             let mut engine = quic_engine.lock().await;
-            
+
             if let Err(e) = engine.process_packet(packet) {
                 log::warn!("Thread {}: Failed to process packet: {}", thread_id, e);
             }
-            
+
             packets_processed += 1;
-            
+
             // Unlock (explicit drop for clarity)
             drop(engine);
-            
+
             // Log statistics every 10 seconds
             if last_log.elapsed().as_secs() >= 10 {
                 let pps = packets_processed / 10;
@@ -215,7 +220,7 @@ impl ProtocolThread {
             }
         }
     }
-    
+
     /// Wait for thread to complete
     pub fn join(mut self) -> Result<(), String> {
         if let Some(handle) = self.handle.take() {
@@ -243,7 +248,7 @@ mod tests {
     use crossbeam::channel::unbounded;
     use network::CpuAffinityStrategy;
     use std::time::Duration;
-    
+
     #[tokio::test]
     async fn test_protocol_thread_spawn() {
         let config = ProtocolConfig {
@@ -252,18 +257,18 @@ mod tests {
             thread_priority: ThreadPriority::Normal,
             channel_buffer_size: 1024,
         };
-        
+
         let (_tx, rx) = unbounded();
         let engine = Arc::new(Mutex::new(Engine::new()));
         let mut placement = ThreadPlacement::new(CpuAffinityStrategy::Auto);
-        
+
         let thread = ProtocolThread::spawn(0, &config, rx, engine, &mut placement);
         assert!(thread.is_ok());
-        
+
         // Let it run briefly
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    
+
     #[tokio::test]
     async fn test_engine_creation() {
         let engine = Engine::new();

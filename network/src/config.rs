@@ -45,16 +45,16 @@ impl Default for CpuAffinityStrategy {
 pub struct NetworkConfig {
     /// Number of dedicated network I/O threads
     pub threads: usize,
-    
+
     /// Enable CPU pinning for network I/O threads
     pub enable_cpu_pinning: bool,
-    
+
     /// Enable NUMA-aware thread placement
     pub enable_numa_awareness: bool,
-    
+
     /// Thread priority
     pub thread_priority: ThreadPriority,
-    
+
     /// CPU affinity strategy
     pub cpu_affinity_strategy: CpuAffinityStrategy,
 }
@@ -70,7 +70,7 @@ impl NetworkConfig {
     pub fn auto_detect() -> Self {
         let cpu_count = num_cpus::get();
         let threads = Self::calculate_threads(cpu_count);
-        
+
         Self {
             threads,
             enable_cpu_pinning: true,
@@ -79,7 +79,7 @@ impl NetworkConfig {
             cpu_affinity_strategy: CpuAffinityStrategy::Interleaved,
         }
     }
-    
+
     /// Calculate optimal thread count based on CPU count
     ///
     /// Formula: `min(max(cpu_count / 4, 1), 8)`

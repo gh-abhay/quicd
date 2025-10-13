@@ -13,13 +13,13 @@
 //! - Latency: <1µs (direct kernel path)
 //! - CPU usage: ~30% @ 500K pps
 
+use crate::config::NetworkConfig;
+use crate::thread_mgmt::{pin_to_core, set_thread_priority, ThreadPlacement};
+use crossbeam::channel::Sender;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::thread;
 use tokio::net::UdpSocket;
-use crossbeam::channel::Sender;
-use socket2::{Socket, Domain, Type, Protocol};
-use crate::config::NetworkConfig;
-use crate::thread_mgmt::{ThreadPlacement, pin_to_core, set_thread_priority};
 
 /// Packet received from network
 #[derive(Clone)]
@@ -68,10 +68,10 @@ impl IoThread {
         } else {
             None
         };
-        
+
         let thread_priority = config.thread_priority;
         let thread_name = format!("network-io-{}", thread_id);
-        
+
         let handle = thread::Builder::new()
             .name(thread_name.clone())
             .spawn(move || {
@@ -79,36 +79,40 @@ impl IoThread {
                 if let Err(e) = set_thread_priority(thread_priority) {
                     log::warn!("Thread {}: Failed to set priority: {}", thread_name, e);
                 }
-                
+
                 // Pin to CPU core
                 if let Some(core) = core_id {
                     if let Err(e) = pin_to_core(core) {
-                        log::warn!("Thread {}: Failed to pin to CPU {}: {}", 
-                            thread_name, core.id, e);
+                        log::warn!(
+                            "Thread {}: Failed to pin to CPU {}: {}",
+                            thread_name,
+                            core.id,
+                            e
+                        );
                     } else {
                         log::info!("Thread {} pinned to CPU core {}", thread_name, core.id);
                     }
                 }
-                
+
                 // Create single-threaded Tokio runtime
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| format!("Failed to create runtime: {}", e))?;
-                
+
                 // Run the I/O loop
                 runtime.block_on(async {
                     Self::run_io_loop(thread_id, listen_addr, reuseport, packet_tx).await
                 })
             })
             .map_err(|e| format!("Failed to spawn thread: {}", e))?;
-        
+
         Ok(Self {
             handle: Some(handle),
             thread_id,
         })
     }
-    
+
     /// Main I/O loop
     ///
     /// Runs on the single-threaded Tokio runtime.
@@ -122,35 +126,39 @@ impl IoThread {
         // Create UDP socket with SO_REUSEPORT
         let socket = Self::create_socket(listen_addr, reuseport)
             .map_err(|e| format!("Failed to create socket: {}", e))?;
-        
+
         let socket = UdpSocket::from_std(socket.into())
             .map_err(|e| format!("Failed to convert to tokio socket: {}", e))?;
-        
-        log::info!("Network I/O thread {} listening on {}", thread_id, listen_addr);
-        
+
+        log::info!(
+            "Network I/O thread {} listening on {}",
+            thread_id,
+            listen_addr
+        );
+
         // Receive buffer (64 KB for jumbo frames)
         let mut buf = vec![0u8; 65536];
         let mut packets_received = 0u64;
         let mut last_log = std::time::Instant::now();
-        
+
         loop {
             // Receive packet
             match socket.recv_from(&mut buf).await {
                 Ok((len, src_addr)) => {
                     packets_received += 1;
-                    
+
                     // Create packet
                     let packet = ReceivedPacket {
                         data: buf[..len].to_vec(),
                         src_addr,
                         recv_time: std::time::Instant::now(),
                     };
-                    
+
                     // Send to channel (non-blocking)
                     if packet_tx.try_send(packet).is_err() {
                         log::warn!("Thread {}: Channel full, dropping packet", thread_id);
                     }
-                    
+
                     // Log statistics every 10 seconds
                     if last_log.elapsed().as_secs() >= 10 {
                         let pps = packets_received / 10;
@@ -166,7 +174,7 @@ impl IoThread {
             }
         }
     }
-    
+
     /// Create UDP socket with SO_REUSEPORT
     fn create_socket(addr: SocketAddr, reuseport: bool) -> std::io::Result<Socket> {
         let domain = if addr.is_ipv4() {
@@ -174,9 +182,9 @@ impl IoThread {
         } else {
             Domain::IPV6
         };
-        
+
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-        
+
         // Set SO_REUSEPORT (critical for multi-threaded I/O)
         if reuseport {
             #[cfg(unix)]
@@ -198,19 +206,19 @@ impl IoThread {
                 }
             }
         }
-        
+
         // Set SO_REUSEADDR
         socket.set_reuse_address(true)?;
-        
+
         // Bind to address
         socket.bind(&addr.into())?;
-        
+
         // Set non-blocking mode
         socket.set_nonblocking(true)?;
-        
+
         Ok(socket)
     }
-    
+
     /// Wait for thread to complete
     pub fn join(mut self) -> Result<(), String> {
         if let Some(handle) = self.handle.take() {
@@ -236,20 +244,20 @@ impl Drop for IoThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{CpuAffinityStrategy, NetworkConfig, ThreadPriority};
     use std::time::Duration;
-    use crate::config::{NetworkConfig, ThreadPriority, CpuAffinityStrategy};
-    
+
     #[test]
     fn test_socket_creation() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let socket = IoThread::create_socket(addr, true);
         assert!(socket.is_ok());
     }
-    
+
     #[tokio::test]
     async fn test_io_thread_spawn() {
         use crossbeam::channel::unbounded;
-        
+
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let config = NetworkConfig {
             threads: 1,
@@ -258,13 +266,13 @@ mod tests {
             thread_priority: ThreadPriority::Normal,
             cpu_affinity_strategy: CpuAffinityStrategy::Auto,
         };
-        
+
         let (tx, _rx) = unbounded();
         let mut placement = ThreadPlacement::new(CpuAffinityStrategy::Auto);
-        
+
         let thread = IoThread::spawn(0, addr, &config, true, tx, &mut placement);
         assert!(thread.is_ok());
-        
+
         // Let it run briefly
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
