@@ -1,10 +1,9 @@
 //! QUIC protocol handler thread implementation
 //!
-//! This module implements dedicated OS threads for QUIC packet processing.
+//! Implements dedicated OS threads for QUIC packet processing.
 //! Each thread:
 //! - Reads packets from a dedicated channel (1:1 with network I/O thread)
 //! - Processes QUIC packets (decrypt, parse, state update)
-//! - Spawns Tokio tasks for connection management
 //! - Is pinned to a specific CPU core (adjacent to its I/O thread)
 //!
 //! # Performance
@@ -17,19 +16,45 @@ use std::sync::Arc;
 use std::thread;
 use crossbeam::channel::Receiver;
 use tokio::sync::Mutex;
-use crate::config_v2::QuicProtocolConfig;
-use crate::thread_mgmt::{ThreadPlacement, pin_to_core, set_thread_priority};
-use crate::network_io_thread::ReceivedPacket;
+use network::{ReceivedPacket, ThreadPlacement, ThreadPriority, pin_to_core, set_thread_priority};
+use serde::{Deserialize, Serialize};
+
+/// QUIC protocol handler configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolConfig {
+    /// Number of QUIC protocol handler threads
+    pub threads: usize,
+    
+    /// Enable CPU pinning for QUIC threads
+    pub enable_cpu_pinning: bool,
+    
+    /// Thread priority
+    pub thread_priority: ThreadPriority,
+    
+    /// Channel buffer size (per I/O thread → QUIC handler)
+    pub channel_buffer_size: usize,
+}
+
+impl Default for ProtocolConfig {
+    fn default() -> Self {
+        Self {
+            threads: 1,
+            enable_cpu_pinning: true,
+            thread_priority: ThreadPriority::Normal,
+            channel_buffer_size: 8192,
+        }
+    }
+}
 
 /// QUIC engine (placeholder - will be replaced with actual quiche integration)
 ///
-/// In production, this will be a quiche::Connection or similar.
-pub struct QuicEngine {
+/// In production, this will manage quiche::Connection instances.
+pub struct Engine {
     // TODO: Add quiche::Connection, connection pool, etc.
     _placeholder: (),
 }
 
-impl QuicEngine {
+impl Engine {
     /// Create a new QUIC engine
     pub fn new() -> Self {
         Self {
@@ -53,15 +78,21 @@ impl QuicEngine {
     }
 }
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// QUIC protocol handler thread handle
-pub struct QuicProtocolThread {
+pub struct ProtocolThread {
     /// Thread handle
     handle: Option<thread::JoinHandle<Result<(), String>>>,
     /// Thread ID for debugging
     thread_id: usize,
 }
 
-impl QuicProtocolThread {
+impl ProtocolThread {
     /// Spawn a new QUIC protocol handler thread
     ///
     /// # Arguments
@@ -74,12 +105,12 @@ impl QuicProtocolThread {
     ///
     /// # Returns
     ///
-    /// A new `QuicProtocolThread` instance
+    /// A new `ProtocolThread` instance
     pub fn spawn(
         thread_id: usize,
-        config: &QuicProtocolConfig,
+        config: &ProtocolConfig,
         packet_rx: Receiver<ReceivedPacket>,
-        quic_engine: Arc<Mutex<QuicEngine>>,
+        quic_engine: Arc<Mutex<Engine>>,
         placement: &mut ThreadPlacement,
     ) -> Result<Self, String> {
         let core_id = if config.enable_cpu_pinning {
@@ -89,7 +120,7 @@ impl QuicProtocolThread {
         };
         
         let thread_priority = config.thread_priority;
-        let thread_name = format!("superd-quic-{}", thread_id);
+        let thread_name = format!("quic-handler-{}", thread_id);
         
         let handle = thread::Builder::new()
             .name(thread_name.clone())
@@ -135,7 +166,7 @@ impl QuicProtocolThread {
     async fn run_processing_loop(
         thread_id: usize,
         packet_rx: Receiver<ReceivedPacket>,
-        quic_engine: Arc<Mutex<QuicEngine>>,
+        quic_engine: Arc<Mutex<Engine>>,
     ) -> Result<(), String> {
         log::info!("QUIC protocol handler {} started", thread_id);
         
@@ -197,7 +228,7 @@ impl QuicProtocolThread {
     }
 }
 
-impl Drop for QuicProtocolThread {
+impl Drop for ProtocolThread {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             log::info!("Dropping QUIC protocol handler {}", self.thread_id);
@@ -210,12 +241,12 @@ impl Drop for QuicProtocolThread {
 mod tests {
     use super::*;
     use crossbeam::channel::unbounded;
-    use crate::config_v2::{QuicProtocolConfig, ThreadPriority, CpuAffinityStrategy};
+    use network::CpuAffinityStrategy;
     use std::time::Duration;
     
     #[tokio::test]
-    async fn test_quic_thread_spawn() {
-        let config = QuicProtocolConfig {
+    async fn test_protocol_thread_spawn() {
+        let config = ProtocolConfig {
             threads: 1,
             enable_cpu_pinning: false, // Disable for test
             thread_priority: ThreadPriority::Normal,
@@ -223,10 +254,10 @@ mod tests {
         };
         
         let (_tx, rx) = unbounded();
-        let engine = Arc::new(Mutex::new(QuicEngine::new()));
+        let engine = Arc::new(Mutex::new(Engine::new()));
         let mut placement = ThreadPlacement::new(CpuAffinityStrategy::Auto);
         
-        let thread = QuicProtocolThread::spawn(0, &config, rx, engine, &mut placement);
+        let thread = ProtocolThread::spawn(0, &config, rx, engine, &mut placement);
         assert!(thread.is_ok());
         
         // Let it run briefly
@@ -234,8 +265,8 @@ mod tests {
     }
     
     #[tokio::test]
-    async fn test_quic_engine_creation() {
-        let engine = QuicEngine::new();
+    async fn test_engine_creation() {
+        let engine = Engine::new();
         // Just verify it can be created
         drop(engine);
     }

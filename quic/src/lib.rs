@@ -1,8 +1,16 @@
+//! QUIC protocol implementation for Superd
+//!
+//! This crate provides QUIC connection management and packet processing.
+
 use quiche::{Config, Connection, RecvInfo};
 use bytes::{Bytes, BytesMut};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use thiserror::Error;
+
+pub mod protocol_handler;
+
+pub use protocol_handler::{ProtocolThread, ProtocolConfig, Engine};
 
 #[derive(Error, Debug)]
 pub enum QuicError {

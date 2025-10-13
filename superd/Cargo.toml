@@ -2,27 +2,34 @@
 name = "superd"
 version = "0.1.0"
 edition = "2021"
+authors = ["Superd Contributors"]
+description = "High-performance QUIC server daemon"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/klaalabs/superd"
+
+[[bin]]
+name = "superd"
+path = "src/main.rs"
 
 [dependencies]
+# Local crates
+network = { path = "../network" }
 quic = { path = "../quic" }
-io = { path = "../io" }
-services = { path = "../services" }
-tokio = { version = "1.0", features = ["full"] }
-bytes = "1.0"
-futures = "0.3"
-thiserror = "1.0"
-anyhow = "1.0"
-log = "0.4"
-env_logger = "0.10"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-clap = { version = "4.0", features = ["derive"] }
 
-# For high-performance networking
-num_cpus = "1.0"
-crossbeam = "0.8"        # Lock-free data structures and sync/async channels (Tokio-recommended)
-socket2 = "0.5"          # Fine-grained socket control (SO_REUSEPORT, etc)
-parking_lot = "0.12"     # Faster mutexes (for single-threaded contexts)
-libc = "0.2"             # For SO_REUSEPORT on Unix
-core_affinity = "0.8"    # CPU pinning for threads
-toml = "0.8"             # TOML config file support
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# CLI and configuration
+clap = { version = "4.0", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Utilities
+log = "0.4"
+env_logger = "0.11"
+num_cpus = "1.16"
+crossbeam = "0.8"
+anyhow = "1.0"
+
+[dev-dependencies]
+tokio-test = "0.4"

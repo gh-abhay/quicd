@@ -1,6 +1,6 @@
 //! Network I/O thread implementation
 //!
-//! This module implements dedicated OS threads for UDP socket operations.
+//! Implements dedicated OS threads for UDP socket operations.
 //! Each thread:
 //! - Binds to the same port using SO_REUSEPORT
 //! - Runs a single-threaded Tokio runtime
@@ -18,7 +18,7 @@ use std::thread;
 use tokio::net::UdpSocket;
 use crossbeam::channel::Sender;
 use socket2::{Socket, Domain, Type, Protocol};
-use crate::config_v2::NetworkIoConfig;
+use crate::config::NetworkConfig;
 use crate::thread_mgmt::{ThreadPlacement, pin_to_core, set_thread_priority};
 
 /// Packet received from network
@@ -33,14 +33,14 @@ pub struct ReceivedPacket {
 }
 
 /// Network I/O thread handle
-pub struct NetworkIoThread {
+pub struct IoThread {
     /// Thread handle
     handle: Option<thread::JoinHandle<Result<(), String>>>,
     /// Thread ID for debugging
     thread_id: usize,
 }
 
-impl NetworkIoThread {
+impl IoThread {
     /// Spawn a new network I/O thread
     ///
     /// # Arguments
@@ -48,17 +48,17 @@ impl NetworkIoThread {
     /// - `thread_id`: Thread identifier (0-based)
     /// - `listen_addr`: Address to bind the UDP socket to
     /// - `config`: Network I/O configuration
-    /// - `reuseport`: Enable SO_REUSEPORT (from ServerConfig)
+    /// - `reuseport`: Enable SO_REUSEPORT
     /// - `packet_tx`: Channel to send received packets
     /// - `placement`: Thread placement manager for CPU pinning
     ///
     /// # Returns
     ///
-    /// A new `NetworkIoThread` instance
+    /// A new `IoThread` instance
     pub fn spawn(
         thread_id: usize,
         listen_addr: SocketAddr,
-        config: &NetworkIoConfig,
+        config: &NetworkConfig,
         reuseport: bool,
         packet_tx: Sender<ReceivedPacket>,
         placement: &mut ThreadPlacement,
@@ -70,7 +70,7 @@ impl NetworkIoThread {
         };
         
         let thread_priority = config.thread_priority;
-        let thread_name = format!("superd-io-{}", thread_id);
+        let thread_name = format!("network-io-{}", thread_id);
         
         let handle = thread::Builder::new()
             .name(thread_name.clone())
@@ -147,7 +147,7 @@ impl NetworkIoThread {
                     };
                     
                     // Send to channel (non-blocking)
-                    if let Err(_) = packet_tx.try_send(packet) {
+                    if packet_tx.try_send(packet).is_err() {
                         log::warn!("Thread {}: Channel full, dropping packet", thread_id);
                     }
                     
@@ -223,7 +223,7 @@ impl NetworkIoThread {
     }
 }
 
-impl Drop for NetworkIoThread {
+impl Drop for IoThread {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             log::info!("Dropping network I/O thread {}", self.thread_id);
@@ -237,21 +237,21 @@ impl Drop for NetworkIoThread {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use crate::config::{NetworkConfig, ThreadPriority, CpuAffinityStrategy};
     
     #[test]
     fn test_socket_creation() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let socket = NetworkIoThread::create_socket(addr, true);
+        let socket = IoThread::create_socket(addr, true);
         assert!(socket.is_ok());
     }
     
     #[tokio::test]
     async fn test_io_thread_spawn() {
         use crossbeam::channel::unbounded;
-        use crate::config_v2::{NetworkIoConfig, ThreadPriority, CpuAffinityStrategy};
         
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let config = NetworkIoConfig {
+        let config = NetworkConfig {
             threads: 1,
             enable_cpu_pinning: false, // Disable for test
             enable_numa_awareness: false,
@@ -262,7 +262,7 @@ mod tests {
         let (tx, _rx) = unbounded();
         let mut placement = ThreadPlacement::new(CpuAffinityStrategy::Auto);
         
-        let thread = NetworkIoThread::spawn(0, addr, &config, true, tx, &mut placement);
+        let thread = IoThread::spawn(0, addr, &config, true, tx, &mut placement);
         assert!(thread.is_ok());
         
         // Let it run briefly

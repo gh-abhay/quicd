@@ -1,333 +1,248 @@
-//! # superd - High-Performance QUIC Multi-Service Daemon
+//! superd - High-Performance QUIC Multi-Service Daemon
 //!
-//! superd is a production-ready QUIC daemon optimized for **ultra-low latency**
-//! and **maximum throughput** based on proven architectures from Cloudflare, Kafka, and Discord.
-//!
-//! ## Architecture V2 (Production-Ready, Three-Layer Design)
-//!
-//! ### Layer 1: Network I/O Threads (Dedicated OS Threads)
-//! - **Dedicated OS threads** with single-threaded Tokio runtimes
-//! - **SO_REUSEPORT** for kernel-level load balancing
-//! - **CPU-pinned** for hot L1/L2 cache
-//! - **NUMA-aware** placement for memory locality
-//! - Capacity: ~500K pps per thread (Cloudflare proven)
-//!
-//! ### Layer 2: QUIC Protocol Handlers (Dedicated OS Threads)
-//! - **1:1 mapping** with I/O threads (dedicated channels)
-//! - **CPU-pinned** adjacent to I/O threads
-//! - **Zero channel contention** (single reader per channel)
-//! - QUIC packet processing: decrypt, parse, state management
-//! - Capacity: ~500K pps per handler
-//!
-//! ### Layer 3: Connection Management (Tokio Async Tasks)
-//! - **Lightweight tasks** (one per connection)
-//! - **Work-stealing scheduler** for load balancing
-//! - **Spawn on-demand** (scales to millions)
-//! - Per-connection application logic
-//!
-//! ### Tokio Runtime Configuration
-//! - **Dedicated mode** (default): Workers use only unpinned CPUs
-//! - **Shared mode** (experimental): Workers can use all CPUs
-//! - Auto-detected optimal worker count
-//!
-//! ## Performance Targets
-//!
-//! - **100,000+** concurrent connections
-//! - **1,000,000+** packets per second
-//! - **Sub-millisecond** latency (p99 < 1ms)
-//!
-//! ## Example (V2 API)
-//!
-//! ```no_run
-//! use superd::{ConfigV2, SuperdV2};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     env_logger::init();
-//!     
-//!     // Auto-detect optimal settings
-//!     let config = ConfigV2::default();
-//!     
-//!     let daemon = SuperdV2::new(config)?;
-//!     daemon.run()?;
-//!     
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Example (Custom Configuration)
-//!
-//! ```no_run
-//! use superd::{ConfigV2, SuperdV2};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut config = ConfigV2::default();
-//!     config.network_io.threads = 4;
-//!     config.quic_protocol.threads = 4;
-//!     
-//!     let daemon = SuperdV2::new(config)?;
-//!     daemon.run()?;
-//!     
-//!     Ok(())
-//! }
-//! ```
+//! This is the main library implementing the finalized three-layer architecture.
 
-use std::net::SocketAddr;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use tokio::sync::Mutex;
+use crossbeam::channel::bounded;
 
-// V2 Architecture modules
-pub mod config_v2;
-pub mod thread_mgmt;
-pub mod network_io_thread;
-pub mod quic_protocol_thread;
+// Use types from the network and quic crates
+use network::{IoThread, ReceivedPacket, ThreadPlacement};
+use quic::{ProtocolThread, Engine};
 
-// V2 Public exports
-pub use config_v2::{
-    ConfigV2, NetworkIoConfig, QuicProtocolConfig, TokioRuntimeConfig,
-    ServerConfig, MonitoringConfig, ThreadPriority, CpuAffinityStrategy,
-    TokioCpuMode,
-};
-
-// Re-export V2 daemon as the main API
-mod lib_v2;
-pub use lib_v2::SuperdV2;
-
-// Legacy V1 modules (for backward compatibility)
-mod config;
-mod error;
-mod metrics;
-mod tasks;
-mod buffer_pool;
-mod network_thread;
-
-// Legacy V1 exports
+pub mod config;
 pub use config::Config;
-pub use error::{SuperdError, Result, ErrorContext};
-pub use metrics::{Metrics, MetricsSnapshot};
-pub use buffer_pool::BufferPool;
-pub use network_thread::{RxPacket, TxPacket, NetworkThreadConfig, spawn_network_thread};
 
-use quic::QuicEngine;
-use services::{ServiceRegistry, echo::EchoService, http3::Http3Service};
-use tasks::{RequestProcessingTask, ServiceHandlingTask};
-
-/// Main server struct
+/// Main daemon struct implementing the three-layer architecture
 ///
-/// Orchestrates network threads (OS-level) and application workers (Tokio tasks).
+/// # Architecture
+///
+/// ```text
+/// ┌─────────────────────────────────────────────────────────────┐
+/// │                  superd Architecture                         │
+/// ├─────────────────────────────────────────────────────────────┤
+/// │                                                               │
+/// │  Layer 1: Network I/O Threads (OS threads, CPU-pinned)       │
+/// │  ├─ Thread 0: UDP recv/send → Channel 0                     │
+/// │  ├─ Thread 1: UDP recv/send → Channel 1                     │
+/// │  └─ ...                                                       │
+/// │                                                               │
+/// │  Layer 2: QUIC Protocol Handlers (OS threads, CPU-pinned)    │
+/// │  ├─ Handler 0: Channel 0 → QUIC processing                  │
+/// │  ├─ Handler 1: Channel 1 → QUIC processing                  │
+/// │  └─ ...                                                       │
+/// │                                                               │
+/// │  Layer 3: Connection Management (Tokio tasks)                │
+/// │  ├─ Task 1: Connection 1                                     │
+/// │  ├─ Task 2: Connection 2                                     │
+/// │  └─ ... (100K+ tasks)                                        │
+/// │                                                               │
+/// │  Tokio Runtime: Multi-threaded work-stealing runtime         │
+/// │  └─ Workers: Dedicated or Shared CPUs (configurable)        │
+/// │                                                               │
+/// └─────────────────────────────────────────────────────────────┘
+/// ```
 pub struct Superd {
+    /// Configuration
     config: Config,
-    quic_engine: QuicEngine,
-    service_registry: ServiceRegistry,
-    metrics: Arc<Metrics>,
+    
+    /// Network I/O threads
+    io_threads: Vec<IoThread>,
+    
+    /// QUIC protocol handler threads
+    quic_threads: Vec<ProtocolThread>,
+    
+    /// Shared QUIC engine
+    quic_engine: Arc<Mutex<Engine>>,
+    
+    /// Tokio runtime handle
+    runtime: tokio::runtime::Runtime,
 }
 
 impl Superd {
     /// Create a new superd instance
     ///
-    /// Initializes QUIC engine and service registry.
-    /// Actual network threads are spawned in `run()`.
-    pub async fn new(config: Config) -> Result<Self> {
+    /// # Arguments
+    ///
+    /// - `config`: Configuration (use `Config::default()` for optimal settings)
+    ///
+    /// # Returns
+    ///
+    /// A new `Superd` instance ready to run
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Configuration validation fails
+    /// - Tokio runtime creation fails
+    /// - Thread spawning fails
+    pub fn new(config: Config) -> Result<Self, String> {
         // Validate configuration
-        config.validate()
-            .map_err(SuperdError::Config)?;
+        config.validate()?;
         
-        log::info!("Initializing superd on {}", config.listen_addr);
-        log::info!("Network threads: {} (SO_REUSEPORT: {})", 
-            config.network_threads, config.reuse_port);
+        // Display configuration summary
+        config.display_summary();
         
-        // Create QUIC engine
-        let quic_engine = QuicEngine::new(config.listen_addr)
-            .map_err(|e| SuperdError::Quic {
-                context: "Failed to initialize QUIC engine".to_string(),
-                source: e,
-            })?;
+        // Create Tokio runtime based on configuration
+        let tokio_workers = config.tokio_worker_count();
+        let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+        runtime_builder.worker_threads(tokio_workers);
+        runtime_builder.thread_name("superd-tokio");
+        runtime_builder.enable_all();
         
-        // Create service registry and register services
-        let mut service_registry = ServiceRegistry::new();
-        service_registry.register("echo".to_string(), Box::new(EchoService::new()));
-        service_registry.register("http3".to_string(), Box::new(Http3Service::new()));
+        if let Some(stack_size) = config.tokio_runtime.thread_stack_size {
+            runtime_builder.thread_stack_size(stack_size);
+        }
         
-        log::info!("Registered services: echo, http3");
+        let runtime = runtime_builder
+            .build()
+            .map_err(|e| format!("Failed to create Tokio runtime: {}", e))?;
         
-        // Create metrics collector
-        let metrics = Metrics::new();
+        log::info!("✓ Tokio runtime created with {} workers", tokio_workers);
+        
+        // Create shared QUIC engine
+        let quic_engine = Arc::new(Mutex::new(Engine::new()));
+        log::info!("✓ QUIC engine initialized");
         
         Ok(Self {
             config,
+            io_threads: Vec::new(),
+            quic_threads: Vec::new(),
             quic_engine,
-            service_registry,
-            metrics,
+            runtime,
         })
     }
-
-    /// Run the superd daemon
+    
+    /// Start the daemon
     ///
-    /// # Architecture
+    /// This spawns all threads and starts processing.
     ///
-    /// Spawns two types of execution contexts:
+    /// # Errors
     ///
-    /// ## Network Threads (OS-level)
-    /// - Dedicated OS threads with single-threaded Tokio runtimes
-    /// - Each thread binds its own socket with SO_REUSEPORT
-    /// - Kernel load-balances UDP packets across threads
-    /// - Minimal latency and deterministic behavior
-    ///
-    /// ## Application Workers (Tokio tasks)
-    /// - Multi-threaded Tokio runtime for QUIC processing
-    /// - Service handling and routing
-    /// - Monitoring and cleanup tasks
-    ///
-    /// ## Data Flow
-    /// ```text
-    /// Network Threads (OS)          App Workers (Tokio)
-    ///   ┌─────────┐
-    ///   │ Thread 0├──┐
-    ///   └─────────┘  │
-    ///   ┌─────────┐  │   crossbeam  ┌──────────────┐
-    ///   │ Thread 1├──┼──────────────►│ QUIC Engine  │
-    ///   └─────────┘  │   (bounded)  └──────┬───────┘
-    ///   ┌─────────┐  │                     │
-    ///   │ Thread N├──┘                     ▼
-    ///   └─────────┘                  ┌────────────┐
-    ///                                │  Services  │
-    ///                                └────────────┘
-    /// ```
-    pub async fn run(self) -> Result<()> {
-        let config = self.config.clone();
+    /// Returns an error if thread spawning fails.
+    pub fn start(&mut self) -> Result<(), String> {
+        let num_threads = self.config.network_io.threads;
+        let listen_addr = self.config.server.listen_addr;
+        let channel_size = self.config.quic_protocol.channel_buffer_size;
         
-        log::info!("Starting superd with {} network threads", config.network_threads);
-        log::info!("Max connections: {}", config.max_connections);
-        log::info!("Channel buffer: {} packets", config.channel_buffer_size);
+        log::info!("Starting superd with {} I/O threads...", num_threads);
         
-        // Create shared buffer pool for all network threads
-        // Pool size = channel_buffer_size * network_threads
-        let pool_size = config.channel_buffer_size * config.network_threads;
-        let buffer_pool = BufferPool::with_capacity(pool_size, 65536);
+        // Create thread placement manager
+        let mut placement = ThreadPlacement::new(
+            self.config.network_io.cpu_affinity_strategy
+        );
         
-        // Create channels for network <-> app communication
-        // Using crossbeam::channel for efficient sync/async bridging (Tokio-recommended)
-        let (rx_tx, rx_rx) = crossbeam::channel::bounded::<RxPacket>(config.channel_buffer_size);
-        let (tx_tx, tx_rx) = crossbeam::channel::bounded::<TxPacket>(config.channel_buffer_size);
+        // Build network config from our config
+        let network_config = network::NetworkConfig {
+            threads: self.config.network_io.threads,
+            enable_cpu_pinning: self.config.network_io.enable_cpu_pinning,
+            enable_numa_awareness: self.config.network_io.enable_numa_awareness,
+            thread_priority: self.config.network_io.thread_priority,
+            cpu_affinity_strategy: self.config.network_io.cpu_affinity_strategy,
+        };
         
-        log::info!("Using crossbeam channels for zero-copy message passing");
+        // Build QUIC config from our config
+        let quic_config = quic::ProtocolConfig {
+            threads: self.config.quic_protocol.threads,
+            enable_cpu_pinning: self.config.quic_protocol.enable_cpu_pinning,
+            thread_priority: self.config.quic_protocol.thread_priority,
+            channel_buffer_size: self.config.quic_protocol.channel_buffer_size,
+        };
         
-        // Spawn dedicated network I/O threads
-        let mut network_handles = Vec::new();
-        for thread_id in 0..config.network_threads {
-            let thread_config = NetworkThreadConfig {
-                bind_addr: config.listen_addr,
-                thread_id,
-                reuse_port: config.reuse_port,
-                recv_buffer_size: config.socket_recv_buffer_size,
-                send_buffer_size: config.socket_send_buffer_size,
-            };
+        // Spawn network I/O threads and QUIC protocol handlers (1:1 pairs)
+        for i in 0..num_threads {
+            // Create channel for this I/O thread → QUIC handler pair
+            let (tx, rx) = bounded::<ReceivedPacket>(channel_size);
             
-            let handle = spawn_network_thread(
-                thread_config,
-                rx_tx.clone(),
-                tx_rx.clone(),
-                buffer_pool.clone(),
-                self.metrics.clone(),
-            );
+            // Spawn network I/O thread
+            let io_thread = IoThread::spawn(
+                i,
+                listen_addr,
+                &network_config,
+                self.config.server.enable_reuseport,
+                tx,
+                &mut placement,
+            )?;
             
-            network_handles.push(handle);
+            log::info!("✓ Network I/O thread {} spawned", i);
+            self.io_threads.push(io_thread);
+            
+            // Spawn QUIC protocol handler thread
+            let quic_thread = ProtocolThread::spawn(
+                i,
+                &quic_config,
+                rx,
+                Arc::clone(&self.quic_engine),
+                &mut placement,
+            )?;
+            
+            log::info!("✓ QUIC protocol handler {} spawned", i);
+            self.quic_threads.push(quic_thread);
         }
         
-        log::info!("Spawned {} network I/O threads (pinned to OS threads)", 
-            config.network_threads);
-        
-        // Drop our copies of the senders so threads can detect shutdown
-        drop(rx_tx);
-        drop(tx_rx);
-        
-        // Create channels for app workers (using tokio for async)
-        let (events_tx, events_rx) = 
-            tokio::sync::mpsc::channel(config.channel_buffer_size);
-        let (responses_tx, responses_rx) = 
-            tokio::sync::mpsc::channel(config.channel_buffer_size);
-        
-        // Wrap components for shared access
-        let quic_engine = Arc::new(tokio::sync::Mutex::new(self.quic_engine));
-        let service_registry = Arc::new(tokio::sync::Mutex::new(self.service_registry));
-        
-        // Spawn QUIC processing worker task
-        let quic_task = {
-            let engine = quic_engine.clone();
-            let metrics = self.metrics.clone();
-            tokio::spawn(async move {
-                RequestProcessingTask::new(
-                    engine,
-                    metrics,
-                    rx_rx,
-                    tx_tx,
-                    events_tx,
-                    responses_rx,
-                ).run_with_crossbeam().await
-            })
-        };
-        
-        // Spawn service handling task
-        let service_task = {
-            let registry = service_registry.clone();
-            let metrics = self.metrics.clone();
-            tokio::spawn(async move {
-                ServiceHandlingTask::new(
-                    registry,
-                    metrics,
-                    events_rx,
-                    responses_tx,
-                ).run().await
-            })
-        };
-        
-        // Spawn monitoring tasks
-        let metrics_task = {
-            let metrics = self.metrics.clone();
-            let interval = config.metrics_interval;
-            tokio::spawn(async move {
-                tasks::monitoring::run_metrics_logging(metrics, interval).await
-            })
-        };
-        
-        let cleanup_task = {
-            let engine = quic_engine.clone();
-            let interval = config.cleanup_interval;
-            tokio::spawn(async move {
-                tasks::monitoring::run_connection_cleanup(engine, interval).await
-            })
-        };
-        
-        log::info!("Application worker tasks spawned");
-        log::info!("superd is ready - network threads receiving on {}", config.listen_addr);
-        
-        // Wait for tasks to complete
-        tokio::select! {
-            res = quic_task => {
-                log::error!("QUIC processing task exited: {:?}", res);
-            }
-            res = service_task => {
-                log::error!("Service handling task exited: {:?}", res);
-            }
-            res = metrics_task => {
-                log::error!("Metrics task exited: {:?}", res);
-            }
-            res = cleanup_task => {
-                log::error!("Cleanup task exited: {:?}", res);
-            }
-        }
-        
-        // Wait for network threads to finish
-        log::info!("Waiting for network threads to shut down...");
-        for (i, handle) in network_handles.into_iter().enumerate() {
-            match handle.join() {
-                Ok(Ok(_)) => log::info!("Network thread {} shut down cleanly", i),
-                Ok(Err(e)) => log::error!("Network thread {} error: {}", i, e),
-                Err(_) => log::error!("Network thread {} panicked", i),
-            }
-        }
+        log::info!("╔═══════════════════════════════════════════════════════════╗");
+        log::info!("║  superd is running!                                       ║");
+        log::info!("║                                                           ║");
+        log::info!("║  Listening on: {}                              ║", listen_addr);
+        log::info!("║  Network I/O threads: {}                                ║", num_threads);
+        log::info!("║  QUIC handlers: {}                                      ║", num_threads);
+        log::info!("║  Tokio workers: {}                                      ║", self.config.tokio_worker_count());
+        log::info!("║                                                           ║");
+        log::info!("║  Ready to serve 100K+ concurrent connections              ║");
+        log::info!("║  Target: 1M+ packets/sec                                  ║");
+        log::info!("╚═══════════════════════════════════════════════════════════╝");
         
         Ok(())
+    }
+    
+    /// Wait for all threads to complete
+    ///
+    /// This blocks until the daemon is shut down.
+    pub fn wait(self) -> Result<(), String> {
+        log::info!("Waiting for threads to complete...");
+        
+        // Join all I/O threads
+        for (i, thread) in self.io_threads.into_iter().enumerate() {
+            thread.join()
+                .map_err(|e| format!("I/O thread {} failed: {}", i, e))?;
+        }
+        
+        // Join all QUIC threads
+        for (i, thread) in self.quic_threads.into_iter().enumerate() {
+            thread.join()
+                .map_err(|e| format!("QUIC thread {} failed: {}", i, e))?;
+        }
+        
+        // Shutdown Tokio runtime
+        self.runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        
+        log::info!("All threads completed successfully");
+        Ok(())
+    }
+    
+    /// Run the daemon (start + wait)
+    ///
+    /// Convenience method that calls `start()` followed by `wait()`.
+    pub fn run(mut self) -> Result<(), String> {
+        self.start()?;
+        self.wait()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_daemon_creation() {
+        let config = Config::default();
+        let daemon = Superd::new(config);
+        assert!(daemon.is_ok());
+    }
+    
+    #[test]
+    fn test_default_config_validation() {
+        let config = Config::default();
+        assert!(config.validate().is_ok());
     }
 }

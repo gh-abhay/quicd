@@ -4,11 +4,9 @@
 //! - CPU pinning of OS threads
 //! - Thread priority management
 //! - NUMA-aware thread placement
-//! - Thread naming for observability
 
-use std::thread;
 use core_affinity::CoreId;
-use crate::config_v2::{ThreadPriority, CpuAffinityStrategy};
+use crate::config::{ThreadPriority, CpuAffinityStrategy};
 
 /// Thread placement manager
 ///
@@ -192,23 +190,6 @@ pub fn set_thread_priority(priority: ThreadPriority) -> Result<(), String> {
     }
     
     Ok(())
-}
-
-/// Set thread name for observability
-///
-/// Shows up in:
-/// - `top -H` (Linux)
-/// - `htop` thread view
-/// - Performance profiling tools (perf, flamegraph)
-/// - Debuggers (gdb, lldb)
-pub fn set_thread_name(name: &str) {
-    thread::current()
-        .name()
-        .map(|_| ())
-        .unwrap_or_else(|| {
-            // Thread was spawned without a name, we can't set it post-creation
-            log::warn!("Cannot set thread name '{}' - thread already started", name);
-        });
 }
 
 #[cfg(test)]
