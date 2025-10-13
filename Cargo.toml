@@ -2,6 +2,9 @@
 members = [
     "network",
     "quic",
+    "superd-service",
+    "echo",
+    "http3",
     "superd",
 ]
 resolver = "2"
