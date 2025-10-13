@@ -1,8 +1,7 @@
 [workspace]
 members = [
+    "network",
     "quic",
-    "io",
-    "services",
     "superd",
 ]
 resolver = "2"
