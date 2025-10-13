@@ -62,6 +62,8 @@ mod tests {
             stream_id: Some(0),
             data: Bytes::from("Hello, World!"),
             is_datagram: false,
+            alpn: None,
+            protocol: None,
         };
 
         let response = handler.process(request.clone()).unwrap();
@@ -83,6 +85,8 @@ mod tests {
             stream_id: Some(0),
             data: data.clone(),
             is_datagram: false,
+            alpn: None,
+            protocol: None,
         };
 
         let response = handler.process(request).unwrap();

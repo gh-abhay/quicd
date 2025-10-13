@@ -165,7 +165,7 @@ struct Cli {
     // Monitoring Configuration
     // ========================================================================
     /// Metrics logging interval (seconds)
-    #[arg(long, default_value = "10", env = "SUPERD_METRICS_INTERVAL")]
+    #[arg(long, default_value = "30", env = "SUPERD_METRICS_INTERVAL")]
     metrics_interval: u64,
 
     /// Enable debug logging

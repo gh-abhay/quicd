@@ -47,6 +47,12 @@ pub struct ServiceRequest {
 
     /// Is this a datagram (vs stream)?
     pub is_datagram: bool,
+    
+    /// Negotiated ALPN protocol
+    pub alpn: Option<Bytes>,
+    
+    /// Detected protocol (if multiplexed)
+    pub protocol: Option<String>,
 }
 
 /// Response to send back (Sans-IO)
@@ -120,40 +126,16 @@ pub const SERVICES: &[ServiceFactory] = &[
     // The daemon re-exports this with actual services included
 ];
 
-/// Router trait for determining which service handles a request
-pub trait Router: Send + Sync {
-    /// Route a request to a service name
-    fn route(&self, request: &ServiceRequest) -> &'static str;
-}
-
-/// Default router using request inspection
-struct DefaultRouter;
-
-impl Router for DefaultRouter {
-    fn route(&self, request: &ServiceRequest) -> &'static str {
-        // Fast path: check first bytes for HTTP methods
-        if request.data.len() >= 4 {
-            match &request.data[..4] {
-                b"GET " | b"POST" | b"PUT " | b"DEL " | b"HEAD" | b"PATC" => {
-                    return "http3";
-                }
-                _ => {}
-            }
-        }
-
-        // Default to echo
-        "echo"
-    }
-}
-
 /// Service registry with automatic registration
+///
+/// Routing is handled externally via ALPN and stream-type detection in the QUIC layer.
+/// This registry simply maps service names to their handlers.
 pub struct ServiceRegistry {
     handlers: HashMap<&'static str, Arc<dyn ServiceHandler>>,
-    router: Box<dyn Router>,
 }
 
 impl ServiceRegistry {
-    /// Create a new registry with default router from a compile-time service array
+    /// Create a new registry from a compile-time service array
     /// 
     /// This provides zero runtime initialization cost when using const SERVICES.
     pub fn from_services(services: &'static [ServiceFactory]) -> Self {
@@ -166,37 +148,14 @@ impl ServiceRegistry {
             handlers.insert(service.name, handler);
         }
         
-        Self {
-            handlers,
-            router: Box::new(DefaultRouter),
-        }
+        Self { handlers }
     }
 
-    /// Create a new registry with default router
+    /// Create a new registry
     /// 
     /// Uses the global SERVICES array. For custom service arrays, use `from_services()`.
     pub fn new() -> Self {
         Self::from_services(SERVICES)
-    }
-
-    /// Create a registry with a custom router from a compile-time service array
-    pub fn from_services_with_router(services: &'static [ServiceFactory], router: Box<dyn Router>) -> Self {
-        let mut handlers = HashMap::with_capacity(services.len());
-        
-        for service in services {
-            let handler = (service.factory)();
-            handlers.insert(service.name, handler);
-        }
-        
-        Self {
-            handlers,
-            router,
-        }
-    }
-
-    /// Create a registry with a custom router
-    pub fn with_router(router: Box<dyn Router>) -> Self {
-        Self::from_services_with_router(SERVICES, router)
     }
 
     /// Get a service by name
@@ -211,10 +170,13 @@ impl ServiceRegistry {
 
     /// Process a request (Sans-IO, synchronous)
     ///
-    /// This is the hot path - no async overhead
+    /// This is the hot path - no async overhead.
+    /// Routing is determined by the `protocol` field in the request,
+    /// which is set by ALPN/stream-type detection in the QUIC layer.
     pub fn process(&self, request: ServiceRequest) -> ServiceResult<ServiceResponse> {
-        // Route the request
-        let service_name = self.router.route(&request);
+        // Get service name from request protocol
+        let service_name = request.protocol.as_deref()
+            .ok_or_else(|| ServiceError::NotFound("No protocol specified in request".to_string()))?;
 
         // Get the handler
         let handler = self
@@ -258,25 +220,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_router() {
-        let router = DefaultRouter;
+    fn test_service_registry_routing() {
+        // Create a minimal test service
+        struct TestService;
+        impl ServiceHandler for TestService {
+            fn name(&self) -> &'static str { "test" }
+            fn description(&self) -> &'static str { "Test service" }
+            fn process(&self, req: ServiceRequest) -> ServiceResult<ServiceResponse> {
+                Ok(ServiceResponse {
+                    data: req.data.clone(),
+                    close_stream: true,
+                })
+            }
+        }
 
-        let http_request = ServiceRequest {
-            connection_id: 1,
-            stream_id: Some(0),
-            data: Bytes::from("GET / HTTP/1.1\r\n"),
-            is_datagram: false,
+        const TEST_SERVICE: ServiceFactory = ServiceFactory {
+            name: "test",
+            description: "Test service",
+            factory: || Arc::new(TestService),
         };
 
-        assert_eq!(router.route(&http_request), "http3");
+        let registry = ServiceRegistry::from_services(&[TEST_SERVICE]);
 
-        let echo_request = ServiceRequest {
+        // Test with protocol specified (normal case from QUIC layer)
+        let request = ServiceRequest {
             connection_id: 1,
             stream_id: Some(0),
             data: Bytes::from("hello"),
             is_datagram: false,
+            alpn: Some(Bytes::from("test")),
+            protocol: Some("test".to_string()),
         };
 
-        assert_eq!(router.route(&echo_request), "echo");
+        let response = registry.process(request).unwrap();
+        assert_eq!(response.data, Bytes::from("hello"));
+
+        // Test with missing protocol (should error)
+        let bad_request = ServiceRequest {
+            connection_id: 1,
+            stream_id: Some(0),
+            data: Bytes::from("hello"),
+            is_datagram: false,
+            alpn: None,
+            protocol: None,
+        };
+
+        assert!(registry.process(bad_request).is_err());
     }
 }

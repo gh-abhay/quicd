@@ -17,6 +17,8 @@ tokio = { version = "1.42", features = ["sync", "time", "rt", "macros"] }
 crossbeam = { version = "0.8", features = ["crossbeam-channel"] }
 serde = { version = "1.0", features = ["derive"] }
 network = { path = "../network" }
+service = { path = "../service" }
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1.42", features = ["full"] }

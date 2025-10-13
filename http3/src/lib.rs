@@ -97,6 +97,8 @@ mod tests {
             stream_id: Some(0),
             data: Bytes::from(http_request),
             is_datagram: false,
+            alpn: Some(Bytes::from("h3")),
+            protocol: Some("http3".to_string()),
         };
 
         let response = handler.process(request).unwrap();
@@ -117,6 +119,8 @@ mod tests {
             stream_id: None,
             data: Bytes::from("GET / HTTP/1.1\r\n\r\n"),
             is_datagram: true,
+            alpn: Some(Bytes::from("h3")),
+            protocol: Some("http3".to_string()),
         };
 
         let result = handler.process(request);

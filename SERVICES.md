@@ -10,7 +10,7 @@ High-performance, modular service architecture with Sans-IO design for maximum t
 2. **Zero-Copy**: Use `Bytes` for shared buffer references
 3. **Synchronous Hot Path**: No async/await overhead in request processing
 4. **Automatic Registration**: Single point of service registration
-5. **Fast Routing**: Pattern matching on raw bytes, no string comparisons
+5. **ALPN/Stream-Type Routing**: Protocol detection at QUIC layer, not byte inspection
 
 ### Performance First
 
@@ -27,20 +27,27 @@ High-performance, modular service architecture with Sans-IO design for maximum t
 │                    Service Layer                             │
 ├──────────────────────────────────────────────────────────────┤
 │                                                                │
-│  QUIC Connection                                              │
+│  Network → QUIC Connection                                    │
 │       │                                                        │
-│       ├──> ServiceRegistry.process(request)                   │
+│       ├──> StreamMultiplexer.detect_protocol()               │
 │       │         │                                              │
-│       │         ├──> Router.route() [fast byte matching]      │
-│       │         │         └──> "echo" or "http3"              │
+│       │         ├──> ALPN negotiation (TLS handshake)         │
+│       │         │    OR stream-type varint header             │
 │       │         │                                              │
-│       │         ├──> Get handler from HashMap                 │
-│       │         │                                              │
-│       │         └──> Handler.process(request)  [Sans-IO]      │
-│       │                   │                                    │
-│       │                   └──> ServiceResponse [zero-copy]    │
+│       │         └──> ProtocolRoute {                          │
+│       │                service_name: "echo" or "http3",       │
+│       │                data_offset: 0 or 1                    │
+│       │              }                                         │
 │       │                                                        │
-│       └──> Send response back                                 │
+│       ├──> ServiceRegistry.get(service_name)                  │
+│       │         │                                              │
+│       │         └──> Handler from HashMap                     │
+│       │                                                        │
+│       └──> Handler.process(request) [Sans-IO, zero-copy]     │
+│                   │                                            │
+│                   └──> ServiceResponse                        │
+│                             │                                  │
+│                             └──> QUIC → Network               │
 │                                                                │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -236,50 +243,61 @@ That's it! The main daemon automatically picks it up.
 
 ## Request Routing
 
-### Default Router
+Routing is handled at the QUIC protocol layer through **ALPN negotiation** and **stream-type detection**, not in the service registry. The service registry simply maps service names to handlers.
 
-The default router uses fast byte pattern matching:
+### ALPN-Based Routing (Single Protocol per Connection)
+
+The QUIC connection negotiates a protocol via ALPN during TLS handshake:
 
 ```rust
-impl Router for DefaultRouter {
-    fn route(&self, request: &ServiceRequest) -> &'static str {
-        // Fast path: check first 4 bytes
-        if request.data.len() >= 4 {
-            match &request.data[..4] {
-                b"GET " | b"POST" | b"PUT " | b"DEL " => return "http3",
-                _ => {}
-            }
-        }
-        
-        "echo"  // Default fallback
-    }
-}
+// Server offers protocols
+config.set_application_protos(&[
+    b"h3",              // HTTP/3
+    b"x-superd-echo",   // Echo service
+    b"x-superd-mux",    // Multiplexed services
+])?;
+
+// Client selects one protocol
+// All streams on this connection use that protocol
 ```
 
-### Custom Router
+### Stream-Type Routing (Multiple Protocols per Connection)
 
-Implement your own routing logic:
+For multiplexed connections (`x-superd-mux`), each stream starts with a protocol-type ID:
 
 ```rust
-struct PathBasedRouter;
+// Stream data format: [varint: protocol-type] + [payload]
+// 
+// Stream 0: [0xC0] + "hello"    -> Echo service
+// Stream 4: [0x00] + "GET /"    -> HTTP/3
+// Stream 8: [0xC1] + "custom"   -> Custom service
+```
 
-impl Router for PathBasedRouter {
-    fn route(&self, request: &ServiceRequest) -> &'static str {
-        // Parse HTTP path and route based on it
-        if let Some(path) = extract_path(&request.data) {
-            match path {
-                "/api/v1" => "api_v1",
-                "/api/v2" => "api_v2",
-                _ => "echo",
-            }
-        } else {
-            "echo"
-        }
-    }
+See `IMPLEMENTATION.md` for complete details on protocol detection and routing.
+
+### How Services Are Invoked
+
+The QUIC `StreamProcessor` detects the protocol and routes to the service:
+
+```rust
+// 1. Detect protocol from ALPN or stream-type header
+let route = mux.detect_protocol(alpn, stream_data);
+
+// 2. Get service by name from registry
+let service = registry.get(route.service_name)?;
+
+// 3. Process request
+let response = service.process(request)?;
+```
+
+The `ServiceRequest` includes the detected protocol information:
+
+```rust
+pub struct ServiceRequest {
+    // ... other fields
+    pub alpn: Option<Bytes>,      // Negotiated ALPN
+    pub protocol: Option<String>,  // Detected protocol name
 }
-
-// Use custom router
-let registry = ServiceRegistry::with_router(Box::new(PathBasedRouter));
 ```
 
 ## Performance Characteristics
@@ -287,13 +305,15 @@ let registry = ServiceRegistry::with_router(Box::new(PathBasedRouter));
 ### Request Processing Path
 
 ```text
-QUIC Packet → ServiceRegistry.process()
-                    ↓ (no allocation)
-              Router.route() [byte pattern match]
-                    ↓ (HashMap lookup)
-              Handler.process() [Sans-IO, sync]
-                    ↓ (zero-copy Bytes)
-              ServiceResponse
+Network → QUIC → StreamMultiplexer.detect_protocol()
+                        ↓ (ALPN or varint decode)
+                  ProtocolRoute { service_name, data_offset }
+                        ↓ (HashMap lookup)
+                  ServiceRegistry.get(service_name)
+                        ↓ (Sans-IO, sync)
+                  Handler.process() [zero-copy Bytes]
+                        ↓
+                  ServiceResponse → QUIC → Network
 ```
 
 **Latency**: ~100-500ns per request (depending on service logic)
@@ -509,62 +529,48 @@ impl ServiceHandler for CachedHandler {
 }
 ```
 
-## Custom Routing
+## Protocol Detection & Routing
 
-### By Protocol
-
-```rust
-struct ProtocolRouter;
-
-impl Router for ProtocolRouter {
-    fn route(&self, request: &ServiceRequest) -> &'static str {
-        if request.is_datagram {
-            "media"  // Datagrams for media
-        } else {
-            "signaling"  // Streams for signaling
-        }
-    }
-}
-```
-
-### By Path
+### ALPN-Based Detection
 
 ```rust
-struct PathRouter;
+// Configure QUIC with supported protocols
+let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+config.set_application_protos(&[
+    b"h3",              // HTTP/3
+    b"x-superd-echo",   // Echo service
+    b"x-superd-mux",    // Multiplexed services
+])?;
 
-impl Router for PathRouter {
-    fn route(&self, request: &ServiceRequest) -> &'static str {
-        // Fast byte scanning for path
-        if let Some(path_start) = find_path_in_request(&request.data) {
-            match path_start {
-                b"/api/" => "api",
-                b"/ws/" => "websocket",
-                b"/media/" => "media",
-                _ => "default",
-            }
-        } else {
-            "echo"
-        }
-    }
-}
+// After handshake, get negotiated protocol
+let alpn = conn.application_proto(); // e.g., b"h3"
+
+// Map ALPN to service
+let service_name = match alpn {
+    b"h3" => "http3",
+    b"x-superd-echo" => "echo",
+    _ => return Err("Unknown protocol"),
+};
 ```
 
-### By Stream ID Range
+### Stream-Type Detection (Multiplexed)
 
 ```rust
-struct StreamIdRouter;
+// For ALPN "x-superd-mux", read protocol-type from stream
+let (protocol_type, offset) = decode_varint(&stream_data)?;
 
-impl Router for StreamIdRouter {
-    fn route(&self, request: &ServiceRequest) -> &'static str {
-        match request.stream_id {
-            Some(0..=99) => "control",
-            Some(100..=999) => "signaling",
-            Some(1000..) => "media",
-            None => "datagram_handler",
-        }
-    }
-}
+let service_name = match protocol_type {
+    0x00 => "http3",      // HTTP/3
+    0xC0 => "echo",       // Echo
+    0xC1 => "custom",     // Custom service
+    _ => return Err("Unknown protocol type"),
+};
+
+// Extract payload after varint header
+let payload = stream_data.slice(offset..);
 ```
+
+See `IMPLEMENTATION.md` and `quic/src/stream_mux.rs` for complete routing details.
 
 ## Best Practices
 

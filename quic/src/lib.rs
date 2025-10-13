@@ -9,8 +9,12 @@ use std::net::SocketAddr;
 use thiserror::Error;
 
 pub mod protocol_handler;
+pub mod stream_mux;
+pub mod integration;
 
 pub use protocol_handler::{Engine, ProtocolConfig, ProtocolThread};
+pub use stream_mux::{StreamMultiplexer, Protocol, ProtocolRoute};
+pub use integration::StreamProcessor;
 
 #[derive(Error, Debug)]
 pub enum QuicError {
