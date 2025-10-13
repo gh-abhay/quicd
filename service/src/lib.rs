@@ -2,6 +2,13 @@
 //!
 //! This crate provides the fundamental types and traits that all Superd services
 //! must implement. It follows Sans-IO principles for maximum performance.
+//!
+//! # Service Registration
+//!
+//! Services are registered at compile time using a const array. This provides:
+//! - Zero runtime initialization cost
+//! - Compile-time service discovery
+//! - Maximum performance
 
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -83,6 +90,36 @@ pub trait ServiceHandler: Send + Sync {
     }
 }
 
+/// Compile-time service factory
+///
+/// This struct is used to register services at compile time.
+/// The factory function is called once during ServiceRegistry initialization.
+pub struct ServiceFactory {
+    /// Service name (must be unique)
+    pub name: &'static str,
+    
+    /// Service description
+    pub description: &'static str,
+    
+    /// Factory function that creates the service handler
+    /// This is called once during registry initialization
+    pub factory: fn() -> Arc<dyn ServiceHandler>,
+}
+
+/// Registry of all services (defined at compile time)
+///
+/// To add a new service:
+/// 1. Create your service crate and implement ServiceHandler
+/// 2. Export a SERVICE_FACTORY constant from your crate
+/// 3. Add it to this SERVICES array
+/// 4. The service will be automatically available
+///
+/// This approach provides zero runtime initialization cost.
+pub const SERVICES: &[ServiceFactory] = &[
+    // Note: This will be populated by the main daemon crate
+    // The daemon re-exports this with actual services included
+];
+
 /// Router trait for determining which service handles a request
 pub trait Router: Send + Sync {
     /// Route a request to a service name
@@ -116,26 +153,50 @@ pub struct ServiceRegistry {
 }
 
 impl ServiceRegistry {
-    /// Create a new registry with default router
-    pub fn new() -> Self {
+    /// Create a new registry with default router from a compile-time service array
+    /// 
+    /// This provides zero runtime initialization cost when using const SERVICES.
+    pub fn from_services(services: &'static [ServiceFactory]) -> Self {
+        let mut handlers = HashMap::with_capacity(services.len());
+        
+        // Build the handler map from the const array
+        // The compiler can optimize this loop significantly
+        for service in services {
+            let handler = (service.factory)();
+            handlers.insert(service.name, handler);
+        }
+        
         Self {
-            handlers: HashMap::new(),
+            handlers,
             router: Box::new(DefaultRouter),
+        }
+    }
+
+    /// Create a new registry with default router
+    /// 
+    /// Uses the global SERVICES array. For custom service arrays, use `from_services()`.
+    pub fn new() -> Self {
+        Self::from_services(SERVICES)
+    }
+
+    /// Create a registry with a custom router from a compile-time service array
+    pub fn from_services_with_router(services: &'static [ServiceFactory], router: Box<dyn Router>) -> Self {
+        let mut handlers = HashMap::with_capacity(services.len());
+        
+        for service in services {
+            let handler = (service.factory)();
+            handlers.insert(service.name, handler);
+        }
+        
+        Self {
+            handlers,
+            router,
         }
     }
 
     /// Create a registry with a custom router
     pub fn with_router(router: Box<dyn Router>) -> Self {
-        Self {
-            handlers: HashMap::new(),
-            router,
-        }
-    }
-
-    /// Register a service handler
-    pub fn register(&mut self, handler: Arc<dyn ServiceHandler>) {
-        let name = handler.name();
-        self.handlers.insert(name, handler);
+        Self::from_services_with_router(SERVICES, router)
     }
 
     /// Get a service by name

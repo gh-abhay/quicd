@@ -9,7 +9,7 @@ repository = "https://github.com/klaalabs/superd"
 
 [dependencies]
 # Core service traits
-superd-service = { path = "../superd-service" }
+service = { path = "../service" }
 
 # Logging
 tracing = "0.1"

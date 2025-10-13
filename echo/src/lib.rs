@@ -3,11 +3,17 @@
 //! A zero-copy echo service that returns whatever data it receives.
 //! Perfect for testing, debugging, and benchmarking.
 
-use superd_service::{ServiceHandler, ServiceRequest, ServiceResponse, ServiceResult};
+use service::{ServiceHandler, ServiceRequest, ServiceResponse, ServiceResult};
 use tracing::debug;
 
 /// Echo service handler (zero-allocation)
 pub struct EchoHandler;
+
+impl Default for EchoHandler {
+    fn default() -> Self {
+        Self
+    }
+}
 
 impl ServiceHandler for EchoHandler {
     fn name(&self) -> &'static str {
@@ -34,6 +40,13 @@ impl ServiceHandler for EchoHandler {
         })
     }
 }
+
+/// Compile-time service factory for Echo service
+pub const ECHO_SERVICE: service::ServiceFactory = service::ServiceFactory {
+    name: "echo",
+    description: "Zero-copy echo service for testing and debugging",
+    factory: || std::sync::Arc::new(EchoHandler),
+};
 
 #[cfg(test)]
 mod tests {

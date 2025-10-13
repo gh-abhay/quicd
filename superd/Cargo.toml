@@ -15,7 +15,7 @@ path = "src/main.rs"
 # Local crates
 network = { path = "../network" }
 quic = { path = "../quic" }
-superd-service = { path = "../superd-service" }
+service = { path = "../service" }
 echo = { path = "../echo" }
 http3 = { path = "../http3" }
 

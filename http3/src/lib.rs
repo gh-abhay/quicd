@@ -6,7 +6,7 @@
 mod parser;
 mod response;
 
-use superd_service::{ServiceError, ServiceHandler, ServiceRequest, ServiceResponse, ServiceResult};
+use service::{ServiceError, ServiceHandler, ServiceRequest, ServiceResponse, ServiceResult};
 use tracing::{debug, warn};
 
 pub use parser::HttpRequest;
@@ -74,6 +74,13 @@ impl ServiceHandler for Http3Handler {
         })
     }
 }
+
+/// Compile-time service factory for HTTP/3 service
+pub const HTTP3_SERVICE: service::ServiceFactory = service::ServiceFactory {
+    name: "http3",
+    description: "HTTP/3 service with JSON responses",
+    factory: || std::sync::Arc::new(Http3Handler::default()),
+};
 
 #[cfg(test)]
 mod tests {

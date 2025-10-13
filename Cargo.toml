@@ -2,7 +2,7 @@
 members = [
     "network",
     "quic",
-    "superd-service",
+    "service",
     "echo",
     "http3",
     "superd",

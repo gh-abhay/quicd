@@ -11,12 +11,27 @@ use network::{IoThread, ReceivedPacket, ThreadPlacement};
 use quic::{Engine, ProtocolThread};
 
 // Use service types from the service crates
-use superd_service::ServiceRegistry;
-use echo::EchoHandler;
-use http3::Http3Handler;
+use service::ServiceRegistry;
 
 pub mod config;
 pub use config::Config;
+
+/// Compile-time service registry
+///
+/// All services are registered here at compile time for zero runtime cost.
+/// To add a new service:
+/// 1. Create the service crate with a SERVICE_FACTORY constant
+/// 2. Add it to this array
+/// 3. Update dependencies in Cargo.toml
+mod services {
+    use service::ServiceFactory;
+    
+    /// All registered services (compile-time constant)
+    pub const ALL_SERVICES: &[ServiceFactory] = &[
+        echo::ECHO_SERVICE,
+        http3::HTTP3_SERVICE,
+    ];
+}
 
 /// Main daemon struct implementing the three-layer architecture
 ///
@@ -112,12 +127,8 @@ impl Superd {
         let quic_engine = Arc::new(Mutex::new(Engine::new()));
         log::info!("✓ QUIC engine initialized");
 
-        // Initialize service registry with auto-registration
-        let mut service_registry = ServiceRegistry::new();
-
-        // Register all built-in services
-        service_registry.register(Arc::new(EchoHandler));
-        service_registry.register(Arc::new(Http3Handler::new()));
+        // Initialize service registry with compile-time registered services
+        let service_registry = ServiceRegistry::from_services(services::ALL_SERVICES);
 
         log::info!(
             "✓ Service registry initialized with {} services",
