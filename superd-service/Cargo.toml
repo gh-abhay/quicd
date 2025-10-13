@@ -1,0 +1,24 @@
+[package]
+name = "superd-service"
+version = "0.1.0"
+edition = "2021"
+authors = ["Superd Contributors"]
+description = "Core service traits and types for Superd"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/klaalabs/superd"
+
+[dependencies]
+# Data structures
+bytes = "1.8"
+
+# Error handling
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+
+# Async trait support
+async-trait = "0.1"
+
+# Async runtime for connection lifecycle hooks
+tokio = { version = "1.42", features = ["rt-multi-thread"] }

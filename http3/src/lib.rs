@@ -6,7 +6,7 @@
 mod parser;
 mod response;
 
-use super::{ServiceError, ServiceHandler, ServiceRequest, ServiceResponse, ServiceResult};
+use superd_service::{ServiceError, ServiceHandler, ServiceRequest, ServiceResponse, ServiceResult};
 use tracing::{debug, warn};
 
 pub use parser::HttpRequest;
@@ -72,14 +72,6 @@ impl ServiceHandler for Http3Handler {
             data: response_data,
             close_stream: true,
         })
-    }
-
-    fn on_connect(&self, connection_id: u64) {
-        debug!(connection_id, "HTTP/3: connection established");
-    }
-
-    fn on_disconnect(&self, connection_id: u64) {
-        debug!(connection_id, "HTTP/3: connection closed");
     }
 }
 

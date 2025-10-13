@@ -10,11 +10,13 @@ use tokio::sync::Mutex;
 use network::{IoThread, ReceivedPacket, ThreadPlacement};
 use quic::{Engine, ProtocolThread};
 
+// Use service types from the service crates
+use superd_service::ServiceRegistry;
+use echo::EchoHandler;
+use http3::Http3Handler;
+
 pub mod config;
 pub use config::Config;
-
-pub mod services;
-pub use services::{ServiceHandler, ServiceRegistry, ServiceRequest, ServiceResponse};
 
 /// Main daemon struct implementing the three-layer architecture
 ///
@@ -111,7 +113,11 @@ impl Superd {
         log::info!("✓ QUIC engine initialized");
 
         // Initialize service registry with auto-registration
-        let service_registry = services::register_all_services();
+        let mut service_registry = ServiceRegistry::new();
+
+        // Register all built-in services
+        service_registry.register(Arc::new(EchoHandler));
+        service_registry.register(Arc::new(Http3Handler::new()));
 
         log::info!(
             "✓ Service registry initialized with {} services",

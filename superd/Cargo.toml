@@ -15,6 +15,9 @@ path = "src/main.rs"
 # Local crates
 network = { path = "../network" }
 quic = { path = "../quic" }
+superd-service = { path = "../superd-service" }
+echo = { path = "../echo" }
+http3 = { path = "../http3" }
 
 # Async runtime
 tokio = { version = "1.42", features = ["full"] }

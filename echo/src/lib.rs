@@ -3,7 +3,7 @@
 //! A zero-copy echo service that returns whatever data it receives.
 //! Perfect for testing, debugging, and benchmarking.
 
-use super::{ServiceHandler, ServiceRequest, ServiceResponse, ServiceResult};
+use superd_service::{ServiceHandler, ServiceRequest, ServiceResponse, ServiceResult};
 use tracing::debug;
 
 /// Echo service handler (zero-allocation)
@@ -32,14 +32,6 @@ impl ServiceHandler for EchoHandler {
             data: request.data,
             close_stream: true,
         })
-    }
-
-    fn on_connect(&self, connection_id: u64) {
-        debug!(connection_id, "Echo: connection established");
-    }
-
-    fn on_disconnect(&self, connection_id: u64) {
-        debug!(connection_id, "Echo: connection closed");
     }
 }
 

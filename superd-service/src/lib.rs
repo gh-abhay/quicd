@@ -1,10 +1,7 @@
-//! Service Registry and Core Types
+//! Core Service Traits and Types for Superd
 //!
-//! This module provides the core service infrastructure with:
-//! - Sans-IO service processing (no async in hot path)
-//! - Zero-copy request/response handling
-//! - Automatic service registration
-//! - Fast request routing
+//! This crate provides the fundamental types and traits that all Superd services
+//! must implement. It follows Sans-IO principles for maximum performance.
 
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -59,6 +56,7 @@ pub struct ServiceResponse {
 ///
 /// This trait uses a synchronous API for maximum performance.
 /// Services should be stateless or use Arc for shared state.
+#[async_trait::async_trait]
 pub trait ServiceHandler: Send + Sync {
     /// Service name (for logging/debugging)
     fn name(&self) -> &'static str;
@@ -75,20 +73,14 @@ pub trait ServiceHandler: Send + Sync {
     fn process(&self, request: ServiceRequest) -> ServiceResult<ServiceResponse>;
 
     /// Called when a new connection is established (optional, async is OK here)
-    fn on_connect(&self, _connection_id: u64) {
+    async fn on_connect(&self, _connection_id: u64) {
         // Default: do nothing
     }
 
     /// Called when a connection is closed (optional, async is OK here)
-    fn on_disconnect(&self, _connection_id: u64) {
+    async fn on_disconnect(&self, _connection_id: u64) {
         // Default: do nothing
     }
-}
-
-/// Service registry with automatic registration
-pub struct ServiceRegistry {
-    handlers: HashMap<&'static str, Arc<dyn ServiceHandler>>,
-    router: Box<dyn Router>,
 }
 
 /// Router trait for determining which service handles a request
@@ -115,6 +107,12 @@ impl Router for DefaultRouter {
         // Default to echo
         "echo"
     }
+}
+
+/// Service registry with automatic registration
+pub struct ServiceRegistry {
+    handlers: HashMap<&'static str, Arc<dyn ServiceHandler>>,
+    router: Box<dyn Router>,
 }
 
 impl ServiceRegistry {
@@ -170,14 +168,20 @@ impl ServiceRegistry {
     /// Notify all services of a new connection
     pub fn on_connect(&self, connection_id: u64) {
         for handler in self.handlers.values() {
-            handler.on_connect(connection_id);
+            let handler = Arc::clone(handler);
+            tokio::spawn(async move {
+                handler.on_connect(connection_id).await;
+            });
         }
     }
 
     /// Notify all services of a closed connection
     pub fn on_disconnect(&self, connection_id: u64) {
         for handler in self.handlers.values() {
-            handler.on_disconnect(connection_id);
+            let handler = Arc::clone(handler);
+            tokio::spawn(async move {
+                handler.on_disconnect(connection_id).await;
+            });
         }
     }
 }
@@ -186,26 +190,6 @@ impl Default for ServiceRegistry {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// Service modules
-pub mod echo;
-pub mod http3;
-
-/// Auto-registration function that all services call
-///
-/// This is the ONLY place where service names appear.
-/// To add a new service:
-/// 1. Create the service module
-/// 2. Add it here
-pub fn register_all_services() -> ServiceRegistry {
-    let mut registry = ServiceRegistry::new();
-
-    // Register all built-in services
-    registry.register(Arc::new(echo::EchoHandler));
-    registry.register(Arc::new(http3::Http3Handler::new()));
-
-    registry
 }
 
 #[cfg(test)]
