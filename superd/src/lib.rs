@@ -14,7 +14,7 @@ pub mod config;
 pub use config::Config;
 
 pub mod services;
-pub use services::{Service, ServiceRegistry, ServiceRequest, ServiceResponse};
+pub use services::{ServiceHandler, ServiceRegistry, ServiceRequest, ServiceResponse};
 
 /// Main daemon struct implementing the three-layer architecture
 ///
@@ -110,12 +110,8 @@ impl Superd {
         let quic_engine = Arc::new(Mutex::new(Engine::new()));
         log::info!("✓ QUIC engine initialized");
 
-        // Initialize service registry
-        let mut service_registry = ServiceRegistry::new();
-
-        // Register built-in services
-        service_registry.register(Arc::new(services::echo::EchoService::new()));
-        service_registry.register(Arc::new(services::http3::Http3Service::new()));
+        // Initialize service registry with auto-registration
+        let service_registry = services::register_all_services();
 
         log::info!(
             "✓ Service registry initialized with {} services",
