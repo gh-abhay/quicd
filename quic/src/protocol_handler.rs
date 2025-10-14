@@ -19,6 +19,9 @@ use std::sync::Arc;
 use std::thread;
 use tokio::sync::Mutex;
 
+use crate::QuicEngine;
+use bytes::Bytes;
+
 /// QUIC protocol handler configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolConfig {
@@ -43,45 +46,6 @@ impl Default for ProtocolConfig {
             thread_priority: ThreadPriority::Normal,
             channel_buffer_size: 8192,
         }
-    }
-}
-
-/// QUIC engine (placeholder - will be replaced with actual quiche integration)
-///
-/// In production, this will manage quiche::Connection instances.
-pub struct Engine {
-    // TODO: Add quiche::Connection, connection pool, etc.
-    _placeholder: (),
-}
-
-impl Engine {
-    /// Create a new QUIC engine
-    pub fn new() -> Self {
-        Self { _placeholder: () }
-    }
-
-    /// Process a received packet
-    ///
-    /// This is where QUIC packet processing happens:
-    /// - Decrypt packet
-    /// - Parse QUIC frames
-    /// - Update connection state
-    /// - Trigger ACKs, retransmissions, etc.
-    pub fn process_packet(&mut self, packet: ReceivedPacket) -> Result<(), String> {
-        // TODO: Implement actual QUIC processing
-        // For now, just log
-        log::trace!(
-            "Processing packet from {} ({} bytes)",
-            packet.src_addr,
-            packet.data.len()
-        );
-        Ok(())
-    }
-}
-
-impl Default for Engine {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -111,7 +75,7 @@ impl ProtocolThread {
         thread_id: usize,
         config: &ProtocolConfig,
         packet_rx: Receiver<ReceivedPacket>,
-        quic_engine: Arc<Mutex<Engine>>,
+        quic_engine: Arc<Mutex<QuicEngine>>,
         placement: &mut ThreadPlacement,
     ) -> Result<Self, String> {
         let core_id = if config.enable_cpu_pinning {
@@ -171,16 +135,22 @@ impl ProtocolThread {
     async fn run_processing_loop(
         thread_id: usize,
         packet_rx: Receiver<ReceivedPacket>,
-        quic_engine: Arc<Mutex<Engine>>,
+        quic_engine: Arc<Mutex<QuicEngine>>,
     ) -> Result<(), String> {
         log::info!("QUIC protocol handler {} started", thread_id);
 
         let mut packets_processed = 0u64;
         let mut last_log = std::time::Instant::now();
 
+        // Get local address from the engine
+        let local_addr = {
+            let engine = quic_engine.lock().await;
+            engine.local_addr
+        };
+
         loop {
             // Poll channel for packets (with yielding to allow Tokio to run)
-            let packet = tokio::select! {
+            let received_packet = tokio::select! {
                 // Try to receive from channel
                 _ = tokio::task::yield_now() => {
                     // Yield to Tokio scheduler
@@ -199,11 +169,26 @@ impl ProtocolThread {
                 }
             };
 
+            // Convert ReceivedPacket to PacketIn
+            let packet = crate::PacketIn {
+                data: Bytes::from(received_packet.data),
+                from: received_packet.src_addr,
+                to: local_addr,
+            };
+
             // Lock QUIC engine and process packet
             let mut engine = quic_engine.lock().await;
 
-            if let Err(e) = engine.process_packet(packet) {
-                log::warn!("Thread {}: Failed to process packet: {}", thread_id, e);
+            match engine.process_packet(packet) {
+                Ok(events) => {
+                    // TODO: Handle QUIC events (stream data, new connections, etc.)
+                    if !events.is_empty() {
+                        log::trace!("Thread {}: Generated {} events", thread_id, events.len());
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Thread {}: Failed to process packet: {}", thread_id, e);
+                }
             }
 
             packets_processed += 1;
@@ -259,7 +244,10 @@ mod tests {
         };
 
         let (_tx, rx) = unbounded();
-        let engine = Arc::new(Mutex::new(Engine::new()));
+        let local_addr = "127.0.0.1:4433".parse().unwrap();
+        let engine = Arc::new(Mutex::new(
+            QuicEngine::new(local_addr).expect("Failed to create QuicEngine")
+        ));
         let mut placement = ThreadPlacement::new(CpuAffinityStrategy::Auto);
 
         let thread = ProtocolThread::spawn(0, &config, rx, engine, &mut placement);
@@ -269,10 +257,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    #[tokio::test]
-    async fn test_engine_creation() {
-        let engine = Engine::new();
-        // Just verify it can be created
-        drop(engine);
+    #[test]
+    fn test_engine_creation() {
+        let local_addr = "127.0.0.1:4433".parse().unwrap();
+        let engine = QuicEngine::new(local_addr);
+        assert!(engine.is_ok());
     }
 }

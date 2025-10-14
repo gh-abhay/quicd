@@ -12,7 +12,7 @@ pub mod protocol_handler;
 pub mod stream_mux;
 pub mod integration;
 
-pub use protocol_handler::{Engine, ProtocolConfig, ProtocolThread};
+pub use protocol_handler::{ProtocolConfig, ProtocolThread};
 pub use stream_mux::{StreamMultiplexer, Protocol, ProtocolRoute};
 pub use integration::StreamProcessor;
 
@@ -85,7 +85,7 @@ impl ConnectionState {
 /// Sans-IO QUIC engine optimized for performance
 pub struct QuicEngine {
     config: Config,
-    local_addr: SocketAddr,
+    pub local_addr: SocketAddr,
     connections: HashMap<u64, ConnectionState>,
     conn_id_to_scid: HashMap<u64, quiche::ConnectionId<'static>>,
     scid_to_conn_id: HashMap<quiche::ConnectionId<'static>, u64>,

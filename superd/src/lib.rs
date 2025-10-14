@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 // Use types from the network and quic crates
 use network::{IoThread, ReceivedPacket, ThreadPlacement};
-use quic::{Engine, ProtocolThread};
+use quic::{QuicEngine, ProtocolThread};
 
 // Use service types from the service crates
 use service::ServiceRegistry;
@@ -73,7 +73,7 @@ pub struct Superd {
     quic_threads: Vec<ProtocolThread>,
 
     /// Shared QUIC engine
-    quic_engine: Arc<Mutex<Engine>>,
+    quic_engine: Arc<Mutex<QuicEngine>>,
 
     /// Service registry
     service_registry: Arc<ServiceRegistry>,
@@ -123,9 +123,12 @@ impl Superd {
 
         log::info!("✓ Tokio runtime created with {} workers", tokio_workers);
 
-        // Create shared QUIC engine
-        let quic_engine = Arc::new(Mutex::new(Engine::new()));
-        log::info!("✓ QUIC engine initialized");
+        // Create shared QUIC engine with proper configuration
+        let listen_addr = config.server.listen_addr;
+        let quic_engine = QuicEngine::new(listen_addr)
+            .map_err(|e| format!("Failed to create QUIC engine: {}", e))?;
+        let quic_engine = Arc::new(Mutex::new(quic_engine));
+        log::info!("✓ QUIC engine initialized for {}", listen_addr);
 
         // Initialize service registry with compile-time registered services
         let service_registry = ServiceRegistry::from_services(services::ALL_SERVICES);
