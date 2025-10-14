@@ -3,8 +3,6 @@ members = [
     "network",
     "quic",
     "service",
-    "echo",
-    "http3",
     "superd",
 ]
 resolver = "2"
