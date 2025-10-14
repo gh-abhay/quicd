@@ -8,7 +8,7 @@
 //! - Bidirectional data flow
 
 use bytes::Bytes;
-use quiche::Connection;
+use quiche::{Connection, ConnectionId};
 use service::{ServiceRegistry, ServiceRequest};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -49,7 +49,7 @@ impl StreamProcessor {
     pub fn process_stream(
         &self,
         conn: &mut Connection,
-        conn_id: u64,
+        conn_id: &ConnectionId,
         stream_id: u64,
     ) -> Result<(), String> {
         // Read stream data
@@ -65,7 +65,7 @@ impl StreamProcessor {
         let stream_data = Bytes::copy_from_slice(&buf[..read]);
         
         debug!(
-            conn_id = conn_id,
+            conn_id = ?conn_id,
             stream_id = stream_id,
             bytes = read,
             fin = fin,
@@ -79,7 +79,7 @@ impl StreamProcessor {
         let route = self.mux.detect_protocol(alpn, &stream_data);
         
         debug!(
-            conn_id = conn_id,
+            conn_id = ?conn_id,
             stream_id = stream_id,
             service = route.service_name,
             data_offset = route.data_offset,
@@ -95,7 +95,7 @@ impl StreamProcessor {
         
         // Create service request
         let request = ServiceRequest {
-            connection_id: conn_id,
+            connection_id: conn_id.to_vec(),
             stream_id: Some(stream_id),
             data: payload,
             is_datagram: false,
@@ -113,7 +113,7 @@ impl StreamProcessor {
             .map_err(|e| format!("Service processing error: {}", e))?;
         
         debug!(
-            conn_id = conn_id,
+            conn_id = ?conn_id,
             stream_id = stream_id,
             response_bytes = response.data.len(),
             "Service processed request, sending response"
@@ -138,11 +138,11 @@ impl StreamProcessor {
     pub fn process_datagram(
         &self,
         conn: &mut Connection,
-        conn_id: u64,
+        conn_id: &ConnectionId,
         data: Bytes,
     ) -> Result<(), String> {
         debug!(
-            conn_id = conn_id,
+            conn_id = ?conn_id,
             bytes = data.len(),
             "Datagram received"
         );
@@ -162,7 +162,7 @@ impl StreamProcessor {
         
         // Create service request
         let request = ServiceRequest {
-            connection_id: conn_id,
+            connection_id: conn_id.to_vec(),
             stream_id: None,
             data: payload,
             is_datagram: true,
@@ -193,45 +193,27 @@ impl StreamProcessor {
     pub fn poll_connection(
         &self,
         conn: &mut Connection,
-        conn_id: u64,
+        conn_id: &ConnectionId,
     ) -> Result<(), String> {
         // Process all readable streams
         for stream_id in conn.readable() {
             if let Err(e) = self.process_stream(conn, conn_id, stream_id) {
                 warn!(
-                    conn_id = conn_id,
-                    stream_id = stream_id,
-                    error = %e,
-                    "Error processing stream"
+                    "Failed to process stream {}: {} for conn {:?}",
+                    stream_id, e, conn_id
                 );
             }
         }
-        
-        // Process datagrams if available
-        while let Some(len) = conn.dgram_recv_front_len() {
-            if len > 0 {
-                let mut buf = vec![0u8; len];
-                match conn.dgram_recv(&mut buf) {
-                    Ok(read) => {
-                        let data = Bytes::copy_from_slice(&buf[..read]);
-                        if let Err(e) = self.process_datagram(conn, conn_id, data) {
-                            warn!(
-                                conn_id = conn_id,
-                                error = %e,
-                                "Error processing datagram"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to receive datagram");
-                        break;
-                    }
-                }
-            } else {
-                break;
+
+        // Process all readable datagrams
+        let mut dgram_buf = [0u8; 65535];
+        while let Ok(len) = conn.dgram_recv(&mut dgram_buf) {
+            let data = Bytes::copy_from_slice(&dgram_buf[..len]);
+            if let Err(e) = self.process_datagram(conn, conn_id, data) {
+                warn!("Failed to process datagram for conn {:?}: {}", conn_id, e);
             }
         }
-        
+
         Ok(())
     }
 }
@@ -239,13 +221,14 @@ impl StreamProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use service::ServiceFactory;
-    
+    use crate::stream_mux::StreamMultiplexer;
+    use service::ServiceRegistry;
+
     #[test]
-    fn test_stream_processor_creation() {
+    fn test_stream_processor_new() {
         let mux = Arc::new(StreamMultiplexer::new());
-        let services = Arc::new(ServiceRegistry::from_services(&[]));
-        
-        let _processor = StreamProcessor::new(mux, services);
+        let services = Arc::new(ServiceRegistry::new());
+        let processor = StreamProcessor::new(mux, services);
+        assert_eq!(processor.services.list_services().len(), 0);
     }
 }

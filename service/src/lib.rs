@@ -37,7 +37,7 @@ pub enum ServiceError {
 #[derive(Debug, Clone)]
 pub struct ServiceRequest {
     /// Connection ID
-    pub connection_id: u64,
+    pub connection_id: Vec<u8>,
 
     /// Stream ID (if stream-based)
     pub stream_id: Option<u64>,
@@ -218,6 +218,30 @@ impl Default for ServiceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn test_service_request_creation() {
+        let request = ServiceRequest {
+            connection_id: vec![1, 2, 3],
+            stream_id: Some(100),
+            data: Bytes::from("test"),
+            is_datagram: false,
+            alpn: None,
+            protocol: None,
+        };
+        assert_eq!(request.connection_id, vec![1, 2, 3]);
+        assert_eq!(request.stream_id, Some(100));
+    }
+
+    #[test]
+    fn test_service_response_creation() {
+        let response = ServiceResponse {
+            data: Bytes::from("response"),
+            close_stream: true,
+        };
+        assert_eq!(response.close_stream, true);
+    }
 
     #[test]
     fn test_service_registry_routing() {
@@ -244,7 +268,7 @@ mod tests {
 
         // Test with protocol specified (normal case from QUIC layer)
         let request = ServiceRequest {
-            connection_id: 1,
+            connection_id: vec![1, 2, 3],
             stream_id: Some(0),
             data: Bytes::from("hello"),
             is_datagram: false,
@@ -257,7 +281,7 @@ mod tests {
 
         // Test with missing protocol (should error)
         let bad_request = ServiceRequest {
-            connection_id: 1,
+            connection_id: vec![1, 2, 3],
             stream_id: Some(0),
             data: Bytes::from("hello"),
             is_datagram: false,

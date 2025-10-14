@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::thread;
 use tokio::sync::Mutex;
 
-use crate::QuicEngine;
-use bytes::Bytes;
+use crate::integration::StreamProcessor;
+use crate::{QuicEngine, QuicEvent};
 
 /// QUIC protocol handler configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +66,7 @@ impl ProtocolThread {
     /// - `config`: QUIC protocol configuration
     /// - `packet_rx`: Channel to receive packets from network I/O thread
     /// - `quic_engine`: Shared QUIC engine (behind mutex)
+    /// - `stream_processor`: Stream processor for handling application-level streams
     /// - `placement`: Thread placement manager for CPU pinning
     ///
     /// # Returns
@@ -76,6 +77,7 @@ impl ProtocolThread {
         config: &ProtocolConfig,
         packet_rx: Receiver<ReceivedPacket>,
         quic_engine: Arc<Mutex<QuicEngine>>,
+        stream_processor: Arc<StreamProcessor>,
         placement: &mut ThreadPlacement,
     ) -> Result<Self, String> {
         let core_id = if config.enable_cpu_pinning {
@@ -86,6 +88,7 @@ impl ProtocolThread {
 
         let thread_priority = config.thread_priority;
         let thread_name = format!("quic-handler-{}", thread_id);
+        let stream_processor = Arc::clone(&stream_processor);
 
         let handle = thread::Builder::new()
             .name(thread_name.clone())
@@ -117,7 +120,8 @@ impl ProtocolThread {
 
                 // Run the processing loop
                 runtime.block_on(async {
-                    Self::run_processing_loop(thread_id, packet_rx, quic_engine).await
+                    Self::run_processing_loop(thread_id, packet_rx, quic_engine, stream_processor)
+                        .await
                 })
             })
             .map_err(|e| format!("Failed to spawn thread: {}", e))?;
@@ -136,6 +140,7 @@ impl ProtocolThread {
         thread_id: usize,
         packet_rx: Receiver<ReceivedPacket>,
         quic_engine: Arc<Mutex<QuicEngine>>,
+        stream_processor: Arc<StreamProcessor>,
     ) -> Result<(), String> {
         log::info!("QUIC protocol handler {} started", thread_id);
 
@@ -171,7 +176,7 @@ impl ProtocolThread {
 
             // Convert ReceivedPacket to PacketIn
             let packet = crate::PacketIn {
-                data: Bytes::from(received_packet.data),
+                data: received_packet.data,
                 from: received_packet.src_addr,
                 to: local_addr,
             };
@@ -179,15 +184,60 @@ impl ProtocolThread {
             // Lock QUIC engine and process packet
             let mut engine = quic_engine.lock().await;
 
-            match engine.process_packet(packet) {
-                Ok(events) => {
-                    // TODO: Handle QUIC events (stream data, new connections, etc.)
-                    if !events.is_empty() {
-                        log::trace!("Thread {}: Generated {} events", thread_id, events.len());
-                    }
-                }
+            let events = match engine.process_packet(packet) {
+                Ok(events) => events,
                 Err(e) => {
                     log::warn!("Thread {}: Failed to process packet: {}", thread_id, e);
+                    continue;
+                }
+            };
+
+            if !events.is_empty() {
+                log::trace!("Thread {}: Generated {} events", thread_id, events.len());
+            }
+
+            // Process all generated QUIC events
+            for event in events {
+                match event {
+                    QuicEvent::StreamData(conn_id, stream_id) => {
+                        if let Some(conn) = engine.get_connection_mut(&conn_id) {
+                            if let Err(e) =
+                                stream_processor.process_stream(conn, &conn_id, stream_id)
+                            {
+                                log::error!(
+                                    "Thread {}: Error processing stream {}: {}",
+                                    thread_id,
+                                    stream_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    QuicEvent::Datagram(conn_id, data) => {
+                        if let Some(conn) = engine.get_connection_mut(&conn_id) {
+                            if let Err(e) =
+                                stream_processor.process_datagram(conn, &conn_id, data)
+                            {
+                                log::error!(
+                                    "Thread {}: Error processing datagram: {}",
+                                    thread_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    QuicEvent::NewConnection(conn_id) => {
+                        log::info!("Thread {}: New connection: {:?}", thread_id, conn_id);
+                    }
+                    QuicEvent::ConnectionLost(conn_id) => {
+                        log::info!("Thread {}: Connection lost: {:?}", thread_id, conn_id);
+                    }
+                    QuicEvent::Send(packets) => {
+                        // This event is handled by the QuicEngine's send_pending_packets method,
+                        // which is called from the I/O threads. We can ignore it here.
+                        // The presence of this match arm makes our event handling exhaustive.
+                        drop(packets);
+                    }
                 }
             }
 
@@ -234,6 +284,10 @@ mod tests {
     use network::CpuAffinityStrategy;
     use std::time::Duration;
 
+    use crate::integration::StreamProcessor;
+    use crate::stream_mux::StreamMultiplexer;
+    use service::ServiceRegistry;
+
     #[tokio::test]
     async fn test_protocol_thread_spawn() {
         let config = ProtocolConfig {
@@ -246,11 +300,20 @@ mod tests {
         let (_tx, rx) = unbounded();
         let local_addr = "127.0.0.1:4433".parse().unwrap();
         let engine = Arc::new(Mutex::new(
-            QuicEngine::new(local_addr).expect("Failed to create QuicEngine")
+            QuicEngine::new(local_addr).expect("Failed to create QuicEngine"),
         ));
         let mut placement = ThreadPlacement::new(CpuAffinityStrategy::Auto);
 
-        let thread = ProtocolThread::spawn(0, &config, rx, engine, &mut placement);
+        // Create a dummy StreamProcessor for the test
+        let service_registry = Arc::new(ServiceRegistry::new());
+        let stream_multiplexer = Arc::new(StreamMultiplexer::new());
+        let stream_processor = Arc::new(StreamProcessor::new(
+            stream_multiplexer,
+            service_registry,
+        ));
+
+        let thread =
+            ProtocolThread::spawn(0, &config, rx, engine, stream_processor, &mut placement);
         assert!(thread.is_ok());
 
         // Let it run briefly

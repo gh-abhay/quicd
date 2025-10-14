@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 // Use types from the network and quic crates
 use network::{IoThread, ReceivedPacket, ThreadPlacement};
-use quic::{QuicEngine, ProtocolThread};
+use quic::{ProtocolThread, QuicEngine, StreamMultiplexer, StreamProcessor};
 
 // Use service types from the service crates
 use service::ServiceRegistry;
@@ -78,6 +78,9 @@ pub struct Superd {
     /// Service registry
     service_registry: Arc<ServiceRegistry>,
 
+    /// Stream processor
+    stream_processor: Arc<StreamProcessor>,
+
     /// Tokio runtime handle
     runtime: tokio::runtime::Runtime,
 }
@@ -143,12 +146,20 @@ impl Superd {
 
         let service_registry = Arc::new(service_registry);
 
+        // Create stream multiplexer and processor
+        let stream_multiplexer = Arc::new(StreamMultiplexer::new());
+        let stream_processor =
+            StreamProcessor::new(stream_multiplexer, Arc::clone(&service_registry));
+        let stream_processor = Arc::new(stream_processor);
+        log::info!("✓ Stream processor and multiplexer initialized");
+
         Ok(Self {
             config,
             io_threads: Vec::new(),
             quic_threads: Vec::new(),
             quic_engine,
             service_registry,
+            stream_processor,
             runtime,
         })
     }
@@ -218,6 +229,7 @@ impl Superd {
                 &quic_config,
                 rx,
                 Arc::clone(&self.quic_engine),
+                Arc::clone(&self.stream_processor),
                 &mut placement,
             )?;
 

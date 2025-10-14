@@ -40,7 +40,7 @@ impl ServiceHandler for Http3Handler {
 
     fn process(&self, request: ServiceRequest) -> ServiceResult<ServiceResponse> {
         debug!(
-            connection_id = request.connection_id,
+            connection_id = ?request.connection_id,
             stream_id = ?request.stream_id,
             data_len = request.data.len(),
             "HTTP/3: processing request"
@@ -93,7 +93,7 @@ mod tests {
 
         let http_request = "GET /api/test HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let request = ServiceRequest {
-            connection_id: 1,
+            connection_id: vec![1],
             stream_id: Some(0),
             data: Bytes::from(http_request),
             is_datagram: false,
@@ -115,7 +115,7 @@ mod tests {
         let handler = Http3Handler::new();
 
         let request = ServiceRequest {
-            connection_id: 1,
+            connection_id: vec![1],
             stream_id: None,
             data: Bytes::from("GET / HTTP/1.1\r\n\r\n"),
             is_datagram: true,

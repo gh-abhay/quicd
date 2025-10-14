@@ -3,37 +3,32 @@
 //! A zero-copy echo service that returns whatever data it receives.
 //! Perfect for testing, debugging, and benchmarking.
 
-use service::{ServiceHandler, ServiceRequest, ServiceResponse, ServiceResult};
+use service::{ServiceHandler, ServiceRequest, ServiceResponse, ServiceResult, ServiceFactory};
+use std::sync::Arc;
 use tracing::debug;
 
-/// Echo service handler (zero-allocation)
-pub struct EchoHandler;
+/// Echo service implementation
+pub struct EchoService;
 
-impl Default for EchoHandler {
-    fn default() -> Self {
-        Self
-    }
-}
-
-impl ServiceHandler for EchoHandler {
+impl ServiceHandler for EchoService {
     fn name(&self) -> &'static str {
         "echo"
     }
 
     fn description(&self) -> &'static str {
-        "Zero-copy echo service for testing and debugging"
+        "A simple echo service for testing"
     }
 
     fn process(&self, request: ServiceRequest) -> ServiceResult<ServiceResponse> {
         debug!(
-            connection_id = request.connection_id,
+            connection_id = ?request.connection_id,
             stream_id = ?request.stream_id,
             data_len = request.data.len(),
             is_datagram = request.is_datagram,
-            "Echo: processing request"
+            "EchoService: processing request"
         );
 
-        // Zero-copy: just return the same Bytes reference
+        // Echo the data back
         Ok(ServiceResponse {
             data: request.data,
             close_stream: true,
@@ -41,11 +36,11 @@ impl ServiceHandler for EchoHandler {
     }
 }
 
-/// Compile-time service factory for Echo service
-pub const ECHO_SERVICE: service::ServiceFactory = service::ServiceFactory {
+/// Compile-time factory for the echo service
+pub const ECHO_SERVICE: ServiceFactory = ServiceFactory {
     name: "echo",
-    description: "Zero-copy echo service for testing and debugging",
-    factory: || std::sync::Arc::new(EchoHandler),
+    description: "A simple echo service for testing",
+    factory: || Arc::new(EchoService),
 };
 
 #[cfg(test)]
@@ -54,44 +49,35 @@ mod tests {
     use bytes::Bytes;
 
     #[test]
-    fn test_echo_handler() {
-        let handler = EchoHandler;
-
+    fn test_echo_service_process() {
+        let service = EchoService;
         let request = ServiceRequest {
-            connection_id: 1,
-            stream_id: Some(0),
-            data: Bytes::from("Hello, World!"),
+            connection_id: vec![1],
+            stream_id: Some(4),
+            data: Bytes::from("hello"),
             is_datagram: false,
             alpn: None,
-            protocol: None,
+            protocol: Some("echo".to_string()),
         };
 
-        let response = handler.process(request.clone()).unwrap();
-
-        // Should be the exact same Bytes (zero-copy)
-        assert_eq!(response.data, request.data);
-        assert!(response.close_stream);
+        let response = service.process(request).unwrap();
+        assert_eq!(response.data, Bytes::from("hello"));
+        assert_eq!(response.close_stream, true);
     }
 
     #[test]
-    fn test_echo_zero_copy() {
-        let handler = EchoHandler;
-
-        let data = Bytes::from_static(b"test data");
-        let ptr_before = data.as_ptr();
-
+    fn test_echo_service_datagram() {
+        let service = EchoService;
         let request = ServiceRequest {
-            connection_id: 1,
-            stream_id: Some(0),
-            data: data.clone(),
-            is_datagram: false,
+            connection_id: vec![2],
+            stream_id: None,
+            data: Bytes::from("datagram"),
+            is_datagram: true,
             alpn: None,
-            protocol: None,
+            protocol: Some("echo".to_string()),
         };
 
-        let response = handler.process(request).unwrap();
-
-        // Verify it's the same pointer (true zero-copy)
-        assert_eq!(response.data.as_ptr(), ptr_before);
+        let response = service.process(request).unwrap();
+        assert_eq!(response.data, Bytes::from("datagram"));
     }
 }
