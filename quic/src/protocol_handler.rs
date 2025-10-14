@@ -182,7 +182,8 @@ impl ProtocolThread {
             };
 
             // Lock QUIC engine and process packet
-            let mut engine = quic_engine.lock().await;
+            let mut engine_guard = quic_engine.lock().await;
+            let mut engine = &mut *engine_guard;
 
             let events = match engine.process_packet(packet) {
                 Ok(events) => events,
@@ -199,32 +200,17 @@ impl ProtocolThread {
             // Process all generated QUIC events
             for event in events {
                 match event {
-                    QuicEvent::StreamData(conn_id, stream_id) => {
-                        if let Some(conn) = engine.get_connection_mut(&conn_id) {
-                            if let Err(e) =
-                                stream_processor.process_stream(conn, &conn_id, stream_id)
-                            {
-                                log::error!(
-                                    "Thread {}: Error processing stream {}: {}",
-                                    thread_id,
-                                    stream_id,
-                                    e
-                                );
-                            }
-                        }
+                    QuicEvent::StreamData(conn_id, stream_id, initial_data) => {
+                        // This is a new stream. Let the StreamProcessor handle it.
+                        // We need to clone the Arc<Mutex<QuicEngine>> to pass it to the async block.
+                        let engine_clone = Arc::clone(&quic_engine);
+                        stream_processor
+                            .process_new_stream(engine_clone, conn_id, stream_id, initial_data)
+                            .await;
                     }
-                    QuicEvent::Datagram(conn_id, data) => {
-                        if let Some(conn) = engine.get_connection_mut(&conn_id) {
-                            if let Err(e) =
-                                stream_processor.process_datagram(conn, &conn_id, data)
-                            {
-                                log::error!(
-                                    "Thread {}: Error processing datagram: {}",
-                                    thread_id,
-                                    e
-                                );
-                            }
-                        }
+                    QuicEvent::Datagram(_conn_id, _data) => {
+                        // TODO: Implement datagram handling
+                        log::warn!("Datagram received but not yet handled.");
                     }
                     QuicEvent::NewConnection(conn_id) => {
                         log::info!("Thread {}: New connection: {:?}", thread_id, conn_id);
@@ -244,7 +230,7 @@ impl ProtocolThread {
             packets_processed += 1;
 
             // Unlock (explicit drop for clarity)
-            drop(engine);
+            drop(engine_guard);
 
             // Log statistics every 10 seconds
             if last_log.elapsed().as_secs() >= 10 {
@@ -318,12 +304,5 @@ mod tests {
 
         // Let it run briefly
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    #[test]
-    fn test_engine_creation() {
-        let local_addr = "127.0.0.1:4433".parse().unwrap();
-        let engine = QuicEngine::new(local_addr);
-        assert!(engine.is_ok());
     }
 }

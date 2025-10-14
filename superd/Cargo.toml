@@ -16,8 +16,6 @@ path = "src/main.rs"
 network = { path = "../network" }
 quic = { path = "../quic" }
 service = { path = "../service" }
-echo = { path = "../echo" }
-http3 = { path = "../http3" }
 
 # Async runtime
 tokio = { version = "1.42", features = ["full"] }

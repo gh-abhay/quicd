@@ -10,9 +10,19 @@
 //! - Compile-time service discovery
 //! - Maximum performance
 
-use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+/// A trait combining AsyncRead and AsyncWrite for use in trait objects.
+pub trait ReadWrite: AsyncRead + AsyncWrite {}
+
+// Blanket implementation for any type that satisfies the bounds.
+impl<T: AsyncRead + AsyncWrite> ReadWrite for T {}
+
+/// A type-erased stream that implements AsyncRead and AsyncWrite.
+/// Services will receive this to handle I/O for a QUIC stream.
+pub type BoxedQuicStream = Box<dyn ReadWrite + Unpin + Send>;
 
 /// Result type for service operations
 pub type ServiceResult<T> = Result<T, ServiceError>;
@@ -33,67 +43,27 @@ pub enum ServiceError {
     ConnectionError(String),
 }
 
-/// Request from a QUIC connection (Sans-IO)
-#[derive(Debug, Clone)]
-pub struct ServiceRequest {
-    /// Connection ID
-    pub connection_id: Vec<u8>,
-
-    /// Stream ID (if stream-based)
-    pub stream_id: Option<u64>,
-
-    /// Request data (zero-copy)
-    pub data: Bytes,
-
-    /// Is this a datagram (vs stream)?
-    pub is_datagram: bool,
-    
-    /// Negotiated ALPN protocol
-    pub alpn: Option<Bytes>,
-    
-    /// Detected protocol (if multiplexed)
-    pub protocol: Option<String>,
-}
-
-/// Response to send back (Sans-IO)
-#[derive(Debug, Clone)]
-pub struct ServiceResponse {
-    /// Response data (zero-copy)
-    pub data: Bytes,
-
-    /// Should close the stream after sending?
-    pub close_stream: bool,
-}
-
-/// Service handler trait (Sans-IO, no async)
+/// Service handler trait.
 ///
-/// This trait uses a synchronous API for maximum performance.
-/// Services should be stateless or use Arc for shared state.
+/// Services implement this trait to handle incoming streams.
 #[async_trait::async_trait]
 pub trait ServiceHandler: Send + Sync {
-    /// Service name (for logging/debugging)
+    /// Service name (for logging/debugging).
     fn name(&self) -> &'static str;
 
-    /// Service description
+    /// Service description.
     fn description(&self) -> &'static str;
 
-    /// Process a request and produce a response (Sans-IO, synchronous)
+    /// Handle a new incoming QUIC stream.
     ///
-    /// This is the hot path - keep it fast:
-    /// - No async/await overhead
-    /// - No allocations if possible
-    /// - Use zero-copy slicing
-    fn process(&self, request: ServiceRequest) -> ServiceResult<ServiceResponse>;
-
-    /// Called when a new connection is established (optional, async is OK here)
-    async fn on_connect(&self, _connection_id: u64) {
-        // Default: do nothing
-    }
-
-    /// Called when a connection is closed (optional, async is OK here)
-    async fn on_disconnect(&self, _connection_id: u64) {
-        // Default: do nothing
-    }
+    /// This method is called by the `StreamProcessor` when a new stream
+    /// is created and routed to this service. The service takes ownership
+    /// of the stream and is responsible for its entire lifecycle.
+    ///
+    /// The provided `stream` is a dynamic trait object that implements
+    /// `AsyncRead` and `AsyncWrite`, allowing it to be used directly by
+    /// libraries like `tonic` or `h3`.
+    async fn handle_stream(&self, stream: BoxedQuicStream);
 }
 
 /// Compile-time service factory
@@ -167,46 +137,6 @@ impl ServiceRegistry {
     pub fn list_services(&self) -> Vec<&'static str> {
         self.handlers.keys().copied().collect()
     }
-
-    /// Process a request (Sans-IO, synchronous)
-    ///
-    /// This is the hot path - no async overhead.
-    /// Routing is determined by the `protocol` field in the request,
-    /// which is set by ALPN/stream-type detection in the QUIC layer.
-    pub fn process(&self, request: ServiceRequest) -> ServiceResult<ServiceResponse> {
-        // Get service name from request protocol
-        let service_name = request.protocol.as_deref()
-            .ok_or_else(|| ServiceError::NotFound("No protocol specified in request".to_string()))?;
-
-        // Get the handler
-        let handler = self
-            .handlers
-            .get(service_name)
-            .ok_or_else(|| ServiceError::NotFound(service_name.to_string()))?;
-
-        // Process the request (Sans-IO)
-        handler.process(request)
-    }
-
-    /// Notify all services of a new connection
-    pub fn on_connect(&self, connection_id: u64) {
-        for handler in self.handlers.values() {
-            let handler = Arc::clone(handler);
-            tokio::spawn(async move {
-                handler.on_connect(connection_id).await;
-            });
-        }
-    }
-
-    /// Notify all services of a closed connection
-    pub fn on_disconnect(&self, connection_id: u64) {
-        for handler in self.handlers.values() {
-            let handler = Arc::clone(handler);
-            tokio::spawn(async move {
-                handler.on_disconnect(connection_id).await;
-            });
-        }
-    }
 }
 
 impl Default for ServiceRegistry {
@@ -218,77 +148,58 @@ impl Default for ServiceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-    #[test]
-    fn test_service_request_creation() {
-        let request = ServiceRequest {
-            connection_id: vec![1, 2, 3],
-            stream_id: Some(100),
-            data: Bytes::from("test"),
-            is_datagram: false,
-            alpn: None,
-            protocol: None,
-        };
-        assert_eq!(request.connection_id, vec![1, 2, 3]);
-        assert_eq!(request.stream_id, Some(100));
+    // A mock stream for testing purposes.
+    struct MockStream;
+    impl AsyncRead for MockStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
-
-    #[test]
-    fn test_service_response_creation() {
-        let response = ServiceResponse {
-            data: Bytes::from("response"),
-            close_stream: true,
-        };
-        assert_eq!(response.close_stream, true);
+    impl AsyncWrite for MockStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
+    impl Unpin for MockStream {}
 
-    #[test]
-    fn test_service_registry_routing() {
-        // Create a minimal test service
+    #[tokio::test]
+    async fn test_service_handler_trait() {
         struct TestService;
+        #[async_trait::async_trait]
         impl ServiceHandler for TestService {
-            fn name(&self) -> &'static str { "test" }
-            fn description(&self) -> &'static str { "Test service" }
-            fn process(&self, req: ServiceRequest) -> ServiceResult<ServiceResponse> {
-                Ok(ServiceResponse {
-                    data: req.data.clone(),
-                    close_stream: true,
-                })
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            fn description(&self) -> &'static str {
+                "A test service"
+            }
+            async fn handle_stream(&self, _stream: BoxedQuicStream) {
+                // In a real test, we would assert I/O on the stream.
             }
         }
 
-        const TEST_SERVICE: ServiceFactory = ServiceFactory {
-            name: "test",
-            description: "Test service",
-            factory: || Arc::new(TestService),
-        };
-
-        let registry = ServiceRegistry::from_services(&[TEST_SERVICE]);
-
-        // Test with protocol specified (normal case from QUIC layer)
-        let request = ServiceRequest {
-            connection_id: vec![1, 2, 3],
-            stream_id: Some(0),
-            data: Bytes::from("hello"),
-            is_datagram: false,
-            alpn: Some(Bytes::from("test")),
-            protocol: Some("test".to_string()),
-        };
-
-        let response = registry.process(request).unwrap();
-        assert_eq!(response.data, Bytes::from("hello"));
-
-        // Test with missing protocol (should error)
-        let bad_request = ServiceRequest {
-            connection_id: vec![1, 2, 3],
-            stream_id: Some(0),
-            data: Bytes::from("hello"),
-            is_datagram: false,
-            alpn: None,
-            protocol: None,
-        };
-
-        assert!(registry.process(bad_request).is_err());
+        let service = TestService;
+        let stream = Box::new(MockStream);
+        service.handle_stream(stream).await;
+        assert_eq!(service.name(), "test");
     }
 }

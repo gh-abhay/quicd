@@ -28,8 +28,8 @@ mod services {
     
     /// All registered services (compile-time constant)
     pub const ALL_SERVICES: &[ServiceFactory] = &[
-        echo::ECHO_SERVICE,
-        http3::HTTP3_SERVICE,
+        // http3::HTTP3_SERVICE,
+        // grpc_service::GRPC_SERVICE,
     ];
 }
 

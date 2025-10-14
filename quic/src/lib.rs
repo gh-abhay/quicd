@@ -7,14 +7,17 @@ use quiche::{Config, Connection, ConnectionId, RecvInfo};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 pub mod protocol_handler;
 pub mod stream_mux;
 pub mod integration;
+pub mod io;
 
 pub use protocol_handler::{ProtocolConfig, ProtocolThread};
 pub use stream_mux::{StreamMultiplexer, Protocol, ProtocolRoute};
 pub use integration::StreamProcessor;
+pub use io::{QuicStream, StreamCommand};
 
 #[derive(Error, Debug)]
 pub enum QuicError {
@@ -47,17 +50,35 @@ pub struct PacketOut {
 #[derive(Debug)]
 pub enum QuicEvent {
     NewConnection(ConnectionId<'static>),
-    StreamData(ConnectionId<'static>, u64),
+    StreamData(ConnectionId<'static>, u64, Bytes),
     Datagram(ConnectionId<'static>, Bytes),
     ConnectionLost(ConnectionId<'static>),
     Send(Vec<PacketOut>),
+}
+
+/// Holds the state for a single QUIC connection.
+pub struct ConnectionState {
+    /// The underlying `quiche` connection object.
+    pub conn: Connection,
+    /// A map of stream IDs to their corresponding data channels (sender halves).
+    /// When the `ProtocolThread` receives data for a stream, it sends it here.
+    stream_data_tx: HashMap<u64, mpsc::Sender<Bytes>>,
+}
+
+impl ConnectionState {
+    fn new(conn: Connection) -> Self {
+        Self {
+            conn,
+            stream_data_tx: HashMap::new(),
+        }
+    }
 }
 
 /// Sans-IO QUIC engine optimized for performance
 pub struct QuicEngine {
     config: Config,
     pub local_addr: SocketAddr,
-    connections: HashMap<ConnectionId<'static>, Connection>,
+    connections: HashMap<ConnectionId<'static>, ConnectionState>,
 }
 
 impl QuicEngine {
@@ -127,12 +148,13 @@ impl QuicEngine {
                 quiche::accept(&hdr.dcid, None, self.local_addr, packet.from, &mut self.config)?;
 
             let conn_id_owned = conn.destination_id().clone().into_owned();
-            self.connections.insert(conn_id_owned.clone(), conn);
+            let conn_state = ConnectionState::new(conn);
+            self.connections.insert(conn_id_owned.clone(), conn_state);
             events.push(QuicEvent::NewConnection(conn_id_owned.clone()));
         }
 
         // Get the connection and process the packet
-        let conn = self.connections.get_mut(&conn_id).unwrap();
+        let conn_state = self.connections.get_mut(&conn_id).unwrap();
 
         // Process the packet
         let recv_info = RecvInfo {
@@ -140,12 +162,12 @@ impl QuicEngine {
             to: self.local_addr,
         };
 
-        match conn.recv(&mut packet.data, recv_info) {
+        match conn_state.conn.recv(&mut packet.data, recv_info) {
             Ok(_) => {}
             Err(quiche::Error::Done) => {}
             Err(e) => {
                 log::warn!("Failed to process packet for connection {:?}: {}", conn_id, e);
-                if conn.is_closed() {
+                if conn_state.conn.is_closed() {
                     events.push(QuicEvent::ConnectionLost(conn_id.clone()));
                     self.connections.remove(&conn_id);
                 }
@@ -154,19 +176,36 @@ impl QuicEngine {
         }
 
         // Process readable streams
-        for stream_id in conn.readable() {
-            events.push(QuicEvent::StreamData(conn_id.clone(), stream_id));
+        for stream_id in conn_state.conn.readable() {
+            let mut buf = [0u8; 65535];
+            while let Ok((read, _fin)) = conn_state.conn.stream_recv(stream_id, &mut buf) {
+                if read == 0 {
+                    break;
+                }
+                let data = Bytes::copy_from_slice(&buf[..read]);
+
+                // If we have a channel for this stream, send the data.
+                // Otherwise, buffer it as a `StreamData` event for the StreamProcessor
+                // to handle and create a new stream.
+                if let Some(tx) = conn_state.stream_data_tx.get(&stream_id) {
+                    if tx.try_send(data).is_err() {
+                        log::warn!("Stream {} channel full or closed, dropping data.", stream_id);
+                    }
+                } else {
+                    events.push(QuicEvent::StreamData(conn_id.clone(), stream_id, data));
+                }
+            }
         }
 
         // Process datagrams
-        while let Ok(len) = conn.dgram_recv(&mut [0u8; 65536]) {
+        while let Ok(len) = conn_state.conn.dgram_recv(&mut [0u8; 65536]) {
             let mut buf = vec![0; len];
-            conn.dgram_recv(&mut buf).unwrap();
+            conn_state.conn.dgram_recv(&mut buf).unwrap();
             events.push(QuicEvent::Datagram(conn_id.clone(), Bytes::from(buf)));
         }
 
         // Handle connection closure
-        if conn.is_closed() {
+        if conn_state.conn.is_closed() {
             events.push(QuicEvent::ConnectionLost(conn_id.clone()));
             self.connections.remove(&conn_id);
         }
@@ -174,11 +213,11 @@ impl QuicEngine {
         Ok(events)
     }
 
-    /// Get a mutable reference to a connection
-    pub fn get_connection_mut(
+    /// Get a mutable reference to a connection state
+    pub fn get_connection_state_mut(
         &mut self,
         conn_id: &ConnectionId<'static>,
-    ) -> Option<&mut Connection> {
+    ) -> Option<&mut ConnectionState> {
         self.connections.get_mut(conn_id)
     }
 
@@ -187,8 +226,8 @@ impl QuicEngine {
         let mut packets_to_send = Vec::new();
         let mut buf = [0u8; 65536];
 
-        for conn in self.connections.values_mut() {
-            while let Ok((write, send_info)) = conn.send(&mut buf) {
+        for conn_state in self.connections.values_mut() {
+            while let Ok((write, send_info)) = conn_state.conn.send(&mut buf) {
                 packets_to_send.push(PacketOut {
                     data: Bytes::copy_from_slice(&buf[..write]),
                     to: send_info.to,
@@ -200,9 +239,9 @@ impl QuicEngine {
 
     /// Cleanup closed connections (call periodically)
     pub fn cleanup_closed_connections(&mut self) {
-        self.connections.retain(|_conn_id, conn| {
-            if conn.is_closed() {
-                log::debug!("Cleaning up closed connection: {:?}", conn.trace_id());
+        self.connections.retain(|_conn_id, conn_state| {
+            if conn_state.conn.is_closed() {
+                log::debug!("Cleaning up closed connection: {:?}", conn_state.conn.trace_id());
                 false
             } else {
                 true
