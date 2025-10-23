@@ -1,0 +1,9 @@
+listen = "0.0.0.0:4433"
+network_threads = 2
+protocol_threads = 2
+app_threads = 4
+cpu_pinning = true
+
+[telemetry]
+otlp_endpoint = "http://localhost:4317"
+service_name = "superd"
