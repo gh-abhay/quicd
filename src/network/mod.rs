@@ -24,24 +24,33 @@
 //! ```rust,no_run
 //! use superd::network::io_uring_net::start_network_layer;
 //! use superd::config::Config;
-//! use tokio::sync::mpsc;
-//! use std::sync::Arc;
-//! use std::sync::atomic::AtomicBool;
+//! use tokio::sync::{broadcast, mpsc};
 //!
 //! // Load configuration
 //! let config = Config::default();
 //!
-//! // Create channels for inter-layer communication
-//! let (to_protocol_tx, to_protocol_rx) = mpsc::unbounded_channel();
-//! let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+//! // Create dedicated channels for each network thread
+//! let mut to_protocol_senders = Vec::new();
+//! let mut from_protocol_receivers = Vec::new();
+//!
+//! for _ in 0..config.network_threads {
+//!     let (to_proto_tx, _to_proto_rx) = mpsc::unbounded_channel();
+//!     let (_from_proto_tx, from_proto_rx) = mpsc::unbounded_channel();
+//!     
+//!     to_protocol_senders.push(to_proto_tx);
+//!     from_protocol_receivers.push(from_proto_rx);
+//! }
+//!
+//! // Create shutdown signal
+//! let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
 //!
 //! // Start network layer
 //! let handles = start_network_layer(
 //!     &config,
-//!     to_protocol_tx,
-//!     from_protocol_rx,
+//!     to_protocol_senders,
+//!     from_protocol_receivers,
 //!     tokio::runtime::Handle::current(),
-//!     Arc::new(AtomicBool::new(true)),
+//!     shutdown_tx,
 //! );
 //! ```
 
@@ -81,6 +90,7 @@ pub enum ProtocolToNetwork {
 }
 
 /// Channel types for async communication between layers
+/// Each network thread has dedicated channels to/from each protocol thread
 pub type ToProtocolSender = mpsc::UnboundedSender<NetworkToProtocol>;
 pub type ToProtocolReceiver = mpsc::UnboundedReceiver<NetworkToProtocol>;
 pub type FromProtocolSender = mpsc::UnboundedSender<ProtocolToNetwork>;

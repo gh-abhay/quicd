@@ -3,32 +3,48 @@
 /// - Minimizing syscalls through batched submissions
 /// - Using completion-based async I/O
 /// - Zero-copy buffer management
+///
+/// Design principles:
+/// - **Purely event-driven**: ALL events use async await, zero polling
+///   * Ingress: waits for io_uring completions
+///   * Egress: waits on MPSC receiver
+///   * Shutdown: waits on broadcast receiver (NOT polling AtomicBool!)
+/// - **Isolated Sans-IO**: only handles network I/O, no protocol logic
+/// - **Dedicated channels**: one receiver per protocol thread for egress
+/// - **Load balanced**: SO_REUSEPORT distributes ingress packets
+/// - **Event-driven shutdown**: broadcast channel for instant propagation
 
 use super::affinity::{CpuAffinityManager, PinningStrategy, ThreadType};
 use super::metrics::{NetworkMetrics, SharedMetrics};
 use super::zerocopy_buffer::{get_buffer_pool, ZeroCopyBuffer, MAX_UDP_PAYLOAD};
-use super::{FromProtocolReceiver, NetworkToProtocol, ToProtocolSender};
+use super::{NetworkToProtocol, ToProtocolSender};
 
 use crate::error::{NetworkError, Result};
 
-use parking_lot::Mutex;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use tokio::runtime::Handle;
+use tokio::select;
+use tokio::sync::{broadcast, mpsc};
 use tokio_uring::net::UdpSocket;
 use tracing::{error, info, warn};
 
 /// Network I/O thread using io_uring for event-driven operations
+/// Each network thread has:
+/// - One dedicated receiver for egress packets from its assigned protocol thread
+/// - One sender to forward ingress packets to its assigned protocol thread
 pub struct IoUringNetworkThread {
     id: usize,
     socket: UdpSocket,
+    // Send ingress packets to assigned protocol thread
     to_protocol: ToProtocolSender,
-    from_protocol: Arc<Mutex<FromProtocolReceiver>>,
+    // Receive egress packets from assigned protocol thread (dedicated channel)
+    from_protocol: mpsc::UnboundedReceiver<super::ProtocolToNetwork>,
     metrics: SharedMetrics,
-    running: Arc<AtomicBool>,
+    // Receive shutdown signal (broadcast)
+    shutdown_rx: broadcast::Receiver<()>,
 }
 
 impl IoUringNetworkThread {
@@ -36,9 +52,9 @@ impl IoUringNetworkThread {
         id: usize,
         listen_addr: SocketAddr,
         to_protocol: ToProtocolSender,
-        from_protocol: Arc<Mutex<FromProtocolReceiver>>,
+        from_protocol: mpsc::UnboundedReceiver<super::ProtocolToNetwork>,
         metrics: SharedMetrics,
-        running: Arc<AtomicBool>,
+        shutdown_rx: broadcast::Receiver<()>,
         _tokio_handle: Handle,
     ) -> std::io::Result<Self> {
         let socket = create_udp_socket(listen_addr).await?;
@@ -49,59 +65,82 @@ impl IoUringNetworkThread {
             to_protocol,
             from_protocol,
             metrics,
-            running,
+            shutdown_rx,
         })
     }
 
-    /// Run the network thread with io_uring
-    pub async fn run(mut self) {
-        info!("Network thread {} starting with io_uring", self.id);
+    /// Run the network thread with truly event-driven io_uring
+    /// Waits for ANY of three events:
+    /// 1. Ingress: Network packet from NIC (io_uring completion)
+    /// 2. Egress: Packet from protocol thread to send (MPSC channel)
+    /// 3. Shutdown: Broadcast signal to gracefully stop
+    pub async fn run(self) {
+        info!("Network thread {} starting with event-driven io_uring", self.id);
 
-        while self.running.load(Ordering::Relaxed) {
-            // Use a timeout to periodically check the running flag
-            let timeout_result = tokio::time::timeout(
-                std::time::Duration::from_millis(100), // Check every 100ms
-                self.recv_from_buffer(),
-            ).await;
+        // Extract owned values to avoid borrowing issues in select!
+        let mut socket = self.socket;
+        let to_protocol = self.to_protocol;
+        let mut from_protocol = self.from_protocol;
+        let metrics = self.metrics;
+        let mut shutdown_rx = self.shutdown_rx;
 
-            match timeout_result {
-                Ok(recv_result) => {
+        // Main event loop - purely event-driven, zero polling
+        loop {
+            select! {
+                // Event 1: Ingress - Network packet received from NIC (truly async)
+                recv_result = Self::recv_from_buffer_static(&mut socket) => {
                     match recv_result {
                         Ok((buffer, addr, len)) => {
-                            self.metrics.record_packet_received(len);
+                            metrics.record_packet_received(len);
 
-                            // Send to protocol layer
+                            // Forward to protocol layer (our assigned protocol thread)
                             let msg = NetworkToProtocol::Datagram { buffer, addr };
-                            if let Err(e) = self.to_protocol.send(msg) {
-                                self.metrics.record_channel_send_error();
+                            if let Err(e) = to_protocol.send(msg) {
+                                metrics.record_channel_send_error();
                                 warn!("Failed to send to protocol layer: {}", e);
                             }
                         }
                         Err(e) => {
                             if e.kind() != std::io::ErrorKind::WouldBlock {
-                                self.metrics.record_receive_error();
+                                metrics.record_receive_error();
                                 error!("recv_from error: {}", e);
                             }
                         }
                     }
                 }
-                Err(_) => {
-                    // Timeout - just continue to check running flag
+
+                // Event 2: Egress - Packet from protocol thread to send to NIC (truly async)
+                msg_option = from_protocol.recv() => {
+                    match msg_option {
+                        Some(super::ProtocolToNetwork::Datagram { buffer, addr }) => {
+                            if let Err(e) = Self::send_to_static(&mut socket, &buffer, addr).await {
+                                metrics.record_send_error();
+                                error!("send_to error: {}", e);
+                            } else {
+                                metrics.record_packet_sent(buffer.len());
+                            }
+                        }
+                        None => {
+                            // Channel closed - protocol layer shut down
+                            info!("Protocol channel closed, shutting down network thread {}", self.id);
+                            break;
+                        }
+                    }
+                }
+
+                // Event 3: Shutdown signal - broadcast event (truly async, no polling!)
+                _ = shutdown_rx.recv() => {
+                    info!("Network thread {} received shutdown signal", self.id);
+                    break;
                 }
             }
-
-            // Send pending packets from protocol layer
-            self.send_pending().await;
-
-            // Small yield to prevent busy spinning
-            tokio::task::yield_now().await;
         }
 
         info!("Network thread {} shutting down", self.id);
     }
 
-    /// Receive a packet using io_uring (internal method)
-    async fn recv_from_buffer(&mut self) -> std::io::Result<(ZeroCopyBuffer, SocketAddr, usize)> {
+    /// Static version of recv_from_buffer to avoid borrowing self
+    async fn recv_from_buffer_static(socket: &mut UdpSocket) -> std::io::Result<(ZeroCopyBuffer, SocketAddr, usize)> {
         let buffer_pool = get_buffer_pool();
         let mut buf = buffer_pool.acquire();
 
@@ -109,7 +148,7 @@ impl IoUringNetworkThread {
         buf.data_mut().resize(MAX_UDP_PAYLOAD, 0);
 
         let data = vec![0u8; MAX_UDP_PAYLOAD];
-        let (result, received_data) = self.socket.recv_from(data).await;
+        let (result, received_data) = socket.recv_from(data).await;
         let (len, addr) = result?;
         
         // Copy data into our zero-copy buffer
@@ -122,35 +161,10 @@ impl IoUringNetworkThread {
         Ok((zero_copy_buf, addr, len))
     }
 
-    /// Send pending packets from protocol layer
-    async fn send_pending(&mut self) {
-        // Create a temporary vector to avoid borrowing issues
-        let mut pending = Vec::new();
-        {
-            let mut from_protocol = self.from_protocol.lock();
-            while let Ok(msg) = from_protocol.try_recv() {
-                pending.push(msg);
-            }
-        }
-        
-        for msg in pending {
-            match msg {
-                super::ProtocolToNetwork::Datagram { buffer, addr } => {
-                    if let Err(e) = self.send_to(&buffer, addr).await {
-                        self.metrics.record_send_error();
-                        error!("send_to error: {}", e);
-                    } else {
-                        self.metrics.record_packet_sent(buffer.len());
-                    }
-                }
-            }
-        }
-    }
-
-    /// Send a packet using io_uring
-    async fn send_to(&mut self, buffer: &ZeroCopyBuffer, addr: SocketAddr) -> std::io::Result<()> {
+    /// Static version of send_to to avoid borrowing self
+    async fn send_to_static(socket: &mut UdpSocket, buffer: &ZeroCopyBuffer, addr: SocketAddr) -> std::io::Result<()> {
         let data = buffer.data().to_vec();
-        let (result, _buf) = self.socket.send_to(data, addr).await;
+        let (result, _buf) = socket.send_to(data, addr).await;
         result?;
         Ok(())
     }
@@ -191,17 +205,40 @@ async fn create_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
 }
 
 /// Start network I/O layer with io_uring-based threads
+/// Creates N network threads, each with dedicated channels to/from protocol layer
+/// 
+/// Channel architecture:
+/// - Each network thread has 1 sender to 1 protocol thread (ingress)
+/// - Each network thread has 1 receiver from 1 protocol thread (egress)
+/// - No shared channels, no broadcasts, complete separation of concerns
 pub fn start_network_layer(
     config: &crate::config::Config,
-    to_protocol: ToProtocolSender,
-    from_protocol: FromProtocolReceiver,
+    to_protocol_senders: Vec<ToProtocolSender>,
+    from_protocol_receivers: Vec<mpsc::UnboundedReceiver<super::ProtocolToNetwork>>,
     tokio_handle: Handle,
-    running: Arc<AtomicBool>,
+    shutdown_tx: broadcast::Sender<()>,
 ) -> Result<Vec<thread::JoinHandle<()>>> {
     info!(
         "Starting network layer with {} io_uring threads on {}",
         config.network_threads, config.listen
     );
+
+    // Validate we have correct number of channels
+    if to_protocol_senders.len() != config.network_threads {
+        return Err(NetworkError::InvalidConfiguration(format!(
+            "Expected {} to_protocol senders, got {}",
+            config.network_threads,
+            to_protocol_senders.len()
+        )).into());
+    }
+
+    if from_protocol_receivers.len() != config.network_threads {
+        return Err(NetworkError::InvalidConfiguration(format!(
+            "Expected {} from_protocol receivers, got {}",
+            config.network_threads,
+            from_protocol_receivers.len()
+        )).into());
+    }
 
     let listen_addr: SocketAddr = config
         .listen
@@ -223,18 +260,17 @@ pub fn start_network_layer(
     };
 
     // Start metrics reporting task on tokio runtime
-    start_metrics_task(Arc::clone(&metrics), Arc::clone(&running), tokio_handle.clone());
-
-    // Wrap from_protocol in Arc<Mutex> for sharing across threads
-    let from_protocol = Arc::new(Mutex::new(from_protocol));
+    start_metrics_task(Arc::clone(&metrics), shutdown_tx.subscribe(), tokio_handle.clone());
 
     let mut handles = Vec::new();
+    let mut receivers_iter = from_protocol_receivers.into_iter();
 
+    // Create each network thread with its dedicated channels
     for i in 0..config.network_threads {
-        let to_protocol = to_protocol.clone();
-        let from_protocol = Arc::clone(&from_protocol);
+        let to_protocol = to_protocol_senders[i].clone();
+        let from_protocol = receivers_iter.next().unwrap(); // Safe due to validation above
         let metrics = Arc::clone(&metrics);
-        let running = Arc::clone(&running);
+        let shutdown_rx = shutdown_tx.subscribe(); // Each thread gets its own receiver
         let affinity_manager = affinity_manager.clone();
         let tokio_handle = tokio_handle.clone();
 
@@ -256,7 +292,7 @@ pub fn start_network_layer(
                         to_protocol,
                         from_protocol,
                         metrics,
-                        running,
+                        shutdown_rx,
                         tokio_handle,
                     ).await {
                         Ok(net_thread) => {
@@ -277,13 +313,23 @@ pub fn start_network_layer(
 }
 
 /// Start metrics reporting task on Tokio runtime
-fn start_metrics_task(metrics: SharedMetrics, running: Arc<AtomicBool>, handle: Handle) {
+fn start_metrics_task(
+    metrics: SharedMetrics, 
+    mut shutdown_rx: broadcast::Receiver<()>, 
+    handle: Handle
+) {
     handle.spawn(async move {
-        while running.load(Ordering::Relaxed) {
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-            let stats = metrics.get_stats();
-            info!("Network Layer Metrics: {}", stats);
+        loop {
+            select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {
+                    let stats = metrics.get_stats();
+                    info!("Network Layer Metrics: {}", stats);
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Metrics task shutting down");
+                    break;
+                }
+            }
         }
     });
 }

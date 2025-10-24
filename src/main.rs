@@ -102,7 +102,7 @@
 //! All network operations use safe abstractions over io_uring.
 
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::info;
 
 use superd::config::{Cli, Config};
@@ -148,12 +148,28 @@ async fn main() {
         config.network_threads, config.app_threads
     );
 
-    // Create channels for network <-> protocol communication
-    let (to_protocol_tx, _to_protocol_rx) = mpsc::unbounded_channel();
-    let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+    // Create dedicated channels for network <-> protocol communication
+    // Each network thread gets its own pair of channels to/from protocol layer
+    let mut to_protocol_senders = Vec::new();
+    let mut to_protocol_receivers = Vec::new();
+    let mut from_protocol_senders = Vec::new();
+    let mut from_protocol_receivers = Vec::new();
 
-    // Create shared running flag for graceful shutdown
-    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    for i in 0..config.network_threads {
+        let (to_proto_tx, to_proto_rx) = mpsc::unbounded_channel();
+        let (from_proto_tx, from_proto_rx) = mpsc::unbounded_channel();
+        
+        to_protocol_senders.push(to_proto_tx);
+        to_protocol_receivers.push(to_proto_rx);
+        from_protocol_senders.push(from_proto_tx);
+        from_protocol_receivers.push(from_proto_rx);
+        
+        info!("Created channel pair {} for network-protocol communication", i);
+    }
+
+    // Create shared shutdown signal for graceful shutdown (broadcast)
+    // All threads subscribe to this signal for event-driven shutdown
+    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
 
     // Get handle to current Tokio runtime
     let tokio_handle = tokio::runtime::Handle::current();
@@ -162,10 +178,10 @@ async fn main() {
     info!("Starting network I/O layer with io_uring...");
     let network_handles = match superd::network::io_uring_net::start_network_layer(
         &config,
-        to_protocol_tx,
-        from_protocol_rx,
+        to_protocol_senders,
+        from_protocol_receivers,
         tokio_handle.clone(),
-        running.clone(),
+        shutdown_tx.clone(),
     ) {
         Ok(handles) => handles,
         Err(e) => {
@@ -176,25 +192,30 @@ async fn main() {
 
     info!("Network layer started successfully");
 
-    // TODO: Start protocol layer (QUIC on Tokio runtime)
-    // let _protocol_task = tokio::spawn(async move {
-    //     superd::protocol::start_protocol_layer(
-    //         &config,
-    //         to_protocol_rx,
-    //         from_protocol_tx,
-    //     ).await;
-    // });
+    // TODO: Start protocol layer (native threads)
+    // Protocol layer will use:
+    // - to_protocol_receivers: receive ingress packets from network threads
+    // - from_protocol_senders: send egress packets to network threads
+    // 
+    // let protocol_handles = superd::protocol::start_protocol_layer(
+    //     &config,
+    //     to_protocol_receivers,
+    //     from_protocol_senders,
+    //     shared_connection_registry,
+    // )?;
 
-    // TODO: Start application layer (on same Tokio runtime)
-    // let _app_task = tokio::spawn(async move {
-    //     superd::application::start_app_layer(&config).await;
-    // });
+    // TODO: Start application layer (shared Tokio runtime)
+    // let app_runtime = superd::application::start_application_runtime(
+    //     config.app_threads,
+    //     shared_connection_registry,
+    // )?;
 
     info!("SuperD server is running. Press Ctrl+C to stop.");
 
     // Setup signal handlers for graceful shutdown
+    let shutdown_tx_for_signal = shutdown_tx.clone();
     let shutdown_handle = tokio::spawn(async move {
-        setup_signal_handlers(running.clone()).await;
+        setup_signal_handlers(shutdown_tx_for_signal).await;
     });
 
     // Wait for network threads to complete
@@ -210,12 +231,14 @@ async fn main() {
     info!("SuperD server stopped");
 }
 
-async fn setup_signal_handlers(running: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+async fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>) {
     if let Err(e) = tokio::signal::ctrl_c().await {
         eprintln!("Failed to listen for Ctrl+C: {}", e);
     }
     println!("\nReceived Ctrl+C, shutting down...");
 
-    // Signal all threads to stop
-    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Broadcast shutdown signal to all threads (event-driven, no polling!)
+    if let Err(e) = shutdown_tx.send(()) {
+        eprintln!("Failed to send shutdown signal: {}", e);
+    }
 }

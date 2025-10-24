@@ -1,10 +1,9 @@
 /// Integration tests for SuperD network layer
 /// Tests the complete network I/O functionality
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 
 use superd::config::Config;
@@ -15,15 +14,27 @@ async fn test_network_layer_startup_shutdown() {
     // Create test configuration
     let mut config = Config::default();
     config.listen = "127.0.0.1:0".to_string(); // Use port 0 for auto-assignment
-    config.network_threads = 1; // Use single thread for testing
+    config.network_threads = 2; // Use 2 threads for testing
     config.cpu_pinning = false; // Disable CPU pinning in tests
 
-    // Create channels
-    let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
-    let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+    // Create dedicated channels for each network thread
+    let mut to_protocol_senders = Vec::new();
+    let mut to_protocol_receivers = Vec::new();
+    let mut from_protocol_senders = Vec::new();
+    let mut from_protocol_receivers = Vec::new();
 
-    // Create running flag
-    let running = Arc::new(AtomicBool::new(true));
+    for _ in 0..config.network_threads {
+        let (to_proto_tx, to_proto_rx) = mpsc::unbounded_channel();
+        let (from_proto_tx, from_proto_rx) = mpsc::unbounded_channel();
+        
+        to_protocol_senders.push(to_proto_tx);
+        to_protocol_receivers.push(to_proto_rx);
+        from_protocol_senders.push(from_proto_tx);
+        from_protocol_receivers.push(from_proto_rx);
+    }
+
+    // Create shutdown signal (broadcast)
+    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
 
     // Get tokio handle
     let tokio_handle = tokio::runtime::Handle::current();
@@ -31,17 +42,17 @@ async fn test_network_layer_startup_shutdown() {
     // Start network layer
     let network_handles = start_network_layer(
         &config,
-        to_protocol_tx,
-        from_protocol_rx,
+        to_protocol_senders,
+        from_protocol_receivers,
         tokio_handle,
-        running.clone(),
+        shutdown_tx.clone(),
     ).expect("Failed to start network layer");
 
     // Give the network layer time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Signal shutdown
-    running.store(false, Ordering::Relaxed);
+    // Signal shutdown via broadcast (event-driven!)
+    shutdown_tx.send(()).expect("Failed to send shutdown signal");
 
     // Wait for threads to finish (with timeout)
     for handle in network_handles {
@@ -57,19 +68,21 @@ async fn test_network_layer_startup_shutdown() {
     }
 
     // Verify no unexpected messages were sent (allow some tolerance for system packets)
-    let mut message_count = 0;
-    let start_time = std::time::Instant::now();
+    for mut rx in to_protocol_receivers {
+        let mut message_count = 0;
+        let start_time = std::time::Instant::now();
 
-    while start_time.elapsed() < Duration::from_millis(200) {
-        match timeout(Duration::from_millis(10), to_protocol_rx.recv()).await {
-            Ok(Some(_)) => message_count += 1,
-            Ok(None) => break, // Channel closed
-            Err(_) => {} // Timeout, continue
+        while start_time.elapsed() < Duration::from_millis(200) {
+            match timeout(Duration::from_millis(10), rx.recv()).await {
+                Ok(Some(_)) => message_count += 1,
+                Ok(None) => break, // Channel closed
+                Err(_) => {} // Timeout, continue
+            }
         }
-    }
 
-    // Allow up to 2 messages (might receive some system/localhost packets)
-    assert!(message_count <= 2, "Received too many unexpected messages: {}", message_count);
+        // Allow up to 2 messages per thread (might receive some system/localhost packets)
+        assert!(message_count <= 2, "Received too many unexpected messages: {}", message_count);
+    }
 }
 
 #[tokio::test]

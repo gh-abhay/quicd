@@ -48,6 +48,8 @@ pub enum NetworkError {
     BufferPoolNotInitialized,
     /// Thread spawn failed
     ThreadSpawnFailed(String),
+    /// Invalid configuration
+    InvalidConfiguration(String),
 }
 
 #[derive(Debug)]
@@ -122,6 +124,9 @@ impl fmt::Display for NetworkError {
             }
             NetworkError::ThreadSpawnFailed(msg) => {
                 write!(f, "Thread spawn failed: {}", msg)
+            }
+            NetworkError::InvalidConfiguration(msg) => {
+                write!(f, "Invalid network configuration: {}", msg)
             }
         }
     }
