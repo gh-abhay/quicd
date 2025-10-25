@@ -10,18 +10,25 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────┐
-//! │         Application Layer (Tokio Async)         │
+//! │   Application Layer (Dynamic Per-Stream Tasks)  │
+//! │   • Spawned on-demand per QUIC stream          │
+//! │   • ALPN-based routing (HTTP/3, WebSocket, etc) │
+//! │   • Ephemeral: lifecycle tied to stream        │
 //! └────────────────────┬────────────────────────────┘
-//!                      │ Zero-Copy Buffers
+//!                      │ Stream Data
 //! ┌────────────────────▼────────────────────────────┐
-//! │      Protocol Layer - QUIC (Tokio Async)        │
+//! │      Protocol Layer - QUIC (Async Tasks)        │
+//! │   • CPU-bound: TLS 1.3 crypto operations       │
+//! │   • Connection state & congestion control       │
+//! │   • 2-4x network tasks (crypto scaling)         │
 //! └────────────────────┬────────────────────────────┘
-//!                      │ Zero-Copy Buffers
+//!                      │ Encrypted Packets
 //! ┌────────────────────▼────────────────────────────┐
-//! │  Network Layer (Async Tokio + io_uring)         │
-//! │   • Pure async runtime                          │
+//! │  Network Layer (Async io_uring Tasks)           │
+//! │   • I/O-bound: raw socket operations           │
+//! │   • 1 task per physical core                   │
 //! │   • SO_REUSEPORT load balancing                 │
-//! │   • Zero-copy buffer management                 │
+//! │   • Fan-out to protocol tasks                   │
 //! └─────────────────────────────────────────────────┘
 //! ```
 //!
@@ -52,4 +59,5 @@
 pub mod config;
 pub mod error;
 pub mod network;
+pub mod protocol;
 pub mod telemetry;

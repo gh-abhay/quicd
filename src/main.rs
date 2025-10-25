@@ -6,7 +6,7 @@
 //!
 //! ## Architecture Overview
 //!
-//! SuperD uses a multi-threaded architecture:
+//! SuperD uses a multi-layer async architecture:
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
@@ -14,18 +14,22 @@
 //! │                                                             │
 //! │  ┌─────────────────┐    ┌─────────────────┐    ┌─────────┐  │
 //! │  │   Network       │    │   Protocol      │    │   App   │  │
-//! │  │   Tasks         │◄──►│   Task          │◄──►│   Layer │  │
+//! │  │   Tasks         │◄──►│   Tasks         │◄──►│   Tasks │  │
+//! │  │   (4 tasks)     │    │   (12 tasks)    │    │(Dynamic)│  │
 //! │  │                 │    │                 │    │         │  │
-//! │  │ • Async Tokio   │    │ • QUIC/UDP      │    │ • Tokio │  │
-//! │  │ • io_uring      │    │ • Parsing       │    │ • Async │  │
-//! │  │ • SO_REUSEPORT  │    │ • Validation    │    │         │  │
+//! │  │ • Async io_uring│    │ • QUIC crypto   │    │ • Spawned│  │
+//! │  │ • SO_REUSEPORT  │    │ • Parsing       │    │ • Per-stream│
+//! │  │ • Zero-copy I/O │    │ • State mgmt    │    │ • ALPN-based│
 //! │  └─────────────────┘    └─────────────────┘    └─────────┘  │
-//! │                    ┌────────────┴────────────┐                  │
-//! │                    │   Shared State          │                  │
-//! │                    │   • Buffer pools        │                  │
-//! │                    │   • Metrics             │                  │
-//! │                    │   • Configuration       │                  │
-//! │                    └─────────────────────────┘                  │
+//! │         │                       │                       │     │
+//! │    Fan-out 1→N            State per conn           Ephemeral │
+//! │                                                                │
+//! │                    ┌────────────────────────────┐              │
+//! │                    │   Shared State             │              │
+//! │                    │   • Buffer pools           │              │
+//! │                    │   • Conn registry          │              │
+//! │                    │   • Metrics                │              │
+//! │                    └────────────────────────────┘              │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -140,8 +144,8 @@ fn main() {
 
     info!("Starting superd server");
     info!(
-        "Configuration: {} network tasks, {} app threads (protocol + application on Tokio)",
-        config.network_threads, config.app_threads
+        "Configuration: {} network tasks, {} protocol tasks (dynamic app tasks per-stream)",
+        config.network_threads, config.protocol_threads
     );
 
     // Create dedicated channels for network <-> protocol communication
@@ -186,18 +190,28 @@ fn main() {
     // - to_protocol_receivers: receive ingress packets from network tasks
     // - from_protocol_senders: send egress packets to network tasks
     // 
-    // let protocol_handles = superd::protocol::start_protocol_layer(
+    // let protocol_handles = superd::protocol::quic_handler::start_protocol_layer(
     //     &config,
     //     to_protocol_receivers,
     //     from_protocol_senders,
-    //     shared_connection_registry,
-    // )?;
+    //     shutdown_tx.clone(),
+    // );
 
-    // TODO: Start application layer (shared Tokio runtime)
-    // let app_runtime = superd::application::start_application_runtime(
-    //     config.app_threads,
-    //     shared_connection_registry,
-    // )?;
+    // TODO: Start application layer (dynamic per-stream tasks)
+    // 
+    // Application architecture:
+    // - No pre-allocated threads
+    // - Tasks spawned dynamically per QUIC stream
+    // - Each stream gets its own task based on ALPN/stream type
+    // - Tasks are ephemeral: created when stream opens, destroyed when stream closes
+    // - Multiplexed streams over single QUIC connection run different apps
+    // 
+    // Example:
+    // - HTTP/3 request: spawn http handler task
+    // - WebSocket stream: spawn websocket handler task
+    // - Custom protocol: spawn custom handler task
+    // 
+    // All tasks share the same tokio_uring runtime (no dedicated worker threads)
 
     info!("SuperD server is running. Press Ctrl+C to stop.");
 
