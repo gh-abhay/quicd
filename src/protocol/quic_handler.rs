@@ -73,7 +73,7 @@ struct ConnectionEntry {
 pub struct QuicProtocolTask {
     id: usize,
     from_network: mpsc::UnboundedReceiver<NetworkToProtocol>,
-    to_network: mpsc::UnboundedSender<ProtocolToNetwork>,
+    to_network_senders: Vec<mpsc::UnboundedSender<ProtocolToNetwork>>,
     shutdown_rx: broadcast::Receiver<()>,
     local_addr: SocketAddr,
     quiche_config: Arc<Mutex<quiche::Config>>,
@@ -87,7 +87,7 @@ impl QuicProtocolTask {
     pub fn new(
         id: usize,
         from_network: mpsc::UnboundedReceiver<NetworkToProtocol>,
-        to_network: mpsc::UnboundedSender<ProtocolToNetwork>,
+        to_network_senders: Vec<mpsc::UnboundedSender<ProtocolToNetwork>>,
         shutdown_rx: broadcast::Receiver<()>,
         local_addr: SocketAddr,
         quiche_config: Arc<Mutex<quiche::Config>>,
@@ -95,7 +95,7 @@ impl QuicProtocolTask {
         Self {
             id,
             from_network,
-            to_network,
+            to_network_senders,
             shutdown_rx,
             local_addr,
             quiche_config,
@@ -156,6 +156,16 @@ impl QuicProtocolTask {
 
         let header = Header::from_slice(&mut packet, quiche::MAX_CONN_ID_LEN)
             .map_err(|e| anyhow!("failed to parse QUIC header: {e}"))?;
+
+        debug!(
+            "Protocol task {} received packet: type={:?}, version={:x}, dcid_len={}, scid_len={}, from={}",
+            self.id,
+            header.ty,
+            header.version,
+            header.dcid.len(),
+            header.scid.len(),
+            addr
+        );
 
         if let Some((canonical, entry)) = self.take_connection(header.dcid.as_ref()) {
             self.handle_existing_connection(header, packet, addr, canonical, entry)
@@ -349,8 +359,29 @@ impl QuicProtocolTask {
         Ok(())
     }
 
+    /// Select a network task to send to (hash by destination address for load balancing)
+    fn select_network_sender(&self, addr: &SocketAddr) -> &mpsc::UnboundedSender<ProtocolToNetwork> {
+        // Hash the destination address to select a network task
+        // This distributes egress load across network tasks
+        let hash = match addr {
+            SocketAddr::V4(v4) => {
+                let octets = v4.ip().octets();
+                let port = v4.port();
+                octets.iter().map(|&b| b as usize).sum::<usize>() + port as usize
+            }
+            SocketAddr::V6(v6) => {
+                let octets = v6.ip().octets();
+                let port = v6.port();
+                octets.iter().map(|&b| b as usize).sum::<usize>() + port as usize
+            }
+        };
+        let idx = hash % self.to_network_senders.len();
+        &self.to_network_senders[idx]
+    }
+
     fn queue_datagram(&self, buffer: ZeroCopyBuffer, addr: SocketAddr) -> Result<()> {
-        self.to_network
+        let sender = self.select_network_sender(&addr);
+        sender
             .send(ProtocolToNetwork::Datagram { buffer, addr })
             .map_err(|err| anyhow!("failed to enqueue datagram: {err}"))
     }
@@ -517,19 +548,22 @@ pub fn start_protocol_layer(
     to_network_senders: Vec<mpsc::UnboundedSender<ProtocolToNetwork>>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
-    if from_network_receivers.len() != to_network_senders.len() {
+    // Validate channel counts
+    // Each protocol task gets ONE receiver (ingress from network tasks via CID hashing)
+    // Each protocol task gets ALL network senders (egress to any network task)
+    if from_network_receivers.len() != config.protocol_threads {
         return Err(anyhow!(
-            "mismatched protocol channel counts: {} receivers vs {} senders",
-            from_network_receivers.len(),
-            to_network_senders.len()
+            "Expected {} from_network receivers (one per protocol task), got {}",
+            config.protocol_threads,
+            from_network_receivers.len()
         ));
     }
 
-    if from_network_receivers.len() != config.protocol_threads {
+    if to_network_senders.len() != config.network_threads {
         return Err(anyhow!(
-            "protocol channel count {} does not match configured protocol_threads {}",
-            from_network_receivers.len(),
-            config.protocol_threads
+            "Expected {} to_network senders (one per network task), got {}",
+            config.network_threads,
+            to_network_senders.len()
         ));
     }
 
@@ -540,17 +574,22 @@ pub fn start_protocol_layer(
 
     let quiche_config = Arc::new(Mutex::new(build_quiche_config(config)?));
 
-    for (idx, (receiver, sender)) in from_network_receivers
-        .into_iter()
-        .zip(to_network_senders.into_iter())
-        .enumerate()
-    {
+    // Each protocol task gets ALL network senders (for load balancing egress)
+    for (idx, receiver) in from_network_receivers.into_iter().enumerate() {
         let shutdown_rx = shutdown_tx.subscribe();
         let task_config = Arc::clone(&quiche_config);
+        let senders_clone: Vec<mpsc::UnboundedSender<ProtocolToNetwork>> = 
+            to_network_senders.iter().map(|s| s.clone()).collect();
 
         tokio_uring::spawn(async move {
-            let task =
-                QuicProtocolTask::new(idx, receiver, sender, shutdown_rx, listen_addr, task_config);
+            let task = QuicProtocolTask::new(
+                idx,
+                receiver,
+                senders_clone,
+                shutdown_rx,
+                listen_addr,
+                task_config,
+            );
 
             if let Err(err) = task.run().await {
                 error!("Protocol task {idx} exited with error: {err:?}");

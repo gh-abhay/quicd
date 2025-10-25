@@ -152,25 +152,30 @@ fn main() {
         );
 
         // Create dedicated channels for network <-> protocol communication
-        // Each network task gets its own pair of channels to/from protocol layer
+        // Architecture:
+        // - Ingress (Network → Protocol): protocol_threads channels (hash CID to route)
+        // - Egress (Protocol → Network): network_threads channels (each protocol task needs all network senders)
+        
+        // INGRESS: Network → Protocol (M channels, one per protocol task)
         let mut to_protocol_senders = Vec::new();
         let mut to_protocol_receivers = Vec::new();
+
+        for i in 0..config.protocol_threads {
+            let (tx, rx) = mpsc::unbounded_channel();
+            to_protocol_senders.push(tx);
+            to_protocol_receivers.push(rx);
+            info!("Created ingress channel {} (Network → Protocol task {})", i, i);
+        }
+
+        // EGRESS: Protocol → Network (N channels, one per network task)
         let mut from_protocol_senders = Vec::new();
         let mut from_protocol_receivers = Vec::new();
 
         for i in 0..config.network_threads {
-            let (to_proto_tx, to_proto_rx) = mpsc::unbounded_channel();
-            let (from_proto_tx, from_proto_rx) = mpsc::unbounded_channel();
-
-            to_protocol_senders.push(to_proto_tx);
-            to_protocol_receivers.push(to_proto_rx);
-            from_protocol_senders.push(from_proto_tx);
-            from_protocol_receivers.push(from_proto_rx);
-
-            info!(
-                "Created channel pair {} for network-protocol communication",
-                i
-            );
+            let (tx, rx) = mpsc::unbounded_channel();
+            from_protocol_senders.push(tx);
+            from_protocol_receivers.push(rx);
+            info!("Created egress channel {} (Protocol → Network task {})", i, i);
         }
 
         // Create shared shutdown signal for graceful shutdown (broadcast)
@@ -191,17 +196,18 @@ fn main() {
 
         info!("Network layer started successfully");
 
-        // TODO: Start protocol layer (async tasks)
-        // Protocol layer will use:
-        // - to_protocol_receivers: receive ingress packets from network tasks
-        // - from_protocol_senders: send egress packets to network tasks
-        //
-        // let protocol_handles = superd::protocol::quic_handler::start_protocol_layer(
-        //     &config,
-        //     to_protocol_receivers,
-        //     from_protocol_senders,
-        //     shutdown_tx.clone(),
-        // );
+        // Start protocol layer (async tasks)
+        info!("Starting QUIC protocol layer...");
+        if let Err(e) = superd::protocol::quic_handler::start_protocol_layer(
+            &config,
+            to_protocol_receivers,
+            from_protocol_senders,
+            shutdown_tx.clone(),
+        ) {
+            eprintln!("Failed to start protocol layer: {}", e);
+            std::process::exit(1);
+        }
+        info!("Protocol layer started successfully");
 
         // TODO: Start application layer (dynamic per-stream tasks)
         //

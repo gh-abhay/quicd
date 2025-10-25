@@ -1,0 +1,42 @@
+Auto-tuned for system: 8 logical CPUs, 4 physical cores, 19GB RAM
+  Network tasks: 4 (I/O-bound, 1 per physical core)
+  Protocol tasks: 12 (CPU-bound, 3x network for QUIC crypto)
+  Application: Dynamic tasks spawned per-stream (ephemeral)
+╔══════════════════════════════════════════════════════════╗
+║              SuperD Configuration Summary               ║
+╠══════════════════════════════════════════════════════════╣
+║ Listen Address    : 0.0.0.0:4433                        ║
+║ Network Tasks     : 2 (I/O layer)                       ║
+║ Protocol Tasks    : 2 (QUIC crypto/parsing)             ║
+║ Application       : Dynamic (per-stream tasks)          ║
+║ CPU Pinning       : Disabled (Async runtime)            ║
+║ QUIC TLS Cert     : certs/server.crt                    ║
+║ QUIC TLS Key      : certs/server.key                    ║
+╠══════════════════════════════════════════════════════════╣
+║ System Info                                              ║
+║ Total CPUs        : 8                                   ║
+║ Physical CPUs     : 4                                   ║
+║ Total Memory      : 19922                            MB ║
+║ Available Memory  : 15057                            MB ║
+╠══════════════════════════════════════════════════════════╣
+║ Telemetry                                                ║
+║ OTLP Endpoint     : http://localhost:4317               ║
+║ Service Name      : superd                              ║
+╠══════════════════════════════════════════════════════════╣
+║ Architecture: Network (Async io_uring) ->               ║
+║               Protocol (QUIC crypto) -> Application      ║
+║               Fan-out: 1 Network → N Protocol tasks      ║
+╚══════════════════════════════════════════════════════════╝
+[2m2025-10-25T21:17:41.767970Z[0m [32m INFO[0m [2msuperd[0m[2m:[0m Starting superd server
+[2m2025-10-25T21:17:41.767983Z[0m [32m INFO[0m [2msuperd[0m[2m:[0m Configuration: 2 network tasks, 2 protocol tasks (dynamic app tasks per-stream)
+[2m2025-10-25T21:17:41.768006Z[0m [32m INFO[0m [2msuperd[0m[2m:[0m Created channel pair 0 for network-protocol communication
+[2m2025-10-25T21:17:41.768013Z[0m [32m INFO[0m [2msuperd[0m[2m:[0m Created channel pair 1 for network-protocol communication
+[2m2025-10-25T21:17:41.768021Z[0m [32m INFO[0m [2msuperd[0m[2m:[0m Starting network I/O layer with io_uring...
+[2m2025-10-25T21:17:41.768025Z[0m [32m INFO[0m [2msuperd::network::io_uring_net[0m[2m:[0m Starting network layer with 2 io_uring tasks on 0.0.0.0:4433
+[2m2025-10-25T21:17:41.782822Z[0m [32m INFO[0m [2msuperd[0m[2m:[0m Network layer started successfully
+[2m2025-10-25T21:17:41.782868Z[0m [32m INFO[0m [2msuperd[0m[2m:[0m SuperD server is running. Press Ctrl+C to stop.
+[2m2025-10-25T21:17:41.782882Z[0m [32m INFO[0m [2msuperd::network::io_uring_net[0m[2m:[0m Network Layer Metrics: RX: 0.00Mpps 0.00Mbps (0 pkts, 0 bytes, 0 errs) | TX: 0.00Mpps 0.00Mbps (0 pkts, 0 bytes, 0 errs) | Channel: 0 send_errs 0 full | Uptime: 0.00s
+[2m2025-10-25T21:17:41.782906Z[0m [32m INFO[0m [2msuperd::network::io_uring_net[0m[2m:[0m Network task 0 starting on 0.0.0.0:4433
+[2m2025-10-25T21:17:41.782952Z[0m [32m INFO[0m [2msuperd::network::io_uring_net[0m[2m:[0m Network task 0 starting with event-driven io_uring
+[2m2025-10-25T21:17:41.783025Z[0m [32m INFO[0m [2msuperd::network::io_uring_net[0m[2m:[0m Network task 1 starting on 0.0.0.0:4433
+[2m2025-10-25T21:17:41.783083Z[0m [32m INFO[0m [2msuperd::network::io_uring_net[0m[2m:[0m Network task 1 starting with event-driven io_uring

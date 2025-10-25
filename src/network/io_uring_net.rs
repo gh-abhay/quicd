@@ -25,18 +25,18 @@ use std::sync::Arc;
 use tokio::select;
 use tokio::sync::{broadcast, mpsc};
 use tokio_uring::net::UdpSocket;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Network I/O task using io_uring for event-driven operations
 /// Each network task has:
-/// - One dedicated receiver for egress packets from its assigned protocol task
-/// - One sender to forward ingress packets to its assigned protocol task
+/// - Access to ALL protocol task senders (for load balancing via connection ID hashing)
+/// - One dedicated receiver for egress packets from ALL protocol tasks (shared via broadcast or multiple receivers)
 pub struct IoUringNetworkThread {
     id: usize,
     socket: UdpSocket,
-    // Send ingress packets to assigned protocol thread
-    to_protocol: ToProtocolSender,
-    // Receive egress packets from assigned protocol thread (dedicated channel)
+    // Send ingress packets to protocol tasks (hash by connection ID)
+    to_protocol_senders: Vec<ToProtocolSender>,
+    // Receive egress packets from protocol tasks
     from_protocol: mpsc::UnboundedReceiver<super::ProtocolToNetwork>,
     metrics: SharedMetrics,
     // Receive shutdown signal (broadcast)
@@ -47,7 +47,7 @@ impl IoUringNetworkThread {
     pub async fn new(
         id: usize,
         listen_addr: SocketAddr,
-        to_protocol: ToProtocolSender,
+        to_protocol_senders: Vec<ToProtocolSender>,
         from_protocol: mpsc::UnboundedReceiver<super::ProtocolToNetwork>,
         metrics: SharedMetrics,
         shutdown_rx: broadcast::Receiver<()>,
@@ -57,11 +57,18 @@ impl IoUringNetworkThread {
         Ok(Self {
             id,
             socket,
-            to_protocol,
+            to_protocol_senders,
             from_protocol,
             metrics,
             shutdown_rx,
         })
+    }
+
+    /// Hash connection ID bytes to select a protocol task
+    fn hash_to_protocol_task_static(dcid: &[u8], num_protocol_tasks: usize) -> usize {
+        // Simple hash: sum of bytes modulo number of protocol tasks
+        let hash: usize = dcid.iter().map(|&b| b as usize).sum();
+        hash % num_protocol_tasks
     }
 
     /// Run the network task with truly event-driven io_uring
@@ -77,7 +84,7 @@ impl IoUringNetworkThread {
 
         // Extract owned values to avoid borrowing issues in select!
         let mut socket = self.socket;
-        let to_protocol = self.to_protocol;
+        let to_protocol_senders = self.to_protocol_senders;
         let mut from_protocol = self.from_protocol;
         let metrics = self.metrics;
         let mut shutdown_rx = self.shutdown_rx;
@@ -90,10 +97,23 @@ impl IoUringNetworkThread {
                     match recv_result {
                         Ok((buffer, addr, len)) => {
                             metrics.record_packet_received(len);
+                            debug!("Network task received {} bytes from {}, first byte: 0x{:02x}", len, addr, buffer.data()[0]);
 
-                            // Forward to protocol layer (our assigned protocol thread)
+                            // Hash connection ID to select protocol task
+                            let protocol_task_idx = if len >= 20 {
+                                // Extract DCID to hash (enough bytes for a connection ID)
+                                let dcid_bytes = &buffer.data()[..20];
+                                Self::hash_to_protocol_task_static(dcid_bytes, to_protocol_senders.len())
+                            } else {
+                                // Fallback for too-short packets: use length as simple hash
+                                len % to_protocol_senders.len()
+                            };
+
+                            debug!("Routing packet to protocol task {} (total {} tasks)", protocol_task_idx, to_protocol_senders.len());
+
+                            // Forward to selected protocol task
                             let msg = NetworkToProtocol::Datagram { buffer, addr };
-                            if let Err(e) = to_protocol.send(msg) {
+                            if let Err(e) = to_protocol_senders[protocol_task_idx].send(msg) {
                                 metrics.record_channel_send_error();
                                 warn!("Failed to send to protocol layer: {}", e);
                             }
@@ -144,18 +164,16 @@ impl IoUringNetworkThread {
         let buffer_pool = get_buffer_pool();
         let mut buf = buffer_pool.acquire();
 
-        // Ensure buffer has capacity
-        buf.data_mut().resize(MAX_UDP_PAYLOAD, 0);
-
+        // Receive data directly
         let data = vec![0u8; MAX_UDP_PAYLOAD];
         let (result, received_data) = socket.recv_from(data).await;
         let (len, addr) = result?;
 
-        // Copy data into our zero-copy buffer
+        // Copy received data into our zero-copy buffer (clear first, then extend)
+        buf.data_mut().clear();
         buf.data_mut().extend_from_slice(&received_data[..len]);
 
-        // Truncate to actual received length and freeze
-        buf.data_mut().truncate(len);
+        // Freeze the buffer
         let zero_copy_buf = buf.freeze();
 
         Ok((zero_copy_buf, addr, len))
@@ -227,10 +245,12 @@ pub fn start_network_layer(
     );
 
     // Validate we have correct number of channels
-    if to_protocol_senders.len() != config.network_threads {
+    // Each network task needs access to ALL protocol task senders (for hashing)
+    // But each network task gets ONE receiver from protocol (for egress)
+    if to_protocol_senders.len() != config.protocol_threads {
         return Err(NetworkError::InvalidConfiguration(format!(
-            "Expected {} to_protocol senders, got {}",
-            config.network_threads,
+            "Expected {} to_protocol senders (one per protocol task), got {}",
+            config.protocol_threads,
             to_protocol_senders.len()
         ))
         .into());
@@ -238,7 +258,7 @@ pub fn start_network_layer(
 
     if from_protocol_receivers.len() != config.network_threads {
         return Err(NetworkError::InvalidConfiguration(format!(
-            "Expected {} from_protocol receivers, got {}",
+            "Expected {} from_protocol receivers (one per network task), got {}",
             config.network_threads,
             from_protocol_receivers.len()
         ))
@@ -261,9 +281,10 @@ pub fn start_network_layer(
 
     let mut receivers_iter = from_protocol_receivers.into_iter();
 
-    // Create each network task with its dedicated channels
+    // Create each network task with access to ALL protocol senders (for hashing)
     for i in 0..config.network_threads {
-        let to_protocol = to_protocol_senders[i].clone();
+        // Each network task gets a CLONE of ALL protocol senders
+        let to_protocol_senders_clone: Vec<ToProtocolSender> = to_protocol_senders.iter().map(|s| s.clone()).collect();
         let from_protocol = receivers_iter.next().unwrap(); // Safe due to validation above
         let metrics = Arc::clone(&metrics);
         let shutdown_rx = shutdown_tx.subscribe(); // Each task gets its own receiver
@@ -274,7 +295,7 @@ pub fn start_network_layer(
             match IoUringNetworkThread::new(
                 i,
                 listen_addr,
-                to_protocol,
+                to_protocol_senders_clone,
                 from_protocol,
                 metrics,
                 shutdown_rx,
