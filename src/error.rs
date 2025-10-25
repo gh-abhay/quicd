@@ -1,6 +1,5 @@
 /// Custom error types for SuperD
 /// Provides specific error handling instead of generic anyhow
-
 use std::fmt;
 use std::io;
 use std::net::AddrParseError;

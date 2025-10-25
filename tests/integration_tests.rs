@@ -1,6 +1,5 @@
 /// Integration tests for SuperD network layer
 /// Tests the complete network I/O functionality
-
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -9,85 +8,81 @@ use tokio::time::timeout;
 use superd::config::Config;
 use superd::network::io_uring_net::start_network_layer;
 
-#[tokio::test]
-async fn test_network_layer_startup_shutdown() {
-    // Create test configuration
-    let mut config = Config::default();
-    config.listen = "127.0.0.1:0".to_string(); // Use port 0 for auto-assignment
-    config.network_threads = 2; // Use 2 threads for testing
-    config.cpu_pinning = false; // Disable CPU pinning in tests
+#[test]
+fn test_network_layer_startup_shutdown() {
+    tokio_uring::start(async {
+        // Create test configuration
+        let mut config = Config::default();
+        config.listen = "127.0.0.1:0".to_string(); // Use port 0 for auto-assignment
+        config.network_threads = 2; // Use 2 threads for testing
+        config.protocol_threads = 4; // Keep protocol tasks modest for tests
+        config.cpu_pinning = false; // Disable CPU pinning in tests
 
-    // Create dedicated channels for each network thread
-    let mut to_protocol_senders = Vec::new();
-    let mut to_protocol_receivers = Vec::new();
-    let mut from_protocol_senders = Vec::new();
-    let mut from_protocol_receivers = Vec::new();
+        // Create dedicated channels for each network thread
+        let mut to_protocol_senders = Vec::new();
+        let mut to_protocol_receivers = Vec::new();
+        let mut from_protocol_senders = Vec::new();
+        let mut from_protocol_receivers = Vec::new();
 
-    for _ in 0..config.network_threads {
-        let (to_proto_tx, to_proto_rx) = mpsc::unbounded_channel();
-        let (from_proto_tx, from_proto_rx) = mpsc::unbounded_channel();
-        
-        to_protocol_senders.push(to_proto_tx);
-        to_protocol_receivers.push(to_proto_rx);
-        from_protocol_senders.push(from_proto_tx);
-        from_protocol_receivers.push(from_proto_rx);
-    }
+        for _ in 0..config.network_threads {
+            let (to_proto_tx, to_proto_rx) = mpsc::unbounded_channel();
+            let (from_proto_tx, from_proto_rx) = mpsc::unbounded_channel();
 
-    // Create shutdown signal (broadcast)
-    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
-
-    // Get tokio handle
-    let tokio_handle = tokio::runtime::Handle::current();
-
-    // Start network layer
-    let network_handles = start_network_layer(
-        &config,
-        to_protocol_senders,
-        from_protocol_receivers,
-        tokio_handle,
-        shutdown_tx.clone(),
-    ).expect("Failed to start network layer");
-
-    // Give the network layer time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Signal shutdown via broadcast (event-driven!)
-    shutdown_tx.send(()).expect("Failed to send shutdown signal");
-
-    // Wait for threads to finish (with timeout)
-    for handle in network_handles {
-        let join_result = tokio::task::spawn_blocking(move || {
-            handle.join()
-        }).await;
-
-        match join_result {
-            Ok(Ok(_)) => {} // Thread joined successfully
-            Ok(Err(_)) => panic!("Network thread panicked"),
-            Err(_) => panic!("Failed to join network thread"),
+            to_protocol_senders.push(to_proto_tx);
+            to_protocol_receivers.push(to_proto_rx);
+            from_protocol_senders.push(from_proto_tx);
+            from_protocol_receivers.push(from_proto_rx);
         }
-    }
 
-    // Verify no unexpected messages were sent (allow some tolerance for system packets)
-    for mut rx in to_protocol_receivers {
-        let mut message_count = 0;
-        let start_time = std::time::Instant::now();
+        // Create shutdown signal (broadcast)
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
 
-        while start_time.elapsed() < Duration::from_millis(200) {
-            match timeout(Duration::from_millis(10), rx.recv()).await {
-                Ok(Some(_)) => message_count += 1,
-                Ok(None) => break, // Channel closed
-                Err(_) => {} // Timeout, continue
+        // Start network layer
+        start_network_layer(
+            &config,
+            to_protocol_senders,
+            from_protocol_receivers,
+            shutdown_tx.clone(),
+        )
+        .expect("Failed to start network layer");
+
+        // Give the network layer time to start
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Signal shutdown via broadcast (event-driven!)
+        shutdown_tx
+            .send(())
+            .expect("Failed to send shutdown signal");
+
+        // Allow worker tasks time to observe the shutdown signal
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Verify no unexpected messages were sent (allow some tolerance for system packets)
+        for mut rx in to_protocol_receivers {
+            let mut message_count = 0;
+            let start_time = std::time::Instant::now();
+
+            while start_time.elapsed() < Duration::from_millis(200) {
+                match timeout(Duration::from_millis(10), rx.recv()).await {
+                    Ok(Some(_)) => message_count += 1,
+                    Ok(None) => break, // Channel closed
+                    Err(_) => {}       // Timeout, continue
+                }
             }
-        }
 
-        // Allow up to 2 messages per thread (might receive some system/localhost packets)
-        assert!(message_count <= 2, "Received too many unexpected messages: {}", message_count);
-    }
+            // Allow up to 2 messages per thread (might receive some system/localhost packets)
+            assert!(
+                message_count <= 2,
+                "Received too many unexpected messages: {}",
+                message_count
+            );
+        }
+    });
 }
 
 #[tokio::test]
 async fn test_buffer_pool_functionality() {
-    use superd::network::zerocopy_buffer::{init_buffer_pool, get_buffer_pool, ZeroCopyBufferMut};
+    use superd::network::zerocopy_buffer::{get_buffer_pool, init_buffer_pool, ZeroCopyBufferMut};
 
     // Initialize buffer pool
     init_buffer_pool(10);
@@ -120,8 +115,8 @@ async fn test_buffer_pool_functionality() {
 
 #[tokio::test]
 async fn test_zero_copy_buffer_clone() {
-    use superd::network::zerocopy_buffer::ZeroCopyBuffer;
     use bytes::Bytes;
+    use superd::network::zerocopy_buffer::ZeroCopyBuffer;
 
     let data = Bytes::from_static(b"test data");
     let buffer = ZeroCopyBuffer::from_bytes(data);
@@ -151,6 +146,11 @@ fn test_config_validation() {
     config = Config::default();
     config.listen = "invalid:address:99999".to_string();
     assert!(config.validate().is_err());
+
+    // Test invalid protocol threads
+    config = Config::default();
+    config.protocol_threads = 0;
+    assert!(config.validate().is_err());
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn test_config_from_cli() {
         config: None,
         listen: "127.0.0.1:8080".to_string(),
         network_threads: Some(2),
-        app_threads: Some(4),
+        protocol_threads: Some(6),
         cpu_pinning: Some(false),
         otlp_endpoint: "http://localhost:4318".to_string(),
         auto_tune: false,
@@ -171,7 +171,7 @@ fn test_config_from_cli() {
 
     assert_eq!(config.listen, "127.0.0.1:8080");
     assert_eq!(config.network_threads, 2);
-    assert_eq!(config.app_threads, 4);
+    assert_eq!(config.protocol_threads, 6);
     assert!(!config.cpu_pinning);
     assert_eq!(config.telemetry.otlp_endpoint, "http://localhost:4318");
 }

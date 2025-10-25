@@ -1,6 +1,5 @@
 /// Network layer metrics for observability
 /// Tracks packets, bytes, errors, and performance metrics
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,16 +10,16 @@ pub struct NetworkMetrics {
     pub packets_received: AtomicU64,
     pub bytes_received: AtomicU64,
     pub receive_errors: AtomicU64,
-    
+
     // Send metrics
     pub packets_sent: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub send_errors: AtomicU64,
-    
+
     // Channel metrics
     pub channel_send_errors: AtomicU64,
     pub channel_full_errors: AtomicU64,
-    
+
     // Timing
     start_time: Instant,
 }
@@ -43,7 +42,8 @@ impl NetworkMetrics {
     #[inline]
     pub fn record_packet_received(&self, bytes: usize) {
         self.packets_received.fetch_add(1, Ordering::Relaxed);
-        self.bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.bytes_received
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     #[inline]
@@ -75,7 +75,7 @@ impl NetworkMetrics {
     pub fn get_stats(&self) -> MetricsSnapshot {
         let uptime = self.start_time.elapsed();
         let uptime_secs = uptime.as_secs_f64();
-        
+
         let packets_rx = self.packets_received.load(Ordering::Relaxed);
         let bytes_rx = self.bytes_received.load(Ordering::Relaxed);
         let packets_tx = self.packets_sent.load(Ordering::Relaxed);

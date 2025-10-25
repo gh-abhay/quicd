@@ -1,9 +1,10 @@
 /// Performance benchmarks for SuperD network layer
 /// Measures throughput, latency, and resource usage
-
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use superd::network::zerocopy_buffer::{init_buffer_pool, get_buffer_pool, ZeroCopyBuffer, ZeroCopyBufferMut};
+use superd::network::zerocopy_buffer::{
+    get_buffer_pool, init_buffer_pool, ZeroCopyBuffer, ZeroCopyBufferMut,
+};
 
 fn bench_buffer_pool_acquire_release(c: &mut Criterion) {
     init_buffer_pool(1000);

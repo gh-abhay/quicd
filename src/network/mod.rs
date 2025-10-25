@@ -22,36 +22,37 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use superd::network::io_uring_net::start_network_layer;
 //! use superd::config::Config;
+//! use superd::network::{
+//!     io_uring_net::start_network_layer,
+//!     NetworkToProtocol,
+//!     ProtocolToNetwork,
+//! };
 //! use tokio::sync::{broadcast, mpsc};
 //!
-//! // Load configuration
+//! # fn main() {
 //! let config = Config::default();
 //!
-//! // Create dedicated channels for each network thread
 //! let mut to_protocol_senders = Vec::new();
 //! let mut from_protocol_receivers = Vec::new();
 //!
 //! for _ in 0..config.network_threads {
-//!     let (to_proto_tx, _to_proto_rx) = mpsc::unbounded_channel();
-//!     let (_from_proto_tx, from_proto_rx) = mpsc::unbounded_channel();
-//!     
+//!     let (to_proto_tx, _to_proto_rx) = mpsc::unbounded_channel::<NetworkToProtocol>();
+//!     let (_from_proto_tx, from_proto_rx) = mpsc::unbounded_channel::<ProtocolToNetwork>();
+//!
 //!     to_protocol_senders.push(to_proto_tx);
 //!     from_protocol_receivers.push(from_proto_rx);
 //! }
 //!
-//! // Create shutdown signal
 //! let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
 //!
-//! // Start network layer
-//! let handles = start_network_layer(
+//! start_network_layer(
 //!     &config,
 //!     to_protocol_senders,
 //!     from_protocol_receivers,
-//!     tokio::runtime::Handle::current(),
 //!     shutdown_tx,
-//! );
+//! ).unwrap();
+//! # }
 //! ```
 
 pub mod io_uring_net;
@@ -94,4 +95,3 @@ pub type ToProtocolSender = mpsc::UnboundedSender<NetworkToProtocol>;
 pub type ToProtocolReceiver = mpsc::UnboundedReceiver<NetworkToProtocol>;
 pub type FromProtocolSender = mpsc::UnboundedSender<ProtocolToNetwork>;
 pub type FromProtocolReceiver = mpsc::UnboundedReceiver<ProtocolToNetwork>;
-

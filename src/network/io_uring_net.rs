@@ -13,7 +13,6 @@
 /// - **Dedicated channels**: one receiver per protocol thread for egress
 /// - **Load balanced**: SO_REUSEPORT distributes ingress packets
 /// - **Event-driven shutdown**: broadcast channel for instant propagation
-
 use super::metrics::{NetworkMetrics, SharedMetrics};
 use super::zerocopy_buffer::{get_buffer_pool, ZeroCopyBuffer, MAX_UDP_PAYLOAD};
 use super::{NetworkToProtocol, ToProtocolSender};
@@ -71,7 +70,10 @@ impl IoUringNetworkThread {
     /// 2. Egress: Packet from protocol task to send (MPSC channel)
     /// 3. Shutdown: Broadcast signal to gracefully stop
     pub async fn run(self) {
-        info!("Network task {} starting with event-driven io_uring", self.id);
+        info!(
+            "Network task {} starting with event-driven io_uring",
+            self.id
+        );
 
         // Extract owned values to avoid borrowing issues in select!
         let mut socket = self.socket;
@@ -136,7 +138,9 @@ impl IoUringNetworkThread {
     }
 
     /// Static version of recv_from_buffer to avoid borrowing self
-    async fn recv_from_buffer_static(socket: &mut UdpSocket) -> std::io::Result<(ZeroCopyBuffer, SocketAddr, usize)> {
+    async fn recv_from_buffer_static(
+        socket: &mut UdpSocket,
+    ) -> std::io::Result<(ZeroCopyBuffer, SocketAddr, usize)> {
         let buffer_pool = get_buffer_pool();
         let mut buf = buffer_pool.acquire();
 
@@ -146,19 +150,23 @@ impl IoUringNetworkThread {
         let data = vec![0u8; MAX_UDP_PAYLOAD];
         let (result, received_data) = socket.recv_from(data).await;
         let (len, addr) = result?;
-        
+
         // Copy data into our zero-copy buffer
         buf.data_mut().extend_from_slice(&received_data[..len]);
-        
+
         // Truncate to actual received length and freeze
         buf.data_mut().truncate(len);
         let zero_copy_buf = buf.freeze();
-        
+
         Ok((zero_copy_buf, addr, len))
     }
 
     /// Static version of send_to to avoid borrowing self
-    async fn send_to_static(socket: &mut UdpSocket, buffer: &ZeroCopyBuffer, addr: SocketAddr) -> std::io::Result<()> {
+    async fn send_to_static(
+        socket: &mut UdpSocket,
+        buffer: &ZeroCopyBuffer,
+        addr: SocketAddr,
+    ) -> std::io::Result<()> {
         let data = buffer.data().to_vec();
         let (result, _buf) = socket.send_to(data, addr).await;
         result?;
@@ -202,7 +210,7 @@ async fn create_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
 
 /// Start network I/O layer with io_uring-based async tasks
 /// Creates N network tasks, each with dedicated channels to/from protocol layer
-/// 
+///
 /// Channel architecture:
 /// - Each network task has 1 sender to 1 protocol task (ingress)
 /// - Each network task has 1 receiver from 1 protocol task (egress)
@@ -224,7 +232,8 @@ pub fn start_network_layer(
             "Expected {} to_protocol senders, got {}",
             config.network_threads,
             to_protocol_senders.len()
-        )).into());
+        ))
+        .into());
     }
 
     if from_protocol_receivers.len() != config.network_threads {
@@ -232,13 +241,13 @@ pub fn start_network_layer(
             "Expected {} from_protocol receivers, got {}",
             config.network_threads,
             from_protocol_receivers.len()
-        )).into());
+        ))
+        .into());
     }
 
-    let listen_addr: SocketAddr = config
-        .listen
-        .parse()
-        .map_err(|_| NetworkError::SocketBindFailed(format!("Invalid listen address: {}", config.listen)))?;
+    let listen_addr: SocketAddr = config.listen.parse().map_err(|_| {
+        NetworkError::SocketBindFailed(format!("Invalid listen address: {}", config.listen))
+    })?;
 
     // Initialize buffer pool
     let pool_capacity = config.network_threads * 2048;
@@ -269,7 +278,9 @@ pub fn start_network_layer(
                 from_protocol,
                 metrics,
                 shutdown_rx,
-            ).await {
+            )
+            .await
+            {
                 Ok(net_thread) => {
                     net_thread.run().await;
                 }
@@ -284,10 +295,7 @@ pub fn start_network_layer(
 }
 
 /// Start metrics reporting task on Tokio runtime
-fn start_metrics_task(
-    metrics: SharedMetrics, 
-    mut shutdown_rx: broadcast::Receiver<()>
-) {
+fn start_metrics_task(metrics: SharedMetrics, mut shutdown_rx: broadcast::Receiver<()>) {
     tokio_uring::spawn(async move {
         loop {
             // Simple delay, since tokio_uring may not have time
@@ -295,7 +303,7 @@ fn start_metrics_task(
             // To keep simple, report every time something happens, but for now, just report once
             let stats = metrics.get_stats();
             info!("Network Layer Metrics: {}", stats);
-            
+
             // Wait for shutdown
             let _ = shutdown_rx.recv().await;
             info!("Metrics task shutting down");

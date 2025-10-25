@@ -63,7 +63,7 @@ cargo build --release
 ./target/release/superd \
   --listen 0.0.0.0:4433 \
   --network-threads 4 \
-  --app-threads 12 \
+  --protocol-threads 8 \
   --cpu-pinning true
 ```
 
@@ -76,23 +76,31 @@ Example `config.toml`:
 ```toml
 listen = "0.0.0.0:4433"
 network_threads = 4
-app_threads = 12
+protocol_threads = 8
 cpu_pinning = true
 
 [telemetry]
 otlp_endpoint = "http://localhost:4317"
 service_name = "superd"
+
+[quic]
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
+verify_peer = false
+enable_early_data = false
+application_protos = ["superd/0.1"]
 ```
 
 ## Configuration
 
 ### Thread Allocation
-- **Network Threads**: Default 25% of CPUs (native OS threads with io_uring)
-- **App Threads**: Default 75% of CPUs (Tokio workers for protocol + application)
+- **Network Threads**: Auto-tuned based on available CPUs for io_uring workers
+- **Protocol Threads**: Auto-tuned (often 2-4x network threads) for QUIC processing
 
 Example on 16-core system:
-- 4 network threads (CPU-pinned)
-- 12 Tokio workers (protocol + application)
+- 4 network threads (io_uring)
+- 8 protocol tasks (QUIC parsing + crypto)
+- Application tasks scale dynamically per connection/stream
 
 ### CPU Pinning
 Interleaved strategy to reduce cache contention:
@@ -124,8 +132,8 @@ Based on research and proven systems:
 - **io_uring**: Modern Linux async I/O (via tokio-uring)
 
 ### Network
-- **quinn-proto**: QUIC protocol implementation (planned)
-- **quinn-udp**: High-performance UDP I/O
+- **quiche**: QUIC protocol implementation with TLS
+- **tokio-uring**: High-performance UDP I/O
 - **socket2**: Low-level socket control
 
 ### Observability
@@ -164,7 +172,7 @@ This project applies best practices from industry leaders:
 - Metrics and observability
 
 🚧 **Phase 2 In Progress**: Protocol Layer
-- QUIC implementation (quinn-proto)
+- QUIC implementation (quiche)
 - Connection management
 - Flow control and reliability
 

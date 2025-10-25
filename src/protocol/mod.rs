@@ -47,16 +47,37 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use superd::protocol::start_protocol_layer;
 //! use superd::config::Config;
+//! use superd::network::{NetworkToProtocol, ProtocolToNetwork};
+//! use superd::protocol::quic_handler::start_protocol_layer;
+//! use tokio::sync::{broadcast, mpsc};
 //!
-//! // Start protocol layer with fan-out from network tasks
-//! let protocol_handles = start_protocol_layer(
+//! # fn main() {
+//! let mut config = Config::default();
+//! config.protocol_threads = 2;
+//!
+//! let mut network_to_protocol_receivers = Vec::new();
+//! let mut protocol_to_network_senders = Vec::new();
+//!
+//! for _ in 0..config.protocol_threads {
+//!     let (net_tx, net_rx) = mpsc::unbounded_channel::<NetworkToProtocol>();
+//!     let (proto_tx, _proto_rx) = mpsc::unbounded_channel::<ProtocolToNetwork>();
+//!
+//!     // In production the senders are passed to the network layer.
+//!     let _ = net_tx;
+//!     protocol_to_network_senders.push(proto_tx);
+//!     network_to_protocol_receivers.push(net_rx);
+//! }
+//!
+//! let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
+//!
+//! start_protocol_layer(
 //!     &config,
 //!     network_to_protocol_receivers,
 //!     protocol_to_network_senders,
 //!     shutdown_tx,
-//! );
+//! ).unwrap();
+//! # }
 //! ```
 
 pub mod quic_handler;
@@ -67,7 +88,7 @@ use tokio::sync::mpsc;
 use crate::network::zerocopy_buffer::ZeroCopyBuffer;
 
 /// Messages from protocol layer to application layer
-/// 
+///
 /// Protocol tasks forward parsed QUIC stream data to application tasks.
 /// Application tasks are spawned dynamically per-stream, not pre-allocated.
 #[derive(Debug, Clone)]
@@ -92,10 +113,7 @@ pub enum ProtocolToApplication {
         reason: String,
     },
     /// Connection closed - all stream tasks for this connection should terminate
-    ConnectionClosed {
-        conn_id: u64,
-        reason: String,
-    },
+    ConnectionClosed { conn_id: u64, reason: String },
 }
 
 /// Messages from application layer to protocol layer
@@ -108,9 +126,7 @@ pub enum ApplicationToProtocol {
         data: ZeroCopyBuffer,
     },
     /// Close a connection
-    CloseConnection {
-        conn_id: u64,
-    },
+    CloseConnection { conn_id: u64 },
 }
 
 /// Channel types for protocol <-> application communication
