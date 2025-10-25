@@ -18,11 +18,10 @@
 //! └────────────────────┬────────────────────────────┘
 //!                      │ Zero-Copy Buffers
 //! ┌────────────────────▼────────────────────────────┐
-//! │  Network Layer (Native Threads + io_uring)      │
-//! │   • Fixed thread count                          │
-//! │   • CPU pinning                                 │
+//! │  Network Layer (Async Tokio + io_uring)         │
+//! │   • Pure async runtime                          │
 //! │   • SO_REUSEPORT load balancing                 │
-//! │   • Batch I/O operations                        │
+//! │   • Zero-copy buffer management                 │
 //! └─────────────────────────────────────────────────┘
 //! ```
 //!

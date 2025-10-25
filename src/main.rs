@@ -14,15 +14,12 @@
 //! │                                                             │
 //! │  ┌─────────────────┐    ┌─────────────────┐    ┌─────────┐  │
 //! │  │   Network       │    │   Protocol      │    │   App   │  │
-//! │  │   Threads       │◄──►│   Thread        │◄──►│   Layer │  │
+//! │  │   Tasks         │◄──►│   Task          │◄──►│   Layer │  │
 //! │  │                 │    │                 │    │         │  │
-//! │  │ • Zero-copy I/O │    │ • QUIC/UDP      │    │ • Tokio │  │
-//! │  │ • CPU pinning   │    │ • Parsing       │    │ • Async │  │
-//! │  │ • Batch ops     │    │ • Validation    │    │         │  │
+//! │  │ • Async Tokio   │    │ • QUIC/UDP      │    │ • Tokio │  │
+//! │  │ • io_uring      │    │ • Parsing       │    │ • Async │  │
+//! │  │ • SO_REUSEPORT  │    │ • Validation    │    │         │  │
 //! │  └─────────────────┘    └─────────────────┘    └─────────┘  │
-//! │         │                       │                       │     │
-//! │         └───────────────────────┼───────────────────────┘     │
-//! │                                 │                               │
 //! │                    ┌────────────┴────────────┐                  │
 //! │                    │   Shared State          │                  │
 //! │                    │   • Buffer pools        │                  │
@@ -91,10 +88,9 @@
 //! ## Scaling
 //!
 //! For high-scale deployments:
-//! - Use CPU pinning for network threads
 //! - Configure buffer pools appropriately
 //! - Enable SO_REUSEPORT for load balancing
-//! - Monitor system resources and adjust thread counts
+//! - Monitor system resources and adjust task counts
 //!
 //! ## Safety
 //!
@@ -108,8 +104,8 @@ use tracing::info;
 use superd::config::{Cli, Config};
 use superd::telemetry;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    tokio_uring::start(async {
     // Initialize basic logging first
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
@@ -144,12 +140,12 @@ async fn main() {
 
     info!("Starting superd server");
     info!(
-        "Configuration: {} network threads, {} app threads (protocol + application on Tokio)",
+        "Configuration: {} network tasks, {} app threads (protocol + application on Tokio)",
         config.network_threads, config.app_threads
     );
 
     // Create dedicated channels for network <-> protocol communication
-    // Each network thread gets its own pair of channels to/from protocol layer
+    // Each network task gets its own pair of channels to/from protocol layer
     let mut to_protocol_senders = Vec::new();
     let mut to_protocol_receivers = Vec::new();
     let mut from_protocol_senders = Vec::new();
@@ -168,34 +164,27 @@ async fn main() {
     }
 
     // Create shared shutdown signal for graceful shutdown (broadcast)
-    // All threads subscribe to this signal for event-driven shutdown
+    // All tasks subscribe to this signal for event-driven shutdown
     let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
 
-    // Get handle to current Tokio runtime
-    let tokio_handle = tokio::runtime::Handle::current();
-
-    // Start network layer (native threads with io_uring)
+    // Start network layer (async tasks with io_uring)
     info!("Starting network I/O layer with io_uring...");
-    let network_handles = match superd::network::io_uring_net::start_network_layer(
+    if let Err(e) = superd::network::io_uring_net::start_network_layer(
         &config,
         to_protocol_senders,
         from_protocol_receivers,
-        tokio_handle.clone(),
         shutdown_tx.clone(),
     ) {
-        Ok(handles) => handles,
-        Err(e) => {
-            eprintln!("Failed to start network layer: {}", e);
-            std::process::exit(1);
-        }
+        eprintln!("Failed to listen address: {}", e);
+        std::process::exit(1);
     };
 
     info!("Network layer started successfully");
 
-    // TODO: Start protocol layer (native threads)
+    // TODO: Start protocol layer (async tasks)
     // Protocol layer will use:
-    // - to_protocol_receivers: receive ingress packets from network threads
-    // - from_protocol_senders: send egress packets to network threads
+    // - to_protocol_receivers: receive ingress packets from network tasks
+    // - from_protocol_senders: send egress packets to network tasks
     // 
     // let protocol_handles = superd::protocol::start_protocol_layer(
     //     &config,
@@ -214,21 +203,15 @@ async fn main() {
 
     // Setup signal handlers for graceful shutdown
     let shutdown_tx_for_signal = shutdown_tx.clone();
-    let shutdown_handle = tokio::spawn(async move {
+    let shutdown_handle = tokio_uring::spawn(async move {
         setup_signal_handlers(shutdown_tx_for_signal).await;
     });
-
-    // Wait for network threads to complete
-    for (i, handle) in network_handles.into_iter().enumerate() {
-        if let Err(e) = handle.join() {
-            eprintln!("Network thread {} panicked: {:?}", i, e);
-        }
-    }
 
     // Wait for shutdown signal to be processed
     let _ = shutdown_handle.await;
 
     info!("SuperD server stopped");
+    });
 }
 
 async fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>) {
@@ -237,7 +220,7 @@ async fn setup_signal_handlers(shutdown_tx: broadcast::Sender<()>) {
     }
     println!("\nReceived Ctrl+C, shutting down...");
 
-    // Broadcast shutdown signal to all threads (event-driven, no polling!)
+    // Broadcast shutdown signal to all tasks (event-driven, no polling!)
     if let Err(e) = shutdown_tx.send(()) {
         eprintln!("Failed to send shutdown signal: {}", e);
     }

@@ -16,7 +16,7 @@ pub struct Cli {
     #[arg(short, long, default_value = "0.0.0.0:4433")]
     pub listen: String,
 
-    /// Number of network IO threads (default: auto-tuned based on system)
+    /// Number of network IO tasks (default: auto-tuned based on system)
     #[arg(long)]
     pub network_threads: Option<usize>,
 
@@ -25,7 +25,7 @@ pub struct Cli {
     #[arg(long)]
     pub app_threads: Option<usize>,
 
-    /// Enable CPU pinning with interleaved strategy
+    /// Enable CPU pinning with interleaved strategy (deprecated - not used in async mode)
     #[arg(long)]
     pub cpu_pinning: Option<bool>,
 
@@ -72,7 +72,7 @@ impl Default for Config {
             listen: "0.0.0.0:4433".to_string(),
             network_threads: 2, // Default fallback
             app_threads: 6,     // Default fallback
-            cpu_pinning: true,
+            cpu_pinning: false,
             telemetry: TelemetryConfig {
                 otlp_endpoint: "http://localhost:4317".to_string(),
                 service_name: "superd".to_string(),
@@ -153,14 +153,8 @@ impl Config {
             ).into());
         }
 
-        // Warn about suboptimal configurations
-        if self.cpu_pinning && self.network_threads > available_cpus / 2 {
-            eprintln!(
-                "WARNING: CPU pinning requested but network_threads ({}) > 50% of available CPUs ({}). \
-                 Consider reducing network_threads or disabling CPU pinning.",
-                self.network_threads, available_cpus
-            );
-        }
+        // Warn about suboptimal configurations (not applicable for async)
+        // CPU pinning not used in async mode
 
         if total_requested > available_cpus * 2 {
             eprintln!(
@@ -174,26 +168,59 @@ impl Config {
     }
 
     /// Auto-tune configuration based on system characteristics
+    /// 
+    /// Based on recommendations from Cloudflare and Discord:
+    /// - Cloudflare: Use 1-2 network tasks per physical core for I/O intensive workloads
+    /// - Discord: Scale network I/O based on memory to handle connection state
+    /// - Industry best practice: Leave headroom for application logic and kernel
     pub fn auto_tune(&mut self) {
         let cpus = self.system_info.total_cpus;
-        let memory_gb = self.system_info.total_memory_kb / (1024 * 1024);
+        let physical_cpus = self.system_info.physical_cpus;
+        // Convert from KB to GB: KB / (1024 KB/MB) / (1024 MB/GB)
+        let memory_gb = self.system_info.total_memory_kb / 1024 / 1024;
 
-        // Network threads: 25-40% of CPUs based on memory
-        let network_ratio = if memory_gb >= 64 {
-            0.4 // Large memory system: more network threads
-        } else if memory_gb >= 32 {
-            0.35 // Medium memory system
-        } else {
-            0.25 // Small memory system: fewer network threads
+        // Network tasks: Based on physical core count and memory
+        // 
+        // Reasoning from industry experts:
+        // - Cloudflare optimizes network I/O with 1 task per physical core (no hyperthreading)
+        // - Discord uses memory-based scaling: ~1 task per 4GB of memory for connection handling
+        // - We use physical cores as baseline since async tasks don't benefit from hyperthreading
+        // - Scale up with more memory to handle larger connection state
+        let network_from_cores = physical_cpus.max(1);
+        let network_from_memory = ((memory_gb / 4).max(1)) as usize; // 1 task per 4GB
+        
+        self.network_threads = match memory_gb {
+            // Small systems: stay conservative, 1 task
+            0..=8 => network_from_cores.min(2),
+            
+            // Medium systems (8-32GB): balance cores and memory
+            9..=32 => ((network_from_cores + network_from_memory) / 2).max(2).min(physical_cpus * 2),
+            
+            // Large systems (32GB+): scale with memory, but cap at 2x physical cores
+            _ => network_from_memory.min(physical_cpus * 2),
         };
-        self.network_threads = ((cpus as f64 * network_ratio).ceil() as usize).max(1).min(cpus);
 
-        // Application threads: remaining CPUs, but not more than network threads * 2
+        // Application threads: Scale with logical CPUs, leave headroom for network tasks
+        // 
+        // Industry practice:
+        // - Use logical CPU count for application thread pool (benefits from hyperthreading for app logic)
+        // - Allocate remaining logical CPUs after network tasks, with headroom
+        // - Tokio scheduler performs best with 1 task per logical CPU for CPU-bound work
         let remaining_cpus = cpus.saturating_sub(self.network_threads);
-        self.app_threads = remaining_cpus.max(1).min(self.network_threads * 2);
+        self.app_threads = remaining_cpus.max(2); // At least 2 for protocol + application
 
-        // Enable CPU pinning if we have enough cores and hyperthreading
-        self.cpu_pinning = cpus >= 8 && self.system_info.physical_cpus < cpus;
+        // Inform user about tuning decisions
+        eprintln!(
+            "Auto-tuned for system: {} logical CPUs, {} physical cores, {}GB RAM",
+            cpus, physical_cpus, memory_gb
+        );
+        eprintln!(
+            "  Network tasks: {} | App threads: {}",
+            self.network_threads, self.app_threads
+        );
+
+        // CPU pinning not used in pure async mode
+        self.cpu_pinning = false;
     }
 
     /// Print configuration summary
@@ -202,9 +229,9 @@ impl Config {
         println!("║              SuperD Configuration Summary               ║");
         println!("╠══════════════════════════════════════════════════════════╣");
         println!("║ Listen Address    : {:<35} ║", self.listen);
-        println!("║ Network Threads   : {:<35} ║", self.network_threads);
+        println!("║ Network Tasks     : {:<35} ║", self.network_threads);
         println!("║ App Threads       : {:<35} ║", format!("{} (Protocol + Application on Tokio)", self.app_threads));
-        println!("║ CPU Pinning       : {:<35} ║", if self.cpu_pinning { "Enabled (Network only)" } else { "Disabled" });
+        println!("║ CPU Pinning       : {:<35} ║", "Disabled (Async runtime)");
         println!("╠══════════════════════════════════════════════════════════╣");
         println!("║ System Info                                              ║");
         println!("║ Total CPUs        : {:<35} ║", self.system_info.total_cpus);
@@ -216,8 +243,9 @@ impl Config {
         println!("║ OTLP Endpoint     : {:<35} ║", self.telemetry.otlp_endpoint);
         println!("║ Service Name      : {:<35} ║", self.telemetry.service_name);
         println!("╠══════════════════════════════════════════════════════════╣");
-        println!("║ Architecture: Network (native + io_uring) -> Protocol   ║");
-        println!("║               (Tokio async) -> Application (Tokio async) ║");
+        println!("║ Architecture: Network (Async Tokio + io_uring) ->       ║");
+        println!("║               Protocol (Tokio async) -> Application      ║");
+        println!("║               (Tokio async)                              ║");
         println!("╚══════════════════════════════════════════════════════════╝");
     }
 }
@@ -230,8 +258,9 @@ impl SystemInfo {
         let mut sys = System::new_all();
         sys.refresh_all();
 
-        let total_memory_kb = sys.total_memory();
-        let available_memory_kb = sys.available_memory();
+        // sysinfo returns memory in bytes, convert to KB
+        let total_memory_kb = sys.total_memory() / 1024;
+        let available_memory_kb = sys.available_memory() / 1024;
 
         Self {
             total_cpus: num_cpus,
