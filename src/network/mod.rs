@@ -7,10 +7,10 @@
 //! ## Architecture
 //!
 //! The network layer uses:
-//! - **io_uring**: 60+ I/O operations per syscall (vs epoll's 4-5)
+//! - **io_uring**: Async I/O with completion-based operations
 //! - **Zero-copy buffers**: Arc-based ownership transfer
 //! - **SO_REUSEPORT**: Kernel-level load balancing
-//! - **CPU pinning**: Optimal thread placement
+//! - **Pure async tasks**: No OS threads, managed by tokio_uring runtime
 //!
 //! ## Performance Characteristics
 //!
@@ -54,7 +54,6 @@
 //! );
 //! ```
 
-pub mod affinity;
 pub mod io_uring_net;
 pub mod metrics;
 pub mod zerocopy_buffer;
