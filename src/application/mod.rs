@@ -1,29 +1,29 @@
 //! # Application Layer - Protocol-Specific Handlers
 //!
 //! This module implements application protocol handlers for SuperD.
-//! Currently supports HTTP/3 (h3) with extensible architecture for other protocols.
+//! Supports HTTP/3 based content serving and WebTransport APIs.
 //!
 //! ## Architecture
 //!
 //! ```text
 //! Protocol Layer (QUIC)
 //!         ↓
-//! Application Dispatcher (ALPN-based routing)
+//! Application Dispatcher (ALPN + Request Type Routing)
 //!         ↓
-//! Protocol Handlers (HTTP/3, WebSocket, etc.)
+//! Content Handler (HTTP/3) / WebTransport Handler (HTTP/3 + WT)
 //! ```
 //!
 //! ## Design Principles
 //!
 //! - **Dynamic Task Spawning**: Tasks created per-stream, not pre-allocated
-//! - **ALPN-Based Routing**: Protocol negotiation determines handler type
+//! - **ALPN + Content-Based Routing**: Protocol + request characteristics determine handler
 //! - **Zero-Copy Data Flow**: Buffers passed directly between layers
 //! - **Ephemeral Tasks**: Tasks live only as long as their streams
 //!
-//! ## Supported Protocols
+//! ## Supported Use Cases
 //!
-//! - **HTTP/3 (h3)**: Primary protocol, RFC 9114 compliant
-//! - **Future**: WebSocket over HTTP/3, custom protocols
+//! - **HTTP/3 Content Serving**: CDN-like content delivery with HTTP/3
+//! - **WebTransport APIs**: Real-time bidirectional communication over HTTP/3
 //!
 //! ## Performance Characteristics
 //!
@@ -32,7 +32,8 @@
 //! - **Concurrency**: Thousands of concurrent application tasks
 //! - **Scalability**: Automatic load distribution across cores
 
-pub mod http3;
+pub mod content;
+pub mod webtransport;
 pub mod dispatcher;
 
 use std::net::SocketAddr;
@@ -43,20 +44,18 @@ use crate::network::zerocopy_buffer::ZeroCopyBuffer;
 /// Application protocol types
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplicationProtocol {
-    /// HTTP/3 (RFC 9114)
-    Http3,
-    /// WebSocket over HTTP/3
-    WebSocket,
-    /// Custom protocol
-    Custom(String),
+    /// HTTP/3 Content Serving (CDN-like functionality)
+    Http3Content,
+    /// WebTransport APIs (real-time bidirectional communication)
+    WebTransport,
 }
 
 impl ApplicationProtocol {
     /// Parse ALPN string to protocol type
     pub fn from_alpn(alpn: &str) -> Option<Self> {
         match alpn {
-            "h3" => Some(Self::Http3),
-            "h3-29" | "h3-30" | "h3-31" | "h3-32" => Some(Self::Http3), // Draft versions
+            "h3" => Some(Self::Http3Content), // Default to content serving for h3
+            "h3-29" | "h3-30" | "h3-31" | "h3-32" => Some(Self::Http3Content), // Draft versions
             _ => None, // Unknown protocols not supported
         }
     }
@@ -64,9 +63,7 @@ impl ApplicationProtocol {
     /// Convert to ALPN string
     pub fn to_alpn(&self) -> &'static str {
         match self {
-            Self::Http3 => "h3",
-            Self::WebSocket => "h3", // WebSocket over HTTP/3 uses h3 ALPN
-            Self::Custom(_) => "custom",
+            Self::Http3Content | Self::WebTransport => "h3", // Both use h3 ALPN
         }
     }
 }
@@ -98,6 +95,9 @@ pub enum ApplicationError {
 
     #[error("Protocol error: {0}")]
     Protocol(String),
+
+    #[error("Channel error: {0}")]
+    ChannelError(String),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
