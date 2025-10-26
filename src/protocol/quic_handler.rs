@@ -26,7 +26,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     config::Config,
     network::{
-        zerocopy_buffer::{ZeroCopyBuffer, ZeroCopyBufferMut, MAX_UDP_PAYLOAD},
+        zerocopy_buffer::ZeroCopyBuffer,
         NetworkToProtocol, ProtocolToNetwork,
     },
 };
@@ -149,7 +149,7 @@ impl QuicProtocolTask {
     }
 
     fn handle_incoming_packet(&mut self, buffer: ZeroCopyBuffer, addr: SocketAddr) -> Result<()> {
-        let mut packet = buffer.data().to_vec();
+        let mut packet = (*buffer).to_vec();
         if packet.is_empty() {
             return Ok(());
         }
@@ -341,10 +341,10 @@ impl QuicProtocolTask {
 
     fn drain_send_queue(&mut self, state: &mut ConnectionState) -> Result<()> {
         loop {
-            let mut buf = ZeroCopyBufferMut::with_capacity(MAX_UDP_PAYLOAD);
-            buf.data_mut().resize(MAX_UDP_PAYLOAD, 0);
+            let buffer_pool = crate::network::zerocopy_buffer::get_buffer_pool();
+            let mut buf = buffer_pool.get_empty();
 
-            let (written, send_info) = match state.conn.send(buf.data_mut()) {
+            let (written, send_info) = match state.conn.send(&mut buf) {
                 Ok(res) => res,
                 Err(quiche::Error::Done) => break,
                 Err(err) => {
@@ -352,9 +352,8 @@ impl QuicProtocolTask {
                 }
             };
 
-            buf.data_mut().truncate(written);
-            let frozen = buf.freeze();
-            self.queue_datagram(frozen, send_info.to)?;
+            buf.truncate(written);
+            self.queue_datagram(buf, send_info.to)?;
         }
         Ok(())
     }
@@ -387,13 +386,13 @@ impl QuicProtocolTask {
     }
 
     fn send_version_negotiation(&self, header: &Header, addr: SocketAddr) -> Result<()> {
-        let mut buf = ZeroCopyBufferMut::with_capacity(MAX_UDP_PAYLOAD);
-        buf.data_mut().resize(MAX_UDP_PAYLOAD, 0);
+        let buffer_pool = crate::network::zerocopy_buffer::get_buffer_pool();
+        let mut buf = buffer_pool.get_empty();
         let scid = ConnectionId::from_ref(header.scid.as_ref());
         let dcid = ConnectionId::from_ref(header.dcid.as_ref());
-        let written = quiche::negotiate_version(&scid, &dcid, buf.data_mut())?;
-        buf.data_mut().truncate(written);
-        self.queue_datagram(buf.freeze(), addr)
+        let written = quiche::negotiate_version(&scid, &dcid, &mut buf)?;
+        buf.truncate(written);
+        self.queue_datagram(buf, addr)
     }
 
     fn process_timers(&mut self) -> Result<()> {

@@ -80,7 +80,7 @@ impl IoUringNetworkThread {
             return Err(NetworkError::IoOperationFailed("Packet too short for QUIC header".to_string()).into());
         }
 
-        let data = buffer.data();
+        let data = &buffer[..];
 
         // Parse QUIC header using quiche
         let mut packet_data = data.to_vec(); // quiche needs mutable data
@@ -206,19 +206,19 @@ impl IoUringNetworkThread {
         socket: &mut UdpSocket,
     ) -> std::io::Result<(ZeroCopyBuffer, SocketAddr, usize)> {
         let buffer_pool = get_buffer_pool();
-        let mut buf = buffer_pool.acquire();
+        let mut buf = buffer_pool.get_empty();
 
         // Receive data directly
         let data = vec![0u8; MAX_UDP_PAYLOAD];
         let (result, received_data) = socket.recv_from(data).await;
         let (len, addr) = result?;
 
-        // Copy received data into our zero-copy buffer (clear first, then extend)
-        buf.data_mut().clear();
-        buf.data_mut().extend_from_slice(&received_data[..len]);
+        // Copy received data into our zero-copy buffer
+        buf.expand(len);
+        buf[..len].copy_from_slice(&received_data[..len]);
 
-        // Freeze the buffer
-        let zero_copy_buf = buf.freeze();
+        // Return the buffer directly (no freeze needed)
+        let zero_copy_buf = buf;
 
         Ok((zero_copy_buf, addr, len))
     }
@@ -229,7 +229,7 @@ impl IoUringNetworkThread {
         buffer: &ZeroCopyBuffer,
         addr: SocketAddr,
     ) -> std::io::Result<()> {
-        let data = buffer.data().to_vec();
+        let data = (*buffer).to_vec();
         let (result, _buf) = socket.send_to(data, addr).await;
         result?;
         Ok(())

@@ -65,7 +65,7 @@ use zerocopy_buffer::ZeroCopyBuffer;
 
 /// Messages from network layer to protocol layer
 /// Zero-copy design: buffer ownership is transferred
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum NetworkToProtocol {
     /// Raw UDP datagram received from network
     Datagram {
@@ -78,7 +78,7 @@ pub enum NetworkToProtocol {
 
 /// Messages from protocol layer to network layer
 /// Zero-copy design: buffer ownership is transferred
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ProtocolToNetwork {
     /// Raw UDP datagram to send to network
     Datagram {

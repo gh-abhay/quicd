@@ -91,7 +91,7 @@ use crate::network::zerocopy_buffer::ZeroCopyBuffer;
 ///
 /// Protocol tasks forward parsed QUIC stream data to application tasks.
 /// Application tasks are spawned dynamically per-stream, not pre-allocated.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ProtocolToApplication {
     /// New QUIC stream opened - spawn application task based on ALPN
     NewStream {
@@ -117,7 +117,7 @@ pub enum ProtocolToApplication {
 }
 
 /// Messages from application layer to protocol layer
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ApplicationToProtocol {
     /// Send data on a QUIC stream
     SendData {
