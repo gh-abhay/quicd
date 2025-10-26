@@ -317,8 +317,8 @@ pub fn start_network_layer(
         NetworkError::SocketBindFailed(format!("Invalid listen address: {}", config.listen))
     })?;
 
-    // Initialize buffer pool
-    let pool_capacity = config.network_threads * 2048;
+    // Initialize buffer pool with optimal size based on expected connections
+    let pool_capacity = config.calculate_buffer_pool_size();
     super::zerocopy_buffer::init_buffer_pool(pool_capacity);
 
     // Create shared metrics

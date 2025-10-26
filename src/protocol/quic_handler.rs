@@ -87,6 +87,7 @@ pub struct QuicProtocolTask {
     aliases: HashMap<Vec<u8>, Vec<u8>>,
     next_conn_id: u64,
     rng: ThreadRng,
+    active_connections: usize, // Track active connections for monitoring
 }
 
 impl QuicProtocolTask {
@@ -111,6 +112,7 @@ impl QuicProtocolTask {
             aliases: HashMap::new(),
             next_conn_id: 0,
             rng: rand::thread_rng(),
+            active_connections: 0,
         }
     }
 
@@ -215,6 +217,7 @@ impl QuicProtocolTask {
                 format_conn_id(&canonical_key)
             );
             self.drain_send_queue(&mut entry.state)?;
+            self.active_connections = self.active_connections.saturating_sub(1);
             return Ok(());
         }
         self.handle_readable_streams(&mut entry.state);
@@ -302,12 +305,14 @@ impl QuicProtocolTask {
 
         let canonical = entry.state.conn.destination_id().as_ref().to_vec();
         self.store_connection(canonical.clone(), entry);
+        self.active_connections += 1;
 
         info!(
-            "Protocol task {} accepted new connection {} from {}",
+            "Protocol task {} accepted new connection {} from {} (active: {})",
             self.id,
             format_conn_id(&canonical),
-            addr
+            addr,
+            self.active_connections
         );
         Ok(())
     }
@@ -481,6 +486,7 @@ impl QuicProtocolTask {
                             format_conn_id(&canonical)
                         );
                         self.drain_send_queue(&mut entry.state)?;
+                        self.active_connections = self.active_connections.saturating_sub(1);
                         continue;
                     }
                     entry.state.refresh_timeout();
