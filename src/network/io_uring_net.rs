@@ -17,7 +17,7 @@ use super::metrics::{NetworkMetrics, SharedMetrics};
 use super::zerocopy_buffer::{get_buffer_pool, ZeroCopyBuffer, MAX_UDP_PAYLOAD};
 use super::{NetworkToProtocol, ToProtocolSender};
 
-use crate::error::{NetworkError, Result};
+use crate::error::{Error, NetworkError, Result};
 
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
@@ -26,6 +26,9 @@ use tokio::select;
 use tokio::sync::{broadcast, mpsc};
 use tokio_uring::net::UdpSocket;
 use tracing::{debug, error, info, warn};
+
+// Import quiche for packet header parsing
+use quiche::Header;
 
 /// Network I/O task using io_uring for event-driven operations
 /// Each network task has:
@@ -71,6 +74,46 @@ impl IoUringNetworkThread {
         hash % num_protocol_tasks
     }
 
+    /// Extract destination connection ID from QUIC packet and hash to select protocol task
+    fn extract_and_hash_dcid(buffer: &ZeroCopyBuffer, len: usize, num_protocol_tasks: usize) -> Result<usize> {
+        if len < 1 {
+            return Err(NetworkError::IoOperationFailed("Packet too short for QUIC header".to_string()).into());
+        }
+
+        let data = buffer.data();
+
+        // Parse QUIC header using quiche
+        let mut packet_data = data.to_vec(); // quiche needs mutable data
+        let header = Header::from_slice(&mut packet_data, quiche::MAX_CONN_ID_LEN)
+            .map_err(|e| Error::Network(NetworkError::IoOperationFailed(format!("Failed to parse QUIC header: {}", e))))?;
+
+        // Use destination connection ID for consistent routing
+        let dcid_bytes = header.dcid.as_ref();
+        if dcid_bytes.is_empty() {
+            return Err(NetworkError::IoOperationFailed("Empty destination connection ID".to_string()).into());
+        }
+
+        Ok(Self::hash_to_protocol_task_static(dcid_bytes, num_protocol_tasks))
+    }
+
+    /// Fallback: hash source address to select protocol task when header parsing fails
+    fn hash_addr_to_protocol_task(addr: &SocketAddr, num_protocol_tasks: usize) -> usize {
+        match addr {
+            SocketAddr::V4(v4) => {
+                let ip = v4.ip().to_bits();
+                let port = v4.port() as u32;
+                let hash = (ip as usize).wrapping_add(port as usize);
+                hash % num_protocol_tasks
+            }
+            SocketAddr::V6(v6) => {
+                let octets = v6.ip().octets();
+                let hash: usize = octets.iter().map(|&b| b as usize).sum();
+                let port = v6.port() as usize;
+                (hash.wrapping_add(port)) % num_protocol_tasks
+            }
+        }
+    }
+
     /// Run the network task with truly event-driven io_uring
     /// Waits for ANY of three events:
     /// 1. Ingress: Network packet from NIC (io_uring completion)
@@ -97,19 +140,20 @@ impl IoUringNetworkThread {
                     match recv_result {
                         Ok((buffer, addr, len)) => {
                             metrics.record_packet_received(len);
-                            debug!("Network task received {} bytes from {}, first byte: 0x{:02x}", len, addr, buffer.data()[0]);
+                            debug!("Network task received {} bytes from {}", len, addr);
 
-                            // Hash connection ID to select protocol task
-                            let protocol_task_idx = if len >= 20 {
-                                // Extract DCID to hash (enough bytes for a connection ID)
-                                let dcid_bytes = &buffer.data()[..20];
-                                Self::hash_to_protocol_task_static(dcid_bytes, to_protocol_senders.len())
-                            } else {
-                                // Fallback for too-short packets: use length as simple hash
-                                len % to_protocol_senders.len()
+                            // Parse QUIC header to extract destination connection ID for proper routing
+                            let protocol_task_idx = match Self::extract_and_hash_dcid(&buffer, len, to_protocol_senders.len()) {
+                                Ok(idx) => {
+                                    debug!("Routing packet with DCID to protocol task {}", idx);
+                                    idx
+                                }
+                                Err(e) => {
+                                    debug!("Failed to parse QUIC header ({}), using fallback hash", e);
+                                    // Fallback: use source address hash for routing
+                                    Self::hash_addr_to_protocol_task(&addr, to_protocol_senders.len())
+                                }
                             };
-
-                            debug!("Routing packet to protocol task {} (total {} tasks)", protocol_task_idx, to_protocol_senders.len());
 
                             // Forward to selected protocol task
                             let msg = NetworkToProtocol::Datagram { buffer, addr };
@@ -203,8 +247,12 @@ async fn create_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
     // Enable SO_REUSEPORT for load balancing across threads
+    // NOTE: Disabled for now due to QUIC connection state issues.
+    // SO_REUSEPORT distributes packets from same connection to different
+    // network tasks, breaking QUIC's requirement for ordered packet processing.
+    // TODO: Implement connection-aware routing or shared state
     #[cfg(target_os = "linux")]
-    socket.set_reuse_port(true)?;
+    // socket.set_reuse_port(true)?;
 
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
