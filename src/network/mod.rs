@@ -63,31 +63,8 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use zerocopy_buffer::ZeroCopyBuffer;
 
-/// Messages from network layer to protocol layer
-/// Zero-copy design: buffer ownership is transferred
-#[derive(Debug)]
-pub enum NetworkToProtocol {
-    /// Raw UDP datagram received from network
-    Datagram {
-        /// Zero-copy buffer containing packet data
-        buffer: ZeroCopyBuffer,
-        /// Source address of the packet
-        addr: SocketAddr,
-    },
-}
-
-/// Messages from protocol layer to network layer
-/// Zero-copy design: buffer ownership is transferred
-#[derive(Debug)]
-pub enum ProtocolToNetwork {
-    /// Raw UDP datagram to send to network
-    Datagram {
-        /// Zero-copy buffer containing packet data
-        buffer: ZeroCopyBuffer,
-        /// Destination address for the packet
-        addr: SocketAddr,
-    },
-}
+/// Re-export message types from the centralized messages module
+pub use crate::messages::{NetworkToProtocol, ProtocolToNetwork};
 
 /// Channel types for async communication between layers
 /// Each network thread has dedicated channels to/from each protocol thread

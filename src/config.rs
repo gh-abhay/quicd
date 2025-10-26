@@ -25,10 +25,6 @@ pub struct Cli {
     #[arg(long)]
     pub protocol_threads: Option<usize>,
 
-    /// Enable CPU pinning with interleaved strategy (deprecated - not used in async mode)
-    #[arg(long)]
-    pub cpu_pinning: Option<bool>,
-
     /// OTLP endpoint for telemetry
     #[arg(long, default_value = "http://localhost:4317")]
     pub otlp_endpoint: String,
@@ -44,7 +40,6 @@ pub struct Config {
     pub listen: String,
     pub network_threads: usize,
     pub protocol_threads: usize,
-    pub cpu_pinning: bool,
     pub telemetry: TelemetryConfig,
     pub quic: QuicConfig,
 
@@ -93,7 +88,6 @@ impl Default for Config {
             listen: "0.0.0.0:4433".to_string(),
             network_threads: 2,  // Default fallback
             protocol_threads: 8, // Default fallback (4x network)
-            cpu_pinning: false,
             telemetry: TelemetryConfig {
                 otlp_endpoint: "http://localhost:4317".to_string(),
                 service_name: "superd".to_string(),
@@ -119,9 +113,6 @@ impl Config {
         }
         if let Some(pt) = cli.protocol_threads {
             config.protocol_threads = pt;
-        }
-        if let Some(cp) = cli.cpu_pinning {
-            config.cpu_pinning = cp;
         }
 
         config.telemetry.otlp_endpoint = cli.otlp_endpoint.clone();
@@ -306,7 +297,7 @@ impl Config {
         eprintln!("  Application: Dynamic tasks spawned per-stream (ephemeral)");
 
         // CPU pinning not used in pure async mode
-        self.cpu_pinning = false;
+        // self.cpu_pinning = false;
     }
 
     /// Print configuration summary
@@ -327,7 +318,6 @@ impl Config {
             "║ Application       : {:<35} ║",
             "Dynamic (per-stream tasks)"
         );
-        println!("║ CPU Pinning       : {:<35} ║", "Disabled (Async runtime)");
         println!(
             "║ QUIC TLS Cert     : {:<35} ║",
             self.quic.cert_path.as_str()

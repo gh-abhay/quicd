@@ -196,12 +196,17 @@ fn main() {
 
         info!("Network layer started successfully");
 
+        // Create channels for protocol <-> application communication
+        let (to_application_tx, to_application_rx) = mpsc::unbounded_channel();
+        let (from_application_tx, from_application_rx) = mpsc::unbounded_channel();
+
         // Start protocol layer (async tasks)
         info!("Starting QUIC protocol layer...");
         if let Err(e) = superd::protocol::quic_handler::start_protocol_layer(
             &config,
             to_protocol_receivers,
             from_protocol_senders,
+            to_application_tx,
             shutdown_tx.clone(),
         ) {
             eprintln!("Failed to start protocol layer: {}", e);
@@ -209,21 +214,16 @@ fn main() {
         }
         info!("Protocol layer started successfully");
 
-        // TODO: Start application layer (dynamic per-stream tasks)
-        //
-        // Application architecture:
-        // - No pre-allocated threads
-        // - Tasks spawned dynamically per QUIC stream
-        // - Each stream gets its own task based on ALPN/stream type
-        // - Tasks are ephemeral: created when stream opens, destroyed when stream closes
-        // - Multiplexed streams over single QUIC connection run different apps
-        //
-        // Example:
-        // - HTTP/3 request: spawn http handler task
-        // - WebSocket stream: spawn websocket handler task
-        // - Custom protocol: spawn custom handler task
-        //
-        // All tasks share the same tokio_uring runtime (no dedicated worker threads)
+        // Start application layer (dynamic per-stream tasks)
+        info!("Starting application layer...");
+        if let Err(e) = superd::application::dispatcher::start_application_layer(
+            to_application_rx,
+            from_application_tx,
+        ) {
+            eprintln!("Failed to start application layer: {}", e);
+            std::process::exit(1);
+        }
+        info!("Application layer started successfully");
 
         info!("SuperD server is running. Press Ctrl+C to stop.");
 

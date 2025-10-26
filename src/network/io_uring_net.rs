@@ -366,17 +366,12 @@ pub fn start_network_layer(
 /// Start metrics reporting task on Tokio runtime
 fn start_metrics_task(metrics: SharedMetrics, mut shutdown_rx: broadcast::Receiver<()>) {
     tokio_uring::spawn(async move {
-        loop {
-            // Simple delay, since tokio_uring may not have time
-            // For now, use a select with timeout if available, but since no, perhaps skip or use std
-            // To keep simple, report every time something happens, but for now, just report once
-            let stats = metrics.get_stats();
-            info!("Network Layer Metrics: {}", stats);
+        // Report initial metrics
+        let stats = metrics.get_stats();
+        info!("Network Layer Metrics: {}", stats);
 
-            // Wait for shutdown
-            let _ = shutdown_rx.recv().await;
-            info!("Metrics task shutting down");
-            break;
-        }
+        // Wait for shutdown
+        let _ = shutdown_rx.recv().await;
+        info!("Metrics task shutting down");
     });
 }

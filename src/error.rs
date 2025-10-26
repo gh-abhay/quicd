@@ -211,3 +211,15 @@ impl From<AddrParseError> for Error {
         Error::Config(ConfigError::InvalidListenAddress(err.to_string()))
     }
 }
+
+impl From<quiche::Error> for Error {
+    fn from(err: quiche::Error) -> Self {
+        Error::Network(NetworkError::IoOperationFailed(format!("QUIC error: {}", err)))
+    }
+}
+
+impl From<anyhow::Error> for Error {
+    fn from(err: anyhow::Error) -> Self {
+        Error::Other(err.to_string())
+    }
+}

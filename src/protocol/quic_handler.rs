@@ -6,13 +6,13 @@
 //! datagrams with the network layer.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context, Result};
+
 use parking_lot::Mutex;
 use quiche::{self, ConnectionId, Header};
 use rand::{rngs::ThreadRng, RngCore};
@@ -25,10 +25,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::Config,
-    network::{
-        zerocopy_buffer::ZeroCopyBuffer,
-        NetworkToProtocol, ProtocolToNetwork,
+    error::Result,
+    messages::{
+        NetworkToProtocol, ProtocolToApplication, ProtocolToNetwork,
     },
+    network::zerocopy_buffer::ZeroCopyBuffer,
 };
 
 const SERVER_CONN_ID_LENGTH: usize = 16;
@@ -39,6 +40,8 @@ struct ConnectionState {
     conn: quiche::Connection,
     peer: SocketAddr,
     next_timeout: Option<Instant>,
+    sent_new_connection: bool,
+    active_streams: HashSet<u64>,
 }
 
 impl ConnectionState {
@@ -48,6 +51,8 @@ impl ConnectionState {
             conn,
             peer,
             next_timeout: None,
+            sent_new_connection: false,
+            active_streams: HashSet::new(),
         };
         state.refresh_timeout();
         state
@@ -74,6 +79,7 @@ pub struct QuicProtocolTask {
     id: usize,
     from_network: mpsc::UnboundedReceiver<NetworkToProtocol>,
     to_network_senders: Vec<mpsc::UnboundedSender<ProtocolToNetwork>>,
+    to_application: mpsc::UnboundedSender<ProtocolToApplication>,
     shutdown_rx: broadcast::Receiver<()>,
     local_addr: SocketAddr,
     quiche_config: Arc<Mutex<quiche::Config>>,
@@ -88,6 +94,7 @@ impl QuicProtocolTask {
         id: usize,
         from_network: mpsc::UnboundedReceiver<NetworkToProtocol>,
         to_network_senders: Vec<mpsc::UnboundedSender<ProtocolToNetwork>>,
+        to_application: mpsc::UnboundedSender<ProtocolToApplication>,
         shutdown_rx: broadcast::Receiver<()>,
         local_addr: SocketAddr,
         quiche_config: Arc<Mutex<quiche::Config>>,
@@ -96,6 +103,7 @@ impl QuicProtocolTask {
             id,
             from_network,
             to_network_senders,
+            to_application,
             shutdown_rx,
             local_addr,
             quiche_config,
@@ -154,8 +162,7 @@ impl QuicProtocolTask {
             return Ok(());
         }
 
-        let header = Header::from_slice(&mut packet, quiche::MAX_CONN_ID_LEN)
-            .map_err(|e| anyhow!("failed to parse QUIC header: {e}"))?;
+        let header = Header::from_slice(&mut packet, quiche::MAX_CONN_ID_LEN)?;
 
         debug!(
             "Protocol task {} received packet: type={:?}, version={:x}, dcid_len={}, scid_len={}, from={}",
@@ -305,13 +312,50 @@ impl QuicProtocolTask {
         Ok(())
     }
 
-    fn handle_readable_streams(&self, state: &mut ConnectionState) {
+    fn handle_readable_streams(&mut self, state: &mut ConnectionState) {
         if !state.conn.is_established() {
             return;
         }
 
+        // Send NewConnection message if this is the first time we see this connection established
+        if state.conn.is_established() && !state.sent_new_connection {
+            let alpn = state.conn.application_proto();
+            if !alpn.is_empty() {
+                let alpn_str = String::from_utf8_lossy(alpn).to_string();
+                let message = ProtocolToApplication::NewConnection {
+                    conn_id: state.conn_id,
+                    peer_addr: state.peer,
+                    alpn: alpn_str,
+                };
+                if let Err(err) = self.to_application.send(message) {
+                    warn!("Protocol task {} failed to send NewConnection: {err:?}", self.id);
+                } else {
+                    state.sent_new_connection = true;
+                }
+            }
+        }
+
         let mut buffer = vec![0u8; 4096];
         for stream_id in state.conn.readable() {
+            // Send NewStream message for new streams
+            if !state.active_streams.contains(&stream_id) {
+                let alpn = state.conn.application_proto();
+                if !alpn.is_empty() {
+                    let alpn_str = String::from_utf8_lossy(alpn).to_string();
+                    let message = ProtocolToApplication::NewStream {
+                        conn_id: state.conn_id,
+                        stream_id,
+                        peer_addr: state.peer,
+                        alpn: alpn_str,
+                    };
+                    if let Err(err) = self.to_application.send(message) {
+                        warn!("Protocol task {} failed to send NewStream: {err:?}", self.id);
+                    } else {
+                        state.active_streams.insert(stream_id);
+                    }
+                }
+            }
+
             loop {
                 match state.conn.stream_recv(stream_id, &mut buffer) {
                     Ok((read, fin)) => {
@@ -322,6 +366,24 @@ impl QuicProtocolTask {
                             "Protocol task {} received {} bytes on conn {} stream {} fin={}",
                             self.id, read, state.conn_id, stream_id, fin
                         );
+
+                        // Send stream data to application layer
+                        let data = &buffer[..read];
+                        let buffer_pool = crate::network::zerocopy_buffer::get_buffer_pool();
+                        let mut zero_copy_buf = buffer_pool.get_empty();
+                        zero_copy_buf.expand(read);
+                        zero_copy_buf[..read].copy_from_slice(data);
+
+                        let message = ProtocolToApplication::StreamData {
+                            conn_id: state.conn_id,
+                            stream_id,
+                            data: zero_copy_buf,
+                            fin,
+                        };
+                        if let Err(err) = self.to_application.send(message) {
+                            warn!("Protocol task {} failed to send StreamData: {err:?}", self.id);
+                        }
+
                         if fin {
                             break;
                         }
@@ -348,7 +410,9 @@ impl QuicProtocolTask {
                 Ok(res) => res,
                 Err(quiche::Error::Done) => break,
                 Err(err) => {
-                    return Err(anyhow!("conn.send failed: {err}"));
+                    return Err(crate::error::Error::Network(
+                        crate::error::NetworkError::IoOperationFailed(format!("conn.send failed: {err}"))
+                    ));
                 }
             };
 
@@ -382,7 +446,9 @@ impl QuicProtocolTask {
         let sender = self.select_network_sender(&addr);
         sender
             .send(ProtocolToNetwork::Datagram { buffer, addr })
-            .map_err(|err| anyhow!("failed to enqueue datagram: {err}"))
+            .map_err(|err| crate::error::Error::Network(
+                crate::error::NetworkError::IoOperationFailed(format!("failed to enqueue datagram: {err}"))
+            ))
     }
 
     fn send_version_negotiation(&self, header: &Header, addr: SocketAddr) -> Result<()> {
@@ -501,24 +567,26 @@ fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     let proto_refs: Vec<&[u8]> = protos.iter().map(|proto| proto.as_slice()).collect();
     quiche_config
         .set_application_protos(&proto_refs)
-        .context("failed to configure QUIC application protocols")?;
+        .map_err(|e| crate::error::Error::Network(
+            crate::error::NetworkError::IoOperationFailed(format!("failed to configure QUIC application protocols: {e}"))
+        ))?;
 
     quiche_config
         .load_cert_chain_from_pem_file(&config.quic.cert_path)
-        .with_context(|| {
-            format!(
-                "failed to load TLS certificate from {}",
+        .map_err(|e| crate::error::Error::Network(
+            crate::error::NetworkError::IoOperationFailed(format!(
+                "failed to load TLS certificate from {}: {e}",
                 config.quic.cert_path
-            )
-        })?;
+            ))
+        ))?;
     quiche_config
         .load_priv_key_from_pem_file(&config.quic.key_path)
-        .with_context(|| {
-            format!(
-                "failed to load TLS private key from {}",
+        .map_err(|e| crate::error::Error::Network(
+            crate::error::NetworkError::IoOperationFailed(format!(
+                "failed to load TLS private key from {}: {e}",
                 config.quic.key_path
-            )
-        })?;
+            ))
+        ))?;
     quiche_config.verify_peer(config.quic.verify_peer);
 
     if config.quic.enable_early_data {
@@ -545,31 +613,38 @@ pub fn start_protocol_layer(
     config: &Config,
     from_network_receivers: Vec<mpsc::UnboundedReceiver<NetworkToProtocol>>,
     to_network_senders: Vec<mpsc::UnboundedSender<ProtocolToNetwork>>,
+    to_application: mpsc::UnboundedSender<ProtocolToApplication>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
     // Validate channel counts
     // Each protocol task gets ONE receiver (ingress from network tasks via CID hashing)
     // Each protocol task gets ALL network senders (egress to any network task)
     if from_network_receivers.len() != config.protocol_threads {
-        return Err(anyhow!(
-            "Expected {} from_network receivers (one per protocol task), got {}",
-            config.protocol_threads,
-            from_network_receivers.len()
+        return Err(crate::error::Error::Network(
+            crate::error::NetworkError::InvalidConfiguration(format!(
+                "Expected {} from_network receivers (one per protocol task), got {}",
+                config.protocol_threads,
+                from_network_receivers.len()
+            ))
         ));
     }
 
     if to_network_senders.len() != config.network_threads {
-        return Err(anyhow!(
-            "Expected {} to_network senders (one per network task), got {}",
-            config.network_threads,
-            to_network_senders.len()
+        return Err(crate::error::Error::Network(
+            crate::error::NetworkError::InvalidConfiguration(format!(
+                "Expected {} to_network senders (one per network task), got {}",
+                config.network_threads,
+                to_network_senders.len()
+            ))
         ));
     }
 
     let listen_addr: SocketAddr = config
         .listen
         .parse()
-        .context("invalid listen socket address")?;
+        .map_err(|e| crate::error::Error::Network(
+            crate::error::NetworkError::InvalidConfiguration(format!("invalid listen socket address: {e}"))
+        ))?;
 
     let quiche_config = Arc::new(Mutex::new(build_quiche_config(config)?));
 
@@ -579,12 +654,14 @@ pub fn start_protocol_layer(
         let task_config = Arc::clone(&quiche_config);
         let senders_clone: Vec<mpsc::UnboundedSender<ProtocolToNetwork>> = 
             to_network_senders.iter().map(|s| s.clone()).collect();
+        let to_application_clone = to_application.clone();
 
         tokio_uring::spawn(async move {
             let task = QuicProtocolTask::new(
                 idx,
                 receiver,
                 senders_clone,
+                to_application_clone,
                 shutdown_rx,
                 listen_addr,
                 task_config,

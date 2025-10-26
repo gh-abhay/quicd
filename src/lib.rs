@@ -61,3 +61,78 @@ pub mod error;
 pub mod network;
 pub mod protocol;
 pub mod telemetry;
+pub mod application;
+
+/// Inter-layer communication messages
+pub mod messages {
+    use std::net::SocketAddr;
+    use crate::network::zerocopy_buffer::ZeroCopyBuffer;
+
+    /// Messages from Network Layer to Protocol Layer
+    #[derive(Debug)]
+    pub enum NetworkToProtocol {
+        Datagram {
+            buffer: ZeroCopyBuffer,
+            addr: SocketAddr,
+        },
+    }
+
+    /// Messages from Protocol Layer to Network Layer
+    #[derive(Debug)]
+    pub enum ProtocolToNetwork {
+        Datagram {
+            buffer: ZeroCopyBuffer,
+            addr: SocketAddr,
+        },
+    }
+
+    /// Messages from Protocol Layer to Application Layer
+    #[derive(Debug)]
+    pub enum ProtocolToApplication {
+        /// New connection established with negotiated ALPN
+        NewConnection {
+            conn_id: u64,
+            peer_addr: SocketAddr,
+            alpn: String,
+        },
+        /// New stream opened on existing connection
+        NewStream {
+            conn_id: u64,
+            stream_id: u64,
+            peer_addr: SocketAddr,
+            alpn: String,
+        },
+        /// Stream data received
+        StreamData {
+            conn_id: u64,
+            stream_id: u64,
+            data: ZeroCopyBuffer,
+            fin: bool,
+        },
+        /// Connection closed
+        ConnectionClosed {
+            conn_id: u64,
+        },
+    }
+
+    /// Messages from Application Layer to Protocol Layer
+    #[derive(Debug)]
+    pub enum ApplicationToProtocol {
+        /// Send data on a stream
+        SendData {
+            conn_id: u64,
+            stream_id: u64,
+            data: ZeroCopyBuffer,
+            fin: bool,
+        },
+        /// Close a stream
+        CloseStream {
+            conn_id: u64,
+            stream_id: u64,
+        },
+        /// Close a connection
+        CloseConnection {
+            conn_id: u64,
+        },
+    }
+}
