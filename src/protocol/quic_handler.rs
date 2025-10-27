@@ -207,7 +207,18 @@ impl QuicProtocolTask {
             );
         }
 
-        self.connection_registry.insert_connection(new_key, entry);
+        self.connection_registry.insert_connection(new_key.clone(), entry);
+
+        // Update timers for the connection
+        if let Some(timeout) = self.connection_registry.get_connection(&new_key)
+            .and_then(|entry_ref| entry_ref.state.conn.timeout()) {
+            self.connection_registry.schedule_timer(
+                new_key,
+                crate::timer_wheel::TimerType::IdleTimeout,
+                timeout,
+            );
+        }
+
         Ok(())
     }
 
@@ -276,6 +287,16 @@ impl QuicProtocolTask {
         let canonical = entry.state.conn.destination_id().as_ref().to_vec();
         self.connection_registry.insert_connection(canonical.clone(), entry);
         self.active_connections = self.connection_registry.active_connection_count();
+
+        // Schedule initial timers for the new connection
+        if let Some(timeout) = self.connection_registry.get_connection(&canonical)
+            .and_then(|entry_ref| entry_ref.state.conn.timeout()) {
+            self.connection_registry.schedule_timer(
+                canonical.clone(),
+                crate::timer_wheel::TimerType::IdleTimeout,
+                timeout,
+            );
+        }
 
         info!(
             "Protocol task {} accepted new connection {} from {} (active: {})",
@@ -437,34 +458,83 @@ impl QuicProtocolTask {
     }
 
     fn process_timers(&mut self) -> Result<()> {
-        let now = Instant::now();
-        let connections_for_task = self.connection_registry.get_connections_for_task(self.id);
+        // Process expired timers from the timer wheel
+        let expired_timers = self.connection_registry.process_expired_timers();
 
-        for (key, mut entry) in connections_for_task {
-            if entry.state.next_timeout.map(|deadline| deadline <= now).unwrap_or(false) {
-                entry.state.conn.on_timeout();
-                if entry.state.conn.is_timed_out() || entry.state.conn.is_closed() {
-                    debug!(
-                        "Protocol task {} connection {} expired after timeout",
-                        self.id,
-                        format_conn_id(&key)
-                    );
-                    self.drain_send_queue(&mut entry.state)?;
-                    self.connection_registry.remove_connection(&key);
-                    self.active_connections = self.connection_registry.active_connection_count();
-                    continue;
+        for timer_entry in expired_timers {
+            match timer_entry.timer_type {
+                crate::timer_wheel::TimerType::IdleTimeout => {
+                    // Handle idle timeout - close the connection
+                    let entry_opt = self.connection_registry.get_connection(&timer_entry.dcid)
+                        .map(|entry_ref| (*entry_ref).clone());
+                    if let Some(mut entry) = entry_opt {
+                        // Check if connection is actually timed out
+                        if entry.state.conn.is_timed_out() || entry.state.conn.is_closed() {
+                            debug!(
+                                "Protocol task {} connection {} idle timeout",
+                                self.id,
+                                format_conn_id(&timer_entry.dcid)
+                            );
+                            self.drain_send_queue(&mut entry.state)?;
+                            self.connection_registry.remove_connection(&timer_entry.dcid);
+                            self.active_connections = self.connection_registry.active_connection_count();
+                        } else {
+                            // Connection is still active, reschedule timer
+                            if let Some(timeout) = entry.state.conn.timeout() {
+                                self.connection_registry.schedule_timer(
+                                    timer_entry.dcid,
+                                    crate::timer_wheel::TimerType::IdleTimeout,
+                                    timeout,
+                                );
+                            }
+                        }
+                    }
                 }
-                entry.state.refresh_timeout();
-                self.handle_readable_streams(&mut entry.state);
-                self.drain_send_queue(&mut entry.state)?;
+                crate::timer_wheel::TimerType::PathPto => {
+                    // Handle PTO timeout
+                    let entry_opt = self.connection_registry.get_connection(&timer_entry.dcid)
+                        .map(|entry_ref| (*entry_ref).clone());
+                    if let Some(mut entry) = entry_opt {
+                        entry.state.conn.on_timeout();
+                        // Reschedule PTO timer if needed
+                        if let Some(timeout) = entry.state.conn.timeout() {
+                            self.connection_registry.schedule_timer(
+                                timer_entry.dcid.clone(),
+                                crate::timer_wheel::TimerType::PathPto,
+                                timeout,
+                            );
+                        }
+                        // Process any readable streams after timeout
+                        self.handle_readable_streams(&mut entry.state);
+                        self.drain_send_queue(&mut entry.state)?;
+                    }
+                }
+                crate::timer_wheel::TimerType::Handshake => {
+                    // Handle handshake timeout
+                    let entry_opt = self.connection_registry.get_connection(&timer_entry.dcid)
+                        .map(|entry_ref| (*entry_ref).clone());
+                    if let Some(mut entry) = entry_opt {
+                        if entry.state.conn.is_closed() {
+                            debug!(
+                                "Protocol task {} connection {} handshake timeout",
+                                self.id,
+                                format_conn_id(&timer_entry.dcid)
+                            );
+                            self.drain_send_queue(&mut entry.state)?;
+                            self.connection_registry.remove_connection(&timer_entry.dcid);
+                            self.active_connections = self.connection_registry.active_connection_count();
+                        }
+                    }
+                }
+                crate::timer_wheel::TimerType::Custom(_) => {
+                    // Handle custom timers - for now just log
+                    debug!(
+                        "Protocol task {} custom timer expired for connection {}",
+                        self.id,
+                        hex::encode(&timer_entry.dcid)
+                    );
+                }
             }
-
-            let new_key = entry.state.conn.destination_id().as_ref().to_vec();
-            if new_key != key && !entry.state.aliases.iter().any(|alias| alias == &key) {
-                entry.state.aliases.push(key.clone());
-            }
-
-            self.connection_registry.insert_connection(new_key, entry);
         }
 
         Ok(())

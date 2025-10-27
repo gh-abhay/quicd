@@ -15,7 +15,7 @@ use std::{
 use dashmap::DashMap;
 use quiche::Connection as QuicheConnection;
 
-use crate::error::Result;
+use crate::timer_wheel::{TimerWheel, TimerType, TimerEntry};
 
 /// Unique connection identifier across the entire system
 pub type GlobalConnectionId = u64;
@@ -55,6 +55,8 @@ pub struct ConnectionRegistry {
     aliases: Arc<DashMap<Vec<u8>, Vec<u8>>>,
     /// Global connection ID generator
     next_conn_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Hierarchical timer wheel for efficient timeout management
+    timer_wheel: Arc<parking_lot::Mutex<TimerWheel>>,
 }
 
 impl ConnectionRegistry {
@@ -64,6 +66,7 @@ impl ConnectionRegistry {
             connections: Arc::new(DashMap::new()),
             aliases: Arc::new(DashMap::new()),
             next_conn_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            timer_wheel: Arc::new(parking_lot::Mutex::new(TimerWheel::new())),
         }
     }
 
@@ -83,7 +86,7 @@ impl ConnectionRegistry {
     }
 
     /// Get a connection by DCID (checking both canonical and aliases)
-    pub fn get_connection(&self, dcid: &[u8]) -> Option<dashmap::mapref::one::Ref<Vec<u8>, ConnectionEntry>> {
+    pub fn get_connection(&self, dcid: &[u8]) -> Option<dashmap::mapref::one::Ref<'_, Vec<u8>, ConnectionEntry>> {
         // Try direct lookup first
         if let Some(entry) = self.connections.get(dcid) {
             return Some(entry);
@@ -171,6 +174,26 @@ impl ConnectionRegistry {
     /// Check if a connection exists
     pub fn connection_exists(&self, dcid: &[u8]) -> bool {
         self.connections.contains_key(dcid) || self.aliases.contains_key(dcid)
+    }
+
+    /// Schedule a timer for a connection
+    pub fn schedule_timer(&self, dcid: Vec<u8>, timer_type: TimerType, duration: std::time::Duration) {
+        self.timer_wheel.lock().add_timer(dcid, timer_type, duration);
+    }
+
+    /// Remove all timers for a connection
+    pub fn remove_connection_timers(&self, dcid: &[u8]) -> usize {
+        self.timer_wheel.lock().remove_connection_timers(dcid)
+    }
+
+    /// Process expired timers and return the expired timer entries
+    pub fn process_expired_timers(&self) -> Vec<TimerEntry> {
+        self.timer_wheel.lock().process_expired_timers()
+    }
+
+    /// Get timer wheel statistics
+    pub fn timer_stats(&self) -> crate::timer_wheel::TimerWheelStats {
+        self.timer_wheel.lock().stats()
     }
 }
 
