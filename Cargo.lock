@@ -2800,6 +2800,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "ctrlc",
+ "dashmap 6.1.0",
  "datagram-socket",
  "libc",
  "num_cpus",
