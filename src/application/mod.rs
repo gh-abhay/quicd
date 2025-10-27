@@ -33,8 +33,8 @@
 //! - **Scalability**: Automatic load distribution across cores
 
 pub mod content;
-pub mod webtransport;
 pub mod dispatcher;
+pub mod webtransport;
 
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -56,7 +56,7 @@ impl ApplicationProtocol {
         match alpn {
             "h3" => Some(Self::Http3Content), // Default to content serving for h3
             "h3-29" | "h3-30" | "h3-31" | "h3-32" => Some(Self::Http3Content), // Draft versions
-            _ => None, // Unknown protocols not supported
+            _ => None,                        // Unknown protocols not supported
         }
     }
 

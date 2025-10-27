@@ -56,19 +56,19 @@
 //! - **Connections**: Millions per node
 //! - **Memory**: ~28-50KB per connection
 
+pub mod application;
 pub mod config;
+pub mod connection_registry;
 pub mod error;
 pub mod network;
 pub mod protocol;
 pub mod telemetry;
-pub mod application;
-pub mod connection_registry;
 pub mod timer_wheel;
 
 /// Inter-layer communication messages
 pub mod messages {
-    use std::net::SocketAddr;
     use crate::network::zerocopy_buffer::ZeroCopyBuffer;
+    use std::net::SocketAddr;
 
     /// Messages from Network Layer to Protocol Layer
     #[derive(Debug)]
@@ -112,9 +112,7 @@ pub mod messages {
             fin: bool,
         },
         /// Connection closed
-        ConnectionClosed {
-            conn_id: u64,
-        },
+        ConnectionClosed { conn_id: u64 },
     }
 
     /// Messages from Application Layer to Protocol Layer
@@ -128,13 +126,8 @@ pub mod messages {
             fin: bool,
         },
         /// Close a stream
-        CloseStream {
-            conn_id: u64,
-            stream_id: u64,
-        },
+        CloseStream { conn_id: u64, stream_id: u64 },
         /// Close a connection
-        CloseConnection {
-            conn_id: u64,
-        },
+        CloseConnection { conn_id: u64 },
     }
 }

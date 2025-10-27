@@ -12,7 +12,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-
 use parking_lot::Mutex;
 use quiche::{self, ConnectionId, Header};
 use rand::RngCore;
@@ -25,12 +24,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     config::Config,
+    connection_registry::{ConnectionEntry, ConnectionRegistry, SharedConnectionState},
     error::Result,
-    messages::{
-        NetworkToProtocol, ProtocolToApplication, ProtocolToNetwork,
-    },
+    messages::{NetworkToProtocol, ProtocolToApplication, ProtocolToNetwork},
     network::zerocopy_buffer::ZeroCopyBuffer,
-    connection_registry::{ConnectionRegistry, SharedConnectionState, ConnectionEntry},
 };
 
 const SERVER_CONN_ID_LENGTH: usize = 16;
@@ -138,12 +135,17 @@ impl QuicProtocolTask {
             addr
         );
 
-        let has_connection = self.connection_registry.connection_exists(header.dcid.as_ref());
+        let has_connection = self
+            .connection_registry
+            .connection_exists(header.dcid.as_ref());
 
         if has_connection {
             // Get connection data and immediately drop the reference
             let (canonical, entry) = {
-                let entry_ref = self.connection_registry.get_connection(header.dcid.as_ref()).unwrap();
+                let entry_ref = self
+                    .connection_registry
+                    .get_connection(header.dcid.as_ref())
+                    .unwrap();
                 let canonical = entry_ref.key().clone();
                 let entry = (*entry_ref).clone();
                 (canonical, entry)
@@ -196,7 +198,13 @@ impl QuicProtocolTask {
         self.drain_send_queue(&mut entry.state)?;
 
         let new_key = entry.state.conn.destination_id().as_ref().to_vec();
-        if new_key != canonical_key && !entry.state.aliases.iter().any(|alias| alias == &canonical_key) {
+        if new_key != canonical_key
+            && !entry
+                .state
+                .aliases
+                .iter()
+                .any(|alias| alias == &canonical_key)
+        {
             entry.state.aliases.push(canonical_key.clone());
         }
 
@@ -208,11 +216,15 @@ impl QuicProtocolTask {
             );
         }
 
-        self.connection_registry.insert_connection(new_key.clone(), entry);
+        self.connection_registry
+            .insert_connection(new_key.clone(), entry);
 
         // Update timers for the connection
-        if let Some(timeout) = self.connection_registry.get_connection(&new_key)
-            .and_then(|entry_ref| entry_ref.state.conn.timeout()) {
+        if let Some(timeout) = self
+            .connection_registry
+            .get_connection(&new_key)
+            .and_then(|entry_ref| entry_ref.state.conn.timeout())
+        {
             self.connection_registry.schedule_timer(
                 new_key,
                 crate::timer_wheel::TimerType::IdleTimeout,
@@ -286,12 +298,16 @@ impl QuicProtocolTask {
         self.drain_send_queue(&mut entry.state)?;
 
         let canonical = entry.state.conn.destination_id().as_ref().to_vec();
-        self.connection_registry.insert_connection(canonical.clone(), entry);
+        self.connection_registry
+            .insert_connection(canonical.clone(), entry);
         self.active_connections = self.connection_registry.active_connection_count();
 
         // Schedule initial timers for the new connection
-        if let Some(timeout) = self.connection_registry.get_connection(&canonical)
-            .and_then(|entry_ref| entry_ref.state.conn.timeout()) {
+        if let Some(timeout) = self
+            .connection_registry
+            .get_connection(&canonical)
+            .and_then(|entry_ref| entry_ref.state.conn.timeout())
+        {
             self.connection_registry.schedule_timer(
                 canonical.clone(),
                 crate::timer_wheel::TimerType::IdleTimeout,
@@ -325,7 +341,10 @@ impl QuicProtocolTask {
                     alpn: alpn_str,
                 };
                 if let Err(err) = self.to_application.send(message) {
-                    warn!("Protocol task {} failed to send NewConnection: {err:?}", self.id);
+                    warn!(
+                        "Protocol task {} failed to send NewConnection: {err:?}",
+                        self.id
+                    );
                 } else {
                     state.sent_new_connection = true;
                 }
@@ -346,7 +365,10 @@ impl QuicProtocolTask {
                         alpn: alpn_str,
                     };
                     if let Err(err) = self.to_application.send(message) {
-                        warn!("Protocol task {} failed to send NewStream: {err:?}", self.id);
+                        warn!(
+                            "Protocol task {} failed to send NewStream: {err:?}",
+                            self.id
+                        );
                     } else {
                         state.active_streams.insert(stream_id);
                     }
@@ -378,7 +400,10 @@ impl QuicProtocolTask {
                             fin,
                         };
                         if let Err(err) = self.to_application.send(message) {
-                            warn!("Protocol task {} failed to send StreamData: {err:?}", self.id);
+                            warn!(
+                                "Protocol task {} failed to send StreamData: {err:?}",
+                                self.id
+                            );
                         }
 
                         if fin {
@@ -408,7 +433,9 @@ impl QuicProtocolTask {
                 Err(quiche::Error::Done) => break,
                 Err(err) => {
                     return Err(crate::error::Error::Network(
-                        crate::error::NetworkError::IoOperationFailed(format!("conn.send failed: {err}"))
+                        crate::error::NetworkError::IoOperationFailed(format!(
+                            "conn.send failed: {err}"
+                        )),
                     ));
                 }
             };
@@ -420,7 +447,10 @@ impl QuicProtocolTask {
     }
 
     /// Select a network task to send to (hash by destination address for load balancing)
-    fn select_network_sender(&self, addr: &SocketAddr) -> &mpsc::UnboundedSender<ProtocolToNetwork> {
+    fn select_network_sender(
+        &self,
+        addr: &SocketAddr,
+    ) -> &mpsc::UnboundedSender<ProtocolToNetwork> {
         // Hash the destination address to select a network task
         // This distributes egress load across network tasks
         let hash = match addr {
@@ -443,9 +473,11 @@ impl QuicProtocolTask {
         let sender = self.select_network_sender(&addr);
         sender
             .send(ProtocolToNetwork::Datagram { buffer, addr })
-            .map_err(|err| crate::error::Error::Network(
-                crate::error::NetworkError::IoOperationFailed(format!("failed to enqueue datagram: {err}"))
-            ))
+            .map_err(|err| {
+                crate::error::Error::Network(crate::error::NetworkError::IoOperationFailed(
+                    format!("failed to enqueue datagram: {err}"),
+                ))
+            })
     }
 
     fn send_version_negotiation(&self, header: &Header, addr: SocketAddr) -> Result<()> {
@@ -465,13 +497,15 @@ impl QuicProtocolTask {
         for timer_entry in expired_timers {
             // All timer expirations should call on_timeout() on the connection
             // This handles idle timeouts, PTO, handshake timeouts, etc. internally
-            let entry_opt = self.connection_registry.get_connection(&timer_entry.dcid)
+            let entry_opt = self
+                .connection_registry
+                .get_connection(&timer_entry.dcid)
                 .map(|entry_ref| (*entry_ref).clone());
-            
+
             if let Some(mut entry) = entry_opt {
                 // Call on_timeout to handle the timeout event
                 entry.state.conn.on_timeout();
-                
+
                 // Check if connection should be closed after timeout
                 if entry.state.conn.is_timed_out() || entry.state.conn.is_closed() {
                     debug!(
@@ -480,7 +514,8 @@ impl QuicProtocolTask {
                         format_conn_id(&timer_entry.dcid)
                     );
                     self.drain_send_queue(&mut entry.state)?;
-                    self.connection_registry.remove_connection(&timer_entry.dcid);
+                    self.connection_registry
+                        .remove_connection(&timer_entry.dcid);
                     self.active_connections = self.connection_registry.active_connection_count();
                 } else {
                     // Connection is still active, reschedule next timer
@@ -491,7 +526,7 @@ impl QuicProtocolTask {
                             timeout,
                         );
                     }
-                    
+
                     // Process any streams that became readable after timeout
                     self.handle_readable_streams(&mut entry.state);
                     self.drain_send_queue(&mut entry.state)?;
@@ -534,14 +569,16 @@ fn format_conn_id(id: &[u8]) -> String {
 
 fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     let mut quiche_config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-    
+
     // Validate application protocols
     if config.quic.application_protos.is_empty() {
         return Err(crate::error::Error::Network(
-            crate::error::NetworkError::InvalidConfiguration("No application protocols specified".to_string())
+            crate::error::NetworkError::InvalidConfiguration(
+                "No application protocols specified".to_string(),
+            ),
         ));
     }
-    
+
     let protos: Vec<Vec<u8>> = config
         .quic
         .application_protos
@@ -551,26 +588,28 @@ fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     let proto_refs: Vec<&[u8]> = protos.iter().map(|proto| proto.as_slice()).collect();
     quiche_config
         .set_application_protos(&proto_refs)
-        .map_err(|e| crate::error::Error::Network(
-            crate::error::NetworkError::IoOperationFailed(format!("failed to configure QUIC application protocols: {e}"))
-        ))?;
+        .map_err(|e| {
+            crate::error::Error::Network(crate::error::NetworkError::IoOperationFailed(format!(
+                "failed to configure QUIC application protocols: {e}"
+            )))
+        })?;
 
     quiche_config
         .load_cert_chain_from_pem_file(&config.quic.cert_path)
-        .map_err(|e| crate::error::Error::Network(
-            crate::error::NetworkError::IoOperationFailed(format!(
+        .map_err(|e| {
+            crate::error::Error::Network(crate::error::NetworkError::IoOperationFailed(format!(
                 "failed to load TLS certificate from {}: {e}",
                 config.quic.cert_path
-            ))
-        ))?;
+            )))
+        })?;
     quiche_config
         .load_priv_key_from_pem_file(&config.quic.key_path)
-        .map_err(|e| crate::error::Error::Network(
-            crate::error::NetworkError::IoOperationFailed(format!(
+        .map_err(|e| {
+            crate::error::Error::Network(crate::error::NetworkError::IoOperationFailed(format!(
                 "failed to load TLS private key from {}: {e}",
                 config.quic.key_path
-            ))
-        ))?;
+            )))
+        })?;
     quiche_config.verify_peer(config.quic.verify_peer);
 
     if config.quic.enable_early_data {
@@ -609,7 +648,7 @@ pub fn start_protocol_layer(
                 "Expected {} from_network receivers (one per protocol task), got {}",
                 config.protocol_threads,
                 from_network_receivers.len()
-            ))
+            )),
         ));
     }
 
@@ -619,16 +658,15 @@ pub fn start_protocol_layer(
                 "Expected {} to_network senders (one per network task), got {}",
                 config.network_threads,
                 to_network_senders.len()
-            ))
+            )),
         ));
     }
 
-    let listen_addr: SocketAddr = config
-        .listen
-        .parse()
-        .map_err(|e| crate::error::Error::Network(
-            crate::error::NetworkError::InvalidConfiguration(format!("invalid listen socket address: {e}"))
-        ))?;
+    let listen_addr: SocketAddr = config.listen.parse().map_err(|e| {
+        crate::error::Error::Network(crate::error::NetworkError::InvalidConfiguration(format!(
+            "invalid listen socket address: {e}"
+        )))
+    })?;
 
     let quiche_config = Arc::new(Mutex::new(build_quiche_config(config)?));
 
@@ -639,7 +677,7 @@ pub fn start_protocol_layer(
     for (idx, receiver) in from_network_receivers.into_iter().enumerate() {
         let shutdown_rx = shutdown_tx.subscribe();
         let quiche_config_clone = Arc::clone(&quiche_config);
-        let senders_clone: Vec<mpsc::UnboundedSender<ProtocolToNetwork>> = 
+        let senders_clone: Vec<mpsc::UnboundedSender<ProtocolToNetwork>> =
             to_network_senders.iter().map(|s| s.clone()).collect();
         let to_application_clone = to_application.clone();
         let registry_clone = Arc::clone(&connection_registry);
@@ -740,15 +778,21 @@ mod tests {
         let sender3 = task.select_network_sender(&addr3);
 
         // All should be valid sender references
-        assert!(std::ptr::eq(sender1, &task.to_network_senders[0]) ||
-                std::ptr::eq(sender1, &task.to_network_senders[1]) ||
-                std::ptr::eq(sender1, &task.to_network_senders[2]));
-        assert!(std::ptr::eq(sender2, &task.to_network_senders[0]) ||
-                std::ptr::eq(sender2, &task.to_network_senders[1]) ||
-                std::ptr::eq(sender2, &task.to_network_senders[2]));
-        assert!(std::ptr::eq(sender3, &task.to_network_senders[0]) ||
-                std::ptr::eq(sender3, &task.to_network_senders[1]) ||
-                std::ptr::eq(sender3, &task.to_network_senders[2]));
+        assert!(
+            std::ptr::eq(sender1, &task.to_network_senders[0])
+                || std::ptr::eq(sender1, &task.to_network_senders[1])
+                || std::ptr::eq(sender1, &task.to_network_senders[2])
+        );
+        assert!(
+            std::ptr::eq(sender2, &task.to_network_senders[0])
+                || std::ptr::eq(sender2, &task.to_network_senders[1])
+                || std::ptr::eq(sender2, &task.to_network_senders[2])
+        );
+        assert!(
+            std::ptr::eq(sender3, &task.to_network_senders[0])
+                || std::ptr::eq(sender3, &task.to_network_senders[1])
+                || std::ptr::eq(sender3, &task.to_network_senders[2])
+        );
     }
 
     #[test]
@@ -895,7 +939,9 @@ mod tests {
         )
     }
 
-    fn create_test_protocol_task_with_senders(senders: Vec<mpsc::UnboundedSender<ProtocolToNetwork>>) -> QuicProtocolTask {
+    fn create_test_protocol_task_with_senders(
+        senders: Vec<mpsc::UnboundedSender<ProtocolToNetwork>>,
+    ) -> QuicProtocolTask {
         let (_tx_net_in, rx_net_in) = mpsc::unbounded_channel();
         let (_tx_app, _rx_app) = mpsc::unbounded_channel();
         let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);

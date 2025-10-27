@@ -155,7 +155,7 @@ fn main() {
         // Architecture:
         // - Ingress (Network → Protocol): protocol_threads channels (hash CID to route)
         // - Egress (Protocol → Network): network_threads channels (each protocol task needs all network senders)
-        
+
         // INGRESS: Network → Protocol (M channels, one per protocol task)
         let mut to_protocol_senders = Vec::new();
         let mut to_protocol_receivers = Vec::new();
@@ -164,7 +164,10 @@ fn main() {
             let (tx, rx) = mpsc::unbounded_channel();
             to_protocol_senders.push(tx);
             to_protocol_receivers.push(rx);
-            info!("Created ingress channel {} (Network → Protocol task {})", i, i);
+            info!(
+                "Created ingress channel {} (Network → Protocol task {})",
+                i, i
+            );
         }
 
         // EGRESS: Protocol → Network (N channels, one per network task)
@@ -175,7 +178,10 @@ fn main() {
             let (tx, rx) = mpsc::unbounded_channel();
             from_protocol_senders.push(tx);
             from_protocol_receivers.push(rx);
-            info!("Created egress channel {} (Protocol → Network task {})", i, i);
+            info!(
+                "Created egress channel {} (Protocol → Network task {})",
+                i, i
+            );
         }
 
         // Create shared shutdown signal for graceful shutdown (broadcast)

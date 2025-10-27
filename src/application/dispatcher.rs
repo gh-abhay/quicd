@@ -34,12 +34,12 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    ApplicationContext, ApplicationError, ApplicationProtocol, ApplicationResult,
-    content::{ContentHandler, create_h3_config},
+    content::{create_h3_config, ContentHandler},
     webtransport::WebTransportHandler,
-    ToProtocolSender, FromProtocolReceiver,
+    ApplicationContext, ApplicationError, ApplicationProtocol, ApplicationResult,
+    FromProtocolReceiver, ToProtocolSender,
 };
-use crate::messages::{ProtocolToApplication, ApplicationToProtocol};
+use crate::messages::{ApplicationToProtocol, ProtocolToApplication};
 
 /// Application dispatcher - routes streams to protocol handlers
 pub struct ApplicationDispatcher {
@@ -72,27 +72,59 @@ impl ApplicationDispatcher {
 
         while let Some(message) = self.from_protocol.recv().await {
             match message {
-                ProtocolToApplication::NewConnection { conn_id, peer_addr, alpn } => {
-                    debug!("New connection established: conn {} from {} with ALPN {}",
-                          conn_id, peer_addr, alpn);
+                ProtocolToApplication::NewConnection {
+                    conn_id,
+                    peer_addr,
+                    alpn,
+                } => {
+                    debug!(
+                        "New connection established: conn {} from {} with ALPN {}",
+                        conn_id, peer_addr, alpn
+                    );
                     self.handle_new_connection(conn_id, peer_addr, alpn).await?;
                 }
-                ProtocolToApplication::NewStream { conn_id, stream_id, peer_addr, alpn } => {
+                ProtocolToApplication::NewStream {
+                    conn_id,
+                    stream_id,
+                    peer_addr,
+                    alpn,
+                } => {
                     // Forward to connection handler
                     if let Some(handler_tx) = self.handlers.get(&conn_id) {
-                        let msg = ProtocolToApplication::NewStream { conn_id, stream_id, peer_addr, alpn };
+                        let msg = ProtocolToApplication::NewStream {
+                            conn_id,
+                            stream_id,
+                            peer_addr,
+                            alpn,
+                        };
                         if let Err(_) = handler_tx.send(msg) {
-                            warn!("Failed to forward NewStream to handler for conn {}", conn_id);
+                            warn!(
+                                "Failed to forward NewStream to handler for conn {}",
+                                conn_id
+                            );
                             self.handlers.remove(&conn_id);
                         }
                     }
                 }
-                ProtocolToApplication::StreamData { conn_id, stream_id, data, fin } => {
+                ProtocolToApplication::StreamData {
+                    conn_id,
+                    stream_id,
+                    data,
+                    fin,
+                } => {
                     // Forward to connection handler
                     if let Some(handler_tx) = self.handlers.get(&conn_id) {
-                        let msg = ProtocolToApplication::StreamData { conn_id, stream_id, data, fin };
+                        let msg = ProtocolToApplication::StreamData {
+                            conn_id,
+                            stream_id,
+                            data,
+                            fin,
+                        };
                         if let Err(_) = handler_tx.send(msg) {
-                            warn!("Failed to forward StreamData to handler for conn {}", conn_id);
+                            warn!(
+                                "Failed to forward StreamData to handler for conn {}",
+                                conn_id
+                            );
                             self.handlers.remove(&conn_id);
                         }
                     }
@@ -121,13 +153,21 @@ impl ApplicationDispatcher {
             None => {
                 warn!("Unsupported ALPN protocol: {} for conn {}", alpn, conn_id);
                 // Close the connection with an error
-                self.to_protocol.send(crate::messages::ApplicationToProtocol::CloseConnection { conn_id })
-                    .map_err(|e| ApplicationError::ChannelError(format!("Failed to close connection: {}", e)))?;
+                self.to_protocol
+                    .send(crate::messages::ApplicationToProtocol::CloseConnection { conn_id })
+                    .map_err(|e| {
+                        ApplicationError::ChannelError(format!("Failed to close connection: {}", e))
+                    })?;
                 return Ok(());
             }
         };
 
-        info!("Starting {} handler for conn {} from {}", protocol.to_alpn(), conn_id, peer_addr);
+        info!(
+            "Starting {} handler for conn {} from {}",
+            protocol.to_alpn(),
+            conn_id,
+            peer_addr
+        );
 
         // Create context for the handler
         let context = ApplicationContext {
@@ -138,8 +178,10 @@ impl ApplicationDispatcher {
         };
 
         // Create channels for the handler
-        let (to_protocol_tx, _) = mpsc::unbounded_channel::<crate::messages::ApplicationToProtocol>();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel::<crate::messages::ProtocolToApplication>();
+        let (to_protocol_tx, _) =
+            mpsc::unbounded_channel::<crate::messages::ApplicationToProtocol>();
+        let (from_protocol_tx, from_protocol_rx) =
+            mpsc::unbounded_channel::<crate::messages::ProtocolToApplication>();
 
         // Store the sender to forward messages to this handler
         self.handlers.insert(conn_id, from_protocol_tx);
@@ -147,11 +189,7 @@ impl ApplicationDispatcher {
         // Spawn the appropriate handler based on protocol
         match protocol {
             ApplicationProtocol::Http3Content => {
-                let handler = ContentHandler::new(
-                    context,
-                    to_protocol_tx,
-                    from_protocol_rx,
-                );
+                let handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
 
                 tokio::spawn(async move {
                     if let Err(e) = handler.run().await {
@@ -160,11 +198,7 @@ impl ApplicationDispatcher {
                 });
             }
             ApplicationProtocol::WebTransport => {
-                let handler = WebTransportHandler::new(
-                    context,
-                    to_protocol_tx,
-                    from_protocol_rx,
-                );
+                let handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
                 tokio::spawn(async move {
                     if let Err(e) = handler.run().await {
@@ -198,17 +232,32 @@ pub fn start_application_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
     use std::net::SocketAddr;
+    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_application_protocol_from_alpn() {
         // Test valid ALPN strings
-        assert_eq!(ApplicationProtocol::from_alpn("h3"), Some(ApplicationProtocol::Http3Content));
-        assert_eq!(ApplicationProtocol::from_alpn("h3-29"), Some(ApplicationProtocol::Http3Content));
-        assert_eq!(ApplicationProtocol::from_alpn("h3-30"), Some(ApplicationProtocol::Http3Content));
-        assert_eq!(ApplicationProtocol::from_alpn("h3-31"), Some(ApplicationProtocol::Http3Content));
-        assert_eq!(ApplicationProtocol::from_alpn("h3-32"), Some(ApplicationProtocol::Http3Content));
+        assert_eq!(
+            ApplicationProtocol::from_alpn("h3"),
+            Some(ApplicationProtocol::Http3Content)
+        );
+        assert_eq!(
+            ApplicationProtocol::from_alpn("h3-29"),
+            Some(ApplicationProtocol::Http3Content)
+        );
+        assert_eq!(
+            ApplicationProtocol::from_alpn("h3-30"),
+            Some(ApplicationProtocol::Http3Content)
+        );
+        assert_eq!(
+            ApplicationProtocol::from_alpn("h3-31"),
+            Some(ApplicationProtocol::Http3Content)
+        );
+        assert_eq!(
+            ApplicationProtocol::from_alpn("h3-32"),
+            Some(ApplicationProtocol::Http3Content)
+        );
 
         // Test invalid ALPN strings
         assert_eq!(ApplicationProtocol::from_alpn("http/1.1"), None);
@@ -247,17 +296,17 @@ mod tests {
         let alpn = "h3".to_string();
 
         // Handle new connection
-        let result = dispatcher.handle_new_connection(conn_id, peer_addr, alpn).await;
+        let result = dispatcher
+            .handle_new_connection(conn_id, peer_addr, alpn)
+            .await;
         assert!(result.is_ok());
 
         // Check that handler was registered
         assert!(dispatcher.handlers.contains_key(&conn_id));
 
         // Check that no close connection message was sent (since ALPN was valid)
-        let timeout_result = tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            to_protocol_rx.recv()
-        ).await;
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(10), to_protocol_rx.recv()).await;
         assert!(timeout_result.is_err()); // Should timeout, no message sent
     }
 
@@ -273,7 +322,9 @@ mod tests {
         let alpn = "unsupported".to_string();
 
         // Handle new connection with unsupported ALPN
-        let result = dispatcher.handle_new_connection(conn_id, peer_addr, alpn).await;
+        let result = dispatcher
+            .handle_new_connection(conn_id, peer_addr, alpn)
+            .await;
         assert!(result.is_ok());
 
         // Check that no handler was registered
@@ -283,7 +334,9 @@ mod tests {
         let message = to_protocol_rx.recv().await;
         assert!(message.is_some());
         match message.unwrap() {
-            crate::messages::ApplicationToProtocol::CloseConnection { conn_id: closed_conn_id } => {
+            crate::messages::ApplicationToProtocol::CloseConnection {
+                conn_id: closed_conn_id,
+            } => {
                 assert_eq!(closed_conn_id, conn_id);
             }
             _ => panic!("Expected CloseConnection message"),
@@ -302,7 +355,10 @@ mod tests {
         let alpn = "h3".to_string();
 
         // First establish a connection
-        dispatcher.handle_new_connection(conn_id, peer_addr, alpn).await.unwrap();
+        dispatcher
+            .handle_new_connection(conn_id, peer_addr, alpn)
+            .await
+            .unwrap();
 
         // Send a NewStream message
         let stream_id = 4;
@@ -317,10 +373,8 @@ mod tests {
 
         // Run dispatcher briefly to process the message
         let dispatcher_future = dispatcher.run();
-        let timeout_result = tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            dispatcher_future
-        ).await;
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(10), dispatcher_future).await;
 
         // The dispatcher should still be running (not completed)
         assert!(timeout_result.is_err());

@@ -212,7 +212,8 @@ impl TimerWheel {
         }
 
         // Advance the wheel by the number of ticks that have elapsed
-        for _ in 0..ticks_elapsed.min(256 * 256) { // Prevent infinite loops
+        for _ in 0..ticks_elapsed.min(256 * 256) {
+            // Prevent infinite loops
             // Process current inner wheel slot
             expired.extend(self.inner_wheel[self.inner_pos].drain(..));
 

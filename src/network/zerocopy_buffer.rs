@@ -52,7 +52,8 @@ pub const MAX_UDP_PAYLOAD: usize = 65536;
 pub type ZeroCopyBuffer = Pooled<buffer_pool::ConsumeBuffer>;
 
 /// Global buffer pool instance
-static BUFFER_POOL: once_cell::sync::OnceCell<Pool<8, buffer_pool::ConsumeBuffer>> = once_cell::sync::OnceCell::new();
+static BUFFER_POOL: once_cell::sync::OnceCell<Pool<8, buffer_pool::ConsumeBuffer>> =
+    once_cell::sync::OnceCell::new();
 
 /// Initialize the global buffer pool
 pub fn init_buffer_pool(capacity: usize) {

@@ -75,25 +75,43 @@ impl IoUringNetworkThread {
     }
 
     /// Extract destination connection ID from QUIC packet and hash to select protocol task
-    fn extract_and_hash_dcid(buffer: &ZeroCopyBuffer, len: usize, num_protocol_tasks: usize) -> Result<usize> {
+    fn extract_and_hash_dcid(
+        buffer: &ZeroCopyBuffer,
+        len: usize,
+        num_protocol_tasks: usize,
+    ) -> Result<usize> {
         if len < 1 {
-            return Err(NetworkError::IoOperationFailed("Packet too short for QUIC header".to_string()).into());
+            return Err(NetworkError::IoOperationFailed(
+                "Packet too short for QUIC header".to_string(),
+            )
+            .into());
         }
 
         let data = &buffer[..];
 
         // Parse QUIC header using quiche
         let mut packet_data = data.to_vec(); // quiche needs mutable data
-        let header = Header::from_slice(&mut packet_data, quiche::MAX_CONN_ID_LEN)
-            .map_err(|e| Error::Network(NetworkError::IoOperationFailed(format!("Failed to parse QUIC header: {}", e))))?;
+        let header =
+            Header::from_slice(&mut packet_data, quiche::MAX_CONN_ID_LEN).map_err(|e| {
+                Error::Network(NetworkError::IoOperationFailed(format!(
+                    "Failed to parse QUIC header: {}",
+                    e
+                )))
+            })?;
 
         // Use destination connection ID for consistent routing
         let dcid_bytes = header.dcid.as_ref();
         if dcid_bytes.is_empty() {
-            return Err(NetworkError::IoOperationFailed("Empty destination connection ID".to_string()).into());
+            return Err(NetworkError::IoOperationFailed(
+                "Empty destination connection ID".to_string(),
+            )
+            .into());
         }
 
-        Ok(Self::hash_to_protocol_task_static(dcid_bytes, num_protocol_tasks))
+        Ok(Self::hash_to_protocol_task_static(
+            dcid_bytes,
+            num_protocol_tasks,
+        ))
     }
 
     /// Fallback: hash source address to select protocol task when header parsing fails
@@ -253,7 +271,6 @@ async fn create_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     // TODO: Implement connection-aware routing or shared state
     #[cfg(target_os = "linux")]
     // socket.set_reuse_port(true)?;
-
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
 
@@ -332,7 +349,8 @@ pub fn start_network_layer(
     // Create each network task with access to ALL protocol senders (for hashing)
     for i in 0..config.network_threads {
         // Each network task gets a CLONE of ALL protocol senders
-        let to_protocol_senders_clone: Vec<ToProtocolSender> = to_protocol_senders.iter().map(|s| s.clone()).collect();
+        let to_protocol_senders_clone: Vec<ToProtocolSender> =
+            to_protocol_senders.iter().map(|s| s.clone()).collect();
         let from_protocol = receivers_iter.next().unwrap(); // Safe due to validation above
         let metrics = Arc::clone(&metrics);
         let shutdown_rx = shutdown_tx.subscribe(); // Each task gets its own receiver
@@ -565,7 +583,10 @@ mod tests {
         // Check that no task gets too much more than others (rough balance)
         let avg = 1000 / num_tasks;
         for &count in &distribution {
-            assert!(count >= avg.saturating_sub(50), "Task should not be too under-utilized");
+            assert!(
+                count >= avg.saturating_sub(50),
+                "Task should not be too under-utilized"
+            );
             assert!(count <= avg + 50, "Task should not be too over-utilized");
         }
     }

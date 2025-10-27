@@ -332,7 +332,8 @@ impl Config {
         // Memory-based limit: use up to 25% of available memory for buffers
         // Each buffer is ~64KB (MAX_UDP_PAYLOAD), so 25% of memory gives us:
         let buffer_size_kb = 64; // MAX_UDP_PAYLOAD
-        let memory_based_buffers = ((self.system_info.available_memory_kb / 4) / buffer_size_kb) as usize;
+        let memory_based_buffers =
+            ((self.system_info.available_memory_kb / 4) / buffer_size_kb) as usize;
 
         // Take the minimum of the two estimates, with reasonable bounds
         let optimal_size = connection_based_buffers.min(memory_based_buffers);
@@ -456,7 +457,7 @@ impl SystemInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{Error, ConfigError};
+    use crate::error::{ConfigError, Error};
     use std::fs;
     use tempfile::tempdir;
 
@@ -474,10 +475,14 @@ mod tests {
     fn test_cli_parsing_with_args() {
         let cli = Cli::parse_from([
             "test",
-            "--listen", "127.0.0.1:8443",
-            "--network-threads", "4",
-            "--protocol-threads", "16",
-            "--otlp-endpoint", "http://otel:4317"
+            "--listen",
+            "127.0.0.1:8443",
+            "--network-threads",
+            "4",
+            "--protocol-threads",
+            "16",
+            "--otlp-endpoint",
+            "http://otel:4317",
         ]);
         assert_eq!(cli.listen, "127.0.0.1:8443");
         assert_eq!(cli.network_threads, Some(4));
@@ -502,10 +507,14 @@ mod tests {
     fn test_config_from_cli_with_explicit_values() {
         let cli = Cli::parse_from([
             "test",
-            "--listen", "127.0.0.1:8443",
-            "--network-threads", "2",
-            "--protocol-threads", "8",
-            "--otlp-endpoint", "http://otel:4317"
+            "--listen",
+            "127.0.0.1:8443",
+            "--network-threads",
+            "2",
+            "--protocol-threads",
+            "8",
+            "--otlp-endpoint",
+            "http://otel:4317",
         ]);
         let config = Config::from_cli(&cli).unwrap();
 
@@ -581,7 +590,10 @@ mod tests {
         let mut config = Config::default();
         config.listen = "invalid:address".to_string();
 
-        assert!(matches!(config.validate(), Err(Error::Config(ConfigError::InvalidListenAddress(_)))));
+        assert!(matches!(
+            config.validate(),
+            Err(Error::Config(ConfigError::InvalidListenAddress(_)))
+        ));
     }
 
     #[test]
@@ -589,7 +601,10 @@ mod tests {
         let mut config = Config::default();
         config.network_threads = 0;
 
-        assert!(matches!(config.validate(), Err(Error::Config(ConfigError::InvalidThreadCount(_)))));
+        assert!(matches!(
+            config.validate(),
+            Err(Error::Config(ConfigError::InvalidThreadCount(_)))
+        ));
     }
 
     #[test]
@@ -597,7 +612,10 @@ mod tests {
         let mut config = Config::default();
         config.protocol_threads = 0;
 
-        assert!(matches!(config.validate(), Err(Error::Config(ConfigError::InvalidThreadCount(_)))));
+        assert!(matches!(
+            config.validate(),
+            Err(Error::Config(ConfigError::InvalidThreadCount(_)))
+        ));
     }
 
     #[test]
@@ -605,7 +623,10 @@ mod tests {
         let mut config = Config::default();
         config.quic.application_protos = vec![];
 
-        assert!(matches!(config.validate(), Err(Error::Config(ConfigError::ValidationFailed(_)))));
+        assert!(matches!(
+            config.validate(),
+            Err(Error::Config(ConfigError::ValidationFailed(_)))
+        ));
     }
 
     #[test]
@@ -621,7 +642,10 @@ mod tests {
         config.network_threads = 20; // 5x physical CPUs
         config.protocol_threads = 60; // Total 80 tasks, exceeds 4 * 4 = 16
 
-        assert!(matches!(config.validate(), Err(Error::Config(ConfigError::ValidationFailed(_)))));
+        assert!(matches!(
+            config.validate(),
+            Err(Error::Config(ConfigError::ValidationFailed(_)))
+        ));
     }
 
     #[test]
@@ -682,7 +706,7 @@ mod tests {
         config.system_info = SystemInfo {
             total_cpus: 8,
             physical_cpus: 4,
-            total_memory_kb: 32 * 1024 * 1024, // 32GB
+            total_memory_kb: 32 * 1024 * 1024,     // 32GB
             available_memory_kb: 24 * 1024 * 1024, // 24GB available
         };
 

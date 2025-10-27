@@ -2,9 +2,7 @@
 /// Measures throughput, latency, and resource usage
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use superd::network::zerocopy_buffer::{
-    get_buffer_pool, init_buffer_pool,
-};
+use superd::network::zerocopy_buffer::{get_buffer_pool, init_buffer_pool};
 
 fn bench_buffer_pool_get_empty(c: &mut Criterion) {
     init_buffer_pool(1000);

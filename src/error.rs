@@ -214,7 +214,10 @@ impl From<AddrParseError> for Error {
 
 impl From<quiche::Error> for Error {
     fn from(err: quiche::Error) -> Self {
-        Error::Network(NetworkError::IoOperationFailed(format!("QUIC error: {}", err)))
+        Error::Network(NetworkError::IoOperationFailed(format!(
+            "QUIC error: {}",
+            err
+        )))
     }
 }
 

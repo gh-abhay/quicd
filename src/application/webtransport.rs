@@ -46,11 +46,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    ApplicationContext, ApplicationError, ApplicationResult,
-    ToProtocolSender, FromProtocolReceiver,
+    ApplicationContext, ApplicationError, ApplicationResult, FromProtocolReceiver, ToProtocolSender,
 };
-use crate::network::zerocopy_buffer::ZeroCopyBuffer;
 use crate::messages::{ApplicationToProtocol, ProtocolToApplication};
+use crate::network::zerocopy_buffer::ZeroCopyBuffer;
 
 /// WebTransport session handler
 pub struct WebTransportHandler {
@@ -157,11 +156,18 @@ impl WebTransportHandler {
     async fn handle_session(&mut self) -> ApplicationResult<()> {
         while let Some(message) = self.from_protocol.recv().await {
             match message {
-                ProtocolToApplication::NewStream { conn_id, stream_id, .. } => {
+                ProtocolToApplication::NewStream {
+                    conn_id, stream_id, ..
+                } => {
                     // New stream in WebTransport session
                     self.handle_new_channel(stream_id).await?;
                 }
-                ProtocolToApplication::StreamData { conn_id, stream_id, data, fin } => {
+                ProtocolToApplication::StreamData {
+                    conn_id,
+                    stream_id,
+                    data,
+                    fin,
+                } => {
                     // Data on existing channel
                     self.handle_channel_data(stream_id, data, fin).await?;
                 }
@@ -192,13 +198,17 @@ impl WebTransportHandler {
                     ]);
                 }
                 ProtocolToApplication::ConnectionClosed { conn_id: _conn_id } => {
-                    return Err(ApplicationError::Stream("Connection closed before CONNECT".into()));
+                    return Err(ApplicationError::Stream(
+                        "Connection closed before CONNECT".into(),
+                    ));
                 }
                 _ => continue,
             }
         }
 
-        Err(ApplicationError::Stream("No CONNECT request received".into()))
+        Err(ApplicationError::Stream(
+            "No CONNECT request received".into(),
+        ))
     }
 
     /// Validate CONNECT request for WebTransport
@@ -211,11 +221,14 @@ impl WebTransportHandler {
         }
 
         // Check for WebTransport headers
-        let has_webtransport_header = headers.iter()
+        let has_webtransport_header = headers
+            .iter()
             .any(|h| h.name() == b"sec-webtransport-http3-draft");
 
         if !has_webtransport_header {
-            return Err(ApplicationError::Protocol("Missing WebTransport headers".into()));
+            return Err(ApplicationError::Protocol(
+                "Missing WebTransport headers".into(),
+            ));
         }
 
         debug!(
@@ -233,21 +246,23 @@ impl WebTransportHandler {
             h3::Header::new(b"sec-webtransport-http3-draft", b"1"),
         ];
 
-        let header_data_str = format!(
-            ":status: 200\r\nsec-webtransport-http3-draft: 1\r\n\r\n"
-        );
+        let header_data_str = format!(":status: 200\r\nsec-webtransport-http3-draft: 1\r\n\r\n");
         let header_bytes = header_data_str.as_bytes();
         let buffer_pool = crate::network::zerocopy_buffer::get_buffer_pool();
         let mut header_data = buffer_pool.get_empty();
         header_data.expand(header_bytes.len());
         header_data[..header_bytes.len()].copy_from_slice(header_bytes);
 
-        self.to_protocol.send(ApplicationToProtocol::SendData {
-            conn_id: self.context.conn_id,
-            stream_id: self.context.stream_id,
-            data: header_data,
-            fin: true, // End the CONNECT stream
-        }).map_err(|e| ApplicationError::Protocol(format!("Failed to send session response: {}", e)))?;
+        self.to_protocol
+            .send(ApplicationToProtocol::SendData {
+                conn_id: self.context.conn_id,
+                stream_id: self.context.stream_id,
+                data: header_data,
+                fin: true, // End the CONNECT stream
+            })
+            .map_err(|e| {
+                ApplicationError::Protocol(format!("Failed to send session response: {}", e))
+            })?;
 
         Ok(())
     }
@@ -257,7 +272,7 @@ impl WebTransportHandler {
         // Determine channel type and API endpoint
         let channel = ApiChannel {
             channel_type: ChannelType::Bidirectional, // Default to bidirectional
-            endpoint: "/api/default".to_string(), // Default endpoint
+            endpoint: "/api/default".to_string(),     // Default endpoint
         };
 
         self.session_state.channels.insert(stream_id, channel);
@@ -271,7 +286,12 @@ impl WebTransportHandler {
     }
 
     /// Handle data on WebTransport channel
-    async fn handle_channel_data(&mut self, stream_id: u64, data: ZeroCopyBuffer, fin: bool) -> ApplicationResult<()> {
+    async fn handle_channel_data(
+        &mut self,
+        stream_id: u64,
+        data: ZeroCopyBuffer,
+        fin: bool,
+    ) -> ApplicationResult<()> {
         let channel = match self.session_state.channels.get(&stream_id) {
             Some(ch) => ch,
             None => {
@@ -298,7 +318,11 @@ impl WebTransportHandler {
     }
 
     /// Handle real-time API requests
-    async fn handle_realtime_api(&mut self, data: ZeroCopyBuffer, fin: bool) -> ApplicationResult<()> {
+    async fn handle_realtime_api(
+        &mut self,
+        data: ZeroCopyBuffer,
+        fin: bool,
+    ) -> ApplicationResult<()> {
         // Simulate real-time API processing
         let response_data = b"{\"status\": \"ok\", \"type\": \"realtime\"}";
         let buffer_pool = crate::network::zerocopy_buffer::get_buffer_pool();
@@ -308,13 +332,20 @@ impl WebTransportHandler {
 
         // Send response back (would use appropriate stream/channel)
         // For now, just log
-        debug!("Processed realtime API request, response: {} bytes", response_data.len());
+        debug!(
+            "Processed realtime API request, response: {} bytes",
+            response_data.len()
+        );
 
         Ok(())
     }
 
     /// Handle events API requests
-    async fn handle_events_api(&mut self, data: ZeroCopyBuffer, fin: bool) -> ApplicationResult<()> {
+    async fn handle_events_api(
+        &mut self,
+        data: ZeroCopyBuffer,
+        fin: bool,
+    ) -> ApplicationResult<()> {
         // Simulate events API processing
         let response_data = b"{\"status\": \"ok\", \"type\": \"events\"}";
         let buffer_pool = crate::network::zerocopy_buffer::get_buffer_pool();
@@ -322,20 +353,33 @@ impl WebTransportHandler {
         response_buffer.expand(response_data.len());
         response_buffer[..response_data.len()].copy_from_slice(response_data);
 
-        debug!("Processed events API request, response: {} bytes", response_data.len());
+        debug!(
+            "Processed events API request, response: {} bytes",
+            response_data.len()
+        );
 
         Ok(())
     }
 
     /// Handle generic API requests
-    async fn handle_generic_api(&mut self, endpoint: &str, data: ZeroCopyBuffer, fin: bool) -> ApplicationResult<()> {
-        let response_data = format!("{{\"status\": \"ok\", \"endpoint\": \"{}\"}}", endpoint).into_bytes();
+    async fn handle_generic_api(
+        &mut self,
+        endpoint: &str,
+        data: ZeroCopyBuffer,
+        fin: bool,
+    ) -> ApplicationResult<()> {
+        let response_data =
+            format!("{{\"status\": \"ok\", \"endpoint\": \"{}\"}}", endpoint).into_bytes();
         let buffer_pool = crate::network::zerocopy_buffer::get_buffer_pool();
         let mut response_buffer = buffer_pool.get_empty();
         response_buffer.expand(response_data.len());
         response_buffer[..response_data.len()].copy_from_slice(&response_data);
 
-        debug!("Processed generic API request to {}, response: {} bytes", endpoint, response_data.len());
+        debug!(
+            "Processed generic API request to {}, response: {} bytes",
+            endpoint,
+            response_data.len()
+        );
 
         Ok(())
     }
@@ -343,9 +387,7 @@ impl WebTransportHandler {
 
 /// Helper function to extract header value
 fn get_header_value<'a>(headers: &'a [h3::Header], name: &[u8]) -> Option<&'a [u8]> {
-    headers.iter()
-        .find(|h| h.name() == name)
-        .map(|h| h.value())
+    headers.iter().find(|h| h.name() == name).map(|h| h.value())
 }
 
 /// Create HTTP/3 configuration for WebTransport
@@ -359,9 +401,9 @@ pub fn create_h3_config() -> ApplicationResult<Arc<h3::Config>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
-    use crate::network::zerocopy_buffer::init_buffer_pool;
     use crate::application::ApplicationProtocol;
+    use crate::network::zerocopy_buffer::init_buffer_pool;
+    use tokio::sync::mpsc;
 
     fn create_test_context() -> ApplicationContext {
         ApplicationContext {
@@ -409,9 +451,18 @@ mod tests {
             h3::Header::new(b"sec-webtransport-http3-draft", b"1"),
         ];
 
-        assert_eq!(get_header_value(&headers, b":method"), Some(&b"CONNECT"[..]));
-        assert_eq!(get_header_value(&headers, b":path"), Some(&b"/api/realtime"[..]));
-        assert_eq!(get_header_value(&headers, b"sec-webtransport-http3-draft"), Some(&b"1"[..]));
+        assert_eq!(
+            get_header_value(&headers, b":method"),
+            Some(&b"CONNECT"[..])
+        );
+        assert_eq!(
+            get_header_value(&headers, b":path"),
+            Some(&b"/api/realtime"[..])
+        );
+        assert_eq!(
+            get_header_value(&headers, b"sec-webtransport-http3-draft"),
+            Some(&b"1"[..])
+        );
         assert_eq!(get_header_value(&headers, b"nonexistent"), None);
     }
 
@@ -451,7 +502,10 @@ mod tests {
 
         let result = handler.validate_connect_request(&headers);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Expected CONNECT method"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Expected CONNECT method"));
     }
 
     #[tokio::test]
@@ -470,7 +524,10 @@ mod tests {
 
         let result = handler.validate_connect_request(&headers);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Missing WebTransport headers"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Missing WebTransport headers"));
     }
 
     #[tokio::test]
@@ -489,7 +546,12 @@ mod tests {
         let message = to_protocol_rx.recv().await;
         assert!(message.is_some());
         match message.unwrap() {
-            ApplicationToProtocol::SendData { conn_id, stream_id, data, fin } => {
+            ApplicationToProtocol::SendData {
+                conn_id,
+                stream_id,
+                data,
+                fin,
+            } => {
                 assert_eq!(conn_id, 1);
                 assert_eq!(stream_id, 0);
                 assert!(fin);
@@ -676,7 +738,9 @@ mod tests {
         let headers = result.unwrap();
         assert!(!headers.is_empty());
         // Check that it contains expected CONNECT headers
-        assert!(headers.iter().any(|h| h.name() == b":method" && h.value() == b"CONNECT"));
+        assert!(headers
+            .iter()
+            .any(|h| h.name() == b":method" && h.value() == b"CONNECT"));
     }
 
     #[tokio::test]
@@ -694,6 +758,9 @@ mod tests {
 
         let result = handler.wait_for_connect().await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Connection closed before CONNECT"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Connection closed before CONNECT"));
     }
 }
