@@ -452,3 +452,323 @@ impl SystemInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{Error, ConfigError};
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_cli_parsing_default() {
+        let cli = Cli::parse_from(["test"]);
+        assert_eq!(cli.listen, "0.0.0.0:4433");
+        assert_eq!(cli.network_threads, None);
+        assert_eq!(cli.protocol_threads, None);
+        assert_eq!(cli.otlp_endpoint, "http://localhost:4317");
+        assert!(cli.auto_tune);
+    }
+
+    #[test]
+    fn test_cli_parsing_with_args() {
+        let cli = Cli::parse_from([
+            "test",
+            "--listen", "127.0.0.1:8443",
+            "--network-threads", "4",
+            "--protocol-threads", "16",
+            "--otlp-endpoint", "http://otel:4317"
+        ]);
+        assert_eq!(cli.listen, "127.0.0.1:8443");
+        assert_eq!(cli.network_threads, Some(4));
+        assert_eq!(cli.protocol_threads, Some(16));
+        assert_eq!(cli.otlp_endpoint, "http://otel:4317");
+        assert!(cli.auto_tune);
+    }
+
+    #[test]
+    fn test_config_from_cli_default() {
+        let cli = Cli::parse_from(["test"]);
+        let config = Config::from_cli(&cli).unwrap();
+
+        assert_eq!(config.listen, "0.0.0.0:4433");
+        assert!(config.network_threads >= 1);
+        assert!(config.protocol_threads >= 8);
+        assert_eq!(config.telemetry.otlp_endpoint, "http://localhost:4317");
+        assert_eq!(config.telemetry.service_name, "superd");
+    }
+
+    #[test]
+    fn test_config_from_cli_with_explicit_values() {
+        let cli = Cli::parse_from([
+            "test",
+            "--listen", "127.0.0.1:8443",
+            "--network-threads", "2",
+            "--protocol-threads", "8",
+            "--otlp-endpoint", "http://otel:4317"
+        ]);
+        let config = Config::from_cli(&cli).unwrap();
+
+        assert_eq!(config.listen, "127.0.0.1:8443");
+        assert_eq!(config.network_threads, 2);
+        assert_eq!(config.protocol_threads, 8);
+        assert_eq!(config.telemetry.otlp_endpoint, "http://otel:4317");
+    }
+
+    #[test]
+    fn test_config_load_from_file() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = temp_dir.path().join("test_config.toml");
+
+        let config_content = r#"
+            listen = "127.0.0.1:8443"
+            network_threads = 4
+            protocol_threads = 16
+
+            [telemetry]
+            otlp_endpoint = "http://otel:4317"
+            service_name = "test-service"
+
+            [quic]
+            cert_path = "test.crt"
+            key_path = "test.key"
+            verify_peer = true
+            enable_early_data = false
+            application_protos = ["test/1.0", "test/2.0"]
+            max_idle_timeout_ms = 60000
+            initial_max_data = 33554432
+            initial_max_stream_data_bidi_local = 8388608
+            initial_max_stream_data_bidi_remote = 8388608
+            initial_max_stream_data_uni = 4194304
+            initial_max_streams_bidi = 512
+            initial_max_streams_uni = 256
+            max_send_udp_payload_size = 1400
+            max_recv_udp_payload_size = 65535
+        "#;
+
+        fs::write(&config_path, config_content).unwrap();
+
+        let config = Config::load_from_file(&config_path).unwrap();
+
+        assert_eq!(config.listen, "127.0.0.1:8443");
+        assert_eq!(config.network_threads, 4);
+        assert_eq!(config.protocol_threads, 16);
+        assert_eq!(config.telemetry.otlp_endpoint, "http://otel:4317");
+        assert_eq!(config.telemetry.service_name, "test-service");
+        assert_eq!(config.quic.cert_path, "test.crt");
+        assert_eq!(config.quic.key_path, "test.key");
+        assert!(config.quic.verify_peer);
+        assert!(!config.quic.enable_early_data);
+        assert_eq!(config.quic.application_protos, vec!["test/1.0", "test/2.0"]);
+        assert_eq!(config.quic.max_idle_timeout_ms, 60000);
+        assert_eq!(config.quic.initial_max_data, 33554432);
+        assert_eq!(config.quic.initial_max_streams_bidi, 512);
+    }
+
+    #[test]
+    fn test_config_validation_valid() {
+        let mut config = Config::default();
+        config.listen = "127.0.0.1:8443".to_string();
+        config.network_threads = 2;
+        config.protocol_threads = 8;
+        config.quic.application_protos = vec!["test/1.0".to_string()];
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_invalid_listen_address() {
+        let mut config = Config::default();
+        config.listen = "invalid:address".to_string();
+
+        assert!(matches!(config.validate(), Err(Error::Config(ConfigError::InvalidListenAddress(_)))));
+    }
+
+    #[test]
+    fn test_config_validation_zero_network_threads() {
+        let mut config = Config::default();
+        config.network_threads = 0;
+
+        assert!(matches!(config.validate(), Err(Error::Config(ConfigError::InvalidThreadCount(_)))));
+    }
+
+    #[test]
+    fn test_config_validation_zero_protocol_threads() {
+        let mut config = Config::default();
+        config.protocol_threads = 0;
+
+        assert!(matches!(config.validate(), Err(Error::Config(ConfigError::InvalidThreadCount(_)))));
+    }
+
+    #[test]
+    fn test_config_validation_empty_application_protos() {
+        let mut config = Config::default();
+        config.quic.application_protos = vec![];
+
+        assert!(matches!(config.validate(), Err(Error::Config(ConfigError::ValidationFailed(_)))));
+    }
+
+    #[test]
+    fn test_config_validation_excessive_threads() {
+        let mut config = Config::default();
+        // Set system info to simulate a small system
+        config.system_info = SystemInfo {
+            total_cpus: 4,
+            physical_cpus: 2,
+            total_memory_kb: 8 * 1024 * 1024, // 8GB
+            available_memory_kb: 6 * 1024 * 1024,
+        };
+        config.network_threads = 20; // 5x physical CPUs
+        config.protocol_threads = 60; // Total 80 tasks, exceeds 4 * 4 = 16
+
+        assert!(matches!(config.validate(), Err(Error::Config(ConfigError::ValidationFailed(_)))));
+    }
+
+    #[test]
+    fn test_auto_tune_small_system() {
+        let mut config = Config::default();
+        // Simulate small system: 2 cores, 4GB RAM
+        config.system_info = SystemInfo {
+            total_cpus: 2,
+            physical_cpus: 2,
+            total_memory_kb: 4 * 1024 * 1024,
+            available_memory_kb: 3 * 1024 * 1024,
+        };
+
+        config.auto_tune();
+
+        assert_eq!(config.network_threads, 2); // Min of physical cores and memory-based limit
+        assert_eq!(config.protocol_threads, 6); // 4x network_threads, capped at 3x logical CPUs (2*3=6)
+    }
+
+    #[test]
+    fn test_auto_tune_medium_system() {
+        let mut config = Config::default();
+        // Simulate medium system: 8 cores, 16GB RAM
+        config.system_info = SystemInfo {
+            total_cpus: 8,
+            physical_cpus: 4,
+            total_memory_kb: 16 * 1024 * 1024,
+            available_memory_kb: 12 * 1024 * 1024,
+        };
+
+        config.auto_tune();
+
+        assert_eq!(config.network_threads, 4); // Equal to physical cores
+        assert_eq!(config.protocol_threads, 24); // 6x network_threads
+    }
+
+    #[test]
+    fn test_auto_tune_large_system() {
+        let mut config = Config::default();
+        // Simulate large system: 32 cores, 128GB RAM
+        config.system_info = SystemInfo {
+            total_cpus: 32,
+            physical_cpus: 16,
+            total_memory_kb: 128 * 1024 * 1024,
+            available_memory_kb: 100 * 1024 * 1024,
+        };
+
+        config.auto_tune();
+
+        assert_eq!(config.network_threads, 24); // 16 + 16/2 = 24, capped appropriately
+        assert_eq!(config.protocol_threads, 96); // 8x network_threads, capped at 3x CPUs
+    }
+
+    #[test]
+    fn test_calculate_buffer_pool_size() {
+        let mut config = Config::default();
+        config.protocol_threads = 4; // 4 * 50,000 = 200,000 estimated connections
+        config.system_info = SystemInfo {
+            total_cpus: 8,
+            physical_cpus: 4,
+            total_memory_kb: 32 * 1024 * 1024, // 32GB
+            available_memory_kb: 24 * 1024 * 1024, // 24GB available
+        };
+
+        let buffer_pool_size = config.calculate_buffer_pool_size();
+
+        // 200,000 connections * 4 buffers = 800,000 connection-based
+        // 24GB / 4 / 64KB = ~93,750 memory-based
+        // Should take min(800,000, 93,750) = 93,750, but clamped to max 1M
+        assert!(buffer_pool_size >= 8192 && buffer_pool_size <= 1_000_000);
+    }
+
+    #[test]
+    fn test_quic_config_defaults() {
+        let quic_config = QuicConfig::default();
+
+        assert_eq!(quic_config.cert_path, "certs/server.crt");
+        assert_eq!(quic_config.key_path, "certs/server.key");
+        assert!(!quic_config.verify_peer);
+        assert!(quic_config.enable_early_data);
+        assert_eq!(quic_config.application_protos, vec!["superd/0.1"]);
+        assert_eq!(quic_config.max_idle_timeout_ms, 30_000);
+        assert_eq!(quic_config.initial_max_data, 16 * 1024 * 1024);
+        assert_eq!(quic_config.initial_max_streams_bidi, 256);
+        assert_eq!(quic_config.max_send_udp_payload_size, 1350);
+        assert_eq!(quic_config.max_recv_udp_payload_size, MAX_UDP_PAYLOAD);
+    }
+
+    #[test]
+    fn test_system_info_detect() {
+        let system_info = SystemInfo::detect();
+
+        assert!(system_info.total_cpus > 0);
+        assert!(system_info.physical_cpus > 0);
+        assert!(system_info.total_memory_kb > 0);
+        assert!(system_info.available_memory_kb > 0);
+        assert!(system_info.total_cpus >= system_info.physical_cpus);
+    }
+
+    #[test]
+    fn test_config_default_values() {
+        let config = Config::default();
+
+        assert_eq!(config.listen, "0.0.0.0:4433");
+        assert!(config.network_threads >= 1);
+        assert!(config.protocol_threads >= 1);
+        assert_eq!(config.telemetry.service_name, "superd");
+        assert!(!config.quic.verify_peer);
+        assert!(config.quic.enable_early_data);
+    }
+
+    #[test]
+    fn test_config_load_from_file_auto_tune() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = temp_dir.path().join("minimal_config.toml");
+
+        // Config with minimal values that should trigger auto-tuning
+        let config_content = r#"
+            listen = "127.0.0.1:8443"
+
+            [quic]
+            application_protos = ["test/1.0"]
+        "#;
+
+        fs::write(&config_path, config_content).unwrap();
+
+        let config = Config::load_from_file(&config_path).unwrap();
+
+        // Should have auto-tuned values
+        assert_eq!(config.listen, "127.0.0.1:8443");
+        assert!(config.network_threads >= 1);
+        assert!(config.protocol_threads >= 8);
+        assert_eq!(config.quic.application_protos, vec!["test/1.0"]);
+    }
+
+    #[test]
+    fn test_config_load_from_file_invalid_toml() {
+        let temp_dir = tempdir().unwrap();
+        let config_path = temp_dir.path().join("invalid_config.toml");
+
+        let invalid_content = r#"
+            listen = "127.0.0.1:8443"
+            invalid_toml_syntax [
+        "#;
+
+        fs::write(&config_path, invalid_content).unwrap();
+
+        assert!(Config::load_from_file(&config_path).is_err());
+    }
+}
