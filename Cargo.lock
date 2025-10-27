@@ -2802,6 +2802,7 @@ dependencies = [
  "ctrlc",
  "dashmap 6.1.0",
  "datagram-socket",
+ "hex",
  "libc",
  "num_cpus",
  "once_cell",
