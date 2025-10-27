@@ -255,8 +255,6 @@ impl Clone for ConnectionEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::time::Duration;
 
     // Mock connection state for testing (since QuicheConnection is not cloneable)
     // NOTE: Removed unsafe mock creation to comply with no-unsafe-in-main-code policy

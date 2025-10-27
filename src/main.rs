@@ -204,7 +204,7 @@ fn main() {
 
         // Create channels for protocol <-> application communication
         let (to_application_tx, to_application_rx) = mpsc::unbounded_channel();
-        let (from_application_tx, from_application_rx) = mpsc::unbounded_channel();
+        let (from_application_tx, _from_application_rx) = mpsc::unbounded_channel();
 
         // Start protocol layer (async tasks)
         info!("Starting QUIC protocol layer...");

@@ -42,8 +42,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use quiche::h3::{self, NameValue};
-use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     ApplicationContext, ApplicationError, ApplicationResult, FromProtocolReceiver, ToProtocolSender,
@@ -56,7 +55,6 @@ pub struct WebTransportHandler {
     context: ApplicationContext,
     to_protocol: ToProtocolSender,
     from_protocol: FromProtocolReceiver,
-    h3_config: Arc<h3::Config>,
     session_state: WebTransportSession,
 }
 
@@ -70,20 +68,8 @@ struct WebTransportSession {
 
 #[derive(Debug)]
 struct ApiChannel {
-    /// Channel type (datagram, stream, etc.)
-    channel_type: ChannelType,
     /// API endpoint this channel serves
     endpoint: String,
-}
-
-#[derive(Debug, Clone)]
-enum ChannelType {
-    /// Unidirectional stream
-    Unidirectional,
-    /// Bidirectional stream
-    Bidirectional,
-    /// Datagram channel
-    Datagram,
 }
 
 impl WebTransportHandler {
@@ -93,17 +79,10 @@ impl WebTransportHandler {
         to_protocol: ToProtocolSender,
         from_protocol: FromProtocolReceiver,
     ) -> Self {
-        let mut h3_config = h3::Config::new().unwrap();
-        // Configure for WebTransport
-        h3_config.set_max_field_section_size(65536);
-        h3_config.set_qpack_max_table_capacity(4096);
-        h3_config.set_qpack_blocked_streams(16);
-
         Self {
             context,
             to_protocol,
             from_protocol,
-            h3_config: Arc::new(h3_config),
             session_state: WebTransportSession {
                 channels: HashMap::new(),
                 established: false,
@@ -157,13 +136,15 @@ impl WebTransportHandler {
         while let Some(message) = self.from_protocol.recv().await {
             match message {
                 ProtocolToApplication::NewStream {
-                    conn_id, stream_id, ..
+                    conn_id: _,
+                    stream_id,
+                    ..
                 } => {
                     // New stream in WebTransport session
                     self.handle_new_channel(stream_id).await?;
                 }
                 ProtocolToApplication::StreamData {
-                    conn_id,
+                    conn_id: _,
                     stream_id,
                     data,
                     fin,
@@ -241,11 +222,6 @@ impl WebTransportHandler {
 
     /// Send 200 OK response to establish WebTransport session
     async fn send_session_response(&mut self) -> ApplicationResult<()> {
-        let headers = vec![
-            h3::Header::new(b":status", b"200"),
-            h3::Header::new(b"sec-webtransport-http3-draft", b"1"),
-        ];
-
         let header_data_str = format!(":status: 200\r\nsec-webtransport-http3-draft: 1\r\n\r\n");
         let header_bytes = header_data_str.as_bytes();
         let buffer_pool = crate::network::zerocopy_buffer::get_buffer_pool();
@@ -271,7 +247,6 @@ impl WebTransportHandler {
     async fn handle_new_channel(&mut self, stream_id: u64) -> ApplicationResult<()> {
         // Determine channel type and API endpoint
         let channel = ApiChannel {
-            channel_type: ChannelType::Bidirectional, // Default to bidirectional
             endpoint: "/api/default".to_string(),     // Default endpoint
         };
 
@@ -320,8 +295,8 @@ impl WebTransportHandler {
     /// Handle real-time API requests
     async fn handle_realtime_api(
         &mut self,
-        data: ZeroCopyBuffer,
-        fin: bool,
+        _data: ZeroCopyBuffer,
+        _fin: bool,
     ) -> ApplicationResult<()> {
         // Simulate real-time API processing
         let response_data = b"{\"status\": \"ok\", \"type\": \"realtime\"}";
@@ -343,8 +318,8 @@ impl WebTransportHandler {
     /// Handle events API requests
     async fn handle_events_api(
         &mut self,
-        data: ZeroCopyBuffer,
-        fin: bool,
+        _data: ZeroCopyBuffer,
+        _fin: bool,
     ) -> ApplicationResult<()> {
         // Simulate events API processing
         let response_data = b"{\"status\": \"ok\", \"type\": \"events\"}";
@@ -365,8 +340,8 @@ impl WebTransportHandler {
     async fn handle_generic_api(
         &mut self,
         endpoint: &str,
-        data: ZeroCopyBuffer,
-        fin: bool,
+        _data: ZeroCopyBuffer,
+        _fin: bool,
     ) -> ApplicationResult<()> {
         let response_data =
             format!("{{\"status\": \"ok\", \"endpoint\": \"{}\"}}", endpoint).into_bytes();
@@ -392,7 +367,7 @@ fn get_header_value<'a>(headers: &'a [h3::Header], name: &[u8]) -> Option<&'a [u
 
 /// Create HTTP/3 configuration for WebTransport
 pub fn create_h3_config() -> ApplicationResult<Arc<h3::Config>> {
-    let mut config = h3::Config::new()?;
+    let config = h3::Config::new()?;
     // Configure HTTP/3 settings for WebTransport
     // Enable datagrams if supported
     Ok(Arc::new(config))
@@ -581,7 +556,6 @@ mod tests {
         assert!(handler.session_state.channels.contains_key(&stream_id));
         let channel = handler.session_state.channels.get(&stream_id).unwrap();
         assert_eq!(channel.endpoint, "/api/default");
-        assert!(matches!(channel.channel_type, ChannelType::Bidirectional));
     }
 
     #[tokio::test]
@@ -596,7 +570,6 @@ mod tests {
         // Set up channel
         let stream_id = 4;
         let channel = ApiChannel {
-            channel_type: ChannelType::Bidirectional,
             endpoint: "/api/realtime".to_string(),
         };
         handler.session_state.channels.insert(stream_id, channel);
@@ -619,7 +592,6 @@ mod tests {
         // Set up channel
         let stream_id = 4;
         let channel = ApiChannel {
-            channel_type: ChannelType::Bidirectional,
             endpoint: "/api/events".to_string(),
         };
         handler.session_state.channels.insert(stream_id, channel);
@@ -642,7 +614,6 @@ mod tests {
         // Set up channel
         let stream_id = 4;
         let channel = ApiChannel {
-            channel_type: ChannelType::Bidirectional,
             endpoint: "/api/custom".to_string(),
         };
         handler.session_state.channels.insert(stream_id, channel);

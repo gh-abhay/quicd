@@ -49,7 +49,6 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use quiche::h3::{self, NameValue};
 use tracing::{debug, info};
@@ -64,7 +63,6 @@ pub struct ContentHandler {
     context: ApplicationContext,
     to_protocol: ToProtocolSender,
     from_protocol: FromProtocolReceiver,
-    h3_config: Arc<h3::Config>,
 }
 
 impl ContentHandler {
@@ -73,17 +71,10 @@ impl ContentHandler {
         to_protocol: ToProtocolSender,
         from_protocol: FromProtocolReceiver,
     ) -> Self {
-        let mut h3_config = h3::Config::new().unwrap();
-        // Configure for content serving
-        h3_config.set_max_field_section_size(65536);
-        h3_config.set_qpack_max_table_capacity(4096);
-        h3_config.set_qpack_blocked_streams(16);
-
         Self {
             context,
             to_protocol,
             from_protocol,
-            h3_config: Arc::new(h3_config),
         }
     }
 
@@ -104,7 +95,7 @@ impl ContentHandler {
                             debug!("New stream {} on connection {}", stream_id, conn_id);
                             active_streams.insert(stream_id, Vec::new());
                         }
-                        Some(crate::messages::ProtocolToApplication::StreamData { conn_id, stream_id, data, fin }) => {
+                        Some(crate::messages::ProtocolToApplication::StreamData { conn_id: _, stream_id, data, fin }) => {
                             self.handle_stream_data(stream_id, data, fin, &mut active_streams).await?;
                         }
                         Some(crate::messages::ProtocolToApplication::ConnectionClosed { .. }) => {
@@ -128,8 +119,8 @@ impl ContentHandler {
         &mut self,
         stream_id: u64,
         data: ZeroCopyBuffer,
-        fin: bool,
-        active_streams: &mut HashMap<u64, Vec<h3::Header>>,
+        _fin: bool,
+        _active_streams: &mut HashMap<u64, Vec<h3::Header>>,
     ) -> ApplicationResult<()> {
         // For demo purposes, simulate receiving HTTP headers
         // In a real implementation, this would parse HTTP/3 frames
@@ -357,40 +348,6 @@ impl ContentHandler {
     }
 }
 
-/// HTTP/3 response structure
-#[derive(Debug)]
-struct Http3Response {
-    status: u16,
-    headers: Vec<h3::Header>,
-    body: Vec<u8>,
-}
-
-/// Helper function to extract header value
-fn get_header_value<'a>(headers: &'a [h3::Header], name: &[u8]) -> Option<&'a [u8]> {
-    headers.iter().find(|h| h.name() == name).map(|h| h.value())
-}
-
-/// Convert headers to string representation for logging
-fn headers_to_strings(headers: &[h3::Header]) -> Vec<String> {
-    headers
-        .iter()
-        .map(|h| {
-            format!(
-                "{}: {}",
-                String::from_utf8_lossy(h.name()),
-                String::from_utf8_lossy(h.value())
-            )
-        })
-        .collect()
-}
-
-/// Create HTTP/3 configuration
-pub fn create_h3_config() -> ApplicationResult<Arc<h3::Config>> {
-    let mut config = h3::Config::new()?;
-    // Configure HTTP/3 settings as needed
-    Ok(Arc::new(config))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,60 +374,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_content_handler_creation() {
-        init_buffer_pool(10);
-        let context = create_test_context();
-        let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
-
-        let handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
-        assert_eq!(handler.context.conn_id, 1);
-        assert_eq!(handler.context.protocol, ApplicationProtocol::Http3Content);
-    }
-
-    #[test]
-    fn test_create_h3_config() {
-        let result = create_h3_config();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_get_header_value() {
-        let headers = vec![
-            h3::Header::new(b"content-type", b"application/json"),
-            h3::Header::new(b"content-length", b"123"),
-        ];
-
-        assert_eq!(
-            get_header_value(&headers, b"content-type"),
-            Some(&b"application/json"[..])
-        );
-        assert_eq!(
-            get_header_value(&headers, b"content-length"),
-            Some(&b"123"[..])
-        );
-        assert_eq!(get_header_value(&headers, b"nonexistent"), None);
-    }
-
-    #[test]
-    fn test_headers_to_strings() {
-        let headers = vec![
-            h3::Header::new(b"content-type", b"application/json"),
-            h3::Header::new(b"content-length", b"123"),
-        ];
-
-        let strings = headers_to_strings(&headers);
-        assert_eq!(strings.len(), 2);
-        assert!(strings[0].contains("content-type"));
-        assert!(strings[1].contains("content-length"));
-    }
-
-    #[tokio::test]
     async fn test_handle_request_from_headers_get_health() {
         init_buffer_pool(10);
         let context = create_test_context();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
         let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -489,7 +397,7 @@ mod tests {
             crate::messages::ApplicationToProtocol::SendData {
                 conn_id,
                 stream_id,
-                data,
+                data: _,
                 fin,
             } => {
                 assert_eq!(conn_id, 1);
@@ -506,7 +414,7 @@ mod tests {
             crate::messages::ApplicationToProtocol::SendData {
                 conn_id,
                 stream_id,
-                data,
+                data: _,
                 fin,
             } => {
                 assert_eq!(conn_id, 1);
@@ -521,8 +429,8 @@ mod tests {
     async fn test_handle_request_from_headers_get_api() {
         init_buffer_pool(10);
         let context = create_test_context();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
         let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -553,8 +461,8 @@ mod tests {
     async fn test_handle_request_from_headers_get_static() {
         init_buffer_pool(10);
         let context = create_test_context();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
         let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -585,8 +493,8 @@ mod tests {
     async fn test_handle_request_from_headers_method_not_allowed() {
         init_buffer_pool(10);
         let context = create_test_context();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
         let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -617,8 +525,8 @@ mod tests {
     async fn test_handle_request_from_headers_webtransport_connect() {
         init_buffer_pool(10);
         let context = create_test_context();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
         let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -650,8 +558,8 @@ mod tests {
     async fn test_handle_stream_data_get_request() {
         init_buffer_pool(10);
         let context = create_test_context();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
         let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
         let mut active_streams = HashMap::new();
@@ -683,8 +591,8 @@ mod tests {
     async fn test_handle_stream_data_connect_request() {
         init_buffer_pool(10);
         let context = create_test_context();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
         let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
         let mut active_streams = HashMap::new();
@@ -712,3 +620,4 @@ mod tests {
         }
     }
 }
+

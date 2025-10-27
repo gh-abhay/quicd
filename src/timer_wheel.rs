@@ -19,11 +19,8 @@
 
 use std::{
     collections::VecDeque,
-    sync::Arc,
     time::{Duration, Instant},
 };
-
-use dashmap::DashMap;
 
 /// Timer types for QUIC connections
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -64,8 +61,6 @@ pub struct TimerWheel {
     outer_pos: usize,
     /// Base time for wheel calculations
     base_time: Instant,
-    /// Tick interval (50ms)
-    tick_interval: Duration,
     /// Active timer count for monitoring
     active_timers: usize,
 }
@@ -80,7 +75,6 @@ impl TimerWheel {
             inner_pos: 0,
             outer_pos: 0,
             base_time: Instant::now(),
-            tick_interval: Duration::from_millis(50),
             active_timers: 0,
         }
     }
@@ -261,14 +255,14 @@ impl TimerWheel {
         let mut max_inner_slot = 0;
         let mut max_outer_slot = 0;
 
-        for (i, slot) in self.inner_wheel.iter().enumerate() {
+        for (_i, slot) in self.inner_wheel.iter().enumerate() {
             if !slot.is_empty() {
                 inner_slots_used += 1;
                 max_inner_slot = max_inner_slot.max(slot.len());
             }
         }
 
-        for (i, slot) in self.outer_wheel.iter().enumerate() {
+        for (_i, slot) in self.outer_wheel.iter().enumerate() {
             if !slot.is_empty() {
                 outer_slots_used += 1;
                 max_outer_slot = max_outer_slot.max(slot.len());

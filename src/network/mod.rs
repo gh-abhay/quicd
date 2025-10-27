@@ -59,9 +59,7 @@ pub mod io_uring_net;
 pub mod metrics;
 pub mod zerocopy_buffer;
 
-use std::net::SocketAddr;
 use tokio::sync::mpsc;
-use zerocopy_buffer::ZeroCopyBuffer;
 
 /// Re-export message types from the centralized messages module
 pub use crate::messages::{NetworkToProtocol, ProtocolToNetwork};

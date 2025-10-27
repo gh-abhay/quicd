@@ -6,10 +6,9 @@
 //! datagrams with the network layer.
 
 use std::{
-    collections::HashSet,
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use parking_lot::Mutex;
@@ -712,12 +711,11 @@ pub fn start_protocol_layer(
 mod tests {
     use super::*;
     use crate::{
-        config::{Config, QuicConfig},
+        config::Config,
         connection_registry::ConnectionRegistry,
-        messages::{NetworkToProtocol, ProtocolToApplication, ProtocolToNetwork},
+        messages::ProtocolToNetwork,
         network::zerocopy_buffer::get_buffer_pool,
     };
-    use std::collections::HashSet;
     use tokio::sync::{broadcast, mpsc};
 
     #[test]

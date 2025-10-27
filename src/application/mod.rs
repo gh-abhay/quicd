@@ -39,8 +39,6 @@ pub mod webtransport;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
 
-use crate::network::zerocopy_buffer::ZeroCopyBuffer;
-
 /// Application protocol types
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplicationProtocol {

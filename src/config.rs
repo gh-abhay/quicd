@@ -319,7 +319,7 @@ impl Config {
     /// - buffers_per_connection = 4 (for ingress/egress queues and processing)
     /// - memory_based_limit = available_memory / buffer_size
     pub fn calculate_buffer_pool_size(&self) -> usize {
-        let memory_gb = self.system_info.total_memory_kb / 1024 / 1024;
+        let _memory_gb = self.system_info.total_memory_kb / 1024 / 1024;
 
         // Estimate concurrent connections based on protocol threads
         // Industry benchmarks: each protocol thread can handle ~50K connections

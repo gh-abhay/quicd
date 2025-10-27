@@ -29,23 +29,21 @@
 //! 5. **Cleanup**: Handler terminates when stream closes
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    content::{create_h3_config, ContentHandler},
+    content::ContentHandler,
     webtransport::WebTransportHandler,
     ApplicationContext, ApplicationError, ApplicationProtocol, ApplicationResult,
     FromProtocolReceiver, ToProtocolSender,
 };
-use crate::messages::{ApplicationToProtocol, ProtocolToApplication};
+use crate::messages::ProtocolToApplication;
 
 /// Application dispatcher - routes streams to protocol handlers
 pub struct ApplicationDispatcher {
     from_protocol: FromProtocolReceiver,
     to_protocol: ToProtocolSender,
-    h3_config: Arc<quiche::h3::Config>,
     /// Map of connection ID to handler message sender
     handlers: HashMap<u64, mpsc::UnboundedSender<ProtocolToApplication>>,
 }
@@ -56,12 +54,9 @@ impl ApplicationDispatcher {
         from_protocol: FromProtocolReceiver,
         to_protocol: ToProtocolSender,
     ) -> ApplicationResult<Self> {
-        let h3_config = create_h3_config()?;
-
         Ok(Self {
             from_protocol,
             to_protocol,
-            h3_config,
             handlers: HashMap::new(),
         })
     }
@@ -232,7 +227,6 @@ pub fn start_application_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -274,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_application_dispatcher_creation() {
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
 
         let dispatcher = ApplicationDispatcher::new(from_protocol_rx, to_protocol_tx);
@@ -286,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_new_connection_http3_content() {
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
         let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
 
         let mut dispatcher = ApplicationDispatcher::new(from_protocol_rx, to_protocol_tx).unwrap();
@@ -312,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_new_connection_unsupported_alpn() {
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
         let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
 
         let mut dispatcher = ApplicationDispatcher::new(from_protocol_rx, to_protocol_tx).unwrap();
@@ -346,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn test_dispatcher_message_forwarding() {
         let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
-        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+        let (to_protocol_tx, _to_protocol_rx) = mpsc::unbounded_channel();
 
         let mut dispatcher = ApplicationDispatcher::new(from_protocol_rx, to_protocol_tx).unwrap();
 
@@ -382,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_application_layer() {
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
 
         let result = start_application_layer(from_protocol_rx, to_protocol_tx);
