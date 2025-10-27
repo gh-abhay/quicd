@@ -195,7 +195,7 @@ impl WebTransportHandler {
     /// Validate CONNECT request for WebTransport
     fn validate_connect_request(&self, headers: &[h3::Header]) -> ApplicationResult<()> {
         let method = get_header_value(headers, b":method").unwrap_or(b"");
-        let path = get_header_value(headers, b":path").unwrap_or(b"");
+        let _path = get_header_value(headers, b":path").unwrap_or(b"");
 
         if method != b"CONNECT" {
             return Err(ApplicationError::Protocol("Expected CONNECT method".into()));
@@ -212,10 +212,7 @@ impl WebTransportHandler {
             ));
         }
 
-        debug!(
-            "Validated WebTransport CONNECT request: {}",
-            String::from_utf8_lossy(path)
-        );
+        // Removed WebTransport CONNECT validation debug logging for performance
 
         Ok(())
     }
@@ -252,10 +249,7 @@ impl WebTransportHandler {
 
         self.session_state.channels.insert(stream_id, channel);
 
-        debug!(
-            "New WebTransport channel {} for conn {} stream {}",
-            stream_id, self.context.conn_id, self.context.stream_id
-        );
+        // Removed per-channel creation debug logging for performance
 
         Ok(())
     }
@@ -307,10 +301,7 @@ impl WebTransportHandler {
 
         // Send response back (would use appropriate stream/channel)
         // For now, just log
-        debug!(
-            "Processed realtime API request, response: {} bytes",
-            response_data.len()
-        );
+        // Removed realtime API processing debug logging for performance
 
         Ok(())
     }

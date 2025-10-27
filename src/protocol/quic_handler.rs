@@ -19,7 +19,7 @@ use tokio::{
     sync::{broadcast, mpsc},
     time::{interval, MissedTickBehavior},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     config::Config,
@@ -124,15 +124,7 @@ impl QuicProtocolTask {
 
         let header = Header::from_slice(&mut packet, quiche::MAX_CONN_ID_LEN)?;
 
-        debug!(
-            "Protocol task {} received packet: type={:?}, version={:x}, dcid_len={}, scid_len={}, from={}",
-            self.id,
-            header.ty,
-            header.version,
-            header.dcid.len(),
-            header.scid.len(),
-            addr
-        );
+        // Removed per-packet debug logging for performance - use metrics instead
 
         let has_connection = self
             .connection_registry
@@ -183,11 +175,7 @@ impl QuicProtocolTask {
 
         entry.state.refresh_timeout();
         if entry.state.conn.is_timed_out() || entry.state.conn.is_closed() {
-            debug!(
-                "Protocol task {} connection {} expired",
-                self.id,
-                format_conn_id(&canonical_key)
-            );
+            // Removed per-connection expiration debug logging for performance
             self.drain_send_queue(&mut entry.state)?;
             self.connection_registry.remove_connection(&canonical_key);
             self.active_connections = self.connection_registry.active_connection_count();
@@ -208,11 +196,7 @@ impl QuicProtocolTask {
         }
 
         if header.ty == quiche::Type::Retry {
-            debug!(
-                "Protocol task {} received RETRY for connection {}",
-                self.id,
-                format_conn_id(&new_key)
-            );
+            // Removed per-retry packet debug logging for performance
         }
 
         self.connection_registry
@@ -241,10 +225,7 @@ impl QuicProtocolTask {
         addr: SocketAddr,
     ) -> Result<()> {
         if header.ty != quiche::Type::Initial {
-            debug!(
-                "Protocol task {} dropping non-initial packet for unknown connection",
-                self.id
-            );
+            // Removed dropped packet debug logging for performance - non-initial packets for unknown connections are normal
             return Ok(());
         }
 
@@ -258,7 +239,7 @@ impl QuicProtocolTask {
         }
 
         if !quiche::version_is_supported(header.version) {
-            debug!("Protocol task {} sending version negotiation", self.id);
+            // Removed version negotiation debug logging for performance
             self.send_version_negotiation(&header, addr)?;
             return Ok(());
         }
@@ -380,10 +361,7 @@ impl QuicProtocolTask {
                         if read == 0 {
                             break;
                         }
-                        debug!(
-                            "Protocol task {} received {} bytes on conn {} stream {} fin={}",
-                            self.id, read, state.conn_id, stream_id, fin
-                        );
+                        // Removed per-stream data debug logging for performance - use metrics instead
 
                         // Send stream data to application layer
                         let data = &buffer[..read];
@@ -507,11 +485,7 @@ impl QuicProtocolTask {
 
                 // Check if connection should be closed after timeout
                 if entry.state.conn.is_timed_out() || entry.state.conn.is_closed() {
-                    debug!(
-                        "Protocol task {} connection {} timed out, closing",
-                        self.id,
-                        format_conn_id(&timer_entry.dcid)
-                    );
+                    // Removed connection timeout debug logging for performance
                     self.drain_send_queue(&mut entry.state)?;
                     self.connection_registry
                         .remove_connection(&timer_entry.dcid);
@@ -542,13 +516,12 @@ impl QuicProtocolTask {
 
         for (key, mut entry) in connections_for_task {
             if let Err(err) = entry.state.conn.close(false, 0, b"server shutdown") {
-                debug!("Protocol task {} close error: {err:?}", self.id);
+                // Removed connection close error debug logging for performance during shutdown
+                let _ = err; // Error intentionally ignored during shutdown
             }
             if let Err(err) = self.drain_send_queue(&mut entry.state) {
-                debug!(
-                    "Protocol task {} send during shutdown failed: {err:?}",
-                    self.id
-                );
+                // Removed send error debug logging for performance during shutdown
+                let _ = err; // Error intentionally ignored during shutdown
             }
             // Remove from registry
             self.connection_registry.remove_connection(&key);

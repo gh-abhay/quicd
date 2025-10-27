@@ -51,7 +51,7 @@
 use std::collections::HashMap;
 
 use quiche::h3::{self, NameValue};
-use tracing::{debug, info};
+use tracing::info;
 
 use super::{
     ApplicationContext, ApplicationError, ApplicationResult, FromProtocolReceiver, ToProtocolSender,
@@ -91,8 +91,8 @@ impl ContentHandler {
             tokio::select! {
                 msg = self.from_protocol.recv() => {
                     match msg {
-                        Some(crate::messages::ProtocolToApplication::NewStream { conn_id, stream_id, .. }) => {
-                            debug!("New stream {} on connection {}", stream_id, conn_id);
+                        Some(crate::messages::ProtocolToApplication::NewStream { conn_id: _, stream_id, .. }) => {
+                            // Removed per-stream creation debug logging for performance
                             active_streams.insert(stream_id, Vec::new());
                         }
                         Some(crate::messages::ProtocolToApplication::StreamData { conn_id: _, stream_id, data, fin }) => {
@@ -164,10 +164,7 @@ impl ContentHandler {
         let method = method.ok_or_else(|| ApplicationError::Protocol("Missing method".into()))?;
         let path = path.ok_or_else(|| ApplicationError::Protocol("Missing path".into()))?;
 
-        debug!(
-            "Content request: {} {} on stream {}",
-            method, path, stream_id
-        );
+        // Removed per-request debug logging for performance - use metrics instead
 
         // Check if this is a WebTransport CONNECT request
         if method == "CONNECT"

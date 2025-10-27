@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use super::{
     content::ContentHandler,
@@ -72,10 +72,7 @@ impl ApplicationDispatcher {
                     peer_addr,
                     alpn,
                 } => {
-                    debug!(
-                        "New connection established: conn {} from {} with ALPN {}",
-                        conn_id, peer_addr, alpn
-                    );
+                    // Removed per-connection establishment debug logging for performance
                     self.handle_new_connection(conn_id, peer_addr, alpn).await?;
                 }
                 ProtocolToApplication::NewStream {

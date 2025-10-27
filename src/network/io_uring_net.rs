@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tokio::select;
 use tokio::sync::{broadcast, mpsc};
 use tokio_uring::net::UdpSocket;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 // Import quiche for packet header parsing
 use quiche::Header;
@@ -158,16 +158,16 @@ impl IoUringNetworkThread {
                     match recv_result {
                         Ok((buffer, addr, len)) => {
                             metrics.record_packet_received(len);
-                            debug!("Network task received {} bytes from {}", len, addr);
+                            // Removed per-packet debug logging for performance - use metrics instead
 
                             // Parse QUIC header to extract destination connection ID for proper routing
                             let protocol_task_idx = match Self::extract_and_hash_dcid(&buffer, len, to_protocol_senders.len()) {
                                 Ok(idx) => {
-                                    debug!("Routing packet with DCID to protocol task {}", idx);
+                                    // Removed per-packet routing debug logging for performance
                                     idx
                                 }
-                                Err(e) => {
-                                    debug!("Failed to parse QUIC header ({}), using fallback hash", e);
+                                Err(_e) => {
+                                    // Removed header parsing failure debug logging - fallback is normal behavior
                                     // Fallback: use source address hash for routing
                                     Self::hash_addr_to_protocol_task(&addr, to_protocol_senders.len())
                                 }
