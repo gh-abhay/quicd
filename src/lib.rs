@@ -62,6 +62,7 @@ pub mod network;
 pub mod protocol;
 pub mod telemetry;
 pub mod application;
+pub mod connection_registry;
 
 /// Inter-layer communication messages
 pub mod messages {

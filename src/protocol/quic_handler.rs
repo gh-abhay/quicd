@@ -6,7 +6,6 @@
 //! datagrams with the network layer.
 
 use std::{
-    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -15,7 +14,7 @@ use std::{
 
 use parking_lot::Mutex;
 use quiche::{self, ConnectionId, Header};
-use rand::{rngs::ThreadRng, RngCore};
+use rand::RngCore;
 use tokio::{
     select,
     sync::{broadcast, mpsc},
@@ -30,46 +29,11 @@ use crate::{
         NetworkToProtocol, ProtocolToApplication, ProtocolToNetwork,
     },
     network::zerocopy_buffer::ZeroCopyBuffer,
+    connection_registry::{ConnectionRegistry, SharedConnectionState, ConnectionEntry},
 };
 
 const SERVER_CONN_ID_LENGTH: usize = 16;
 const TIMER_RESOLUTION: Duration = Duration::from_millis(50);
-
-struct ConnectionState {
-    conn_id: u64,
-    conn: quiche::Connection,
-    peer: SocketAddr,
-    next_timeout: Option<Instant>,
-    sent_new_connection: bool,
-    active_streams: HashSet<u64>,
-}
-
-impl ConnectionState {
-    fn new(conn_id: u64, conn: quiche::Connection, peer: SocketAddr) -> Self {
-        let mut state = Self {
-            conn_id,
-            conn,
-            peer,
-            next_timeout: None,
-            sent_new_connection: false,
-            active_streams: HashSet::new(),
-        };
-        state.refresh_timeout();
-        state
-    }
-
-    fn refresh_timeout(&mut self) {
-        self.next_timeout = self
-            .conn
-            .timeout()
-            .map(|duration| Instant::now() + duration);
-    }
-}
-
-struct ConnectionEntry {
-    state: ConnectionState,
-    aliases: Vec<Vec<u8>>,
-}
 
 /// QUIC Protocol Handler Task
 ///
@@ -83,11 +47,10 @@ pub struct QuicProtocolTask {
     shutdown_rx: broadcast::Receiver<()>,
     local_addr: SocketAddr,
     quiche_config: Arc<Mutex<quiche::Config>>,
-    connections: HashMap<Vec<u8>, ConnectionEntry>,
-    aliases: HashMap<Vec<u8>, Vec<u8>>,
-    next_conn_id: u64,
-    rng: ThreadRng,
-    active_connections: usize, // Track active connections for monitoring
+    /// Shared connection registry for all connections
+    connection_registry: Arc<ConnectionRegistry>,
+    /// Track active connections for monitoring (now from shared registry)
+    active_connections: usize, // This will be updated from the registry
 }
 
 impl QuicProtocolTask {
@@ -99,6 +62,7 @@ impl QuicProtocolTask {
         shutdown_rx: broadcast::Receiver<()>,
         local_addr: SocketAddr,
         quiche_config: Arc<Mutex<quiche::Config>>,
+        connection_registry: Arc<ConnectionRegistry>,
     ) -> Self {
         Self {
             id,
@@ -108,10 +72,7 @@ impl QuicProtocolTask {
             shutdown_rx,
             local_addr,
             quiche_config,
-            connections: HashMap::new(),
-            aliases: HashMap::new(),
-            next_conn_id: 0,
-            rng: rand::thread_rng(),
+            connection_registry,
             active_connections: 0,
         }
     }
@@ -176,7 +137,16 @@ impl QuicProtocolTask {
             addr
         );
 
-        if let Some((canonical, entry)) = self.take_connection(header.dcid.as_ref()) {
+        let has_connection = self.connection_registry.connection_exists(header.dcid.as_ref());
+
+        if has_connection {
+            // Get connection data and immediately drop the reference
+            let (canonical, entry) = {
+                let entry_ref = self.connection_registry.get_connection(header.dcid.as_ref()).unwrap();
+                let canonical = entry_ref.key().clone();
+                let entry = (*entry_ref).clone();
+                (canonical, entry)
+            };
             self.handle_existing_connection(header, packet, addr, canonical, entry)
         } else {
             self.accept_new_connection(header, packet, addr)
@@ -217,15 +187,16 @@ impl QuicProtocolTask {
                 format_conn_id(&canonical_key)
             );
             self.drain_send_queue(&mut entry.state)?;
-            self.active_connections = self.active_connections.saturating_sub(1);
+            self.connection_registry.remove_connection(&canonical_key);
+            self.active_connections = self.connection_registry.active_connection_count();
             return Ok(());
         }
         self.handle_readable_streams(&mut entry.state);
         self.drain_send_queue(&mut entry.state)?;
 
         let new_key = entry.state.conn.destination_id().as_ref().to_vec();
-        if new_key != canonical_key && !entry.aliases.iter().any(|alias| alias == &canonical_key) {
-            entry.aliases.push(canonical_key.clone());
+        if new_key != canonical_key && !entry.state.aliases.iter().any(|alias| alias == &canonical_key) {
+            entry.state.aliases.push(canonical_key.clone());
         }
 
         if header.ty == quiche::Type::Retry {
@@ -236,7 +207,7 @@ impl QuicProtocolTask {
             );
         }
 
-        self.store_connection(new_key, entry);
+        self.connection_registry.insert_connection(new_key, entry);
         Ok(())
     }
 
@@ -275,16 +246,15 @@ impl QuicProtocolTask {
         let conn = quiche::accept(&scid, Some(&odcid), self.local_addr, addr, &mut *config)?;
         drop(config);
 
-        let conn_id = self.next_conn_id;
-        self.next_conn_id += 1;
+        let conn_id = self.connection_registry.next_connection_id();
 
         let mut entry = ConnectionEntry {
-            state: ConnectionState::new(conn_id, conn, addr),
-            aliases: Vec::new(),
+            state: SharedConnectionState::new(conn_id, conn, addr),
+            owning_task_id: self.id,
         };
 
         if header.dcid.as_ref() != entry.state.conn.destination_id().as_ref() {
-            entry.aliases.push(header.dcid.as_ref().to_vec());
+            entry.state.aliases.push(header.dcid.as_ref().to_vec());
         }
 
         let recv_info = quiche::RecvInfo {
@@ -304,8 +274,8 @@ impl QuicProtocolTask {
         self.drain_send_queue(&mut entry.state)?;
 
         let canonical = entry.state.conn.destination_id().as_ref().to_vec();
-        self.store_connection(canonical.clone(), entry);
-        self.active_connections += 1;
+        self.connection_registry.insert_connection(canonical.clone(), entry);
+        self.active_connections = self.connection_registry.active_connection_count();
 
         info!(
             "Protocol task {} accepted new connection {} from {} (active: {})",
@@ -317,7 +287,7 @@ impl QuicProtocolTask {
         Ok(())
     }
 
-    fn handle_readable_streams(&mut self, state: &mut ConnectionState) {
+    fn handle_readable_streams(&mut self, state: &mut SharedConnectionState) {
         if !state.conn.is_established() {
             return;
         }
@@ -406,7 +376,7 @@ impl QuicProtocolTask {
         }
     }
 
-    fn drain_send_queue(&mut self, state: &mut ConnectionState) -> Result<()> {
+    fn drain_send_queue(&mut self, state: &mut SharedConnectionState) -> Result<()> {
         loop {
             let buffer_pool = crate::network::zerocopy_buffer::get_buffer_pool();
             let mut buf = buffer_pool.get_empty();
@@ -468,50 +438,43 @@ impl QuicProtocolTask {
 
     fn process_timers(&mut self) -> Result<()> {
         let now = Instant::now();
-        let keys: Vec<Vec<u8>> = self.connections.keys().cloned().collect();
+        let connections_for_task = self.connection_registry.get_connections_for_task(self.id);
 
-        for key in keys {
-            if let Some((canonical, mut entry)) = self.take_connection(&key) {
-                if entry
-                    .state
-                    .next_timeout
-                    .map(|deadline| deadline <= now)
-                    .unwrap_or(false)
-                {
-                    entry.state.conn.on_timeout();
-                    if entry.state.conn.is_timed_out() || entry.state.conn.is_closed() {
-                        debug!(
-                            "Protocol task {} connection {} expired after timeout",
-                            self.id,
-                            format_conn_id(&canonical)
-                        );
-                        self.drain_send_queue(&mut entry.state)?;
-                        self.active_connections = self.active_connections.saturating_sub(1);
-                        continue;
-                    }
-                    entry.state.refresh_timeout();
-                    self.handle_readable_streams(&mut entry.state);
+        for (key, mut entry) in connections_for_task {
+            if entry.state.next_timeout.map(|deadline| deadline <= now).unwrap_or(false) {
+                entry.state.conn.on_timeout();
+                if entry.state.conn.is_timed_out() || entry.state.conn.is_closed() {
+                    debug!(
+                        "Protocol task {} connection {} expired after timeout",
+                        self.id,
+                        format_conn_id(&key)
+                    );
                     self.drain_send_queue(&mut entry.state)?;
+                    self.connection_registry.remove_connection(&key);
+                    self.active_connections = self.connection_registry.active_connection_count();
+                    continue;
                 }
-
-                let new_key = entry.state.conn.destination_id().as_ref().to_vec();
-                if new_key != canonical && !entry.aliases.iter().any(|alias| alias == &canonical) {
-                    entry.aliases.push(canonical.clone());
-                }
-
-                self.store_connection(new_key, entry);
+                entry.state.refresh_timeout();
+                self.handle_readable_streams(&mut entry.state);
+                self.drain_send_queue(&mut entry.state)?;
             }
+
+            let new_key = entry.state.conn.destination_id().as_ref().to_vec();
+            if new_key != key && !entry.state.aliases.iter().any(|alias| alias == &key) {
+                entry.state.aliases.push(key.clone());
+            }
+
+            self.connection_registry.insert_connection(new_key, entry);
         }
 
         Ok(())
     }
 
     fn drain_all_connections(&mut self) {
-        let mut drained: Vec<ConnectionEntry> =
-            self.connections.drain().map(|(_, entry)| entry).collect();
-        self.aliases.clear();
+        // Get all connections owned by this task
+        let connections_for_task = self.connection_registry.get_connections_for_task(self.id);
 
-        for entry in drained.iter_mut() {
+        for (key, mut entry) in connections_for_task {
             if let Err(err) = entry.state.conn.close(false, 0, b"server shutdown") {
                 debug!("Protocol task {} close error: {err:?}", self.id);
             }
@@ -521,39 +484,14 @@ impl QuicProtocolTask {
                     self.id
                 );
             }
+            // Remove from registry
+            self.connection_registry.remove_connection(&key);
         }
-    }
-
-    fn take_connection(&mut self, dcid: &[u8]) -> Option<(Vec<u8>, ConnectionEntry)> {
-        if let Some(entry) = self.connections.remove(dcid) {
-            for alias in &entry.aliases {
-                self.aliases.remove(alias);
-            }
-            return Some((dcid.to_vec(), entry));
-        }
-
-        if let Some(canonical) = self.aliases.remove(dcid) {
-            if let Some(entry) = self.connections.remove(&canonical) {
-                for alias in &entry.aliases {
-                    self.aliases.remove(alias);
-                }
-                return Some((canonical, entry));
-            }
-        }
-
-        None
-    }
-
-    fn store_connection(&mut self, canonical: Vec<u8>, entry: ConnectionEntry) {
-        for alias in &entry.aliases {
-            self.aliases.insert(alias.clone(), canonical.clone());
-        }
-        self.connections.insert(canonical, entry);
     }
 
     fn generate_connection_id(&mut self) -> ConnectionId<'static> {
         let mut cid = vec![0u8; SERVER_CONN_ID_LENGTH];
-        self.rng.fill_bytes(&mut cid);
+        rand::thread_rng().fill_bytes(&mut cid);
         ConnectionId::from_vec(cid)
     }
 }
@@ -654,13 +592,17 @@ pub fn start_protocol_layer(
 
     let quiche_config = Arc::new(Mutex::new(build_quiche_config(config)?));
 
+    // Create shared connection registry
+    let connection_registry = Arc::new(ConnectionRegistry::new());
+
     // Each protocol task gets ALL network senders (for load balancing egress)
     for (idx, receiver) in from_network_receivers.into_iter().enumerate() {
         let shutdown_rx = shutdown_tx.subscribe();
-        let task_config = Arc::clone(&quiche_config);
+        let quiche_config_clone = Arc::clone(&quiche_config);
         let senders_clone: Vec<mpsc::UnboundedSender<ProtocolToNetwork>> = 
             to_network_senders.iter().map(|s| s.clone()).collect();
         let to_application_clone = to_application.clone();
+        let registry_clone = Arc::clone(&connection_registry);
 
         tokio_uring::spawn(async move {
             let task = QuicProtocolTask::new(
@@ -670,7 +612,8 @@ pub fn start_protocol_layer(
                 to_application_clone,
                 shutdown_rx,
                 listen_addr,
-                task_config,
+                quiche_config_clone,
+                registry_clone,
             );
 
             if let Err(err) = task.run().await {
