@@ -355,3 +355,345 @@ pub fn create_h3_config() -> ApplicationResult<Arc<h3::Config>> {
     // Enable datagrams if supported
     Ok(Arc::new(config))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+    use crate::network::zerocopy_buffer::init_buffer_pool;
+    use crate::application::ApplicationProtocol;
+
+    fn create_test_context() -> ApplicationContext {
+        ApplicationContext {
+            conn_id: 1,
+            stream_id: 0,
+            peer_addr: "127.0.0.1:4433".parse().unwrap(),
+            protocol: ApplicationProtocol::WebTransport,
+        }
+    }
+
+    fn create_test_buffer(data: &[u8]) -> ZeroCopyBuffer {
+        init_buffer_pool(10);
+        let pool = crate::network::zerocopy_buffer::get_buffer_pool();
+        let mut buffer = pool.get_empty();
+        buffer.expand(data.len());
+        buffer[..data.len()].copy_from_slice(data);
+        buffer
+    }
+
+    #[tokio::test]
+    async fn test_webtransport_handler_creation() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+        assert_eq!(handler.context.conn_id, 1);
+        assert_eq!(handler.context.protocol, ApplicationProtocol::WebTransport);
+        assert!(!handler.session_state.established);
+        assert!(handler.session_state.channels.is_empty());
+    }
+
+    #[test]
+    fn test_create_h3_config_webtransport() {
+        let result = create_h3_config();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_header_value_webtransport() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":path", b"/api/realtime"),
+            h3::Header::new(b"sec-webtransport-http3-draft", b"1"),
+        ];
+
+        assert_eq!(get_header_value(&headers, b":method"), Some(&b"CONNECT"[..]));
+        assert_eq!(get_header_value(&headers, b":path"), Some(&b"/api/realtime"[..]));
+        assert_eq!(get_header_value(&headers, b"sec-webtransport-http3-draft"), Some(&b"1"[..]));
+        assert_eq!(get_header_value(&headers, b"nonexistent"), None);
+    }
+
+    #[tokio::test]
+    async fn test_validate_connect_request_valid() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":path", b"/api/realtime"),
+            h3::Header::new(b"sec-webtransport-http3-draft", b"1"),
+        ];
+
+        let result = handler.validate_connect_request(&headers);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_connect_request_invalid_method() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let headers = vec![
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b":path", b"/api/realtime"),
+            h3::Header::new(b"sec-webtransport-http3-draft", b"1"),
+        ];
+
+        let result = handler.validate_connect_request(&headers);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Expected CONNECT method"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_connect_request_missing_webtransport_header() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":path", b"/api/realtime"),
+        ];
+
+        let result = handler.validate_connect_request(&headers);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Missing WebTransport headers"));
+    }
+
+    #[tokio::test]
+    async fn test_send_session_response() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let result = handler.send_session_response().await;
+        assert!(result.is_ok());
+
+        // Check that 200 OK response was sent
+        let message = to_protocol_rx.recv().await;
+        assert!(message.is_some());
+        match message.unwrap() {
+            ApplicationToProtocol::SendData { conn_id, stream_id, data, fin } => {
+                assert_eq!(conn_id, 1);
+                assert_eq!(stream_id, 0);
+                assert!(fin);
+                // Check that response contains WebTransport headers
+                let response_str = String::from_utf8_lossy(&data[..]);
+                assert!(response_str.contains(":status: 200"));
+                assert!(response_str.contains("sec-webtransport-http3-draft: 1"));
+            }
+            _ => panic!("Expected SendData message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_new_channel() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let stream_id = 4;
+        let result = handler.handle_new_channel(stream_id).await;
+        assert!(result.is_ok());
+
+        // Check that channel was registered
+        assert!(handler.session_state.channels.contains_key(&stream_id));
+        let channel = handler.session_state.channels.get(&stream_id).unwrap();
+        assert_eq!(channel.endpoint, "/api/default");
+        assert!(matches!(channel.channel_type, ChannelType::Bidirectional));
+    }
+
+    #[tokio::test]
+    async fn test_handle_channel_data_realtime_api() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        // Set up channel
+        let stream_id = 4;
+        let channel = ApiChannel {
+            channel_type: ChannelType::Bidirectional,
+            endpoint: "/api/realtime".to_string(),
+        };
+        handler.session_state.channels.insert(stream_id, channel);
+
+        let data = create_test_buffer(b"test data");
+
+        let result = handler.handle_channel_data(stream_id, data, false).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_channel_data_events_api() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        // Set up channel
+        let stream_id = 4;
+        let channel = ApiChannel {
+            channel_type: ChannelType::Bidirectional,
+            endpoint: "/api/events".to_string(),
+        };
+        handler.session_state.channels.insert(stream_id, channel);
+
+        let data = create_test_buffer(b"test data");
+
+        let result = handler.handle_channel_data(stream_id, data, false).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_channel_data_generic_api() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        // Set up channel
+        let stream_id = 4;
+        let channel = ApiChannel {
+            channel_type: ChannelType::Bidirectional,
+            endpoint: "/api/custom".to_string(),
+        };
+        handler.session_state.channels.insert(stream_id, channel);
+
+        let data = create_test_buffer(b"test data");
+
+        let result = handler.handle_channel_data(stream_id, data, false).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_channel_data_unknown_channel() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let data = create_test_buffer(b"test data");
+
+        let result = handler.handle_channel_data(999, data, false).await;
+        assert!(result.is_ok()); // Should not error, just warn
+    }
+
+    #[tokio::test]
+    async fn test_handle_realtime_api() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let data = create_test_buffer(b"test request");
+
+        let result = handler.handle_realtime_api(data, false).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_events_api() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let data = create_test_buffer(b"test request");
+
+        let result = handler.handle_events_api(data, false).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_generic_api() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let data = create_test_buffer(b"test request");
+
+        let result = handler.handle_generic_api("/api/test", data, false).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_connect_success() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        // Send stream data message
+        let data = create_test_buffer(b"CONNECT request");
+        let message = ProtocolToApplication::StreamData {
+            conn_id: 1,
+            stream_id: 0,
+            data,
+            fin: false,
+        };
+        from_protocol_tx.send(message).unwrap();
+
+        let result = handler.wait_for_connect().await;
+        assert!(result.is_ok());
+
+        let headers = result.unwrap();
+        assert!(!headers.is_empty());
+        // Check that it contains expected CONNECT headers
+        assert!(headers.iter().any(|h| h.name() == b":method" && h.value() == b"CONNECT"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_connect_connection_closed() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        // Send connection closed message
+        let message = ProtocolToApplication::ConnectionClosed { conn_id: 1 };
+        from_protocol_tx.send(message).unwrap();
+
+        let result = handler.wait_for_connect().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Connection closed before CONNECT"));
+    }
+}

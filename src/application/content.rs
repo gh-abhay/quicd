@@ -328,3 +328,305 @@ pub fn create_h3_config() -> ApplicationResult<Arc<h3::Config>> {
     // Configure HTTP/3 settings as needed
     Ok(Arc::new(config))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+    use crate::network::zerocopy_buffer::init_buffer_pool;
+    use crate::application::ApplicationProtocol;
+
+    fn create_test_context() -> ApplicationContext {
+        ApplicationContext {
+            conn_id: 1,
+            stream_id: 0,
+            peer_addr: "127.0.0.1:4433".parse().unwrap(),
+            protocol: ApplicationProtocol::Http3Content,
+        }
+    }
+
+    fn create_test_buffer(data: &[u8]) -> ZeroCopyBuffer {
+        init_buffer_pool(10);
+        let pool = crate::network::zerocopy_buffer::get_buffer_pool();
+        let mut buffer = pool.get_empty();
+        buffer.expand(data.len());
+        buffer[..data.len()].copy_from_slice(data);
+        buffer
+    }
+
+    #[tokio::test]
+    async fn test_content_handler_creation() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
+        assert_eq!(handler.context.conn_id, 1);
+        assert_eq!(handler.context.protocol, ApplicationProtocol::Http3Content);
+    }
+
+    #[test]
+    fn test_create_h3_config() {
+        let result = create_h3_config();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_header_value() {
+        let headers = vec![
+            h3::Header::new(b"content-type", b"application/json"),
+            h3::Header::new(b"content-length", b"123"),
+        ];
+
+        assert_eq!(get_header_value(&headers, b"content-type"), Some(&b"application/json"[..]));
+        assert_eq!(get_header_value(&headers, b"content-length"), Some(&b"123"[..]));
+        assert_eq!(get_header_value(&headers, b"nonexistent"), None);
+    }
+
+    #[test]
+    fn test_headers_to_strings() {
+        let headers = vec![
+            h3::Header::new(b"content-type", b"application/json"),
+            h3::Header::new(b"content-length", b"123"),
+        ];
+
+        let strings = headers_to_strings(&headers);
+        assert_eq!(strings.len(), 2);
+        assert!(strings[0].contains("content-type"));
+        assert!(strings[1].contains("content-length"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_from_headers_get_health() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let headers = vec![
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b":path", b"/health"),
+        ];
+
+        let result = handler.handle_request_from_headers(4, headers).await;
+        assert!(result.is_ok());
+
+        // Check that response was sent
+        let message = to_protocol_rx.recv().await;
+        assert!(message.is_some());
+        match message.unwrap() {
+            crate::messages::ApplicationToProtocol::SendData { conn_id, stream_id, data, fin } => {
+                assert_eq!(conn_id, 1);
+                assert_eq!(stream_id, 4);
+                assert!(!fin); // Headers first
+            }
+            _ => panic!("Expected SendData message"),
+        }
+
+        // Check body message
+        let body_message = to_protocol_rx.recv().await;
+        assert!(body_message.is_some());
+        match body_message.unwrap() {
+            crate::messages::ApplicationToProtocol::SendData { conn_id, stream_id, data, fin } => {
+                assert_eq!(conn_id, 1);
+                assert_eq!(stream_id, 4);
+                assert!(fin); // Body with fin
+            }
+            _ => panic!("Expected SendData message for body"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_from_headers_get_api() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let headers = vec![
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b":path", b"/api/test"),
+        ];
+
+        let result = handler.handle_request_from_headers(4, headers).await;
+        assert!(result.is_ok());
+
+        // Should receive header and body messages
+        let header_msg = to_protocol_rx.recv().await.unwrap();
+        let body_msg = to_protocol_rx.recv().await.unwrap();
+
+        match (header_msg, body_msg) {
+            (
+                crate::messages::ApplicationToProtocol::SendData { fin: false, .. },
+                crate::messages::ApplicationToProtocol::SendData { fin: true, .. }
+            ) => {
+                // Correct message sequence
+            }
+            _ => panic!("Expected header then body messages"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_from_headers_get_static() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let headers = vec![
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b":path", b"/index.html"),
+        ];
+
+        let result = handler.handle_request_from_headers(4, headers).await;
+        assert!(result.is_ok());
+
+        // Should receive header and body messages
+        let header_msg = to_protocol_rx.recv().await.unwrap();
+        let body_msg = to_protocol_rx.recv().await.unwrap();
+
+        match (header_msg, body_msg) {
+            (
+                crate::messages::ApplicationToProtocol::SendData { fin: false, .. },
+                crate::messages::ApplicationToProtocol::SendData { fin: true, .. }
+            ) => {
+                // Correct message sequence
+            }
+            _ => panic!("Expected header then body messages"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_from_headers_method_not_allowed() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let headers = vec![
+            h3::Header::new(b":method", b"POST"),
+            h3::Header::new(b":path", b"/health"),
+        ];
+
+        let result = handler.handle_request_from_headers(4, headers).await;
+        assert!(result.is_ok());
+
+        // Should receive error response
+        let header_msg = to_protocol_rx.recv().await.unwrap();
+        let body_msg = to_protocol_rx.recv().await.unwrap();
+
+        match (header_msg, body_msg) {
+            (
+                crate::messages::ApplicationToProtocol::SendData { fin: false, .. },
+                crate::messages::ApplicationToProtocol::SendData { fin: true, .. }
+            ) => {
+                // Correct message sequence for error
+            }
+            _ => panic!("Expected header then body messages for error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_from_headers_webtransport_connect() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
+
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":path", b"/api/realtime"),
+            h3::Header::new(b"sec-webtransport-http3-draft", b"1"),
+        ];
+
+        let result = handler.handle_request_from_headers(4, headers).await;
+        assert!(result.is_ok());
+
+        // Should receive 405 error response
+        let header_msg = to_protocol_rx.recv().await.unwrap();
+        let body_msg = to_protocol_rx.recv().await.unwrap();
+
+        match (header_msg, body_msg) {
+            (
+                crate::messages::ApplicationToProtocol::SendData { fin: false, .. },
+                crate::messages::ApplicationToProtocol::SendData { fin: true, .. }
+            ) => {
+                // Correct message sequence for 405 error
+            }
+            _ => panic!("Expected header then body messages for 405 error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_stream_data_get_request() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
+        let mut active_streams = HashMap::new();
+        active_streams.insert(4u64, Vec::new());
+
+        let data = create_test_buffer(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        let result = handler.handle_stream_data(4, data, true, &mut active_streams).await;
+        assert!(result.is_ok());
+
+        // Should receive health check response
+        let header_msg = to_protocol_rx.recv().await.unwrap();
+        let body_msg = to_protocol_rx.recv().await.unwrap();
+
+        match (header_msg, body_msg) {
+            (
+                crate::messages::ApplicationToProtocol::SendData { fin: false, .. },
+                crate::messages::ApplicationToProtocol::SendData { fin: true, .. }
+            ) => {
+                // Correct response
+            }
+            _ => panic!("Expected health check response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_stream_data_connect_request() {
+        init_buffer_pool(10);
+        let context = create_test_context();
+        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut handler = ContentHandler::new(context, to_protocol_tx, from_protocol_rx);
+        let mut active_streams = HashMap::new();
+        active_streams.insert(4u64, Vec::new());
+
+        let data = create_test_buffer(b"CONNECT /api/realtime HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+        let result = handler.handle_stream_data(4, data, true, &mut active_streams).await;
+        assert!(result.is_ok());
+
+        // Should receive 405 error for WebTransport CONNECT
+        let header_msg = to_protocol_rx.recv().await.unwrap();
+        let body_msg = to_protocol_rx.recv().await.unwrap();
+
+        match (header_msg, body_msg) {
+            (
+                crate::messages::ApplicationToProtocol::SendData { fin: false, .. },
+                crate::messages::ApplicationToProtocol::SendData { fin: true, .. }
+            ) => {
+                // Correct 405 error response
+            }
+            _ => panic!("Expected 405 error response for WebTransport CONNECT"),
+        }
+    }
+}

@@ -194,3 +194,144 @@ pub fn start_application_layer(
     info!("Application layer started with HTTP/3 support");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+    use std::net::SocketAddr;
+
+    #[tokio::test]
+    async fn test_application_protocol_from_alpn() {
+        // Test valid ALPN strings
+        assert_eq!(ApplicationProtocol::from_alpn("h3"), Some(ApplicationProtocol::Http3Content));
+        assert_eq!(ApplicationProtocol::from_alpn("h3-29"), Some(ApplicationProtocol::Http3Content));
+        assert_eq!(ApplicationProtocol::from_alpn("h3-30"), Some(ApplicationProtocol::Http3Content));
+        assert_eq!(ApplicationProtocol::from_alpn("h3-31"), Some(ApplicationProtocol::Http3Content));
+        assert_eq!(ApplicationProtocol::from_alpn("h3-32"), Some(ApplicationProtocol::Http3Content));
+
+        // Test invalid ALPN strings
+        assert_eq!(ApplicationProtocol::from_alpn("http/1.1"), None);
+        assert_eq!(ApplicationProtocol::from_alpn("h2"), None);
+        assert_eq!(ApplicationProtocol::from_alpn(""), None);
+        assert_eq!(ApplicationProtocol::from_alpn("unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn test_application_protocol_to_alpn() {
+        assert_eq!(ApplicationProtocol::Http3Content.to_alpn(), "h3");
+        assert_eq!(ApplicationProtocol::WebTransport.to_alpn(), "h3");
+    }
+
+    #[tokio::test]
+    async fn test_application_dispatcher_creation() {
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+
+        let dispatcher = ApplicationDispatcher::new(from_protocol_rx, to_protocol_tx);
+        assert!(dispatcher.is_ok());
+
+        let dispatcher = dispatcher.unwrap();
+        assert!(dispatcher.handlers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_new_connection_http3_content() {
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut dispatcher = ApplicationDispatcher::new(from_protocol_rx, to_protocol_tx).unwrap();
+
+        let conn_id = 1;
+        let peer_addr = "127.0.0.1:4433".parse().unwrap();
+        let alpn = "h3".to_string();
+
+        // Handle new connection
+        let result = dispatcher.handle_new_connection(conn_id, peer_addr, alpn).await;
+        assert!(result.is_ok());
+
+        // Check that handler was registered
+        assert!(dispatcher.handlers.contains_key(&conn_id));
+
+        // Check that no close connection message was sent (since ALPN was valid)
+        let timeout_result = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            to_protocol_rx.recv()
+        ).await;
+        assert!(timeout_result.is_err()); // Should timeout, no message sent
+    }
+
+    #[tokio::test]
+    async fn test_handle_new_connection_unsupported_alpn() {
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut dispatcher = ApplicationDispatcher::new(from_protocol_rx, to_protocol_tx).unwrap();
+
+        let conn_id = 1;
+        let peer_addr = "127.0.0.1:4433".parse().unwrap();
+        let alpn = "unsupported".to_string();
+
+        // Handle new connection with unsupported ALPN
+        let result = dispatcher.handle_new_connection(conn_id, peer_addr, alpn).await;
+        assert!(result.is_ok());
+
+        // Check that no handler was registered
+        assert!(!dispatcher.handlers.contains_key(&conn_id));
+
+        // Check that close connection message was sent
+        let message = to_protocol_rx.recv().await;
+        assert!(message.is_some());
+        match message.unwrap() {
+            crate::messages::ApplicationToProtocol::CloseConnection { conn_id: closed_conn_id } => {
+                assert_eq!(closed_conn_id, conn_id);
+            }
+            _ => panic!("Expected CloseConnection message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatcher_message_forwarding() {
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
+
+        let mut dispatcher = ApplicationDispatcher::new(from_protocol_rx, to_protocol_tx).unwrap();
+
+        let conn_id = 1;
+        let peer_addr = "127.0.0.1:4433".parse().unwrap();
+        let alpn = "h3".to_string();
+
+        // First establish a connection
+        dispatcher.handle_new_connection(conn_id, peer_addr, alpn).await.unwrap();
+
+        // Send a NewStream message
+        let stream_id = 4;
+        let new_stream_msg = ProtocolToApplication::NewStream {
+            conn_id,
+            stream_id,
+            peer_addr,
+            alpn: "h3".to_string(),
+        };
+
+        from_protocol_tx.send(new_stream_msg).unwrap();
+
+        // Run dispatcher briefly to process the message
+        let dispatcher_future = dispatcher.run();
+        let timeout_result = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            dispatcher_future
+        ).await;
+
+        // The dispatcher should still be running (not completed)
+        assert!(timeout_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_start_application_layer() {
+        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (to_protocol_tx, _) = mpsc::unbounded_channel();
+
+        let result = start_application_layer(from_protocol_rx, to_protocol_tx);
+        assert!(result.is_ok());
+    }
+}
