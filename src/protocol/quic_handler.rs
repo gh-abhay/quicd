@@ -534,6 +534,14 @@ fn format_conn_id(id: &[u8]) -> String {
 
 fn build_quiche_config(config: &Config) -> Result<quiche::Config> {
     let mut quiche_config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    
+    // Validate application protocols
+    if config.quic.application_protos.is_empty() {
+        return Err(crate::error::Error::Network(
+            crate::error::NetworkError::InvalidConfiguration("No application protocols specified".to_string())
+        ));
+    }
+    
     let protos: Vec<Vec<u8>> = config
         .quic
         .application_protos
@@ -688,28 +696,9 @@ mod tests {
 
     #[test]
     fn test_build_quiche_config_valid() {
-        let mut config = Config::default();
-        config.quic = QuicConfig {
-            cert_path: "certs/server.crt".to_string(),
-            key_path: "certs/server.key".to_string(),
-            verify_peer: false,
-            enable_early_data: true,
-            application_protos: vec!["superd/0.1".to_string()],
-            max_idle_timeout_ms: 30000,
-            initial_max_data: 16 * 1024 * 1024,
-            initial_max_stream_data_bidi_local: 4 * 1024 * 1024,
-            initial_max_stream_data_bidi_remote: 4 * 1024 * 1024,
-            initial_max_stream_data_uni: 2 * 1024 * 1024,
-            initial_max_streams_bidi: 256,
-            initial_max_streams_uni: 128,
-            max_send_udp_payload_size: 1350,
-            max_recv_udp_payload_size: 65535,
-        };
-
-        // This will fail because cert files don't exist, but we can test the config building logic
+        let config = Config::default();
         let result = build_quiche_config(&config);
-        assert!(result.is_err()); // Expected due to missing cert files
-        assert!(matches!(result, Err(crate::error::Error::Network(_))));
+        assert!(result.is_ok()); // Should succeed with default config and existing certs
     }
 
     #[test]
