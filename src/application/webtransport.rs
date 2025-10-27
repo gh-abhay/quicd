@@ -403,7 +403,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
         assert_eq!(handler.context.conn_id, 1);
@@ -446,7 +446,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -465,7 +465,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -488,7 +488,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -510,7 +510,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, mut to_protocol_rx) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -544,7 +544,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -563,7 +563,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -585,7 +585,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -607,7 +607,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -629,7 +629,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -644,7 +644,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -659,7 +659,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -674,7 +674,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -689,7 +689,7 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
@@ -701,7 +701,7 @@ mod tests {
             data,
             fin: false,
         };
-        from_protocol_tx.send(message).unwrap();
+        _from_protocol_tx.send(message).unwrap();
 
         let result = handler.wait_for_connect().await;
         assert!(result.is_ok());
@@ -719,13 +719,13 @@ mod tests {
         init_buffer_pool(10);
         let context = create_test_context();
         let (to_protocol_tx, _) = mpsc::unbounded_channel();
-        let (from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
+        let (_from_protocol_tx, from_protocol_rx) = mpsc::unbounded_channel();
 
         let mut handler = WebTransportHandler::new(context, to_protocol_tx, from_protocol_rx);
 
         // Send connection closed message
         let message = ProtocolToApplication::ConnectionClosed { conn_id: 1 };
-        from_protocol_tx.send(message).unwrap();
+        _from_protocol_tx.send(message).unwrap();
 
         let result = handler.wait_for_connect().await;
         assert!(result.is_err());

@@ -839,14 +839,14 @@ mod tests {
 
     #[test]
     fn test_accept_new_connection_short_initial() {
-        let mut task = create_test_protocol_task();
+        let _task = create_test_protocol_task();
 
         // Create a short initial packet (less than MIN_CLIENT_INITIAL_LEN)
-        let mut packet = vec![0u8; quiche::MIN_CLIENT_INITIAL_LEN - 1];
+        let _packet = vec![0u8; quiche::MIN_CLIENT_INITIAL_LEN - 1];
         // We can't easily create a valid Header for testing, so we'll test the packet length check
         // by calling handle_incoming_packet with a short packet that would be parsed as Initial
 
-        let addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let _addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
 
         // Create a minimal initial packet that would pass header parsing but fail length check
         // This is hard to test precisely without mocking quiche, so we'll skip this specific test
@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn test_accept_new_connection_unsupported_version() {
-        let mut task = create_test_protocol_task();
+        let _task = create_test_protocol_task();
 
         // We can't easily create Header instances for testing unsupported versions
         // without complex mocking. This test would require mocking quiche::version_is_supported
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn test_accept_new_connection_non_initial() {
-        let mut task = create_test_protocol_task();
+        let _task = create_test_protocol_task();
 
         // We can't easily create Header instances for testing packet types
         // without complex mocking of quiche
