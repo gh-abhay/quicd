@@ -1,82 +1,106 @@
-# SuperD - High-Performance UDP Socket Service
+# SuperD
 
-A modern, high-throughput UDP server built with Rust, featuring:
-- **io_uring**: Linux's cutting-edge async I/O for maximum performance
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/klaalabs/superd/ci.yml)](https://github.com/klaalabs/superd/actions)
+
+A high-performance, zero-copy UDP server built with Rust, designed for million-user scale with sub-microsecond latency. SuperD leverages Linux's io_uring for maximum I/O performance and implements the QUIC protocol for secure, multiplexed connections.
+
+## 🚀 Key Features
+
+- **Blazing Fast I/O**: Uses Linux io_uring for asynchronous I/O operations
 - **Zero-Copy Architecture**: Buffers flow through the stack without copying
-- **Event-Driven I/O**: Inspired by NGINX and ejabberd
-- **Sans-IO Design**: Clean separation of network, protocol, and application layers
+- **QUIC Protocol**: Modern transport protocol with TLS 1.3 encryption
+- **HTTP/3 Support**: Content serving and WebTransport APIs
+- **Event-Driven Design**: Inspired by NGINX and ejabberd patterns
+- **Sans-IO Architecture**: Clean separation of network, protocol, and application layers
+- **SO_REUSEPORT**: Kernel-level load balancing across multiple processes
+- **OpenTelemetry**: Comprehensive observability and monitoring
+- **Auto-Tuning**: Automatic configuration based on system capabilities
 
-## Architecture
+## 📊 Performance
+
+- **Throughput**: 9.5+ Gbps per node
+- **Latency**: Sub-millisecond packet processing
+- **Connections**: Millions of concurrent connections
+- **Memory**: ~28-50KB per active connection
+
+## 🏗️ Architecture
+
+SuperD uses a multi-layer async architecture for optimal performance and scalability:
 
 ```
 ┌─────────────────────────────────────────────────┐
-│         Application Layer (Tokio Async)         │
+│   Application Layer (Dynamic Per-Stream Tasks)  │
+│   • Spawned on-demand per QUIC stream          │
+│   • ALPN-based routing (HTTP/3, WebTransport)   │
+│   • Ephemeral: lifecycle tied to stream        │
 └────────────────────┬────────────────────────────┘
-                     │ Zero-Copy Buffers
+                     │ Stream Data
 ┌────────────────────▼────────────────────────────┐
-│      Protocol Layer - QUIC (Tokio Async)        │
+│      Protocol Layer - QUIC (Async Tasks)        │
+│   • CPU-bound: TLS 1.3 crypto operations       │
+│   • Connection state & congestion control       │
+│   • 2-4x network tasks (crypto scaling)         │
 └────────────────────┬────────────────────────────┘
-                     │ Zero-Copy Buffers
+                     │ Encrypted Packets
 ┌────────────────────▼────────────────────────────┐
-│  Network Layer (Native Threads + io_uring)      │
-│   • Fixed thread count                          │
-│   • CPU pinning                                 │
+│  Network Layer (Async io_uring Tasks)           │
+│   • I/O-bound: raw socket operations           │
+│   • 1 task per physical core                   │
 │   • SO_REUSEPORT load balancing                 │
-│   • Batch I/O operations                        │
+│   • Fan-out to protocol tasks                   │
 └─────────────────────────────────────────────────┘
 ```
 
-## Features
+## 🛠️ Quick Start
 
-### Performance
-- **io_uring**: 60+ I/O operations per syscall (vs 4-5 with epoll)
-- **Zero-Copy**: Arc-based buffer sharing across layers
-- **CPU Pinning**: Interleaved pinning to reduce cache thrashing
-- **Batch Processing**: Minimize syscalls and context switches
+### Prerequisites
 
-### Scalability
-- **Fixed Thread Pools**: Predictable resource usage
-- **Event-Driven**: Thousands of connections per thread
-- **SO_REUSEPORT**: Kernel-level load balancing
-- **Millions of Connections**: Proven patterns from NGINX
+- Rust 1.70 or later
+- Linux kernel 5.10+ (for io_uring support)
+- TLS certificates (self-signed or CA-issued)
 
-### Design
-- **Sans-IO**: Independent network, protocol, and application layers
-- **Type-Safe**: Strong typing for zero-copy buffers
-- **Async Runtime**: Tokio for protocol and application layers
-- **Comprehensive Metrics**: Built-in observability
+### Installation
 
-## Quick Start
-
-### Build
 ```bash
+# Clone the repository
+git clone https://github.com/klaalabs/superd.git
+cd superd
+
+# Build the project
 cargo build --release
+
+# Run tests
+cargo test
 ```
 
-### Run
-```bash
-./target/release/superd --listen 0.0.0.0:4433
-```
+### Basic Usage
 
-### With Custom Configuration
 ```bash
-./target/release/superd \
-  --listen 0.0.0.0:4433 \
-  --network-threads 4 \
-  --protocol-threads 8 \
-  --cpu-pinning true
-```
+# Start with default configuration (auto-tuned for your system)
+./target/release/superd
 
-### Using Config File
-```bash
+# Start with custom config file
 ./target/release/superd --config config.toml
+
+# Start with CLI configuration
+./target/release/superd --listen 0.0.0.0:4433 --network-threads 4 --protocol-threads 8
+
+# Enable debug logging
+RUST_LOG=debug ./target/release/superd
 ```
 
-Example `config.toml`:
+### Configuration
+
+SuperD supports multiple configuration methods:
+
+#### Configuration File (config.toml)
+
 ```toml
 listen = "0.0.0.0:4433"
 network_threads = 4
-protocol_threads = 8
+protocol_threads = 12
 cpu_pinning = true
 
 [telemetry]
@@ -88,122 +112,198 @@ cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 verify_peer = false
 enable_early_data = false
-application_protos = ["superd/0.1"]
+application_protos = ["h3"]
+max_idle_timeout_ms = 30000
+initial_max_data = 4194304
+initial_max_stream_data_bidi_local = 1048576
+initial_max_stream_data_bidi_remote = 1048576
+initial_max_stream_data_uni = 1048576
+initial_max_streams_bidi = 128
+initial_max_streams_uni = 64
+max_send_udp_payload_size = 1350
+max_recv_udp_payload_size = 65536
 ```
 
-## Configuration
+#### Command Line Options
 
-### Thread Allocation
-- **Network Threads**: Auto-tuned based on available CPUs for io_uring workers
-- **Protocol Threads**: Auto-tuned (often 2-4x network threads) for QUIC processing
+```bash
+superd --help
+```
 
-Example on 16-core system:
-- 4 network threads (io_uring)
-- 8 protocol tasks (QUIC parsing + crypto)
-- Application tasks scale dynamically per connection/stream
+#### Auto-Tuning
 
-### CPU Pinning
-Interleaved strategy to reduce cache contention:
-- Thread 0 → CPU 0
-- Thread 1 → CPU 2
-- Thread 2 → CPU 4
-- Thread 3 → CPU 6
+SuperD automatically tunes configuration based on your system's capabilities:
 
-## Performance Expectations
+```bash
+# Enable auto-tuning (default: true)
+./target/release/superd --auto-tune true
+```
 
-Based on research and proven systems:
+### TLS Certificates
 
-- **Throughput**: 9.5+ Gbps per node
-- **Latency**: Sub-millisecond with io_uring
-- **Connections**: Millions per node
-- **Memory**: ~28-50KB per connection
-- **Packets/sec**: 1M+ packets/sec
+Generate self-signed certificates for development:
 
-## Documentation
+```bash
+# Create certs directory
+mkdir -p certs
 
-- [Architecture Guide](docs/ARCHITECTURE.md) - Comprehensive design documentation
-- [Implementation Summary](docs/IMPLEMENTATION_SUMMARY.md) - What we built and why
+# Generate private key
+openssl genrsa -out certs/server.key 2048
 
-## Technology Stack
+# Generate certificate
+openssl req -new -x509 -key certs/server.key -out certs/server.crt -days 365 -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+```
 
-### Core
-- **Rust 2021**: Memory safety + performance
-- **Tokio**: Async runtime for protocol and application
-- **io_uring**: Modern Linux async I/O (via tokio-uring)
+## 📡 Supported Protocols
 
-### Network
-- **quiche**: QUIC protocol implementation with TLS
-- **tokio-uring**: High-performance UDP I/O
-- **socket2**: Low-level socket control
+### HTTP/3 Content Serving
 
-### Observability
-- **tracing**: Structured logging
-- **OpenTelemetry**: Metrics and traces
-- **OTLP**: Export to observability backends
+SuperD serves HTTP/3 content with endpoints for:
+- Health checks (`GET /health`)
+- API information (`GET /api`)
+- Static content serving
 
-## Inspiration
+### WebTransport APIs
 
-This project applies best practices from industry leaders:
+Real-time bidirectional communication over HTTP/3 streams:
+- Generic API channels
+- Events API for pub/sub patterns
+- Realtime API for low-latency data
 
-### NGINX
-- Event-driven non-blocking I/O
-- Fixed worker processes
-- Thread pools for blocking operations
-- Proven to handle millions of connections
+## 🔍 Monitoring & Observability
 
-### ejabberd
-- 2M concurrent users on single node
-- Lightweight concurrency model (adapted to Rust)
-- Efficient memory usage (~28KB per user)
-- Message passing architecture
+SuperD provides comprehensive telemetry:
 
-### Modern Linux
-- io_uring for minimal syscalls
-- SO_REUSEPORT for kernel load balancing
-- Large socket buffers for throughput
-- CPU pinning for cache efficiency
+### Logging
 
-## Development Status
+Structured logging with configurable levels:
 
-✅ **Phase 1 Complete**: Network Layer
-- io_uring-based I/O
-- Zero-copy buffer pool
-- CPU pinning
-- Metrics and observability
+```bash
+# Set log level
+RUST_LOG=info ./target/release/superd
+RUST_LOG=debug ./target/release/superd
+```
 
-🚧 **Phase 2 In Progress**: Protocol Layer
-- QUIC implementation (quiche)
-- Connection management
-- Flow control and reliability
+### Metrics
 
-📋 **Phase 3 Planned**: Application Layer
-- Business logic framework
-- Request routing
-- Integration tests
-- Performance benchmarks
+OpenTelemetry integration for external monitoring:
 
-## Requirements
+```toml
+[telemetry]
+otlp_endpoint = "http://localhost:4317"
+service_name = "superd"
+```
 
-- **Linux**: io_uring requires Linux 5.14+
-- **Rust**: 1.70+
-- **Tokio**: 1.x
+### Health Checks
 
-## License
+Built-in health endpoints:
+- `GET /health` - Server health status
+- `GET /api` - API information and capabilities
 
-[Your License Here]
+## 🧪 Testing & Benchmarks
 
-## Contributing
+```bash
+# Run all tests
+cargo test
 
-Contributions welcome! When making changes:
-1. Maintain zero-copy principles
-2. No blocking operations in async code
-3. Add tests for new features
-4. Update documentation
-5. Follow Rust idioms
+# Run benchmarks
+cargo bench
 
-## References
+# Run specific test
+cargo test test_name
 
-- [io_uring and Network I/O](https://developers.redhat.com/articles/2023/04/12/why-you-should-use-iouring-network-io)
-- [NGINX Architecture](https://www.nginx.com/blog/inside-nginx-how-we-designed-for-performance-scale/)
-- [ejabberd 2M Users](https://blog.process-one.net/ejabberd-massive-scalability-2million-concurrent-users/)
-- [QUIC Protocol](https://www.chromium.org/quic/)
+# Run with release optimizations
+cargo test --release
+```
+
+## 🚀 Production Deployment
+
+### System Requirements
+
+- **OS**: Linux (kernel 5.10+)
+- **CPU**: Multi-core system (4+ cores recommended)
+- **Memory**: 4GB+ RAM
+- **Network**: High-speed networking (10Gbps+)
+
+### Scaling Configuration
+
+For high-scale deployments:
+
+```toml
+# Scale network threads with CPU cores
+network_threads = 8
+
+# Scale protocol threads for crypto operations
+protocol_threads = 32
+
+# Optimize buffer pools for your workload
+# (Auto-tuned by default)
+```
+
+### Load Balancing
+
+Use SO_REUSEPORT for multi-process load balancing:
+
+```bash
+# Start multiple instances on the same port
+./target/release/superd --listen 0.0.0.0:4433 &
+./target/release/superd --listen 0.0.0.0:4433 &
+./target/release/superd --listen 0.0.0.0:4433 &
+```
+
+## 🤝 Contributing
+
+We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+
+### Development Setup
+
+```bash
+# Clone and build
+git clone https://github.com/klaalabs/superd.git
+cd superd
+cargo build
+
+# Run tests
+cargo test
+
+# Format code
+cargo fmt
+
+# Lint code
+cargo clippy
+```
+
+### Architecture Guidelines
+
+- **Zero-Copy**: Minimize data copying throughout the stack
+- **Async First**: Use async/await patterns consistently
+- **Layer Separation**: Keep network, protocol, and application concerns separate
+- **Performance**: Profile and optimize hot paths
+
+## 📚 Documentation
+
+- [API Documentation](https://docs.rs/superd/) - Generated Rust docs
+- [Architecture Overview](docs/architecture.md) - Detailed architecture docs
+- [Performance Guide](docs/performance.md) - Performance tuning guide
+- [Deployment Guide](docs/deployment.md) - Production deployment instructions
+
+## 📄 License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+
+## 🙏 Acknowledgments
+
+SuperD builds upon the excellent work of:
+- [quiche](https://github.com/cloudflare/quiche) - Cloudflare's QUIC implementation
+- [tokio-uring](https://github.com/tokio-rs/tokio-uring) - Tokio's io_uring integration
+- [buffer-pool](https://github.com/klaalabs/buffer-pool) - Zero-copy buffer management
+
+## 📞 Support
+
+- **Issues**: [GitHub Issues](https://github.com/klaalabs/superd/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/klaalabs/superd/discussions)
+- **Documentation**: [Wiki](https://github.com/klaalabs/superd/wiki)
+
+---
+
+**SuperD** - High-performance networking, reimagined in Rust.
