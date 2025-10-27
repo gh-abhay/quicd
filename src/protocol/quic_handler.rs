@@ -327,6 +327,11 @@ impl QuicProtocolTask {
                     );
                 } else {
                     state.sent_new_connection = true;
+
+                    // Record connection established metric
+                    if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
+                        crate::telemetry::record_event(crate::telemetry::MetricsEvent::ConnectionEstablished);
+                    }
                 }
             }
         }
@@ -351,6 +356,11 @@ impl QuicProtocolTask {
                         );
                     } else {
                         state.active_streams.insert(stream_id);
+
+                        // Record stream opened metric
+                        if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
+                            crate::telemetry::record_event(crate::telemetry::MetricsEvent::StreamOpened);
+                        }
                     }
                 }
             }
@@ -384,6 +394,10 @@ impl QuicProtocolTask {
                         }
 
                         if fin {
+                            // Record stream closed metric
+                            if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
+                                crate::telemetry::record_event(crate::telemetry::MetricsEvent::StreamClosed);
+                            }
                             break;
                         }
                     }
@@ -393,6 +407,11 @@ impl QuicProtocolTask {
                             "Protocol task {} stream recv error on conn {} stream {}: {err:?}",
                             self.id, state.conn_id, stream_id
                         );
+
+                        // Record protocol error metric
+                        if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
+                            crate::telemetry::record_event(crate::telemetry::MetricsEvent::ProtocolError);
+                        }
                         break;
                     }
                 }
@@ -490,6 +509,11 @@ impl QuicProtocolTask {
                     self.connection_registry
                         .remove_connection(&timer_entry.dcid);
                     self.active_connections = self.connection_registry.active_connection_count();
+
+                    // Record connection closed metric
+                    if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
+                        crate::telemetry::record_event(crate::telemetry::MetricsEvent::ConnectionClosed);
+                    }
                 } else {
                     // Connection is still active, reschedule next timer
                     if let Some(timeout) = entry.state.conn.timeout() {
@@ -525,6 +549,11 @@ impl QuicProtocolTask {
             }
             // Remove from registry
             self.connection_registry.remove_connection(&key);
+
+            // Record connection closed metric during shutdown
+            if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
+                crate::telemetry::record_event(crate::telemetry::MetricsEvent::ConnectionClosed);
+            }
         }
     }
 

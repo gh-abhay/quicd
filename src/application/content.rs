@@ -166,6 +166,13 @@ impl ContentHandler {
 
         // Removed per-request debug logging for performance - use metrics instead
 
+        // Record HTTP request metric
+        if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
+            crate::telemetry::record_event(crate::telemetry::MetricsEvent::ApplicationRequest {
+                endpoint: path.to_string(),
+            });
+        }
+
         // Check if this is a WebTransport CONNECT request
         if method == "CONNECT"
             && headers

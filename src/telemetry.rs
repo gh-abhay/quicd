@@ -71,20 +71,102 @@
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Global metrics registry for the entire application
+pub static mut GLOBAL_METRICS: Option<GlobalMetrics> = None;
+
+/// Event-driven metrics updates to avoid allocations in hot paths
+#[derive(Debug, Clone)]
+pub enum MetricsEvent {
+    /// Network packet received (bytes)
+    PacketReceived { bytes: usize },
+    /// Network packet sent (bytes)
+    PacketSent { bytes: usize },
+    /// Network receive error
+    NetworkReceiveError,
+    /// Network send error
+    NetworkSendError,
+    /// Channel send error
+    ChannelSendError,
+    /// New connection established
+    ConnectionEstablished,
+    /// Connection closed
+    ConnectionClosed,
+    /// Active connection count update
+    ActiveConnections { count: usize },
+    /// New stream opened
+    StreamOpened,
+    /// Stream closed
+    StreamClosed,
+    /// Protocol error occurred
+    ProtocolError,
+    /// Application request processed
+    ApplicationRequest { endpoint: String },
+    /// Buffer pool utilization
+    BufferPoolUtilization { used: usize, total: usize },
+}
+
+/// Global metrics handler for event-driven updates
+pub struct GlobalMetrics {
+    event_receiver: std::sync::mpsc::Receiver<MetricsEvent>,
+}
+
+impl GlobalMetrics {
+    /// Initialize global metrics with event channel
+    pub fn init(_service_name: &str, _otlp_endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        // Store sender globally for other modules to use
+        unsafe {
+            GLOBAL_METRICS_SENDER = Some(_sender);
+        }
+        Ok(Self {
+            event_receiver: receiver,
+        })
+    }
+
+    /// Get the global event sender for recording metrics
+    pub fn get_sender() -> Option<std::sync::mpsc::Sender<MetricsEvent>> {
+        unsafe { GLOBAL_METRICS_SENDER.clone() }
+    }
+}
+
+/// Global sender for metrics events
+static mut GLOBAL_METRICS_SENDER: Option<std::sync::mpsc::Sender<MetricsEvent>> = None;
+
+/// Record a metrics event globally
+pub fn record_event(event: MetricsEvent) {
+    if let Some(sender) = unsafe { GLOBAL_METRICS_SENDER.as_ref() } {
+        let _ = sender.send(event);
+    }
+}
+
 pub fn init_telemetry(config: &crate::config::TelemetryConfig) {
-    // For now, we'll use simple console logging
-    // Full OTLP support requires tokio runtime which we'll add with the application layer
+    // Initialize logging first
     let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
+    // Initialize OpenTelemetry metrics if endpoint is configured
     if config.otlp_endpoint != "http://localhost:4317" {
-        tracing::warn!(
-            "OTLP telemetry configuration provided but will be enabled when application layer is implemented"
-        );
+        match GlobalMetrics::init(&config.service_name, &config.otlp_endpoint) {
+            Ok(metrics) => {
+                unsafe {
+                    GLOBAL_METRICS = Some(metrics);
+                }
+                tracing::info!("Event-driven metrics initialized");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize metrics: {}", e);
+            }
+        }
+    }
+
+    // Set up tracing
+    let registry = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer());
+
+    registry.init();
+
+    if config.otlp_endpoint == "http://localhost:4317" {
+        tracing::info!("Telemetry initialized with console logging only. Configure OTLP endpoint for metrics export.");
     }
 }

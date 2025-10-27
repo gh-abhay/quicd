@@ -385,7 +385,7 @@ pub fn start_network_layer(
 fn start_metrics_task(metrics: SharedMetrics, mut shutdown_rx: broadcast::Receiver<()>) {
     tokio_uring::spawn(async move {
         // Report initial metrics
-        let stats = metrics.get_stats();
+        let stats = metrics.snapshot();
         info!("Network Layer Metrics: {}", stats);
 
         // Wait for shutdown

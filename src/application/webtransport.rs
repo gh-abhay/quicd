@@ -128,6 +128,13 @@ impl WebTransportHandler {
             self.context.conn_id, self.context.stream_id
         );
 
+        // Record WebTransport session established metric
+        if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
+            crate::telemetry::record_event(crate::telemetry::MetricsEvent::ApplicationRequest {
+                endpoint: "webtransport_session".to_string(),
+            });
+        }
+
         Ok(())
     }
 
