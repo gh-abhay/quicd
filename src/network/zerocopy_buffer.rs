@@ -27,19 +27,18 @@
 //!
 //! // Get buffer from pool
 //! let pool = get_buffer_pool();
-//! let mut buffer = pool.acquire();
+//! let mut buffer = pool.get_empty();
 //!
 //! // Fill with data
-//! buffer.extend_from_slice(b"hello world");
+//! let data = b"hello world";
+//! buffer.expand(data.len());
+//! buffer[..data.len()].copy_from_slice(data);
 //!
-//! // Freeze for zero-copy transfer (consumes buffer)
-//! let frozen = buffer.freeze();
+//! // Convert to ConsumeBuffer for zero-copy transfer
+//! let consume_buffer = buffer.into_inner();
 //!
-//! // Clone is cheap (Arc increment)
-//! let cloned = frozen.clone();
-//!
-//! // Frozen buffer is automatically cleaned up when dropped
-//! // No need to return it to pool - it's just ConsumeBuffer
+//! // ConsumeBuffer provides zero-copy access to the data
+//! // and is automatically cleaned up when dropped
 //! ```
 
 use buffer_pool::{Pool, Pooled};

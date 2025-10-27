@@ -71,10 +71,13 @@
 //!
 //! let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
 //!
+//! let (_to_application_tx, _to_application_rx) = mpsc::unbounded_channel();
+//!
 //! start_protocol_layer(
 //!     &config,
 //!     network_to_protocol_receivers,
 //!     protocol_to_network_senders,
+//!     _to_application_tx,
 //!     shutdown_tx,
 //! ).unwrap();
 //! # }
