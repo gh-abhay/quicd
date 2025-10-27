@@ -33,10 +33,9 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::{
-    content::ContentHandler,
-    webtransport::WebTransportHandler,
-    ApplicationContext, ApplicationError, ApplicationProtocol, ApplicationResult,
-    FromProtocolReceiver, ToProtocolSender,
+    content::ContentHandler, webtransport::WebTransportHandler, ApplicationContext,
+    ApplicationError, ApplicationProtocol, ApplicationResult, FromProtocolReceiver,
+    ToProtocolSender,
 };
 use crate::messages::ProtocolToApplication;
 

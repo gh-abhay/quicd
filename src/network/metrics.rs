@@ -77,11 +77,14 @@ impl NetworkMetrics {
     #[inline]
     pub fn record_packet_received(&self, bytes: usize) {
         self.packets_received.fetch_add(1, Ordering::Relaxed);
-        self.bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.bytes_received
+            .fetch_add(bytes as u64, Ordering::Relaxed);
 
         // Send event to global metrics if available
         if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
-            crate::telemetry::record_event(crate::telemetry::MetricsEvent::PacketReceived { bytes });
+            crate::telemetry::record_event(crate::telemetry::MetricsEvent::PacketReceived {
+                bytes,
+            });
         }
     }
 

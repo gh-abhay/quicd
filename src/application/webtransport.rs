@@ -264,7 +264,7 @@ impl WebTransportHandler {
     async fn handle_new_channel(&mut self, stream_id: u64) -> ApplicationResult<()> {
         // Determine channel type and API endpoint
         let channel = ApiChannel {
-            endpoint: "/api/default".to_string(),     // Default endpoint
+            endpoint: "/api/default".to_string(), // Default endpoint
         };
 
         self.session_state.channels.insert(stream_id, channel);

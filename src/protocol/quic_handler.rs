@@ -5,11 +5,7 @@
 //! cryptography, maintains congestion-control state, and exchanges encrypted
 //! datagrams with the network layer.
 
-use std::{
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
 use quiche::{self, ConnectionId, Header};
@@ -330,7 +326,9 @@ impl QuicProtocolTask {
 
                     // Record connection established metric
                     if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
-                        crate::telemetry::record_event(crate::telemetry::MetricsEvent::ConnectionEstablished);
+                        crate::telemetry::record_event(
+                            crate::telemetry::MetricsEvent::ConnectionEstablished,
+                        );
                     }
                 }
             }
@@ -356,11 +354,16 @@ impl QuicProtocolTask {
                         );
                     } else {
                         state.active_streams.insert(stream_id);
-                        state.stream_start_times.insert(stream_id, std::time::Instant::now());
+                        state
+                            .stream_start_times
+                            .insert(stream_id, std::time::Instant::now());
 
                         // Record stream opened metric
-                        if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
-                            crate::telemetry::record_event(crate::telemetry::MetricsEvent::StreamOpened);
+                        if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() }
+                        {
+                            crate::telemetry::record_event(
+                                crate::telemetry::MetricsEvent::StreamOpened,
+                            );
                         }
                     }
                 }
@@ -396,12 +399,18 @@ impl QuicProtocolTask {
 
                         if fin {
                             // Record stream closed metric
-                            if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
-                                let duration_ms = state.stream_start_times.get(&stream_id)
+                            if let Some(_metrics) =
+                                unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() }
+                            {
+                                let duration_ms = state
+                                    .stream_start_times
+                                    .get(&stream_id)
                                     .map(|start| start.elapsed().as_millis() as u64)
                                     .unwrap_or(0);
                                 state.stream_start_times.remove(&stream_id);
-                                crate::telemetry::record_event(crate::telemetry::MetricsEvent::StreamClosed { duration_ms });
+                                crate::telemetry::record_event(
+                                    crate::telemetry::MetricsEvent::StreamClosed { duration_ms },
+                                );
                             }
                             break;
                         }
@@ -414,10 +423,13 @@ impl QuicProtocolTask {
                         );
 
                         // Record protocol error metric
-                        if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
-                            crate::telemetry::record_event(crate::telemetry::MetricsEvent::ProtocolError {
-                                error_type: crate::telemetry::ProtocolErrorType::Stream
-                            });
+                        if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() }
+                        {
+                            crate::telemetry::record_event(
+                                crate::telemetry::MetricsEvent::ProtocolError {
+                                    error_type: crate::telemetry::ProtocolErrorType::Stream,
+                                },
+                            );
                         }
                         break;
                     }
@@ -520,7 +532,9 @@ impl QuicProtocolTask {
                     // Record connection closed metric
                     if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
                         let duration_ms = entry.state.start_time.elapsed().as_millis() as u64;
-                        crate::telemetry::record_event(crate::telemetry::MetricsEvent::ConnectionClosed { duration_ms });
+                        crate::telemetry::record_event(
+                            crate::telemetry::MetricsEvent::ConnectionClosed { duration_ms },
+                        );
                     }
                 } else {
                     // Connection is still active, reschedule next timer
@@ -561,7 +575,9 @@ impl QuicProtocolTask {
             // Record connection closed metric during shutdown
             if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
                 let duration_ms = entry.state.start_time.elapsed().as_millis() as u64;
-                crate::telemetry::record_event(crate::telemetry::MetricsEvent::ConnectionClosed { duration_ms });
+                crate::telemetry::record_event(crate::telemetry::MetricsEvent::ConnectionClosed {
+                    duration_ms,
+                });
             }
         }
     }
@@ -722,9 +738,7 @@ pub fn start_protocol_layer(
 mod tests {
     use super::*;
     use crate::{
-        config::Config,
-        connection_registry::ConnectionRegistry,
-        messages::ProtocolToNetwork,
+        config::Config, connection_registry::ConnectionRegistry, messages::ProtocolToNetwork,
         network::zerocopy_buffer::get_buffer_pool,
     };
     use tokio::sync::{broadcast, mpsc};

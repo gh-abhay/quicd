@@ -148,7 +148,10 @@ pub struct GlobalMetrics {
 
 impl GlobalMetrics {
     /// Initialize global metrics with event channel
-    pub fn init(_service_name: &str, _otlp_endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn init(
+        _service_name: &str,
+        _otlp_endpoint: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (_sender, receiver) = std::sync::mpsc::channel();
         // Store sender globally for other modules to use
         unsafe {
