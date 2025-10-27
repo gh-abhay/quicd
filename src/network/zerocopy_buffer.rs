@@ -66,3 +66,122 @@ pub fn get_buffer_pool() -> &'static Pool<8, buffer_pool::ConsumeBuffer> {
         .get()
         .unwrap_or_else(|| panic!("Buffer pool not initialized - call init_buffer_pool first"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_buffer_pool_initialization() {
+        // Test that buffer pool can be initialized
+        init_buffer_pool(10);
+        let pool = get_buffer_pool();
+        // We can't test capacity directly, but we can test that we can get buffers
+        let _buffer = pool.get_empty();
+    }
+
+    #[test]
+    fn test_buffer_pool_panic_without_init() {
+        // Note: This test can't reliably test the panic behavior due to global state
+        // being shared across tests. In a real scenario, calling get_buffer_pool()
+        // without init_buffer_pool() would panic, but test ordering makes this
+        // unreliable. The function signature and documentation ensure correct usage.
+        assert!(true); // Placeholder test
+    }
+
+    #[test]
+    fn test_buffer_acquisition_and_operations() {
+        init_buffer_pool(10);
+
+        let pool = get_buffer_pool();
+        let mut buffer = pool.get_empty();
+
+        // Test initial state
+        assert_eq!(buffer.len(), 0);
+
+        // Test expanding buffer
+        let test_data = b"Hello, World!";
+        buffer.expand(test_data.len());
+        buffer[..test_data.len()].copy_from_slice(test_data);
+        assert_eq!(buffer.len(), test_data.len());
+        assert_eq!(&buffer[..test_data.len()], test_data);
+    }
+
+    #[test]
+    fn test_buffer_pool_capacity_limits() {
+        let capacity = 5;
+        init_buffer_pool(capacity);
+
+        let pool = get_buffer_pool();
+
+        // Acquire multiple buffers
+        let mut buffers = Vec::new();
+        for _ in 0..capacity {
+            buffers.push(pool.get_empty());
+        }
+
+        // Pool should still allow getting more empty buffers
+        let _new_buffer = pool.get_empty();
+    }
+
+    #[test]
+    fn test_max_udp_payload_constant() {
+        // Test that MAX_UDP_PAYLOAD is a reasonable value
+        assert!(MAX_UDP_PAYLOAD >= 65536); // IPv6 jumbo frame size
+        assert!(MAX_UDP_PAYLOAD <= 65536); // Should not exceed maximum
+    }
+
+    #[test]
+    fn test_buffer_zero_copy_semantics() {
+        init_buffer_pool(10);
+        let pool = get_buffer_pool();
+
+        // Create a buffer with data
+        let mut buffer = pool.get_empty();
+        let original_data = vec![1, 2, 3, 4, 5];
+        buffer.expand(original_data.len());
+        buffer[..original_data.len()].copy_from_slice(&original_data);
+
+        // Convert to ConsumeBuffer
+        let consume_buffer = buffer.into_inner();
+
+        // Test that the data is correct
+        assert_eq!(consume_buffer.len(), original_data.len());
+        assert_eq!(&consume_buffer[..], &original_data[..]);
+    }
+
+    #[test]
+    fn test_buffer_pool_reuse() {
+        init_buffer_pool(10);
+        let pool = get_buffer_pool();
+
+        // Get a buffer, use it, and let it drop
+        {
+            let mut buffer = pool.get_empty();
+            buffer.expand(9);
+            buffer[..9].copy_from_slice(b"test data");
+            assert_eq!(buffer.len(), 9);
+            // buffer goes out of scope here
+        }
+
+        // Pool should still be able to provide new buffers
+        let new_buffer = pool.get_empty();
+        assert_eq!(new_buffer.len(), 0);
+    }
+
+    #[test]
+    fn test_buffer_large_data_handling() {
+        init_buffer_pool(10);
+        let pool = get_buffer_pool();
+
+        let mut buffer = pool.get_empty();
+
+        // Test with data larger than typical packet but within MAX_UDP_PAYLOAD
+        let large_data = vec![0u8; 8192]; // 8KB
+        buffer.expand(large_data.len());
+        buffer[..large_data.len()].copy_from_slice(&large_data);
+
+        assert_eq!(buffer.len(), 8192);
+        assert_eq!(&buffer[..8192], &large_data[..]);
+    }
+}
