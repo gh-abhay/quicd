@@ -31,6 +31,10 @@ pub struct SharedConnectionState {
     pub active_streams: HashSet<u64>,
     /// Connection aliases (different DCIDs that map to this connection)
     pub aliases: Vec<Vec<u8>>,
+    /// Connection start time for duration tracking
+    pub start_time: Instant,
+    /// Stream start times for duration tracking
+    pub stream_start_times: std::collections::HashMap<u64, Instant>,
 }
 
 /// Entry in the shared connection registry
@@ -223,6 +227,8 @@ impl SharedConnectionState {
             sent_new_connection: false,
             active_streams: HashSet::new(),
             aliases: Vec::new(),
+            start_time: Instant::now(),
+            stream_start_times: std::collections::HashMap::new(),
         };
         state.refresh_timeout();
         state

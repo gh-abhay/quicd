@@ -40,6 +40,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use quiche::h3::{self, NameValue};
 use tracing::{debug, info, warn};
@@ -56,6 +57,7 @@ pub struct WebTransportHandler {
     to_protocol: ToProtocolSender,
     from_protocol: FromProtocolReceiver,
     session_state: WebTransportSession,
+    session_start: Instant,
 }
 
 #[derive(Debug)]
@@ -87,6 +89,7 @@ impl WebTransportHandler {
                 channels: HashMap::new(),
                 established: false,
             },
+            session_start: Instant::now(),
         }
     }
 
@@ -107,6 +110,15 @@ impl WebTransportHandler {
             "WebTransport handler completed for conn {} stream {}",
             self.context.conn_id, self.context.stream_id
         );
+
+        // Record WebTransport session completion metric
+        if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
+            let duration = self.session_start.elapsed().as_millis() as u64;
+            crate::telemetry::record_event(crate::telemetry::MetricsEvent::ApplicationRequest {
+                endpoint: "webtransport_session".to_string(),
+                duration_ms: duration,
+            });
+        }
 
         Ok(())
     }
@@ -132,6 +144,7 @@ impl WebTransportHandler {
         if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
             crate::telemetry::record_event(crate::telemetry::MetricsEvent::ApplicationRequest {
                 endpoint: "webtransport_session".to_string(),
+                duration_ms: 0, // Session just started
             });
         }
 

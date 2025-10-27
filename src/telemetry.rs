@@ -85,24 +85,60 @@ pub enum MetricsEvent {
     NetworkReceiveError,
     /// Network send error
     NetworkSendError,
-    /// Channel send error
+    /// Channel send error (metrics channel full)
     ChannelSendError,
     /// New connection established
     ConnectionEstablished,
-    /// Connection closed
-    ConnectionClosed,
-    /// Active connection count update
-    ActiveConnections { count: usize },
+    /// Connection closed with duration
+    ConnectionClosed { duration_ms: u64 },
     /// New stream opened
     StreamOpened,
-    /// Stream closed
-    StreamClosed,
-    /// Protocol error occurred
-    ProtocolError,
+    /// Stream closed with duration
+    StreamClosed { duration_ms: u64 },
+    /// Protocol error by category
+    ProtocolError { error_type: ProtocolErrorType },
+    /// QUIC handshake completed successfully
+    HandshakeCompleted { duration_ms: u64 },
+    /// QUIC handshake failed
+    HandshakeFailed,
+    /// Retransmission occurred (packets)
+    Retransmission { packets: usize },
     /// Application request processed
-    ApplicationRequest { endpoint: String },
+    ApplicationRequest { endpoint: String, duration_ms: u64 },
+    /// Memory usage per connection (KB)
+    ConnectionMemoryUsage { conn_id: u64, memory_kb: u64 },
+    /// Queue depth for inter-layer communication
+    QueueDepth { layer: LayerType, depth: usize },
     /// Buffer pool utilization
     BufferPoolUtilization { used: usize, total: usize },
+}
+
+/// Protocol error categories for better classification
+#[derive(Debug, Clone, Copy)]
+pub enum ProtocolErrorType {
+    /// TLS handshake errors
+    Handshake,
+    /// Transport-level errors (congestion, timeouts)
+    Transport,
+    /// Stream-level errors
+    Stream,
+    /// Application-level errors
+    Application,
+    /// Connection-level errors
+    Connection,
+    /// Unknown/other errors
+    Other,
+}
+
+/// Layer types for queue depth monitoring
+#[derive(Debug, Clone, Copy)]
+pub enum LayerType {
+    /// Network to Protocol queue
+    NetworkToProtocol,
+    /// Protocol to Application queue
+    ProtocolToApplication,
+    /// Application to Protocol queue
+    ApplicationToProtocol,
 }
 
 /// Global metrics handler for event-driven updates

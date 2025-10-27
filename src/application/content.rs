@@ -63,6 +63,7 @@ pub struct ContentHandler {
     context: ApplicationContext,
     to_protocol: ToProtocolSender,
     from_protocol: FromProtocolReceiver,
+    request_start: std::time::Instant,
 }
 
 impl ContentHandler {
@@ -75,6 +76,7 @@ impl ContentHandler {
             context,
             to_protocol,
             from_protocol,
+            request_start: std::time::Instant::now(),
         }
     }
 
@@ -166,10 +168,11 @@ impl ContentHandler {
 
         // Removed per-request debug logging for performance - use metrics instead
 
-        // Record HTTP request metric
+        // Record HTTP request start metric
         if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
             crate::telemetry::record_event(crate::telemetry::MetricsEvent::ApplicationRequest {
                 endpoint: path.to_string(),
+                duration_ms: 0, // Placeholder, actual duration recorded on completion
             });
         }
 
@@ -322,6 +325,15 @@ impl ContentHandler {
                     fin: true,
                 })
                 .map_err(|e| ApplicationError::ChannelError(e.to_string()))?;
+        }
+
+        // Record request completion with duration
+        if let Some(_metrics) = unsafe { crate::telemetry::GLOBAL_METRICS.as_ref() } {
+            let duration_ms = self.request_start.elapsed().as_millis() as u64;
+            crate::telemetry::record_event(crate::telemetry::MetricsEvent::ApplicationRequest {
+                endpoint: "request_completed".to_string(), // Could be improved to track actual endpoint
+                duration_ms,
+            });
         }
 
         Ok(())
