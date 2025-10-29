@@ -22,11 +22,8 @@ fn main() -> anyhow::Result<()> {
 
     // Create tokio runtime for non-critical async tasks (telemetry, future app logic)
     info!("Creating tokio runtime for async tasks");
-    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2) // Small runtime, just for telemetry and app tasks
-        .thread_name("tokio-worker")
-        .enable_all()
-        .build()?;
+    let tokio_runtime = runtime::create_runtime(&config.runtime)
+        .with_context(|| "failed to create tokio runtime")?;
 
     // Get runtime handle for explicit task spawning
     let runtime_handle = tokio_runtime.handle().clone();
