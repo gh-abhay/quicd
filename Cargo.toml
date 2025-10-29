@@ -1,41 +1,4 @@
-[package]
-name = "superd"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-socket2 = "0.5"
-clap = { version = "4.0", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
-crossbeam-channel = "0.5"
-bytes = "1.0"
-quiche = { version = "0.24", features = ["boringssl-vendored"] }
-tokio-quiche = { version = "0.10", features = ["zero-copy"] }
-buffer-pool = "0.1"
-datagram-socket = "0.5"
-rand = "0.8"
-opentelemetry = "0.23"
-opentelemetry_sdk = { version = "0.23", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.16", features = ["grpc-tonic"] }
-tracing = "0.1"
-tracing-opentelemetry = "0.24"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-num_cpus = "1.16"
-sysinfo = "0.30"
-core_affinity = "0.8"
-parking_lot = "0.12"
-once_cell = "1.19"
-libc = "0.2"
-thiserror = "1.0"
-anyhow = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "signal", "net"] }
-tokio-uring = "0.5"
-ctrlc = "3.4"
-dashmap = "6.1"
-hex = "0.4"
-
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-tempfile = "3.0"
+[workspace]
+members = ["quicd", "quicd-x", "quicd-h3", "quicd-moq"]
+resolver = "2"
 
