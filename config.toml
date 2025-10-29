@@ -2,6 +2,15 @@ host = "0.0.0.0"
 port = 3000
 log_level = "info"
 
+[runtime]
+# Tokio runtime configuration for non-critical async tasks
+# This runtime is used for telemetry, signal handling, and future app-layer tasks
+# Network I/O workers run on native threads, not on this runtime
+worker_threads = 2
+max_blocking_threads = 8
+thread_name = "tokio-worker"
+thread_stack_size = 2097152  # 2 MB
+
 [telemetry]
 otlp_endpoint = "http://localhost:4317"
 service_name = "quicd"
