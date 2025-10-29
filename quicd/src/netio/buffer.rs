@@ -125,7 +125,10 @@ impl WorkerBuffer {
     /// Called by io_uring completion handler after recvmsg completes.
     #[inline]
     pub fn set_received_len(&mut self, len: usize) {
-        debug_assert!(len <= self.inner.len(), "received length exceeds buffer capacity");
+        debug_assert!(
+            len <= self.inner.len(),
+            "received length exceeds buffer capacity"
+        );
         self.len = len;
     }
 
