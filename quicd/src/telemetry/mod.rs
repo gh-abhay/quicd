@@ -52,11 +52,15 @@ pub use metrics::{record_metric, start_metrics_task, MetricsEvent, MetricsHandle
 /// # Arguments
 ///
 /// * `config` - Telemetry configuration
+/// * `runtime_handle` - Tokio runtime handle for spawning tasks
 ///
 /// # Returns
 ///
 /// Handle to the metrics task for graceful shutdown
-pub async fn init_telemetry(config: &TelemetryConfig) -> Result<MetricsHandle> {
+pub async fn init_telemetry(
+    config: &TelemetryConfig,
+    runtime_handle: &tokio::runtime::Handle,
+) -> Result<MetricsHandle> {
     // Initialize logging
     init_logging(&config.service_name)?;
 
@@ -68,7 +72,7 @@ pub async fn init_telemetry(config: &TelemetryConfig) -> Result<MetricsHandle> {
             interval_secs = config.export_interval_secs,
             "Starting event-driven metrics system"
         );
-        start_metrics_task(config).await?
+        start_metrics_task(config, runtime_handle).await?
     } else {
         tracing::warn!("Metrics collection is disabled");
         MetricsHandle::disabled()
