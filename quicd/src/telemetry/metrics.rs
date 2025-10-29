@@ -490,11 +490,15 @@ pub fn record_metric(event: MetricsEvent) {
 /// # Arguments
 ///
 /// * `config` - Telemetry configuration
+/// * `runtime_handle` - Tokio runtime handle for spawning the task
 ///
 /// # Returns
 ///
 /// Handle to the metrics task for graceful shutdown
-pub async fn start_metrics_task(config: &TelemetryConfig) -> Result<MetricsHandle> {
+pub async fn start_metrics_task(
+    config: &TelemetryConfig,
+    runtime_handle: &tokio::runtime::Handle,
+) -> Result<MetricsHandle> {
     // Create channel for metrics events
     // Using crossbeam_channel::unbounded for:
     // - Send + Sync receiver (std::sync::mpsc::Receiver is !Sync)
@@ -533,8 +537,8 @@ pub async fn start_metrics_task(config: &TelemetryConfig) -> Result<MetricsHandl
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
-    // Spawn metrics processing task
-    let task_handle = tokio::spawn(async move {
+    // Spawn metrics processing task on the provided runtime
+    let task_handle = runtime_handle.spawn(async move {
         tracing::info!("Metrics collection task started");
 
         // Pre-allocate batch buffer for efficiency
