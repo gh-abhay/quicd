@@ -1,6 +1,13 @@
 host = "0.0.0.0"
 port = 3000
-log_level = "debug"
+log_level = "info"
+
+[telemetry]
+otlp_endpoint = "http://localhost:4317"
+service_name = "quicd"
+enable_metrics = true
+enable_tracing = false
+export_interval_secs = 60
 
 [netio]
 workers = 2

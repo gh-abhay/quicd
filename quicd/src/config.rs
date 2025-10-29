@@ -2,7 +2,8 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use config::Config as ConfigLoader;
 use serde::{Deserialize, Serialize};
 
-use crate::netio::config::NetIoConfig;
+use crate::netio::NetIoConfig;
+use crate::telemetry::TelemetryConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
@@ -56,6 +57,11 @@ pub struct Config {
     #[clap(skip)]
     #[serde(default)]
     pub netio: NetIoConfig,
+
+    /// Telemetry configuration
+    #[clap(skip)]
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 pub fn load_config() -> anyhow::Result<Config> {
@@ -67,8 +73,9 @@ pub fn load_config() -> anyhow::Result<Config> {
         port: 8080,
         log_level: "info".to_string(),
         config_file: cli.config_file.clone(),
-    runtime: RuntimeConfig::default(),
-    netio: NetIoConfig::default(),
+        runtime: RuntimeConfig::default(),
+        netio: NetIoConfig::default(),
+        telemetry: TelemetryConfig::default(),
     };
 
     // Load config from file and env

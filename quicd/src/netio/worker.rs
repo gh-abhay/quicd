@@ -9,6 +9,7 @@
 use super::buffer::{UringBuffer, MAX_UDP_PAYLOAD};
 use super::config::NetIoConfig;
 use super::socket::bind_udp_socket;
+use crate::telemetry::{record_metric, MetricsEvent};
 use anyhow::Result;
 use quiche::RecvInfo;
 use std::io;
@@ -16,7 +17,7 @@ use std::net::SocketAddr;
 use tokio::select;
 use tokio::sync::broadcast;
 use tokio_uring::net::UdpSocket;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 /// Network worker task - purely event-driven with async/await
 pub struct NetworkWorker {
@@ -60,6 +61,9 @@ impl NetworkWorker {
             "Network worker starting event loop"
         );
 
+        // Record worker started
+        record_metric(MetricsEvent::WorkerStarted);
+
         // Extract fields to avoid borrow checker issues in select!
         let mut socket = self.socket;
         let local_addr = self.local_addr;
@@ -72,15 +76,20 @@ impl NetworkWorker {
                 recv_result = recv_packet(&mut socket) => {
                     match recv_result {
                         Ok((buffer, peer, bytes_read)) => {
+                            // Record packet received metric
+                            record_metric(MetricsEvent::PacketReceived { bytes: bytes_read });
                             handle_ingress(worker_id, local_addr, buffer, peer, bytes_read);
                         }
                         Err(e) => {
                             if e.kind() != io::ErrorKind::WouldBlock {
-                                warn!(
+                                // Log critical network errors only
+                                error!(
                                     worker_id,
                                     error = %e,
                                     "UDP receive error"
                                 );
+                                // Record network error metric
+                                record_metric(MetricsEvent::NetworkReceiveError);
                             }
                         }
                     }
@@ -97,6 +106,9 @@ impl NetworkWorker {
         }
 
         info!(worker_id, "Network worker shutting down");
+
+        // Record worker stopped
+        record_metric(MetricsEvent::WorkerStopped);
     }
 }
 
