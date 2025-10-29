@@ -1,61 +1,85 @@
 mod netio;
 mod config;
 mod runtime;
+mod telemetry;
 
 use anyhow::Context;
 use std::net::SocketAddr;
-use tokio::signal;
-use tracing::{info, warn};
+use std::sync::Arc;
+use tokio::sync::Notify;
+use tracing::info;
 
 fn main() -> anyhow::Result<()> {
     let config = config::load_config()?;
 
-    init_tracing(&config.log_level)?;
     info!(?config, "configuration loaded");
 
     let bind_addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
         .with_context(|| "invalid bind address")?;
     let netio_cfg = config.netio.clone();
+    let telemetry_cfg = config.telemetry.clone();
 
-    // Use tokio-uring runtime for io_uring support
-    info!("Starting tokio-uring runtime");
-    tokio_uring::start(async move {
-        let netio_handle = netio::spawn(bind_addr, netio_cfg)
-            .with_context(|| "failed to spawn network layer")?;
+    // Create tokio runtime for non-critical async tasks (telemetry, future app logic)
+    info!("Creating tokio runtime for async tasks");
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2) // Small runtime, just for telemetry
+        .thread_name("tokio-worker")
+        .enable_all()
+        .build()?;
 
-        info!(
-            %bind_addr,
-            workers = netio_handle.worker_count(),
-            "Network IO layer started"
-        );
-
-        // Wait for Ctrl+C signal
-        signal::ctrl_c()
+    // Initialize telemetry on tokio runtime
+    let metrics_handle = tokio_runtime.block_on(async {
+        telemetry::init_telemetry(&telemetry_cfg)
             .await
-            .context("failed to install Ctrl+C handler")?;
+            .with_context(|| "failed to initialize telemetry")
+    })?;
 
+    info!("Telemetry system initialized");
+
+    // Spawn network workers as native threads (NOT on tokio runtime)
+    info!("Spawning network worker threads");
+    let netio_handle = netio::spawn(bind_addr, netio_cfg)
+        .with_context(|| "failed to spawn network layer")?;
+
+    info!(
+        %bind_addr,
+        workers = netio_handle.worker_count(),
+        "Network IO layer started with native threads"
+    );
+
+    // Setup signal handler on tokio runtime
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_clone = Arc::clone(&shutdown_notify);
+
+    tokio_runtime.spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            eprintln!("Failed to install Ctrl+C handler: {}", e);
+            return;
+        }
         info!("Shutdown signal received");
+        shutdown_notify_clone.notify_one();
+    });
 
-        // Gracefully shutdown network layer
-        netio_handle.shutdown().await;
+    // Wait for shutdown signal (blocks main thread)
+    tokio_runtime.block_on(async {
+        shutdown_notify.notified().await;
+    });
 
-        Ok::<(), anyhow::Error>(())
-    })
-}
+    info!("Initiating graceful shutdown");
 
-fn init_tracing(level: &str) -> anyhow::Result<()> {
-    let env_filter = tracing_subscriber::EnvFilter::try_new(level)
-        .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))?;
+    // Shutdown network layer (blocks until workers exit)
+    netio_handle.shutdown();
 
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .finish();
+    // Shutdown telemetry
+    tokio_runtime.block_on(async {
+        metrics_handle.shutdown().await;
+    });
 
-    if tracing::subscriber::set_global_default(subscriber).is_err() {
-        warn!("tracing subscriber already initialized");
-    }
+    // Shutdown tokio runtime
+    info!("Shutting down tokio runtime");
+    tokio_runtime.shutdown_timeout(std::time::Duration::from_secs(5));
 
+    info!("Shutdown complete");
     Ok(())
 }
