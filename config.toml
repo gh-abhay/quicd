@@ -10,12 +10,27 @@ enable_tracing = false
 export_interval_secs = 60
 
 [netio]
+# Number of worker threads (defaults to number of CPU cores)
 workers = 2
+# Enable SO_REUSEPORT for kernel-level load distribution
 reuse_port = true
-uring_entries = 1024
-socket_recv_buffer_size = 33554432
-socket_send_buffer_size = 33554432
+# Pin worker threads to CPU cores for cache locality
+pin_to_cpu = true
+# Number of io_uring submission queue entries per worker (must be power of 2)
+# Higher values allow more in-flight operations but consume more memory
+uring_entries = 2048
+# Kernel socket receive buffer size in bytes (SO_RCVBUF)
+# Larger buffers reduce packet loss under burst traffic
+socket_recv_buffer_size = 33554432  # 32 MB
+# Kernel socket send buffer size in bytes (SO_SNDBUF)
+# Larger buffers improve throughput for high-rate sending
+socket_send_buffer_size = 33554432  # 32 MB
 
 [netio.buffer_pool]
-max_buffers = 16384
+# Maximum number of buffers in each worker's pool
+# Each worker has its own isolated pool - no sharing between workers
+# Total memory = workers × max_buffers_per_worker × datagram_size (approximately)
+max_buffers_per_worker = 16384
+# Target size for datagrams (actual buffers can grow larger if needed)
+# Standard QUIC datagram size for good MTU compatibility
 datagram_size = 1350

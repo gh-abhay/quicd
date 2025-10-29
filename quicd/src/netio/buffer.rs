@@ -1,140 +1,153 @@
-//! Global buffer pool using buffer-pool crate for zero-copy operations.
+//! Per-worker buffer pool for zero-copy operations.
 //!
-//! Uses ConsumeBuffer for efficient buffer management and pre-allocated pools
-//! to minimize runtime allocations.
+//! **Critical Design Principle**: Each worker thread owns its own buffer pool with
+//! **ZERO SHARING** between workers. This eliminates all synchronization overhead
+//! and maximizes cache locality.
+//!
+//! # Architecture
+//!
+//! - Each worker creates its own isolated `WorkerBufPool` at startup
+//! - Buffers never cross thread boundaries
+//! - No atomic operations, no locks, no contention in hot path
+//! - Pool lives for entire worker lifetime (leaked with 'static lifetime)
+//!
+//! # Performance Benefits
+//!
+//! - **Zero contention**: No shared state = no cache line bouncing
+//! - **Cache locality**: Buffers stay in L1/L2 cache of single core
+//! - **Predictable latency**: No lock/unlock overhead
+//! - **Linear scaling**: N workers = N independent pools
 
 use crate::netio::config::BufferPoolConfig;
 use buffer_pool::{Pool, Pooled};
-use once_cell::sync::OnceCell;
 use std::ops::{Deref, DerefMut};
-use tokio_uring::buf::{IoBuf, IoBufMut};
 
-/// Maximum UDP payload size (standard IPv6 jumbo frame)
+/// Maximum UDP payload size (IPv6 jumbo frame)
+/// This is the absolute maximum for a single UDP datagram
 pub const MAX_UDP_PAYLOAD: usize = 65536;
 
-/// Type alias for the shared buffer pool with 8 shards for reduced contention
-pub type BufPool = Pool<8, buffer_pool::ConsumeBuffer>;
+/// Type alias for worker-local buffer pool.
+///
+/// Using single shard (1) because:
+/// - This pool is thread-local (only accessed by one worker)
+/// - No need for sharding overhead
+/// - Simpler and faster than multi-shard design
+pub type WorkerBufPool = Pool<1, buffer_pool::ConsumeBuffer>;
 
 /// Type alias for a pooled buffer
 pub type PooledBuf = Pooled<buffer_pool::ConsumeBuffer>;
 
-/// Global buffer pool instance shared across all network workers
-static BUFFER_POOL: OnceCell<BufPool> = OnceCell::new();
-
-/// Initialize the global buffer pool. Must be called once before any workers start.
+/// Create a new per-worker buffer pool.
 ///
-/// # Panics
-/// Panics if called more than once.
-pub fn init_buffer_pool(config: &BufferPoolConfig) {
-    let pool = BufPool::new(config.max_buffers, config.datagram_size);
-    BUFFER_POOL
-        .set(pool)
-        .expect("Buffer pool already initialized");
+/// **Must be called once per worker thread during initialization.**
+/// The returned pool should be leaked (Box::leak) to get 'static lifetime
+/// since it lives for the entire worker thread lifetime.
+///
+/// # Arguments
+///
+/// * `config` - Buffer pool configuration
+///
+/// # Returns
+///
+/// A new, isolated buffer pool for this worker
+pub fn create_worker_pool(config: &BufferPoolConfig) -> WorkerBufPool {
+    WorkerBufPool::new(config.max_buffers_per_worker, config.datagram_size)
 }
 
-/// Get a reference to the global buffer pool.
+/// Buffer wrapper for io_uring operations.
 ///
-/// # Panics
-/// Panics if buffer pool has not been initialized.
-pub fn get_buffer_pool() -> &'static BufPool {
-    BUFFER_POOL
-        .get()
-        .expect("Buffer pool not initialized - call init_buffer_pool first")
-}
-
-/// Wrapper around PooledBuf that implements tokio-uring IoBuf traits.
-///
-/// This allows zero-copy buffer usage with io_uring while maintaining
-/// the benefits of buffer pooling.
-pub struct UringBuffer {
+/// This wraps the pooled buffer and provides safe APIs for:
+/// - Receiving datagrams into the buffer
+/// - Tracking received data length
+/// - Zero-copy access to received data
+pub struct WorkerBuffer {
     inner: PooledBuf,
+    /// Actual length of received data (buffer capacity may be larger)
+    len: usize,
 }
 
-#[allow(dead_code)]
-impl UringBuffer {
-    /// Create a new buffer from the global pool
-    pub fn new() -> Self {
-        let pool = get_buffer_pool();
+impl WorkerBuffer {
+    /// Create a new buffer from the worker's local pool.
+    ///
+    /// # Safety
+    ///
+    /// The pool reference must have 'static lifetime. In our architecture,
+    /// we leak the pool at worker startup, so this is safe.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - Reference to the leaked worker pool
+    ///
+    /// # Returns
+    ///
+    /// A new buffer ready for I/O operations
+    pub unsafe fn new_from_leaked(pool: &'static WorkerBufPool) -> Self {
         Self {
             inner: pool.get_empty(),
+            len: 0,
         }
     }
 
-    /// Get the length of initialized data
+    /// Get the length of received data
+    #[inline]
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.len
     }
 
     /// Check if buffer is empty
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.len == 0
     }
 
-    /// Get buffer as a slice
+    /// Get buffer as a slice (only the received portion)
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        &self.inner
+        &self.inner[..self.len]
     }
 
-    /// Expand the buffer to hold more data
-    pub fn expand(&mut self, additional: usize) {
-        self.inner.expand(additional);
+    /// Get buffer as a mutable slice for I/O operations.
+    ///
+    /// Ensures buffer has capacity for maximum UDP payload size.
+    /// This is used for both recv and send operations with io_uring.
+    #[inline]
+    pub fn as_mut_slice_for_io(&mut self) -> &mut [u8] {
+        // Ensure buffer can hold max UDP datagram
+        let current_capacity = self.inner.len();
+        if current_capacity < MAX_UDP_PAYLOAD {
+            self.inner.expand(MAX_UDP_PAYLOAD - current_capacity);
+        }
+        &mut self.inner[..]
     }
 
-    /// Copy data from a slice into the buffer
-    pub fn copy_from_slice(&mut self, src: &[u8]) {
-        self.expand(src.len());
-        self.inner[..src.len()].copy_from_slice(src);
+    /// Set the actual received length after I/O completion.
+    ///
+    /// Called by io_uring completion handler after recvmsg completes.
+    #[inline]
+    pub fn set_received_len(&mut self, len: usize) {
+        debug_assert!(len <= self.inner.len(), "received length exceeds buffer capacity");
+        self.len = len;
+    }
+
+    /// Get the inner buffer (for advanced use cases)
+    #[inline]
+    pub fn into_inner(self) -> PooledBuf {
+        self.inner
     }
 }
 
-impl Default for UringBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Deref for UringBuffer {
+impl Deref for WorkerBuffer {
     type Target = [u8];
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl DerefMut for UringBuffer {
+impl DerefMut for WorkerBuffer {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
-    }
-}
-
-// SAFETY: UringBuffer wraps ConsumeBuffer from buffer-pool, which provides
-// stable memory addresses. The Pooled wrapper ensures the buffer stays alive
-// for the duration of the I/O operation, and tokio-uring ensures operations
-// complete before the buffer is dropped.
-unsafe impl IoBuf for UringBuffer {
-    fn stable_ptr(&self) -> *const u8 {
-        self.inner.as_ptr()
-    }
-
-    fn bytes_init(&self) -> usize {
-        self.inner.len()
-    }
-
-    fn bytes_total(&self) -> usize {
-        MAX_UDP_PAYLOAD
-    }
-}
-
-unsafe impl IoBufMut for UringBuffer {
-    fn stable_mut_ptr(&mut self) -> *mut u8 {
-        self.inner.as_mut_ptr()
-    }
-
-    unsafe fn set_init(&mut self, pos: usize) {
-        // ConsumeBuffer handles length internally via expand
-        let current_len = self.inner.len();
-        if pos > current_len {
-            self.inner.expand(pos - current_len);
-        }
     }
 }
