@@ -28,7 +28,7 @@
 //! - **High throughput**: Multiple in-flight operations
 //! - **Low latency**: Event-driven, no polling overhead
 
-use super::buffer::{create_worker_pool, WorkerBuffer, WorkerBufPool};
+use super::buffer::{create_worker_pool, WorkerBufPool, WorkerBuffer};
 use super::config::NetIoConfig;
 use super::socket::create_udp_socket;
 use crate::telemetry::{record_metric, MetricsEvent};
@@ -59,7 +59,7 @@ impl From<u64> for OpType {
     fn from(val: u64) -> Self {
         let op_tag = (val >> 56) as u8;
         let buf_id = val & 0x00FFFFFFFFFFFFFF;
-        
+
         match op_tag {
             0 => OpType::Recv(buf_id),
             1 => OpType::Send(buf_id),
@@ -104,11 +104,11 @@ impl NetworkWorker {
         // Create UDP socket with SO_REUSEPORT
         let socket = create_udp_socket(bind_addr, &config)?;
         let socket_fd = socket.as_raw_fd();
-        
+
         // Prevent socket from being closed when it goes out of scope
         // We'll manage the FD manually
         std::mem::forget(socket);
-        
+
         // Create worker's own buffer pool (NO SHARING!)
         let buffer_pool = create_worker_pool(&config.buffer_pool);
 
@@ -134,8 +134,8 @@ impl NetworkWorker {
     pub fn run(self) -> Result<()> {
         // Pin thread to CPU core if enabled
         if self.config.pin_to_cpu {
-            if let Some(core_id) = core_affinity::get_core_ids()
-                .and_then(|ids| ids.get(self.id).copied())
+            if let Some(core_id) =
+                core_affinity::get_core_ids().and_then(|ids| ids.get(self.id).copied())
             {
                 if core_affinity::set_for_current(core_id) {
                     info!(
@@ -249,11 +249,11 @@ impl NetworkWorker {
                                 // Successfully received packet
                                 let bytes_read = result as usize;
                                 buffer.set_received_len(bytes_read);
-                                
+
                                 // TODO: Extract peer address from addr_storage
                                 // For now, use a placeholder
                                 let peer_addr = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
-                                
+
                                 record_metric(MetricsEvent::PacketReceived { bytes: bytes_read });
                                 handle_ingress(worker_id, bind_addr, buffer, peer_addr, bytes_read);
                             }
@@ -332,12 +332,9 @@ fn submit_recv_op(
     let buf_id = *next_buf_id;
     *next_buf_id = next_buf_id.wrapping_add(1);
 
-    let recv_op = opcode::RecvMsg::new(
-        types::Fd(socket_fd),
-        &mut msg as *mut _,
-    )
-    .build()
-    .user_data(OpType::Recv(buf_id).into());
+    let recv_op = opcode::RecvMsg::new(types::Fd(socket_fd), &mut msg as *mut _)
+        .build()
+        .user_data(OpType::Recv(buf_id).into());
 
     // Store buffer and address storage in in-flight map
     in_flight.insert(buf_id, (buffer, addr_storage));

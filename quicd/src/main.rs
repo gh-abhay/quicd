@@ -1,5 +1,5 @@
-mod netio;
 mod config;
+mod netio;
 mod runtime;
 mod telemetry;
 
@@ -39,8 +39,8 @@ fn main() -> anyhow::Result<()> {
 
     // Spawn network workers as native threads (NOT on tokio runtime)
     info!("Spawning network worker threads");
-    let netio_handle = netio::spawn(bind_addr, netio_cfg)
-        .with_context(|| "failed to spawn network layer")?;
+    let netio_handle =
+        netio::spawn(bind_addr, netio_cfg).with_context(|| "failed to spawn network layer")?;
 
     info!(
         %bind_addr,

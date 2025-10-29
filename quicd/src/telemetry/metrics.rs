@@ -14,8 +14,7 @@ use opentelemetry::{
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     metrics::{PeriodicReader, SdkMeterProvider},
-    runtime,
-    Resource,
+    runtime, Resource,
 };
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -34,7 +33,7 @@ static METRICS_SENDER: OnceCell<Sender<MetricsEvent>> = OnceCell::new();
 /// # Example
 /// ```no_run
 /// use quicd::telemetry::{MetricsTimer, record_metric, MetricsEvent};
-/// 
+///
 /// let timer = MetricsTimer::start();
 /// // ... do QUIC handshake ...
 /// let duration_ms = timer.elapsed_ms();
@@ -82,7 +81,6 @@ impl MetricsTimer {
 #[allow(dead_code)] // Many variants are for future protocol/application layer instrumentation
 pub enum MetricsEvent {
     // ========== Network Layer Metrics ==========
-    
     /// UDP packet received from network
     /// Records both packet count and total bytes received
     PacketReceived { bytes: usize },
@@ -112,7 +110,6 @@ pub enum MetricsEvent {
     WorkerStopped,
 
     // ========== Protocol Layer Metrics (QUIC) ==========
-    
     /// New QUIC connection established successfully
     ConnectionEstablished,
 
@@ -140,7 +137,6 @@ pub enum MetricsEvent {
     PacketRetransmitted,
 
     // ========== Application Layer Metrics (HTTP/3) ==========
-    
     /// HTTP/3 request completed
     /// Includes method, status code, and duration for full request analysis
     HttpRequest {
@@ -556,7 +552,7 @@ pub async fn start_metrics_task(
                             Ok(event) => batch.push(event),
                             Err(_) => break, // Channel empty or disconnected
                         }
-                        
+
                         // Process batch if it gets large (prevent unbounded memory growth)
                         if batch.len() >= 1000 {
                             for event in batch.drain(..) {
@@ -566,7 +562,7 @@ pub async fn start_metrics_task(
                             tokio::task::yield_now().await;
                         }
                     }
-                    
+
                     // Process any remaining events in batch
                     if !batch.is_empty() {
                         for event in batch.drain(..) {

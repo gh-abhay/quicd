@@ -1,5 +1,5 @@
-pub mod config;
 mod buffer;
+pub mod config;
 mod socket;
 mod worker;
 
@@ -45,7 +45,7 @@ impl NetIoHandle {
                 }
             }
         }
-        
+
         info!("Network layer shutdown complete");
     }
 }
@@ -156,7 +156,10 @@ pub fn spawn(bind_addr: SocketAddr, config: NetIoConfig) -> Result<NetIoHandle> 
         workers.push(handle);
     }
 
-    info!(workers = config.workers, "Network layer started with io_uring");
+    info!(
+        workers = config.workers,
+        "Network layer started with io_uring"
+    );
 
     Ok(NetIoHandle {
         workers,
