@@ -1,6 +1,8 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
-use serde::{Deserialize, Serialize};
 use config::Config as ConfigLoader;
+use serde::{Deserialize, Serialize};
+
+use crate::netio::config::NetIoConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
@@ -49,6 +51,11 @@ pub struct Config {
     #[clap(skip)]
     #[serde(default)]
     pub runtime: RuntimeConfig,
+
+    /// Network I/O configuration
+    #[clap(skip)]
+    #[serde(default)]
+    pub netio: NetIoConfig,
 }
 
 pub fn load_config() -> anyhow::Result<Config> {
@@ -60,7 +67,8 @@ pub fn load_config() -> anyhow::Result<Config> {
         port: 8080,
         log_level: "info".to_string(),
         config_file: cli.config_file.clone(),
-        runtime: RuntimeConfig::default(),
+    runtime: RuntimeConfig::default(),
+    netio: NetIoConfig::default(),
     };
 
     // Load config from file and env
