@@ -1,7 +1,9 @@
-mod netio;
 mod config;
+mod netio;
+mod quic;
 mod runtime;
 mod telemetry;
+mod worker;
 
 use anyhow::Context;
 use std::net::SocketAddr;
@@ -18,6 +20,7 @@ fn main() -> anyhow::Result<()> {
         .parse()
         .with_context(|| "invalid bind address")?;
     let netio_cfg = config.netio.clone();
+    let quic_cfg = config.quic.clone();
     let telemetry_cfg = config.telemetry.clone();
 
     // Create tokio runtime for non-critical async tasks (telemetry, future app logic)
@@ -39,7 +42,7 @@ fn main() -> anyhow::Result<()> {
 
     // Spawn network workers as native threads (NOT on tokio runtime)
     info!("Spawning network worker threads");
-    let netio_handle = netio::spawn(bind_addr, netio_cfg)
+    let netio_handle = worker::spawn(bind_addr, netio_cfg, quic_cfg)
         .with_context(|| "failed to spawn network layer")?;
 
     info!(
