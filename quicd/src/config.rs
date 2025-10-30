@@ -3,6 +3,7 @@ use config::Config as ConfigLoader;
 use serde::{Deserialize, Serialize};
 
 use crate::netio::NetIoConfig;
+use crate::quic::QuicConfig;
 use crate::telemetry::TelemetryConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -58,6 +59,11 @@ pub struct Config {
     #[serde(default)]
     pub netio: NetIoConfig,
 
+    /// QUIC protocol configuration
+    #[clap(skip)]
+    #[serde(default)]
+    pub quic: QuicConfig,
+
     /// Telemetry configuration
     #[clap(skip)]
     #[serde(default)]
@@ -75,6 +81,7 @@ pub fn load_config() -> anyhow::Result<Config> {
         config_file: cli.config_file.clone(),
         runtime: RuntimeConfig::default(),
         netio: NetIoConfig::default(),
+        quic: QuicConfig::default(),
         telemetry: TelemetryConfig::default(),
     };
 

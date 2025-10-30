@@ -22,6 +22,8 @@ buffer-pool = "0.1.0"
 once_cell = "1.21.3"
 crossbeam-channel = "0.5"
 core_affinity = "0.8"
+rcgen = "0.13"
+ring = "0.17"
 
 # OpenTelemetry for metrics and tracing
 opentelemetry = { version = "0.27", features = ["metrics", "trace"] }
