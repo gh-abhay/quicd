@@ -49,8 +49,8 @@ pub fn create_udp_socket(bind_addr: SocketAddr, config: &NetIoConfig) -> Result<
     };
 
     // Create socket with socket2 for fine-grained control
-    let socket = Socket2::new(domain, Type::DGRAM, Some(Protocol::UDP))
-        .context("creating UDP socket")?;
+    let socket =
+        Socket2::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("creating UDP socket")?;
 
     // Enable SO_REUSEADDR (standard practice for server sockets)
     socket

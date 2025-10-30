@@ -33,30 +33,30 @@ pub struct NetIoConfig {
     /// Each worker is a native OS thread pinned to a CPU core.
     /// Defaults to number of CPU cores.
     pub workers: usize,
-    
+
     /// Enable SO_REUSEPORT so multiple workers can share the same UDP port.
     /// This distributes incoming packets across workers at the kernel level.
     pub reuse_port: bool,
-    
+
     /// Pin each worker thread to a specific CPU core for cache locality.
     /// Highly recommended for maximum performance.
     #[serde(default = "default_true")]
     pub pin_to_cpu: bool,
-    
+
     /// Number of io_uring submission queue entries per worker.
     /// Must be a power of 2. Higher values allow more in-flight operations
     /// but consume more memory. Typical values: 1024, 2048, 4096.
     #[serde(default = "default_uring_entries")]
     pub uring_entries: u32,
-    
+
     /// Optional kernel receive buffer size (SO_RCVBUF).
     /// Larger buffers reduce packet loss under burst traffic.
     pub socket_recv_buffer_size: Option<usize>,
-    
+
     /// Optional kernel send buffer size (SO_SNDBUF).
     /// Larger buffers improve throughput for high-rate sending.
     pub socket_send_buffer_size: Option<usize>,
-    
+
     /// Buffer pool configuration (per worker).
     /// Each worker has its own isolated buffer pool - zero sharing.
     #[serde(default)]
