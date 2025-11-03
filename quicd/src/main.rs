@@ -40,6 +40,13 @@ fn main() -> anyhow::Result<()> {
 
     info!("Telemetry system initialized");
 
+    // Initialize eBPF-based routing for connection affinity
+    info!("Initializing eBPF-based QUIC routing");
+    crate::quic::routing::initialize_router()
+        .with_context(|| "failed to initialize eBPF routing")?;
+
+    info!("eBPF routing initialized successfully");
+
     // Spawn network workers as native threads (NOT on tokio runtime)
     info!("Spawning network worker threads");
     let netio_handle = worker::spawn(bind_addr, netio_cfg, quic_cfg)

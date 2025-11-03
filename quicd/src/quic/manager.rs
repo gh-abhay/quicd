@@ -24,6 +24,7 @@ use super::config::QuicConfig;
 use super::connection::QuicConnection;
 use super::crypto::{create_quiche_config, TlsCredentials};
 use crate::netio::buffer::WorkerBuffer;
+use crate::quic::routing;
 use anyhow::{Context, Result};
 use quiche::ConnectionId;
 use std::cell::RefCell;
@@ -302,10 +303,24 @@ impl QuicManager {
             anyhow::bail!("connection limit reached");
         }
 
-        // Generate new connection ID for server
-        let mut scid_bytes = [0u8; MAX_CONN_ID_LEN];
-        let scid_len = generate_cid(&self.conn_id_seed, &hdr.dcid, &mut scid_bytes);
-        let scid = ConnectionId::from_vec(scid_bytes[..scid_len].to_vec());
+        // Generate new connection ID for server with eBPF routing cookie.
+        // The connection ID embeds the worker index so packets for this
+        // connection are routed directly to this worker via eBPF.
+        if self.worker_id > u8::MAX as usize {
+            anyhow::bail!(
+                "worker_id {} exceeds maximum supported workers for routing (255)",
+                self.worker_id
+            );
+        }
+        let worker_id_u8 = self.worker_id as u8;
+
+        let tag = ring::hmac::sign(&self.conn_id_seed, &hdr.dcid);
+        let mut seed_bytes = [0u8; 4];
+        seed_bytes.copy_from_slice(&tag.as_ref()[0..4]);
+        let seed = u32::from_be_bytes(seed_bytes);
+
+        let scid_bytes = routing::generate_connection_id(worker_id_u8, seed);
+        let scid = ConnectionId::from_vec(scid_bytes.to_vec());
 
         // Create Quiche connection
         let conn = quiche::accept(
@@ -325,7 +340,7 @@ impl QuicManager {
             peer = %peer_addr,
             scid = ?scid,
             dcid = ?hdr.dcid,
-            "Created new QUIC connection"
+            "Created new QUIC connection with eBPF routing cookie"
         );
 
         self.stats.borrow_mut().connections_created += 1;
@@ -496,22 +511,6 @@ impl QuicManager {
 
 /// Maximum UDP datagram size
 const MAX_DATAGRAM_SIZE: usize = 65536;
-
-/// Generate a connection ID using HMAC
-///
-/// This ensures connection IDs are:
-/// - Unpredictable (cryptographically secure)
-/// - Unique per worker (different seed per worker)
-/// - Deterministic for the same input
-fn generate_cid(key: &ring::hmac::Key, input: &[u8], out: &mut [u8]) -> usize {
-    let tag = ring::hmac::sign(key, input);
-    let tag_bytes = tag.as_ref();
-
-    // Use first 16 bytes of HMAC as connection ID
-    let len = std::cmp::min(16, out.len());
-    out[..len].copy_from_slice(&tag_bytes[..len]);
-    len
-}
 
 impl std::fmt::Debug for QuicManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
