@@ -80,10 +80,11 @@ pub struct NetworkWorker {
     id: usize,
     socket_fd: i32,
     bind_addr: SocketAddr,
-    buffer_pool: WorkerBufPool,
+    buffer_pool: Option<WorkerBufPool>,
     config: NetIoConfig,
     quic_config: crate::quic::QuicConfig,
     shutdown: Arc<AtomicBool>,
+    routing_cookie: Option<u16>,
 }
 
 impl NetworkWorker {
@@ -98,6 +99,17 @@ impl NetworkWorker {
         // Create UDP socket with SO_REUSEPORT
         let socket = create_udp_socket(bind_addr, &config)?;
         let socket_fd = socket.as_raw_fd();
+
+        // Register socket with eBPF router so packets for this worker are
+        // routed directly by the kernel once the cookie is embedded in CIDs.
+        let routing_cookie = crate::quic::routing::register_worker_socket(id, &socket)
+            .with_context(|| format!("registering worker {id} socket with eBPF router"))?;
+
+        info!(
+            worker_id = id,
+            cookie = routing_cookie,
+            "Worker socket registered with eBPF"
+        );
 
         // Prevent socket from being closed when it goes out of scope
         // We'll manage the FD manually
@@ -118,15 +130,16 @@ impl NetworkWorker {
             id,
             socket_fd,
             bind_addr,
-            buffer_pool,
+            buffer_pool: Some(buffer_pool),
             config,
             quic_config,
             shutdown,
+            routing_cookie: Some(routing_cookie),
         })
     }
 
     /// Run the worker's io_uring event loop (runs in dedicated native thread).
-    pub fn run(self) -> Result<()> {
+    pub fn run(mut self) -> Result<()> {
         // Pin thread to CPU core if enabled
         if self.config.pin_to_cpu {
             if let Some(core_id) =
@@ -157,7 +170,11 @@ impl NetworkWorker {
 
         // Leak the buffer pool to get 'static lifetime
         // This is safe because the pool lives for the entire worker thread lifetime
-        let buffer_pool: &'static WorkerBufPool = Box::leak(Box::new(self.buffer_pool));
+        let pool = self
+            .buffer_pool
+            .take()
+            .expect("worker buffer pool already taken");
+        let buffer_pool: &'static WorkerBufPool = Box::leak(Box::new(pool));
 
         // Create QUIC manager for this worker
         let mut quic_manager =
@@ -364,6 +381,21 @@ impl NetworkWorker {
         in_flight.clear();
 
         Ok(())
+    }
+}
+
+impl Drop for NetworkWorker {
+    fn drop(&mut self) {
+        if let Some(cookie) = self.routing_cookie.take() {
+            if let Err(e) = crate::quic::routing::unregister_worker_socket(self.id) {
+                warn!(worker_id = self.id, cookie, error = ?e, "Failed to unregister worker socket from eBPF map");
+            } else {
+                info!(
+                    worker_id = self.id,
+                    cookie, "Worker socket unregistered from eBPF map"
+                );
+            }
+        }
     }
 }
 
