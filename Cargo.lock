@@ -1540,6 +1540,13 @@ version = "0.1.0"
 [[package]]
 name = "quicd-x"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-core",
+ "thiserror 1.0.69",
+ "tokio",
+]
 
 [[package]]
 name = "quiche"
