@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+quicd-x = { path = "../quicd-x" }
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros"] }
+tracing = "0.1"
