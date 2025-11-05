@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 
 /// TLS credentials (certificate chain and private key)
+#[derive(Clone)]
 pub struct TlsCredentials {
     /// Certificate chain in PEM format
     pub cert_chain: Vec<u8>,
@@ -55,10 +56,17 @@ pub fn create_quiche_config(
         quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create quiche config")?;
 
     // Write credentials to temp files (Quiche expects file paths)
-    // In a production system, we'd use a more sophisticated approach
+    // Use thread ID + timestamp for uniqueness to avoid races
     let temp_dir = std::env::temp_dir();
-    let cert_path = temp_dir.join(format!("quicd-cert-{}.pem", std::process::id()));
-    let key_path = temp_dir.join(format!("quicd-key-{}.pem", std::process::id()));
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let thread_id = std::thread::current().id();
+    let unique_id = format!("{:?}-{}", thread_id, timestamp);
+    
+    let cert_path = temp_dir.join(format!("quicd-cert-{}.pem", unique_id));
+    let key_path = temp_dir.join(format!("quicd-key-{}.pem", unique_id));
 
     std::fs::write(&cert_path, &credentials.cert_chain)
         .context("failed to write certificate to temp file")?;

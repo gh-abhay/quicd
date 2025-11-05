@@ -1,5 +1,6 @@
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -13,6 +14,18 @@ pub type StreamId = u64;
 /// Identifier for a QUIC connection.
 pub type ConnectionId = u128;
 
+/// Zero-copy stream data container.
+///
+/// This enum allows the worker to send either data references or FIN signals
+/// to applications without copying data.
+#[derive(Debug)]
+pub enum StreamData {
+    /// Stream data chunk with owned buffer
+    Data(bytes::Bytes),
+    /// Stream finished (FIN received)
+    Fin,
+}
+
 /// Shared handle exposed to applications for connection-scoped operations.
 #[derive(Clone)]
 pub struct ConnectionHandle {
@@ -20,6 +33,7 @@ pub struct ConnectionHandle {
     egress_tx: mpsc::Sender<EgressCommand>,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
+    next_request_id: Arc<AtomicU64>,
 }
 
 impl ConnectionHandle {
@@ -34,6 +48,7 @@ impl ConnectionHandle {
             egress_tx,
             local_addr,
             peer_addr,
+            next_request_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -53,86 +68,124 @@ impl ConnectionHandle {
     }
 
     /// Opens a new bi-directional stream.
-    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
+    ///
+    /// The result will be delivered as an AppEvent::StreamOpened.
+    /// Returns the request ID which will be used to correlate the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub fn open_bi(&self) -> Result<u64, ConnectionError> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         self.egress_tx
-            .send(EgressCommand::OpenBi { reply: reply_tx })
-            .await
-            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?
+            .try_send(EgressCommand::OpenBi {
+                request_id,
+                connection_id: self.connection_id,
+            })
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+        Ok(request_id)
     }
 
     /// Opens a new uni-directional stream.
-    pub async fn open_uni(&self) -> Result<SendStream, ConnectionError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
+    ///
+    /// The result will be delivered as an AppEvent::UniStreamOpened.
+    /// Returns the request ID which will be used to correlate the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub fn open_uni(&self) -> Result<u64, ConnectionError> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         self.egress_tx
-            .send(EgressCommand::OpenUni { reply: reply_tx })
-            .await
-            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?
+            .try_send(EgressCommand::OpenUni {
+                request_id,
+                connection_id: self.connection_id,
+            })
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+        Ok(request_id)
     }
 
     /// Sends an unreliable datagram.
-    pub async fn send_datagram(&self, data: Bytes) -> Result<usize, ConnectionError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
+    ///
+    /// Datagrams are independent packets that are not guaranteed delivery.
+    /// The result will be delivered as an AppEvent::DatagramSent.
+    /// Returns the request ID which will be used to correlate the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub fn send_datagram(&self, data: Bytes) -> Result<u64, ConnectionError> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         self.egress_tx
-            .send(EgressCommand::SendDatagram {
+            .try_send(EgressCommand::SendDatagram {
+                request_id,
+                connection_id: self.connection_id,
                 data,
-                reply: reply_tx,
             })
-            .await
-            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+        Ok(request_id)
     }
 
-    /// Resets a stream.
-    pub async fn reset_stream(
+    /// Resets a stream with an error code.
+    ///
+    /// The result will be delivered as an AppEvent::StreamReset.
+    /// Returns the request ID which will be used to correlate the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub fn reset_stream(
         &self,
         stream_id: StreamId,
         error_code: u64,
-    ) -> Result<(), ConnectionError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
+    ) -> Result<u64, ConnectionError> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         self.egress_tx
-            .send(EgressCommand::ResetStream {
+            .try_send(EgressCommand::ResetStream {
+                request_id,
+                connection_id: self.connection_id,
                 stream_id,
                 error_code,
-                reply: reply_tx,
             })
-            .await
-            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+        Ok(request_id)
     }
 
     /// Gracefully closes the connection.
-    pub async fn close(
-        &self,
-        error_code: u64,
-        reason: Option<Bytes>,
-    ) -> Result<(), ConnectionError> {
+    ///
+    /// Sends a QUIC CONNECTION_CLOSE frame with the specified error code and optional reason.
+    /// After sending, the connection will transition to closed state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub fn close(&self, error_code: u64, reason: Option<Bytes>) -> Result<(), ConnectionError> {
         self.egress_tx
-            .send(EgressCommand::Close { error_code, reason })
-            .await
-            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))
+            .try_send(EgressCommand::Close {
+                connection_id: self.connection_id,
+                error_code,
+                reason,
+            })
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))
     }
 
     /// Requests latest transport statistics for this connection.
-    pub async fn stats(&self) -> Result<ConnectionStats, ConnectionError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
+    ///
+    /// The result will be delivered as an AppEvent::StatsReceived.
+    /// Returns the request ID which will be used to correlate the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub fn stats(&self) -> Result<u64, ConnectionError> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         self.egress_tx
-            .send(EgressCommand::RequestStats { reply: reply_tx })
-            .await
-            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?
+            .try_send(EgressCommand::RequestStats {
+                request_id,
+                connection_id: self.connection_id,
+            })
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+        Ok(request_id)
     }
 }
 
@@ -159,7 +212,23 @@ impl SendStream {
         }
     }
 
-    /// Write a data chunk to the stream. `fin` finalises the stream when true.
+    /// Write a data chunk to the stream.
+    ///
+    /// # Arguments
+    ///
+    /// - `data`: Bytes to send (zero-copy via Bytes reference counting)
+    /// - `fin`: If true, sets the FIN flag to indicate end-of-stream
+    ///
+    /// # Returns
+    ///
+    /// The number of bytes actually written to the QUIC stream buffer.
+    /// This may be less than `data.len()` if the stream buffer is full.
+    /// The application can retry with the remaining data.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread becomes unavailable
+    /// or the connection is closed.
     pub async fn write(&self, data: Bytes, fin: bool) -> Result<usize, ConnectionError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
@@ -177,6 +246,9 @@ impl SendStream {
     }
 
     /// Convenience helper to finish the stream with an empty FIN frame.
+    ///
+    /// This sends a FIN signal with zero bytes of data, indicating that no more
+    /// data will be sent on this stream.
     pub async fn finish(&self) -> Result<(), ConnectionError> {
         self.write(Bytes::new(), true).await.map(|_| ())
     }
@@ -189,7 +261,7 @@ struct SendStreamInner {
 /// Handle allowing the application to read stream data.
 pub struct RecvStream {
     pub stream_id: StreamId,
-    rx: mpsc::Receiver<Bytes>,
+    rx: mpsc::Receiver<StreamData>,
 }
 
 impl fmt::Debug for RecvStream {
@@ -201,12 +273,25 @@ impl fmt::Debug for RecvStream {
 }
 
 impl RecvStream {
-    pub(crate) fn new(stream_id: StreamId, rx: mpsc::Receiver<Bytes>) -> Self {
+    pub(crate) fn new(stream_id: StreamId, rx: mpsc::Receiver<StreamData>) -> Self {
         Self { stream_id, rx }
     }
 
-    /// Reads the next chunk of data. `Ok(None)` signals FIN.
-    pub async fn read(&mut self) -> Result<Option<Bytes>, ConnectionError> {
+    /// Reads the next chunk of data from the stream.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(StreamData::Data(bytes)))` - Data chunk received (zero-copy via Bytes)
+    /// - `Ok(Some(StreamData::Fin))` - FIN received, no more data will arrive
+    /// - `Ok(None)` - Channel closed (equivalent to FIN)
+    /// - `Err(...)` - Connection error
+    ///
+    /// # Zero-Copy
+    ///
+    /// The returned `StreamData::Data(bytes)` uses `Bytes` which provides cheap
+    /// cloning without copying the underlying buffer. This is zero-copy relative
+    /// to the worker thread's buffer pool.
+    pub async fn read(&mut self) -> Result<Option<StreamData>, ConnectionError> {
         Ok(self.rx.recv().await)
     }
 }
@@ -219,6 +304,19 @@ pub struct TransportControls {
 }
 
 /// Snapshot of connection statistics useful to applications.
+///
+/// These are informational metrics that applications can use to adapt their
+/// behavior (e.g., adaptive bitrate based on RTT, backpressure handling, etc.).
+///
+/// # Fields
+///
+/// - `rtt_estimate_ms`: Estimated round-trip time in milliseconds
+/// - `bytes_sent`: Total application data bytes sent on this connection
+/// - `bytes_received`: Total application data bytes received on this connection
+/// - `active_streams`: Number of currently open streams
+/// - `congestion_state`: Current congestion control state (e.g., "slow_start", "congestion_avoidance")
+/// - `packets_sent`: Total QUIC packets transmitted
+/// - `packets_received`: Total QUIC packets received
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionStats {
     pub rtt_estimate_ms: Option<u32>,
@@ -226,4 +324,6 @@ pub struct ConnectionStats {
     pub bytes_received: u64,
     pub active_streams: usize,
     pub congestion_state: Option<String>,
+    pub packets_sent: u64,
+    pub packets_received: u64,
 }
