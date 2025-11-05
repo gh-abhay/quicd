@@ -23,14 +23,14 @@ const UDP_SEGMENT: libc::c_int = 103; // UDP_SEGMENT for GSO
 const UDP_GRO: libc::c_int = 104; // UDP_GRO for receive offload
 
 /// GSO (Generic Segmentation Offload) segment size.
-/// 
+///
 /// This is the maximum size of each segment when using UDP_SEGMENT.
 /// Should match the path MTU for optimal performance.
-/// 
+///
 /// For QUIC over UDP:
 /// - IPv4: Typically 1472 bytes (1500 MTU - 20 IP - 8 UDP)
 /// - IPv6: Typically 1452 bytes (1500 MTU - 40 IP - 8 UDP)
-/// 
+///
 /// Using 1280 (IPv6 minimum MTU) ensures compatibility across all paths.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Will be used when GSO send batching is implemented
@@ -262,12 +262,12 @@ pub fn get_max_gso_segment_size(socket_fd: i32) -> Option<usize> {
     // Query the socket for max GSO segment size
     // For UDP, this is typically limited by the interface MTU
     // Most NICs support up to 64KB of GSO data (about 45 packets @ 1500 bytes each)
-    
+
     // For now, use a conservative default based on typical MTU
     // This can be enhanced with actual socket queries if needed
     const DEFAULT_MAX_GSO_SIZE: usize = 65536; // 64 KB
-    const DEFAULT_SEGMENT_SIZE: usize = 1280;  // IPv6 min MTU
-    
+    const DEFAULT_SEGMENT_SIZE: usize = 1280; // IPv6 min MTU
+
     // Conservative: allow batching up to 48 packets (64KB / 1280 bytes)
     // This works with most modern NICs
     let _ = socket_fd; // Suppress unused warning
@@ -279,4 +279,3 @@ pub fn get_max_gso_segment_size(socket_fd: i32) -> Option<usize> {
 pub fn get_max_gso_segment_size(_socket_fd: i32) -> Option<usize> {
     None
 }
-

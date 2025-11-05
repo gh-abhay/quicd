@@ -132,12 +132,12 @@ impl ChannelConfig {
     pub fn estimate_memory_per_connection(&self, avg_streams: usize) -> usize {
         // Connection ingress channel
         let conn_ingress = self.connection_ingress_capacity * std::mem::size_of::<()>(); // Approximate
-        
+
         // Stream channels (both directions)
-        let stream_channels = avg_streams * (
-            self.stream_ingress_capacity + self.stream_egress_capacity
-        ) * std::mem::size_of::<()>();
-        
+        let stream_channels = avg_streams
+            * (self.stream_ingress_capacity + self.stream_egress_capacity)
+            * std::mem::size_of::<()>();
+
         conn_ingress + stream_channels
     }
 }

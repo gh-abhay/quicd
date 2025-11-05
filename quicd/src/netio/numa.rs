@@ -29,11 +29,11 @@ use tracing::{debug, info, warn};
 /// NUMA memory policy modes (from linux/mempolicy.h)
 #[allow(dead_code)]
 mod mpol {
-    pub const MPOL_DEFAULT: i32 = 0;     // Default policy
-    pub const MPOL_PREFERRED: i32 = 1;   // Prefer specific node, fall back allowed
-    pub const MPOL_BIND: i32 = 2;        // Strict binding to nodes
-    pub const MPOL_INTERLEAVE: i32 = 3;  // Interleave across nodes
-    pub const MPOL_LOCAL: i32 = 4;       // Prefer local node
+    pub const MPOL_DEFAULT: i32 = 0; // Default policy
+    pub const MPOL_PREFERRED: i32 = 1; // Prefer specific node, fall back allowed
+    pub const MPOL_BIND: i32 = 2; // Strict binding to nodes
+    pub const MPOL_INTERLEAVE: i32 = 3; // Interleave across nodes
+    pub const MPOL_LOCAL: i32 = 4; // Prefer local node
 }
 
 /// Maximum number of NUMA nodes supported (typical servers have 2-8)
@@ -70,12 +70,12 @@ fn is_numa_available() -> bool {
 #[cfg(target_os = "linux")]
 fn get_current_numa_node() -> Option<u32> {
     use std::mem::MaybeUninit;
-    
+
     // Use getcpu() syscall to get current CPU and NUMA node
     // This is faster than reading /proc or /sys
     let mut cpu: u32 = 0;
     let mut node: u32 = 0;
-    
+
     unsafe {
         // syscall(__NR_getcpu, &cpu, &node, NULL)
         // getcpu returns current CPU and NUMA node
@@ -85,7 +85,7 @@ fn get_current_numa_node() -> Option<u32> {
             &mut node as *mut u32,
             std::ptr::null_mut::<libc::c_void>(),
         );
-        
+
         if ret == 0 {
             Some(node)
         } else {
