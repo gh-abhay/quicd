@@ -56,6 +56,7 @@ pub mod connection;
 pub mod crypto;
 pub mod ebpf_routing;
 pub mod manager;
+pub mod prefetch;
 
 pub use config::QuicConfig;
 pub use ebpf_routing as routing;

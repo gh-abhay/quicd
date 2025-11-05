@@ -4,13 +4,16 @@
 //! - Buffer pool management for zero-copy operations
 //! - Socket creation and configuration
 //! - Network I/O configuration
+//! - NUMA-aware memory allocation
 //!
 //! For worker thread orchestration, see the `worker` module.
 
 pub mod buffer;
 pub mod config;
+pub mod numa;
 pub(crate) mod socket;
 
 pub use buffer::{create_worker_pool, WorkerBufPool, WorkerBuffer};
 pub use config::NetIoConfig;
+pub use numa::configure_numa_for_worker;
 pub(crate) use socket::create_udp_socket;

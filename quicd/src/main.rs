@@ -1,3 +1,5 @@
+mod apps;
+mod channel_config;
 mod config;
 mod netio;
 mod quic;
@@ -12,6 +14,10 @@ use tokio::sync::Notify;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
+    // Check if running with sufficient privileges for eBPF
+    if !nix::unistd::Uid::effective().is_root() {
+        anyhow::bail!("quicd must be run with root privileges (sudo) for eBPF functionality");
+    }
     let config = config::load_config()?;
 
     info!(?config, "configuration loaded");
@@ -42,15 +48,34 @@ fn main() -> anyhow::Result<()> {
 
     // Initialize eBPF-based routing for connection affinity
     info!("Initializing eBPF-based QUIC routing");
-    crate::quic::routing::initialize_router()
-        .with_context(|| "failed to initialize eBPF routing")?;
+    crate::quic::routing::initialize_router().with_context(|| {
+        "failed to initialize eBPF routing - eBPF is mandatory for connection affinity"
+    })?;
 
     info!("eBPF routing initialized successfully");
 
+    // Create application registry (initially empty; apps can be registered here)
+    info!("Initializing application registry");
+    let app_registry = apps::AppRegistry::new()
+        .register("h3", Arc::new(quicd_h3::H3Factory::new()))
+        .register("h3-29", Arc::new(quicd_h3::H3Factory::new()));
+
+    info!(
+        registered_alpns = ?app_registry.alpns(),
+        "Application registry initialized"
+    );
+
     // Spawn network workers as native threads (NOT on tokio runtime)
     info!("Spawning network worker threads");
-    let netio_handle = worker::spawn(bind_addr, netio_cfg, quic_cfg)
-        .with_context(|| "failed to spawn network layer")?;
+    let netio_handle = worker::spawn(
+        bind_addr,
+        netio_cfg,
+        quic_cfg,
+        config.channels.clone(),
+        runtime_handle.clone(),
+        app_registry,
+    )
+    .with_context(|| "failed to spawn network layer")?;
 
     info!(
         %bind_addr,

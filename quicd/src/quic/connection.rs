@@ -9,6 +9,19 @@
 use quiche::ConnectionId;
 use std::net::SocketAddr;
 use std::time::Instant;
+use tokio::sync::{mpsc, oneshot};
+
+/// Convert a quiche ConnectionId to a quicd-x ConnectionId (u128).
+///
+/// We take the first 16 bytes of the scid and convert to u128.
+/// If scid is shorter, we pad with zeros.
+fn scid_to_connection_id(scid: &ConnectionId) -> quicd_x::ConnectionId {
+    let bytes = scid.as_ref();
+    let mut buf = [0u8; 16];
+    let len = bytes.len().min(16);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    u128::from_be_bytes(buf)
+}
 
 /// Wrapper around a Quiche connection
 pub struct QuicConnection {
@@ -21,11 +34,38 @@ pub struct QuicConnection {
     /// Connection ID for routing (Destination Connection ID from client perspective)
     pub scid: ConnectionId<'static>,
 
+    /// Alternate Destination Connection IDs observed for this connection.
+    ///
+    /// The QUIC client may use multiple destination connection IDs over the
+    /// lifetime of the connection (e.g. during Initial packets, migrations or
+    /// as part of connection ID retirement). We track the set of DCIDs we have
+    /// seen so the worker can route future packets correctly and clean up the
+    /// alias map when the connection is dropped.
+    pub dcid_aliases: Vec<ConnectionId<'static>>,
+
     /// Last time we received a packet from this connection
     pub last_active: Instant,
 
     /// Connection statistics (updated periodically)
     pub stats: ConnectionStats,
+
+    /// Channel for sending events to the application task (ingress from worker to app)
+    pub ingress_tx: Option<mpsc::Sender<quicd_x::AppEvent>>,
+
+    /// Handle to the application task (for tracking and cleanup)
+    pub app_task_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Unique connection ID for quicd-x handle (derived from scid)
+    pub connection_id: quicd_x::ConnectionId,
+
+    /// Stream manager for handling stream lifecycle and data flow
+    pub stream_manager: Option<crate::worker::streams::StreamManager>,
+
+    /// Shutdown signal sender (used to notify app task when connection closes)
+    pub shutdown_tx: Option<oneshot::Sender<()>>,
+
+    /// Stream ID generator for this connection
+    pub stream_id_gen: StreamIdGenerator,
 }
 
 /// Connection statistics
@@ -43,6 +83,55 @@ pub struct ConnectionStats {
     pub active_streams: usize,
 }
 
+/// Stream ID counters for a connection.
+///
+/// QUIC stream IDs follow this pattern:
+/// - Client-initiated bidirectional: 0, 4, 8, 12, ... (id % 4 == 0)
+/// - Client-initiated unidirectional: 2, 6, 10, 14, ... (id % 4 == 2)
+/// - Server-initiated bidirectional: 1, 5, 9, 13, ... (id % 4 == 1)
+/// - Server-initiated unidirectional: 3, 7, 11, 15, ... (id % 4 == 3)
+///
+/// Each connection maintains its own stream ID counters, and stream IDs
+/// are unique only within a single connection (not globally).
+#[derive(Debug, Clone)]
+pub struct StreamIdGenerator {
+    /// Next server-initiated bidirectional stream ID
+    next_bidi: u64,
+    /// Next server-initiated unidirectional stream ID
+    next_uni: u64,
+}
+
+impl Default for StreamIdGenerator {
+    fn default() -> Self {
+        Self {
+            // Server-initiated bidirectional streams start at 1
+            next_bidi: 1,
+            // Server-initiated unidirectional streams start at 3
+            next_uni: 3,
+        }
+    }
+}
+
+impl StreamIdGenerator {
+    /// Generate next server-initiated bidirectional stream ID.
+    ///
+    /// Returns stream IDs: 1, 5, 9, 13, ...
+    pub fn next_bidi(&mut self) -> u64 {
+        let id = self.next_bidi;
+        self.next_bidi += 4;
+        id
+    }
+
+    /// Generate next server-initiated unidirectional stream ID.
+    ///
+    /// Returns stream IDs: 3, 7, 11, 15, ...
+    pub fn next_uni(&mut self) -> u64 {
+        let id = self.next_uni;
+        self.next_uni += 4;
+        id
+    }
+}
+
 impl QuicConnection {
     /// Create a new QUIC connection
     pub fn new(
@@ -50,12 +139,22 @@ impl QuicConnection {
         peer_addr: SocketAddr,
         scid: ConnectionId<'static>,
     ) -> Self {
+        // Generate a stable connection ID for quicd-x from the scid
+        let connection_id = scid_to_connection_id(&scid);
+
         Self {
             conn,
             peer_addr,
             scid,
+            dcid_aliases: Vec::new(),
             last_active: Instant::now(),
             stats: ConnectionStats::default(),
+            ingress_tx: None,
+            app_task_handle: None,
+            connection_id,
+            stream_manager: None,
+            shutdown_tx: None,
+            stream_id_gen: StreamIdGenerator::default(),
         }
     }
 
@@ -185,6 +284,15 @@ impl QuicConnection {
     /// Get path statistics
     pub fn path_stats(&self) -> Option<quiche::PathStats> {
         self.conn.path_stats().next()
+    }
+
+    /// Get next path event (connection migration, path validation)
+    ///
+    /// Returns the next path event if any are pending.
+    /// Should be called after processing received packets to handle
+    /// connection migration and path validation events.
+    pub fn path_event_next(&mut self) -> Option<quiche::PathEvent> {
+        self.conn.path_event_next()
     }
 
     /// Send DATAGRAM

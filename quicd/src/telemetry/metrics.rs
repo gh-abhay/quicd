@@ -161,13 +161,23 @@ impl MetricsHandle {
         }
     }
 
-    /// Shutdown the metrics task gracefully
+    /// Shutdown the metrics task gracefully with timeout
     pub async fn shutdown(self) {
         if let Some(tx) = self.shutdown_tx {
             let _ = tx.send(());
         }
         if let Some(handle) = self.task_handle {
-            let _ = handle.await;
+            // Wait for the task to complete, but with a timeout to avoid hanging
+            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+                Ok(result) => {
+                    if let Err(e) = result {
+                        tracing::error!(error = ?e, "Metrics task panicked during shutdown");
+                    }
+                }
+                Err(_) => {
+                    tracing::error!("Metrics task shutdown timed out after 5 seconds");
+                }
+            }
         }
     }
 }
@@ -515,6 +525,7 @@ pub async fn start_metrics_task(
 
     let reader = PeriodicReader::builder(exporter, runtime::Tokio)
         .with_interval(Duration::from_secs(config.export_interval_secs))
+        .with_timeout(Duration::from_secs(5)) // Timeout for export operations
         .build();
 
     let provider = SdkMeterProvider::builder()
@@ -543,23 +554,38 @@ pub async fn start_metrics_task(
 
         loop {
             tokio::select! {
-                // Process metrics events in batches for better cache locality
-                // and reduced OpenTelemetry API overhead
+                // Shutdown signal - break immediately
+                _ = &mut shutdown_rx => {
+                    tracing::info!("Metrics task shutting down");
+                    break;
+                }
+
+                // Process metrics events in small batches with periodic yields
+                // This ensures the shutdown signal can be checked frequently
                 _ = async {
-                    // Drain channel without blocking (try_recv in tight loop)
+                    let mut processed = 0;
+                    // Process up to 1000 events per iteration
                     loop {
                         match rx.try_recv() {
-                            Ok(event) => batch.push(event),
+                            Ok(event) => {
+                                batch.push(event);
+                                processed += 1;
+
+                                // Process batch when it gets large
+                                if batch.len() >= 100 {
+                                    for event in batch.drain(..) {
+                                        collector.process_event(event);
+                                    }
+                                    // Yield to allow shutdown signal to be checked
+                                    tokio::task::yield_now().await;
+                                }
+                            }
                             Err(_) => break, // Channel empty or disconnected
                         }
 
-                        // Process batch if it gets large (prevent unbounded memory growth)
-                        if batch.len() >= 1000 {
-                            for event in batch.drain(..) {
-                                collector.process_event(event);
-                            }
-                            // Yield to allow other tasks to run (prevent starvation)
-                            tokio::task::yield_now().await;
+                        // Limit events processed per async block to stay responsive
+                        if processed >= 1000 {
+                            break;
                         }
                     }
 
@@ -568,17 +594,13 @@ pub async fn start_metrics_task(
                         for event in batch.drain(..) {
                             collector.process_event(event);
                         }
-                    } else {
-                        // No events available, sleep briefly to avoid CPU spinning
+                    }
+
+                    // If no events were processed, sleep briefly to avoid busy waiting
+                    if processed == 0 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
-                } => {},
-
-                // Shutdown signal
-                _ = &mut shutdown_rx => {
-                    tracing::info!("Metrics task shutting down");
-                    break;
-                }
+                } => {}
             }
         }
 
@@ -591,6 +613,7 @@ pub async fn start_metrics_task(
         }
 
         // Shutdown provider to flush final metrics to OTLP collector
+        // Note: This may block if OTLP export is slow, but we have a timeout in MetricsHandle::shutdown
         if let Err(e) = provider.shutdown() {
             tracing::error!(error = ?e, "Failed to shutdown metrics provider");
         }

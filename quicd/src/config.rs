@@ -2,6 +2,7 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use config::Config as ConfigLoader;
 use serde::{Deserialize, Serialize};
 
+use crate::channel_config::ChannelConfig;
 use crate::netio::NetIoConfig;
 use crate::quic::QuicConfig;
 use crate::telemetry::TelemetryConfig;
@@ -68,6 +69,11 @@ pub struct Config {
     #[clap(skip)]
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+
+    /// Channel capacity configuration
+    #[clap(skip)]
+    #[serde(default)]
+    pub channels: ChannelConfig,
 }
 
 pub fn load_config() -> anyhow::Result<Config> {
@@ -83,6 +89,7 @@ pub fn load_config() -> anyhow::Result<Config> {
         netio: NetIoConfig::default(),
         quic: QuicConfig::default(),
         telemetry: TelemetryConfig::default(),
+        channels: ChannelConfig::default(),
     };
 
     // Load config from file and env

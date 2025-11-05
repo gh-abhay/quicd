@@ -43,3 +43,24 @@ max_buffers_per_worker = 16384
 # Target size for datagrams (actual buffers can grow larger if needed)
 # Standard QUIC datagram size for good MTU compatibility
 datagram_size = 1350
+
+[quic]
+# TLS certificate and key paths for QUIC connection encryption
+# If not provided, uses self-signed certificates (NOT for production)
+# cert_path = "/home/abhay/quicd/certs/cert.pem"
+# key_path = "/home/abhay/quicd/certs/key.pem"
+# Transport parameters
+max_idle_timeout_ms = 30000
+initial_rtt_ms = 100
+max_streams_bidi = 100
+max_streams_uni = 100
+max_udp_payload_size = 1350
+recv_window = 10485760  # 10 MB
+stream_recv_window = 1048576  # 1 MB
+congestion_control = "cubic"
+disable_active_migration = false
+enable_pacing = true
+enable_version_negotiation = true
+enable_dgram = false
+max_dgram_size = 1350
+enable_stats = true
