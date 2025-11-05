@@ -39,7 +39,7 @@
 //! 4. App receives event and creates handler task for the stream
 //! 5. Worker receives data from quiche and sends via `send_stream_data()`
 //! 6. App's `RecvStream::read()` receives data chunks as `StreamData::Data(bytes)`
-//! 7. On FIN, worker calls `signal_stream_fin()` 
+//! 7. On FIN, worker calls `signal_stream_fin()`
 //! 8. App's `RecvStream::read()` returns `Ok(None)` or receives `StreamData::Fin`
 //!
 //! # Event Flow - Outgoing Streams

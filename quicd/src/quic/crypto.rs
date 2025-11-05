@@ -64,7 +64,7 @@ pub fn create_quiche_config(
         .as_nanos();
     let thread_id = std::thread::current().id();
     let unique_id = format!("{:?}-{}", thread_id, timestamp);
-    
+
     let cert_path = temp_dir.join(format!("quicd-cert-{}.pem", unique_id));
     let key_path = temp_dir.join(format!("quicd-key-{}.pem", unique_id));
 

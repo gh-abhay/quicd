@@ -32,8 +32,8 @@ use bytes::Bytes;
 use quiche::ConnectionId;
 use smallvec::SmallVec;
 use std::cell::RefCell;
-use std::collections::BinaryHeap;
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -68,7 +68,7 @@ fn connection_id_to_owned(cid: &ConnectionId) -> ConnectionId<'static> {
     // Use SmallVec with inline capacity matching QUIC's max CID length
     // This avoids heap allocation for all valid QUIC connection IDs
     let small_vec: SmallVec<[u8; MAX_CONN_ID_LEN]> = SmallVec::from_slice(cid);
-    
+
     // Convert SmallVec to Vec for ConnectionId::from
     // If len ≤ 20: uses SmallVec's inline storage, then moves to Vec (still no heap)
     // If len > 20: would heap allocate, but impossible per QUIC spec
@@ -160,7 +160,7 @@ impl StreamBufferPool {
 }
 
 /// Buffer pool for send packet data to eliminate allocations in hot path.
-/// 
+///
 /// CRITICAL OPTIMIZATION: This pool eliminates ~100k allocations/sec at 100k pps.
 /// Each packet send previously allocated a new Vec - now we reuse buffers.
 ///
@@ -186,14 +186,14 @@ impl SendBufferPool {
         let pool = (0..initial_buffers)
             .map(|_| vec![0u8; buffer_size])
             .collect();
-        
+
         Self {
             pool: RefCell::new(pool),
             max_buffers,
             buffer_size,
         }
     }
-    
+
     /// Get a buffer from the pool (LIFO for cache locality)
     fn get(&self) -> Vec<u8> {
         self.pool
@@ -201,21 +201,21 @@ impl SendBufferPool {
             .pop()
             .unwrap_or_else(|| vec![0u8; self.buffer_size])
     }
-    
+
     /// Return a buffer to the pool after send completion
     fn put(&self, mut buf: Vec<u8>) {
         let mut pool = self.pool.borrow_mut();
-        
+
         // Only keep if pool isn't full and buffer has correct capacity
         if pool.len() < self.max_buffers && buf.capacity() >= self.buffer_size {
             // Clear and resize to standard size for next use
             buf.clear();
             buf.resize(self.buffer_size, 0);
-            pool.push(buf);  // LIFO: push to end, pop from end
+            pool.push(buf); // LIFO: push to end, pop from end
         }
         // Otherwise drop (deallocate)
     }
-    
+
     /// Get current pool size (for diagnostics/metrics)
     #[allow(dead_code)]
     fn len(&self) -> usize {
@@ -283,14 +283,14 @@ pub struct QuicManager {
     /// Active connections mapped by Connection ID
     /// Key: Destination Connection ID (DCID) from packet header
     /// Value: The connection handling packets with this DCID
-    /// 
+    ///
     /// Uses AHashMap for fast lookups (10-50x faster than default SipHash).
     /// Every incoming packet performs a lookup, making this a critical hot path.
     connections: AHashMap<ConnectionId<'static>, QuicConnection>,
 
     /// Mapping from alternate DCIDs observed on the wire to the canonical
     /// connection identifier stored in `connections`.
-    /// 
+    ///
     /// Uses AHashMap for fast alias resolution in packet routing.
     connection_aliases: AHashMap<ConnectionId<'static>, ConnectionId<'static>>,
 
@@ -323,7 +323,7 @@ pub struct QuicManager {
     timeout_queue: BinaryHeap<TimeoutEntry>,
 
     /// Map from application connection_id to QUIC DCID for egress command routing
-    /// 
+    ///
     /// Uses AHashMap for fast lookups when routing egress commands to connections.
     connection_id_map: AHashMap<quicd_x::ConnectionId, quiche::ConnectionId<'static>>,
 }
@@ -370,7 +370,10 @@ impl QuicManager {
 
         // Use pre-loaded credentials if provided, otherwise load/generate them
         let credentials = if let Some(creds) = tls_credentials {
-            debug!(worker_id, "Using pre-loaded TLS credentials (shared from main thread)");
+            debug!(
+                worker_id,
+                "Using pre-loaded TLS credentials (shared from main thread)"
+            );
             creds
         } else {
             // This should never happen if spawn() enforces certificate requirement
@@ -646,9 +649,12 @@ impl QuicManager {
         if let Some(conn_ptr) = self.connections.get(&canonical_dcid) {
             // Prefetch the connection structure
             prefetch(conn_ptr as *const QuicConnection, PrefetchMode::Write);
-            
+
             // Prefetch the underlying quiche::Connection (first field, likely hot)
-            prefetch(&conn_ptr.conn as *const quiche::Connection, PrefetchMode::Write);
+            prefetch(
+                &conn_ptr.conn as *const quiche::Connection,
+                PrefetchMode::Write,
+            );
         }
 
         let mut should_process_streams = false;
@@ -737,13 +743,19 @@ impl QuicManager {
 
         if should_send_packets {
             if let Some(conn) = self.connections.get_mut(&canonical_dcid) {
-                collect_packets_for_conn(self.worker_id, conn, &self.send_buffer_pool, &mut outgoing_packets)?;
-                
+                collect_packets_for_conn(
+                    self.worker_id,
+                    conn,
+                    &self.send_buffer_pool,
+                    &mut outgoing_packets,
+                )?;
+
                 // Reschedule timeout after processing packet (connection activity updated)
                 // Do this while we have the mutable borrow
                 if let Some(timeout) = conn.timeout() {
                     let deadline = conn.last_active + timeout;
-                    self.timeout_queue.push(TimeoutEntry::new(deadline, canonical_dcid.clone()));
+                    self.timeout_queue
+                        .push(TimeoutEntry::new(deadline, canonical_dcid.clone()));
                 }
             }
         }
@@ -781,7 +793,10 @@ impl QuicManager {
             // Prefetch connection before accessing it (hides memory latency)
             if let Some(conn_ptr) = self.connections.get(&entry.dcid) {
                 prefetch(conn_ptr as *const QuicConnection, PrefetchMode::Write);
-                prefetch(&conn_ptr.conn as *const quiche::Connection, PrefetchMode::Write);
+                prefetch(
+                    &conn_ptr.conn as *const quiche::Connection,
+                    PrefetchMode::Write,
+                );
             }
 
             // Check if connection still exists and needs timeout processing
@@ -790,23 +805,32 @@ impl QuicManager {
                 if let Some(timeout) = conn.timeout() {
                     if now >= conn.last_active + timeout {
                         conn.on_timeout();
-                        
+
                         // Collect packets generated by timeout
-                        collect_packets_for_conn(self.worker_id, conn, &self.send_buffer_pool, &mut outgoing_packets)?;
+                        collect_packets_for_conn(
+                            self.worker_id,
+                            conn,
+                            &self.send_buffer_pool,
+                            &mut outgoing_packets,
+                        )?;
 
                         // Check if connection is now closed
                         if conn.conn.is_closed() {
-                            to_close.push((entry.dcid.clone(), Self::connection_close_info(&conn.conn)));
+                            to_close.push((
+                                entry.dcid.clone(),
+                                Self::connection_close_info(&conn.conn),
+                            ));
                         } else {
                             // Reschedule timeout for next cycle
                             if let Some(timeout) = conn.timeout() {
                                 let deadline = conn.last_active + timeout;
-                                self.timeout_queue.push(TimeoutEntry::new(deadline, entry.dcid.clone()));
+                                self.timeout_queue
+                                    .push(TimeoutEntry::new(deadline, entry.dcid.clone()));
                             }
                         }
                     }
                 }
-                
+
                 processed_dcids.insert(entry.dcid);
             }
         }
@@ -820,7 +844,7 @@ impl QuicManager {
     }
 
     /// Handle path events (connection migration, path validation).
-    /// 
+    ///
     /// QUIC supports connection migration where a client can change its IP address
     /// or port during a connection (e.g., mobile device switching networks).
     /// This method processes path events from Quiche and updates connection state.
@@ -881,7 +905,11 @@ impl QuicManager {
                 );
             }
 
-            PathEvent::ReusedSourceConnectionId(seq, (old_local, old_peer), (new_local, new_peer)) => {
+            PathEvent::ReusedSourceConnectionId(
+                seq,
+                (old_local, old_peer),
+                (new_local, new_peer),
+            ) => {
                 // Source connection ID is being reused on a different path
                 debug!(
                     worker_id = self.worker_id,
@@ -900,7 +928,7 @@ impl QuicManager {
                 // This is the critical event for mobile clients
                 let old_peer_addr = conn.peer_addr;
                 conn.peer_addr = peer_addr;
-                
+
                 info!(
                     worker_id = self.worker_id,
                     connection_id = ?dcid,
@@ -946,8 +974,8 @@ impl QuicManager {
                 // Send CONNECTION_CLOSE frame (application close, no error)
                 // Error code 0 indicates normal graceful shutdown
                 let close_result = conn.close(
-                    true,  // application close (not transport error)
-                    0,     // error code 0 = graceful shutdown
+                    true, // application close (not transport error)
+                    0,    // error code 0 = graceful shutdown
                     b"Server shutting down",
                 );
 
@@ -979,9 +1007,10 @@ impl QuicManager {
 
         // Clean up connection state (will notify apps via shutdown channels)
         for dcid in self.connections.keys().cloned().collect::<Vec<_>>() {
-            let info = self.connections.get(&dcid).map(|c| {
-                Self::connection_close_info(&c.conn)
-            });
+            let info = self
+                .connections
+                .get(&dcid)
+                .map(|c| Self::connection_close_info(&c.conn));
             if let Some(info) = info {
                 if let Err(e) = self.finalize_connection(&dcid, info, &mut outgoing_packets) {
                     error!(
@@ -1026,7 +1055,7 @@ fn process_streams(
     // Check for newly opened streams by peer and register them
     for stream_id in &readable_streams {
         let stream_manager = conn.stream_manager.as_mut().unwrap();
-        
+
         // Check if this is a new stream
         if !stream_manager.has_stream(*stream_id) {
             // Determine if bidirectional (even stream IDs are client-initiated bidirectional)
@@ -1045,7 +1074,7 @@ fn process_streams(
                 continue; // Skip this stream for now, will retry on next readable event
             }
         }
-        
+
         // Stream is registered (either just now or previously), safe to process
         registered_streams.push(*stream_id);
     }
@@ -1061,7 +1090,7 @@ fn process_streams(
 
         // Get a buffer from the pool instead of allocating
         let mut buf = buffer_pool.get();
-        
+
         match conn.stream_recv(stream_id, &mut buf) {
             Ok((read, fin)) => {
                 debug!(worker_id, stream_id, bytes = read, fin, "Read from stream");
@@ -1163,7 +1192,7 @@ fn process_streams(
 /// Collect all pending packets for a connection (free function to avoid borrow issues).
 ///
 /// This is called after processing a connection to collect all packets that need to be sent.
-/// 
+///
 /// CRITICAL OPTIMIZATION: Uses send buffer pool to eliminate allocations in hot path.
 /// Previous implementation allocated Vec for each packet (~100k allocations/sec at 100k pps).
 /// Now we reuse buffers from the pool for zero allocations in steady state.
@@ -1182,13 +1211,13 @@ fn collect_packets_for_conn(
                 // Extract the packet data by taking ownership of the buffer
                 // The buffer will be transferred to SendOpState and eventually returned to pool
                 let mut packet_data = out;
-                packet_data.truncate(len);  // Shrink to actual packet size
-                
+                packet_data.truncate(len); // Shrink to actual packet size
+
                 outgoing_packets.push(OutgoingPacket {
                     to: send_info.to,
                     data: packet_data,
                 });
-                
+
                 // Get a fresh buffer from pool for next packet
                 out = send_pool.get();
             }
@@ -1233,7 +1262,7 @@ impl QuicManager {
     /// - None if no connections or no pending timeouts
     pub fn next_timeout(&self) -> Option<std::time::Duration> {
         let now = Instant::now();
-        
+
         // Peek at the earliest timeout in the priority queue (O(1) operation)
         // The heap is a min-heap by deadline, so peek() gives us the soonest timeout
         if let Some(entry) = self.timeout_queue.peek() {
@@ -1304,8 +1333,8 @@ impl QuicManager {
             bytes_received: quiche_stats.recv as u64,
             active_streams,
             congestion_state: None, // quiche doesn't expose congestion state in a simple way
-            packets_sent: 0, // quiche doesn't expose total packet count directly
-            packets_received: 0, // tracked separately if needed
+            packets_sent: 0,        // quiche doesn't expose total packet count directly
+            packets_received: 0,    // tracked separately if needed
         })
     }
 
@@ -1356,7 +1385,8 @@ impl QuicManager {
         );
 
         // Create connection ingress channel with configured capacity
-        let (ingress_tx, ingress_rx) = mpsc::channel(self.channel_config.connection_ingress_capacity);
+        let (ingress_tx, ingress_rx) =
+            mpsc::channel(self.channel_config.connection_ingress_capacity);
         let stream_manager = crate::worker::streams::StreamManager::new(ingress_tx.clone());
 
         let handle = quicd_x::new_connection_handle(
@@ -1399,13 +1429,7 @@ impl QuicManager {
         let alpn_for_logging = alpn.clone();
         let task_handle = self.runtime_handle.spawn(async move {
             match factory_clone
-                .spawn_app(
-                    alpn,
-                    handle,
-                    event_stream,
-                    transport,
-                    shutdown_future,
-                )
+                .spawn_app(alpn, handle, event_stream, transport, shutdown_future)
                 .await
             {
                 Ok(()) => {
@@ -1506,8 +1530,10 @@ impl QuicManager {
         let stream_id = conn.stream_id_gen.next_bidi();
 
         // Create stream channels with configured capacities
-        let (stream_ingress_tx, stream_ingress_rx) = tokio::sync::mpsc::channel(stream_ingress_capacity);
-        let (stream_egress_tx, stream_egress_rx) = tokio::sync::mpsc::channel(stream_egress_capacity);
+        let (stream_ingress_tx, stream_ingress_rx) =
+            tokio::sync::mpsc::channel(stream_ingress_capacity);
+        let (stream_egress_tx, stream_egress_rx) =
+            tokio::sync::mpsc::channel(stream_egress_capacity);
 
         let recv_stream = quicd_x::new_recv_stream(stream_id, stream_ingress_rx);
         let send_stream = quicd_x::new_send_stream(stream_id, stream_egress_tx);
@@ -1600,7 +1626,8 @@ impl QuicManager {
         let stream_id = conn.stream_id_gen.next_uni();
 
         // Create stream handle with configured capacity
-        let (stream_egress_tx, stream_egress_rx) = tokio::sync::mpsc::channel(stream_egress_capacity);
+        let (stream_egress_tx, stream_egress_rx) =
+            tokio::sync::mpsc::channel(stream_egress_capacity);
         let send_stream = quicd_x::new_send_stream(stream_id, stream_egress_tx);
 
         // Store egress channel in stream manager (no ingress for uni streams from client)
@@ -1974,11 +2001,19 @@ impl QuicManager {
             // Prefetch the connection object before accessing it
             if let Some(conn_ptr) = self.connections.get(dcid) {
                 prefetch(conn_ptr as *const QuicConnection, PrefetchMode::Write);
-                prefetch(&conn_ptr.conn as *const quiche::Connection, PrefetchMode::Write);
+                prefetch(
+                    &conn_ptr.conn as *const quiche::Connection,
+                    PrefetchMode::Write,
+                );
             }
-            
+
             if let Some(conn) = self.connections.get_mut(dcid) {
-                collect_packets_for_conn(worker_id, conn, &self.send_buffer_pool, &mut outgoing_packets)?;
+                collect_packets_for_conn(
+                    worker_id,
+                    conn,
+                    &self.send_buffer_pool,
+                    &mut outgoing_packets,
+                )?;
             }
         }
 
@@ -2018,7 +2053,7 @@ impl QuicManager {
 
         let scid_bytes = routing::generate_connection_id(worker_id_u8, seed);
         let scid = ConnectionId::from_vec(scid_bytes.to_vec());
-        
+
         // Convert borrowed ConnectionId to owned using inline storage (no heap allocation)
         let initial_dcid = connection_id_to_owned(&hdr.dcid);
 
@@ -2055,7 +2090,8 @@ impl QuicManager {
         self.connection_aliases.insert(initial_dcid, scid.clone());
 
         if let Some(deadline) = timeout_deadline {
-            self.timeout_queue.push(TimeoutEntry::new(deadline, scid.clone()));
+            self.timeout_queue
+                .push(TimeoutEntry::new(deadline, scid.clone()));
         }
 
         Ok(scid)
@@ -2113,7 +2149,12 @@ impl QuicManager {
                 }
 
                 // Generate packets for this connection after processing writes
-                collect_packets_for_conn(worker_id, conn, &self.send_buffer_pool, &mut outgoing_packets)?;
+                collect_packets_for_conn(
+                    worker_id,
+                    conn,
+                    &self.send_buffer_pool,
+                    &mut outgoing_packets,
+                )?;
             }
         }
 

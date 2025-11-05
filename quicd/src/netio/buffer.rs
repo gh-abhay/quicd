@@ -114,13 +114,13 @@ impl WorkerBufPool {
     /// to be allocated. If pool is full, buffer is dropped.
     fn put(&self, mut buffer: Vec<u8>) {
         let mut buffers = self.buffers.borrow_mut();
-        
+
         // Only keep buffer if pool isn't full
         if buffers.len() < self.max_buffers {
             // Trim buffer to target size to prevent unbounded growth
             buffer.clear();
             buffer.shrink_to(self.buffer_size);
-            
+
             // Push to end (LIFO: next to be allocated)
             buffers.push(buffer);
         }
@@ -268,15 +268,15 @@ impl WorkerBuffer {
     #[inline]
     pub fn as_mut_slice_for_io(&mut self) -> &mut [u8] {
         let inner = &mut *self.inner;
-        
+
         // Ensure buffer can hold max UDP datagram
         if inner.capacity() < MAX_UDP_PAYLOAD {
             inner.reserve(MAX_UDP_PAYLOAD - inner.capacity());
         }
-        
+
         // Resize to max capacity for recvmsg
         inner.resize(MAX_UDP_PAYLOAD, 0);
-        
+
         inner.as_mut_slice()
     }
 

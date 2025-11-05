@@ -38,9 +38,7 @@ pub fn prefetch<T>(ptr: *const T, _mode: PrefetchMode) {
         // but doesn't need to be aligned or initialized. On x86_64, prefetcht0
         // loads data into all cache levels with temporal locality hint.
         unsafe {
-            core::arch::x86_64::_mm_prefetch::<_MM_HINT_T0>(
-                ptr as *const i8,
-            );
+            core::arch::x86_64::_mm_prefetch::<_MM_HINT_T0>(ptr as *const i8);
         }
     }
 

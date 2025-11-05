@@ -279,7 +279,7 @@ impl NetworkWorker {
 
         // Adaptive receive buffer pre-posting state
         // Dynamically adjusts number of pre-posted receive operations based on traffic patterns
-        let min_recv_ops = 8usize;  // Minimum to avoid starvation
+        let min_recv_ops = 8usize; // Minimum to avoid starvation
         let max_recv_ops = (self.config.uring_entries / 2).min(128) as usize; // Cap at half ring size
         let mut target_recv_ops = (self.config.uring_entries / 4).min(64) as usize; // Start conservative
         let mut recent_completion_counts = std::collections::VecDeque::with_capacity(16);
@@ -353,14 +353,17 @@ impl NetworkWorker {
         loop {
             // Check shutdown flag (only overhead in event loop)
             if shutdown.load(Ordering::Relaxed) {
-                info!(worker_id, "Shutdown signal received, beginning graceful shutdown");
+                info!(
+                    worker_id,
+                    "Shutdown signal received, beginning graceful shutdown"
+                );
                 break;
             }
 
             // Calculate next QUIC timeout adaptively from the priority queue
             // This provides precise timeout tracking - we wait exactly until the
             // next connection needs timeout processing, instead of polling every 100ms.
-            // 
+            //
             // Benefits:
             // - Reduces wasted CPU from unnecessary timeout checks
             // - Improves responsiveness (processes timeouts exactly when needed)
@@ -499,8 +502,7 @@ impl NetworkWorker {
             if sq_dropped > 0 {
                 warn!(
                     worker_id,
-                    sq_dropped,
-                    "io_uring submission queue entries dropped"
+                    sq_dropped, "io_uring submission queue entries dropped"
                 );
             }
 
@@ -522,7 +524,7 @@ impl NetworkWorker {
             // This improves cache locality for connection state and buffer pool access
             let mut outgoing_packets = Vec::new();
             let recv_count = recv_completions.len();
-            
+
             for (buf_id, result) in recv_completions {
                 if let Some(mut state) = in_flight_recv.remove(&buf_id) {
                     if result < 0 {
@@ -605,7 +607,10 @@ impl NetworkWorker {
                     &mut next_send_id,
                 ) {
                     Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::Other && e.to_string().contains("submission queue full") => {
+                    Err(e)
+                        if e.kind() == io::ErrorKind::Other
+                            && e.to_string().contains("submission queue full") =>
+                    {
                         // SQ full - packet will be lost, but QUIC will retransmit
                         send_sq_full = true;
                         warn!(
@@ -628,8 +633,7 @@ impl NetworkWorker {
                 target_recv_ops = (target_recv_ops.saturating_sub(8)).max(min_recv_ops);
                 debug!(
                     worker_id,
-                    target_recv_ops,
-                    "Reduced recv target due to send SQ pressure"
+                    target_recv_ops, "Reduced recv target due to send SQ pressure"
                 );
             }
 
@@ -661,18 +665,29 @@ impl NetworkWorker {
             // Adapt target every 16 cycles (avoid frequent oscillation)
             adaptation_cycle += 1;
             if adaptation_cycle % 16 == 0 && recent_completion_counts.len() >= 16 {
-                let avg_completions: usize = recent_completion_counts.iter().sum::<usize>() / recent_completion_counts.len();
-                
+                let avg_completions: usize =
+                    recent_completion_counts.iter().sum::<usize>() / recent_completion_counts.len();
+
                 // If average completions are high relative to target, we're likely under pressure
                 // Increase target to keep more buffers ready
                 if avg_completions > (target_recv_ops * 3) / 4 {
                     target_recv_ops = (target_recv_ops + 4).min(max_recv_ops);
-                    debug!(worker_id, target_recv_ops, avg_completions, "Increased recv buffer target (high traffic)");
+                    debug!(
+                        worker_id,
+                        target_recv_ops,
+                        avg_completions,
+                        "Increased recv buffer target (high traffic)"
+                    );
                 }
                 // If average completions are low, we can reduce overhead
                 else if avg_completions < target_recv_ops / 4 {
                     target_recv_ops = (target_recv_ops.saturating_sub(4)).max(min_recv_ops);
-                    debug!(worker_id, target_recv_ops, avg_completions, "Decreased recv buffer target (low traffic)");
+                    debug!(
+                        worker_id,
+                        target_recv_ops,
+                        avg_completions,
+                        "Decreased recv buffer target (low traffic)"
+                    );
                 }
             }
 
@@ -696,7 +711,10 @@ impl NetworkWorker {
                     &mut next_buf_id,
                 ) {
                     Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::Other && e.to_string().contains("submission queue full") => {
+                    Err(e)
+                        if e.kind() == io::ErrorKind::Other
+                            && e.to_string().contains("submission queue full") =>
+                    {
                         // Submission queue is full - this is expected under heavy load
                         // We'll retry on next loop iteration
                         sq_full_count += 1;
@@ -747,7 +765,7 @@ impl NetworkWorker {
         info!(worker_id, "Initiating graceful shutdown sequence");
 
         // Step 1: Stop accepting new connections (already done - loop exited)
-        
+
         // Step 2: Gracefully close all active QUIC connections
         let shutdown_packets = match quic_manager.shutdown_all_connections() {
             Ok(packets) => packets,
@@ -758,11 +776,15 @@ impl NetworkWorker {
         };
 
         // Step 3: Send CONNECTION_CLOSE frames to all peers
-        info!(worker_id, packet_count = shutdown_packets.len(), "Sending shutdown notifications to peers");
-        
+        info!(
+            worker_id,
+            packet_count = shutdown_packets.len(),
+            "Sending shutdown notifications to peers"
+        );
+
         // Coalesce shutdown packets before sending
         let coalesced_shutdown = coalesce_packets(shutdown_packets);
-        
+
         for packet in coalesced_shutdown {
             if let Err(e) = submit_send_op(
                 &mut ring,
@@ -784,7 +806,7 @@ impl NetworkWorker {
         // Step 4: Cancel all pending io_uring operations and drain completions
         let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut drain_iterations = 0;
-        
+
         info!(
             worker_id,
             in_flight_recv = in_flight_recv.len(),
@@ -795,8 +817,7 @@ impl NetworkWorker {
         // First, try to cancel all pending receive operations
         // This makes them complete immediately with ECANCELED
         for &buf_id in in_flight_recv.keys() {
-            let cancel_op = opcode::AsyncCancel::new(OpType::Recv(buf_id).into())
-                .build();
+            let cancel_op = opcode::AsyncCancel::new(OpType::Recv(buf_id).into()).build();
             unsafe {
                 let _ = ring.submission().push(&cancel_op);
             }
@@ -806,11 +827,11 @@ impl NetworkWorker {
         let _ = ring.submit();
 
         // Now drain any remaining completions with a timeout
-        while (!in_flight_recv.is_empty() || !send_in_flight.is_empty()) 
-            && std::time::Instant::now() < shutdown_deadline 
+        while (!in_flight_recv.is_empty() || !send_in_flight.is_empty())
+            && std::time::Instant::now() < shutdown_deadline
         {
             drain_iterations += 1;
-            
+
             // Use submit_and_wait(0) with a very short timeout
             // This doesn't block indefinitely like submit_and_wait(1)
             match ring.submit_and_wait(0) {
@@ -832,7 +853,7 @@ impl NetworkWorker {
                             }
                         }
                     }
-                    
+
                     // If no completions, sleep briefly before retry
                     if processed == 0 {
                         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -921,7 +942,7 @@ fn submit_recv_op(
 
     // Create operation state (heap-allocated with stable addresses)
     let mut state = RecvOpState::new(buffer);
-    
+
     // Create recvmsg operation
     let buf_id = *next_buf_id;
     *next_buf_id = next_buf_id.wrapping_add(1);
@@ -979,7 +1000,7 @@ fn coalesce_packets(
     packets: Vec<crate::quic::manager::OutgoingPacket>,
 ) -> Vec<crate::quic::manager::OutgoingPacket> {
     use std::collections::HashMap;
-    
+
     if packets.is_empty() {
         return Vec::new();
     }
@@ -991,9 +1012,10 @@ fn coalesce_packets(
     // Group packets by destination address
     // HashMap<destination, Vec<packet_data>>
     let mut by_dest: HashMap<std::net::SocketAddr, Vec<Vec<u8>>> = HashMap::new();
-    
+
     for packet in packets {
-        by_dest.entry(packet.to)
+        by_dest
+            .entry(packet.to)
             .or_insert_with(Vec::new)
             .push(packet.data);
     }
@@ -1006,7 +1028,7 @@ fn coalesce_packets(
 
         for packet_data in packets {
             let packet_len = packet_data.len();
-            
+
             // Check if adding this packet would exceed MTU
             if !current_dgram.is_empty() && current_dgram.len() + packet_len > MAX_COALESCED_SIZE {
                 // Current datagram is full - emit it and start a new one
@@ -1054,7 +1076,7 @@ fn submit_send_op(
 ) -> io::Result<()> {
     // Create operation state (heap-allocated with stable addresses)
     let state = SendOpState::new(packet, to);
-    
+
     // Create sendmsg operation
     let send_id = *next_send_id;
     *next_send_id = next_send_id.wrapping_add(1);
@@ -1098,9 +1120,9 @@ impl NetIoHandle {
     /// Signal all workers to shut down and wait for them to complete
     pub fn shutdown(mut self) {
         use std::sync::mpsc;
-        
+
         info!("Shutting down network layer");
-        
+
         // Signal shutdown to all workers
         self.shutdown.store(true, Ordering::Relaxed);
 
@@ -1128,14 +1150,14 @@ impl NetIoHandle {
 
         // Wait for workers to complete graceful shutdown (with per-worker timeout)
         let per_worker_deadline = std::time::Duration::from_secs(3);
-        
+
         for (i, worker) in self.workers.drain(..).enumerate() {
             let worker_start = std::time::Instant::now();
-            
+
             // Try to join the worker thread
             // Note: std::thread::JoinHandle doesn't support timeout, so we use a spawn+join pattern
             let join_handle = std::thread::spawn(move || worker.join());
-            
+
             // Poll the join with a timeout
             let mut elapsed = std::time::Duration::ZERO;
             loop {
@@ -1156,7 +1178,7 @@ impl NetIoHandle {
                     }
                     break;
                 }
-                
+
                 elapsed = worker_start.elapsed();
                 if elapsed >= per_worker_deadline {
                     warn!(
@@ -1166,7 +1188,7 @@ impl NetIoHandle {
                     );
                     break;
                 }
-                
+
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
@@ -1262,7 +1284,7 @@ pub fn spawn(
     app_registry: crate::apps::AppRegistry,
 ) -> Result<NetIoHandle> {
     use std::path::Path;
-    
+
     if config.workers == 0 {
         anyhow::bail!("netio workers must be at least 1");
     }
@@ -1292,24 +1314,22 @@ pub fn spawn(
     // CRITICAL: We require valid certificates - no self-signed fallback!
     // Production deployments must provide proper TLS certificates.
     // ═══════════════════════════════════════════════════════════════════
-    let shared_credentials = 
-        if let (Some(cert_path), Some(key_path)) = (&quic_config.cert_path, &quic_config.key_path) {
-            info!(
-                cert = cert_path,
-                key = key_path,
-                "Loading TLS credentials from files (shared across all workers)"
-            );
-            crate::quic::crypto::TlsCredentials::from_files(
-                Path::new(cert_path),
-                Path::new(key_path)
-            )?
-        } else {
-            anyhow::bail!(
-                "TLS certificate and key are required. \
+    let shared_credentials = if let (Some(cert_path), Some(key_path)) =
+        (&quic_config.cert_path, &quic_config.key_path)
+    {
+        info!(
+            cert = cert_path,
+            key = key_path,
+            "Loading TLS credentials from files (shared across all workers)"
+        );
+        crate::quic::crypto::TlsCredentials::from_files(Path::new(cert_path), Path::new(key_path))?
+    } else {
+        anyhow::bail!(
+            "TLS certificate and key are required. \
                  Please provide cert_path and key_path in configuration. \
                  Self-signed certificates are not supported for security reasons."
-            );
-        };
+        );
+    };
 
     // Shared shutdown flag (only for coordination, not hot path)
     let shutdown = Arc::new(AtomicBool::new(false));

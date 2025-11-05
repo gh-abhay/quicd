@@ -104,10 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if conn.is_established() {
             println!("✓ Handshake completed!");
             let alpn = conn.application_proto();
-            println!(
-                "  ALPN: {}",
-                String::from_utf8_lossy(alpn)
-            );
+            println!("  ALPN: {}", String::from_utf8_lossy(alpn));
             break;
         }
 
