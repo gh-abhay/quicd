@@ -32,12 +32,14 @@
 //! - **Connection Events**: `AppEvent::HandshakeCompleted`, `AppEvent::ConnectionClosing`
 //! - **Stream Events**: `AppEvent::NewStream` when peer opens a stream
 //! - **Stream Data**: Via `RecvStream::read()` (zero-copy `Bytes`)
+//! - **Stream Readable**: `AppEvent::StreamReadable` for efficient backpressure signaling
 //! - **Datagrams**: `AppEvent::Datagram` for unreliable packets
 //! - **Command Responses**: `AppEvent::StreamOpened`, `AppEvent::DatagramSent`, etc.
 //!
 //! ### Data Flow (Egress: App → Server)
 //! - **Stream Operations**: Via `ConnectionHandle::open_bi()`, `open_uni()`
 //! - **Stream Writes**: Via `SendStream::write()` (zero-copy `Bytes`)
+//! - **Fluent API**: Use `send_data().with_fin(true).send()` for ergonomic patterns
 //! - **Datagrams**: Via `ConnectionHandle::send_datagram()`
 //! - **Stream Control**: Via `ConnectionHandle::reset_stream()`, `close()`
 //! - **Stats**: Via `ConnectionHandle::stats()`
@@ -49,6 +51,28 @@
 //! - **App Task**: Driven by events from `AppEventStream`; uses channels for all I/O
 //! - **Channel Backpressure**: If ingress channel fills, worker will block (but other connections unaffected)
 //! - **Zero-Copy**: Uses `bytes::Bytes` throughout to avoid unnecessary allocations
+//!
+//! ## API Refinements (v0.2)
+//!
+//! ### Backpressure Signaling
+//! - **`AppEvent::StreamReadable`**: Edge-triggered notification when buffered data is available
+//! - Helps apps implement efficient polling without constant `read()` calls
+//! - Enables better flow control and resource management
+//!
+//! ### Ergonomic Builders
+//! - **`SendStream::send_data()`**: Fluent builder for HTTP/3 patterns
+//! - Example: `send_stream.send_data(body).with_fin(true).send().await`
+//! - Keeps the API ergonomic without added complexity
+//!
+//! ### Enhanced Error Handling
+//! - **`ConnectionError::QuicError`**: RFC 9000 compliant error codes
+//! - **`ConnectionError::TlsFail`**: Specific TLS handshake failures
+//! - Better error propagation for protocol-aware applications
+//!
+//! ### Graceful Shutdown
+//! - **30-second timeout**: Apps have grace period after `ConnectionClosing`
+//! - **`ShutdownFuture`**: Global shutdown signal independent of connection events
+//! - Prevents zombie tasks and ensures clean resource cleanup
 //!
 //! # Example
 //!
@@ -71,23 +95,38 @@
 //!         handle: ConnectionHandle,
 //!         mut events: quicd_x::AppEventStream,
 //!         _transport: quicd_x::TransportControls,
-//!         _shutdown: quicd_x::ShutdownFuture,
+//!         mut shutdown: quicd_x::ShutdownFuture,
 //!     ) -> Result<(), quicd_x::ConnectionError> {
-//!         while let Some(event) = events.next().await {
-//!             match event {
-//!                 AppEvent::HandshakeCompleted { .. } => {
-//!                     // Connection established
-//!                 }
-//!                 AppEvent::NewStream { stream_id, mut recv_stream, send_stream, .. } => {
-//!                     if let Some(send) = send_stream {
-//!                         // Handle bidirectional stream
-//!                         while let Ok(Some(StreamData::Data(data))) = recv_stream.read().await {
-//!                             send.write(data, false).await?;
+//!         loop {
+//!             tokio::select! {
+//!                 Some(event) = events.next() => {
+//!                     match event {
+//!                         AppEvent::HandshakeCompleted { .. } => {
+//!                             // Connection established
 //!                         }
+//!                         AppEvent::NewStream { stream_id, mut recv_stream, send_stream, .. } => {
+//!                             if let Some(send) = send_stream {
+//!                                 // Echo using fluent API
+//!                                 while let Ok(Some(StreamData::Data(data))) = recv_stream.read().await {
+//!                                     send.send_data(data).with_fin(false).send().await?;
+//!                                 }
+//!                                 send.finish().await?;
+//!                             }
+//!                         }
+//!                         AppEvent::StreamReadable { stream_id } => {
+//!                             // Stream has buffered data - can read without blocking
+//!                         }
+//!                         AppEvent::ConnectionClosing { .. } => {
+//!                             // Graceful cleanup
+//!                             break;
+//!                         }
+//!                         _ => {}
 //!                     }
 //!                 }
-//!                 AppEvent::ConnectionClosing { .. } => break,
-//!                 _ => {}
+//!                 _ = &mut shutdown => {
+//!                     // Global shutdown - cleanup and exit
+//!                     break;
+//!                 }
 //!             }
 //!         }
 //!         Ok(())
@@ -105,8 +144,8 @@ pub use crate::error::ConnectionError;
 pub use crate::events::{AppEvent, TransportEvent};
 pub use crate::factory::{AppEventStream, QuicAppFactory, ShutdownFuture};
 pub use crate::handle::{
-    ConnectionHandle, ConnectionId, ConnectionStats, RecvStream, SendStream, StreamData, StreamId,
-    TransportControls,
+    ConnectionHandle, ConnectionId, ConnectionStats, RecvStream, SendDataBuilder, SendStream,
+    StreamData, StreamId, TransportControls,
 };
 pub use crate::server::{
     new_connection_handle, new_recv_stream, new_send_stream, EgressCommand, StreamWriteCmd,
