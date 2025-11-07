@@ -69,8 +69,8 @@ impl QuicAppFactory for H3Factory {
                                             "Received data on stream"
                                         );
 
-                                        // Echo back the data
-                                        match send_stream.write(data, false).await {
+                                        // Echo back the data using fluent API
+                                        match send_stream.send_data(data).with_fin(false).send().await {
                                             Ok(written) => {
                                                 debug!(stream_id, written, "Echoed data back");
                                             }
@@ -111,6 +111,9 @@ impl QuicAppFactory for H3Factory {
                         }
                         debug!(stream_id, "Stream finished");
                     });
+                }
+                AppEvent::StreamReadable { stream_id } => {
+                    debug!(stream_id, "Stream has buffered data available");
                 }
                 AppEvent::StreamFinished { stream_id } => {
                     debug!(stream_id, "Stream finished");
