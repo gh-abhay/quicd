@@ -67,4 +67,37 @@ pub enum ConnectionError {
     /// - Protocol state violations
     #[error("transport error: {0}")]
     Transport(String),
+
+    /// QUIC protocol error with RFC-compliant error code.
+    ///
+    /// This variant includes the QUIC error code as defined in RFC 9000.
+    /// Common error codes:
+    /// - 0x00: NO_ERROR
+    /// - 0x01: INTERNAL_ERROR
+    /// - 0x02: CONNECTION_REFUSED
+    /// - 0x03: FLOW_CONTROL_ERROR
+    /// - 0x04: STREAM_LIMIT_ERROR
+    /// - 0x05: STREAM_STATE_ERROR
+    /// - 0x0A: PROTOCOL_VIOLATION
+    /// - 0x0D: INVALID_TOKEN
+    ///
+    /// Applications can use this for RFC-compliant error reporting.
+    #[error("quic error (code=0x{code:x}): {message}")]
+    QuicError {
+        /// QUIC error code from RFC 9000
+        code: u64,
+        /// Human-readable error description
+        message: String,
+    },
+
+    /// TLS handshake failure during connection establishment.
+    ///
+    /// This indicates a failure in the TLS 1.3 handshake that is required
+    /// for all QUIC connections. Common causes:
+    /// - Certificate validation failure
+    /// - Cipher suite mismatch
+    /// - ALPN negotiation failure
+    /// - Invalid TLS configuration
+    #[error("tls handshake failed: {0}")]
+    TlsFail(String),
 }

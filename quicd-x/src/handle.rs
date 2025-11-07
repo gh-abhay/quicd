@@ -252,6 +252,61 @@ impl SendStream {
     pub async fn finish(&self) -> Result<(), ConnectionError> {
         self.write(Bytes::new(), true).await.map(|_| ())
     }
+
+    /// Creates a fluent builder for sending data with optional FIN.
+    ///
+    /// This enables ergonomic patterns like:
+    /// ```ignore
+    /// send_stream.send_data(data).with_fin(true).await?;
+    /// ```
+    ///
+    /// This is particularly useful for HTTP/3 patterns where you send
+    /// HEADERS + DATA + FIN in one logical operation.
+    pub fn send_data(&self, data: Bytes) -> SendDataBuilder {
+        SendDataBuilder {
+            stream: self.clone(),
+            data,
+            fin: false,
+        }
+    }
+}
+
+/// Fluent builder for sending stream data with optional FIN flag.
+///
+/// Created by `SendStream::send_data()`. Provides ergonomic method chaining
+/// for common patterns like HTTP/3 request/response finalization.
+///
+/// # Example
+///
+/// ```ignore
+/// // Send data with FIN in one fluent call
+/// send_stream.send_data(body).with_fin(true).send().await?;
+///
+/// // Or split for clarity
+/// let builder = send_stream.send_data(headers);
+/// let written = builder.with_fin(false).send().await?;
+/// ```
+pub struct SendDataBuilder {
+    stream: SendStream,
+    data: Bytes,
+    fin: bool,
+}
+
+impl SendDataBuilder {
+    /// Sets the FIN flag to indicate end-of-stream after this data.
+    ///
+    /// Returns self for method chaining.
+    pub fn with_fin(mut self, fin: bool) -> Self {
+        self.fin = fin;
+        self
+    }
+
+    /// Sends the data with the configured flags.
+    ///
+    /// Returns the number of bytes written to the stream buffer.
+    pub async fn send(self) -> Result<usize, ConnectionError> {
+        self.stream.write(self.data, self.fin).await
+    }
 }
 
 struct SendStreamInner {

@@ -47,6 +47,19 @@ pub enum AppEvent {
         send_stream: Option<SendStream>,
     },
 
+    /// Stream has buffered data available to read.
+    ///
+    /// This event signals that a stream has data ready without requiring the app
+    /// to poll constantly. Useful for backpressure handling and efficient I/O patterns.
+    ///
+    /// Apps can call `RecvStream::read()` when this event arrives. This event is
+    /// edge-triggered: it fires when data becomes available, not continuously while
+    /// data is buffered.
+    ///
+    /// **Note**: The stream may not have received FIN yet. Check the result of
+    /// `read()` to determine if more data will arrive.
+    StreamReadable { stream_id: StreamId },
+
     /// Peer has finished sending data on a stream (FIN received).
     ///
     /// This is informational; `RecvStream::read()` will return `Ok(None)` afterwards.
