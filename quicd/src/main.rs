@@ -57,8 +57,8 @@ fn main() -> anyhow::Result<()> {
     // Create application registry (initially empty; apps can be registered here)
     info!("Initializing application registry");
     let app_registry = apps::AppRegistry::new()
-        .register("h3", Arc::new(quicd_h3::H3Factory::new()))
-        .register("h3-29", Arc::new(quicd_h3::H3Factory::new()));
+        .register("h3", Arc::new(quicd_h3::H3Factory::new(quicd_h3::DefaultH3HandlerFactory::new())))
+        .register("h3-29", Arc::new(quicd_h3::H3Factory::new(quicd_h3::DefaultH3HandlerFactory::new())));
 
     info!(
         registered_alpns = ?app_registry.alpns(),
