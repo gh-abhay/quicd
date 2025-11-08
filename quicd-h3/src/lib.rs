@@ -1,166 +1,187 @@
 //! HTTP/3 implementation for quicd server.
 //!
 //! This crate provides an HTTP/3 application that runs on top of the quicd QUIC server.
+//! It implements the H3ServerSession trait and related types for building HTTP/3 applications.
 
+mod quic_impl;
+mod session;
+
+pub use session::{H3Factory, H3Session, DefaultH3HandlerFactory};
+
+use std::pin::Pin;
+use std::sync::Arc;
 use async_trait::async_trait;
-use futures::stream::StreamExt;
-use quicd_x::{
-    AppEvent, AppEventStream, ConnectionError, ConnectionHandle, QuicAppFactory, ShutdownFuture,
-    TransportControls,
-};
-use tracing::{debug, info};
+use bytes::Bytes;
+use futures::Stream;
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
+use quicd_x::{StreamId, TransportEvent};
 
-/// HTTP/3 application factory.
-///
-/// For now, this is a simple echo server for testing the quicd-x integration.
-pub struct H3Factory;
+/// HTTP/3-specific errors.
+#[derive(Debug, thiserror::Error)]
+pub enum H3Error {
+    #[error("Frame unexpected in stream phase")]
+    PhaseError,
+    #[error("QPACK decode failure")]
+    CompressionError,
+    #[error("QUIC transport: {0}")]
+    Transport(#[from] quicd_x::ConnectionError),
+    #[error("HTTP/3 protocol error: {0}")]
+    Protocol(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
 
-impl H3Factory {
-    pub fn new() -> Self {
-        Self
+/// Events from the H3 session to the app.
+pub enum H3Event {
+    /// Incoming request: Headers + optional body stream.
+    Request {
+        req: Request<()>,
+        #[allow(dead_code)] // TODO: implement
+        body: Pin<Box<dyn Stream<Item = Result<Bytes, H3Error>> + Send>>,
+        stream_id: StreamId,
+        /// Channel to send the response back
+        response_tx: tokio::sync::mpsc::Sender<H3ResponseBuilder>,
+    },
+    /// Peer promised a push (client-initiated; app can cancel or handle).
+    PushPromise {
+        push_uri: Uri,
+        promised_id: u64,
+        headers: HeaderMap,
+    },
+    /// Priority update from peer.
+    PriorityUpdate {
+        element_id: u64,
+        priority: H3Priority,
+    },
+    /// Datagram received.
+    Datagram { payload: Bytes },
+    /// Session closing.
+    Closing { reason: Option<H3Error> },
+    /// Transport event bubbled up.
+    Transport(TransportEvent),
+}
+
+/// Priority struct (RFC 9218).
+#[derive(Debug, Clone, Copy)]
+pub struct H3Priority {
+    pub urgency: u8,
+    pub incremental: bool,
+}
+
+/// Fluent response builder.
+#[derive(Debug)]
+pub struct H3ResponseBuilder {
+    inner: Response<()>,
+    priority: Option<H3Priority>,
+    trailers: Option<HeaderMap>,
+    response_tx: Option<tokio::sync::mpsc::Sender<H3ResponseBuilder>>,
+}
+
+impl H3ResponseBuilder {
+    pub fn new(status: StatusCode) -> Self {
+        Self {
+            inner: Response::builder().status(status).body(()).unwrap(),
+            priority: None,
+            trailers: None,
+            response_tx: None,
+        }
+    }
+
+    /// Internal method to set the response sender
+    pub(crate) fn with_sender(mut self, tx: tokio::sync::mpsc::Sender<H3ResponseBuilder>) -> Self {
+        self.response_tx = Some(tx);
+        self
+    }
+
+    pub fn status(mut self, status: StatusCode) -> Self {
+        *self.inner.status_mut() = status;
+        self
+    }
+
+    pub fn header<K: AsRef<str>, V: AsRef<[u8]>>(mut self, key: K, value: V) -> Self {
+        self.inner.headers_mut().insert(
+            HeaderName::from_bytes(key.as_ref().as_bytes()).unwrap(),
+            HeaderValue::from_bytes(value.as_ref()).unwrap(),
+        );
+        self
+    }
+
+    pub fn with_priority(mut self, prio: H3Priority) -> Self {
+        self.priority = Some(prio);
+        self
+    }
+
+    pub fn trailers(mut self, trailers: HeaderMap) -> Self {
+        self.trailers = Some(trailers);
+        self
+    }
+
+    pub async fn body<St>(mut self, _body: St) -> Result<(), H3Error>
+    where
+        St: Stream<Item = Result<Bytes, H3Error>> + Send + Unpin + 'static,
+    {
+        // Send the response back to the session
+        if let Some(tx) = self.response_tx.take() {
+            let _ = tx.send(self).await;
+        }
+        // TODO: In a full implementation, we'd wait for confirmation that the response was sent
+        Ok(())
     }
 }
 
+/// Core trait for H3 session handle.
 #[async_trait]
-impl QuicAppFactory for H3Factory {
-    fn accepts_alpn(&self, alpn: &str) -> bool {
-        matches!(alpn, "h3" | "h3-29")
-    }
+pub trait H3ServerSession: Send + Sync {
+    /// Async stream of incoming H3 events.
+    fn events(&self) -> Pin<Box<dyn Stream<Item = H3Event> + Send>>;
 
-    async fn spawn_app(
-        &self,
-        alpn: String,
-        handle: ConnectionHandle,
-        mut events: AppEventStream,
-        _transport: TransportControls,
-        _shutdown: ShutdownFuture,
-    ) -> Result<(), ConnectionError> {
-        info!(
-            alpn,
-            connection_id = %handle.connection_id(),
-            peer = %handle.peer_addr(),
-            "H3 application task started"
-        );
+    /// Send response to an incoming request.
+    async fn send_response(&self, stream_id: StreamId, builder: H3ResponseBuilder) -> Result<(), H3Error>;
 
-        // Simple event loop for testing
-        while let Some(event) = events.next().await {
-            match event {
-                AppEvent::HandshakeCompleted { .. } => {
-                    debug!("Handshake completed");
-                }
-                AppEvent::NewStream {
-                    stream_id,
-                    bidirectional,
-                    mut recv_stream,
-                    send_stream,
-                } => {
-                    info!(stream_id, bidirectional, "New stream opened");
+    /// Initiate server push.
+    async fn push(&self, method: Method, uri: Uri, headers: HeaderMap) -> Result<H3ResponseBuilder, H3Error>;
 
-                    // Echo back any data received
-                    tokio::spawn(async move {
-                        // Only echo on bidirectional streams
-                        if let Some(send_stream) = send_stream {
-                            while let Ok(Some(stream_data)) = recv_stream.read().await {
-                                match stream_data {
-                                    quicd_x::StreamData::Data(data) => {
-                                        debug!(
-                                            stream_id,
-                                            bytes = data.len(),
-                                            "Received data on stream"
-                                        );
+    /// Update priority for a stream/push.
+    async fn update_priority(&self, element_id: u64, prio: H3Priority) -> Result<(), H3Error>;
 
-                                        // Echo back the data using fluent API
-                                        match send_stream.send_data(data).with_fin(false).send().await {
-                                            Ok(written) => {
-                                                debug!(stream_id, written, "Echoed data back");
-                                            }
-                                            Err(e) => {
-                                                debug!(stream_id, error = ?e, "Failed to echo data");
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    quicd_x::StreamData::Fin => {
-                                        debug!(stream_id, "Received FIN on stream");
-                                        break;
-                                    }
-                                }
-                            }
+    /// Send unreliable datagram.
+    async fn send_datagram(&self, data: Bytes) -> Result<usize, H3Error>;
 
-                            // Close the send stream
-                            if let Err(e) = send_stream.finish().await {
-                                debug!(stream_id, error = ?e, "Failed to finish stream");
-                            }
-                        } else {
-                            // Unidirectional recv stream - just consume data
-                            while let Ok(Some(stream_data)) = recv_stream.read().await {
-                                match stream_data {
-                                    quicd_x::StreamData::Data(data) => {
-                                        debug!(
-                                            stream_id,
-                                            bytes = data.len(),
-                                            "Received data on uni stream"
-                                        );
-                                    }
-                                    quicd_x::StreamData::Fin => {
-                                        debug!(stream_id, "Received FIN on uni stream");
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        debug!(stream_id, "Stream finished");
-                    });
-                }
-                AppEvent::StreamReadable { stream_id } => {
-                    debug!(stream_id, "Stream has buffered data available");
-                }
-                AppEvent::StreamFinished { stream_id } => {
-                    debug!(stream_id, "Stream finished");
-                }
-                AppEvent::StreamClosed {
-                    stream_id,
-                    app_initiated,
-                    error_code,
-                } => {
-                    debug!(stream_id, app_initiated, error_code, "Stream closed");
-                }
-                AppEvent::Datagram { payload } => {
-                    debug!(bytes = payload.len(), "Received datagram");
-                }
-                AppEvent::ConnectionCapacityChanged => {
-                    debug!("Connection capacity changed");
-                }
-                AppEvent::TransportEvent(event) => {
-                    debug!(?event, "Transport event");
-                }
-                AppEvent::ConnectionClosing { error_code, reason } => {
-                    info!(
-                        error_code,
-                        reason_len = reason.as_ref().map(|r| r.len()).unwrap_or(0),
-                        "Connection closing"
-                    );
-                    break;
-                }
-                AppEvent::StreamOpened { request_id, result } => {
-                    debug!(request_id, ?result, "Stream opened response");
-                }
-                AppEvent::UniStreamOpened { request_id, result } => {
-                    debug!(request_id, ?result, "Uni stream opened response");
-                }
-                AppEvent::DatagramSent { request_id, result } => {
-                    debug!(request_id, ?result, "Datagram sent response");
-                }
-                AppEvent::StreamReset { request_id, result } => {
-                    debug!(request_id, ?result, "Stream reset response");
-                }
-                AppEvent::StatsReceived { request_id, result } => {
-                    debug!(request_id, ?result, "Stats received response");
-                }
-            }
-        }
+    /// Graceful close with GOAWAY.
+    async fn goaway(&self, last_id: u64, reason: Option<H3Error>) -> Result<(), H3Error>;
 
-        info!("H3 application task ended");
-        Ok(())
-    }
+    /// Session stats.
+    fn stats(&self) -> H3Stats;
+
+    /// Raw QUIC stream access.
+    async fn open_raw_bidir(&self) -> Result<(quicd_x::SendStream, quicd_x::RecvStream), H3Error>;
+}
+
+/// Stats struct.
+#[derive(Debug, Clone)]
+pub struct H3Stats {
+    pub active_requests: usize,
+    pub qpack_table_size: usize,
+    pub push_promises: usize,
+}
+
+/// App handler trait.
+#[async_trait]
+pub trait H3Handler: Send + 'static {
+    /// Init and return the handler.
+    async fn init(&mut self, session: Arc<dyn H3ServerSession>) -> Result<(), H3Error>;
+
+    /// Handle events.
+    async fn handle(&mut self, event: H3Event) -> Result<(), H3Error>;
+
+    /// Shutdown hook.
+    async fn shutdown(&mut self, reason: Option<H3Error>);
+}
+
+/// Factory for runtime loading.
+#[async_trait]
+pub trait H3HandlerFactory: Send + Sync + 'static {
+    fn accepts(&self, config: &str) -> bool;
+
+    async fn create(&self, session: Arc<dyn H3ServerSession + Send + Sync>, config: Bytes) -> Result<Box<dyn H3Handler + Send + 'static>, H3Error>;
 }
