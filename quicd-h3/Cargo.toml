@@ -5,13 +5,20 @@ edition = "2021"
 
 [dependencies]
 quicd-x = { path = "../quicd-x" }
-async-trait = "0.1"
+tokio = { version = "1.0", features = ["full"] }
+bytes = "1.0"
 futures = "0.3"
-tokio = { version = "1", features = ["rt", "macros"] }
-tracing = "0.1"
-h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
-http = "1"
-bytes = "1"
-pin-project-lite = "0.2"
-parking_lot = "0.12"
-thiserror = "1"
+async-trait = "0.1"
+thiserror = "1.0"
+http = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "huffman_benchmark"
+harness = false
+
+[[bench]]
+name = "h3_benchmarks"
+harness = false
