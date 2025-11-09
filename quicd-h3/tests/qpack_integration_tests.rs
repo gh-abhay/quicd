@@ -1,0 +1,191 @@
+use quicd_h3::qpack::QpackCodec;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_qpack_header_compression() {
+        let mut codec = QpackCodec::new();
+
+        // Set up dynamic table
+        codec.set_max_table_capacity(1024);
+
+        // Test headers that should benefit from compression
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("cache-control".to_string(), "no-cache".to_string()),
+            ("accept-encoding".to_string(), "gzip, deflate, br".to_string()),
+        ];
+
+        // Encode headers
+        let encoded = codec.encode_headers(&headers).unwrap();
+
+        // Decode headers
+        let decoded = codec.decode_headers(&encoded).unwrap();
+
+        // Verify roundtrip
+        assert_eq!(decoded.len(), headers.len());
+        for (i, (name, value)) in headers.iter().enumerate() {
+            assert_eq!(decoded[i].0, *name);
+            assert_eq!(decoded[i].1, *value);
+        }
+    }
+
+    #[test]
+    fn test_qpack_dynamic_table_usage() {
+        let mut codec = QpackCodec::new();
+        codec.set_max_table_capacity(1024);
+
+        // Insert some headers into dynamic table
+        let name1 = "x-custom-header".to_string();
+        let value1 = "custom-value-1".to_string();
+        codec.insert(name1.clone(), value1.clone());
+
+        let name2 = "x-custom-header".to_string();
+        let value2 = "custom-value-2".to_string();
+        codec.insert(name2.clone(), value2.clone());
+
+        // Create headers that reference the dynamic table
+        let headers = vec![
+            (name1.clone(), value1.clone()), // Should use dynamic table
+            (name2.clone(), value2.clone()), // Should use dynamic table
+            ("content-type".to_string(), "text/plain".to_string()), // Static table
+        ];
+
+        let encoded = codec.encode_headers(&headers).unwrap();
+        let decoded = codec.decode_headers(&encoded).unwrap();
+
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], (name1, value1));
+        assert_eq!(decoded[1], (name2, value2));
+        assert_eq!(decoded[2], ("content-type".to_string(), "text/plain".to_string()));
+    }
+
+    #[test]
+    fn test_qpack_static_table() {
+        let codec = QpackCodec::new();
+
+        // Test some static table entries
+        let static_entries = vec![
+            (":authority", ""),
+            (":path", "/"),
+            (":method", "GET"),
+            (":method", "POST"),
+            (":status", "200"),
+            (":status", "404"),
+            ("content-type", "text/plain"),
+            ("cache-control", "no-cache"),
+        ];
+
+        for (name, value) in static_entries {
+            let index = codec.find_static_name_index(name);
+            assert!(index.is_some(), "Static table should contain: {}", name);
+
+            let entry = codec.get_static_entry(index.unwrap());
+            assert!(entry.is_some());
+            let (entry_name, entry_value) = entry.unwrap();
+            assert_eq!(entry_name, name);
+            assert_eq!(entry_value, value);
+        }
+    }
+
+    #[test]
+    fn test_qpack_instruction_encoding_decoding() {
+        let codec = QpackCodec::new();
+
+        use quicd_h3::qpack::QpackInstruction;
+
+        let instructions = vec![
+            QpackInstruction::SetDynamicTableCapacity { capacity: 1024 },
+            QpackInstruction::InsertWithNameReference {
+                static_table: true,
+                name_index: 1,
+                value: "test-value".to_string(),
+            },
+            QpackInstruction::InsertWithLiteralName {
+                name: "custom-header".to_string(),
+                value: "custom-value".to_string(),
+            },
+            QpackInstruction::Duplicate { index: 5 },
+        ];
+
+        for instruction in instructions {
+            let encoded = codec.encode_instruction(&instruction).unwrap();
+            let (decoded, consumed) = codec.decode_instruction(&encoded).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(format!("{:?}", instruction), format!("{:?}", decoded));
+        }
+    }
+
+    #[test]
+    fn test_qpack_table_eviction() {
+        let mut codec = QpackCodec::new();
+        codec.set_max_table_capacity(100); // Small capacity
+
+        // Insert entries that exceed capacity
+        for i in 0..10 {
+            let name = format!("header{}", i);
+            let value = "x".repeat(20); // Each entry ~32 bytes
+            codec.insert(name, value);
+        }
+
+        // Table should have evicted old entries to fit
+        let capacity = codec.table_capacity();
+        assert!(capacity <= 100);
+
+        // Should be able to insert more
+        codec.insert("final".to_string(), "value".to_string());
+        assert!(codec.get_relative(0).is_some());
+    }
+
+    #[test]
+    fn test_qpack_large_headers() {
+        let codec = QpackCodec::new();
+
+        // Test with very large header values
+        let large_value = "x".repeat(10000);
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-large-header".to_string(), large_value.clone()),
+        ];
+
+        let encoded = codec.encode_headers(&headers).unwrap();
+        let decoded = codec.decode_headers(&encoded).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].1, "application/json");
+        assert_eq!(decoded[1].1, large_value);
+    }
+
+    #[test]
+    fn test_qpack_mixed_encoding() {
+        let mut codec = QpackCodec::new();
+        codec.set_max_table_capacity(1024);
+
+        // Mix of static table, dynamic table, and literal encoding
+        let headers = vec![
+            (":method".to_string(), "GET".to_string()), // Static table
+            ("x-dynamic".to_string(), "dynamic-value".to_string()), // Will be added to dynamic table
+            ("x-literal".to_string(), "literal-value".to_string()), // Literal encoding
+        ];
+
+        // First encoding - x-dynamic goes to dynamic table
+        let _encoded1 = codec.encode_headers(&headers).unwrap();
+
+        // Second encoding - x-dynamic should use dynamic table reference
+        let headers2 = vec![
+            (":method".to_string(), "GET".to_string()), // Static table
+            ("x-dynamic".to_string(), "dynamic-value".to_string()), // Dynamic table reference
+            ("x-new-literal".to_string(), "new-literal".to_string()), // New literal
+        ];
+
+        let encoded2 = codec.encode_headers(&headers2).unwrap();
+        let decoded2 = codec.decode_headers(&encoded2).unwrap();
+
+        assert_eq!(decoded2.len(), 3);
+        assert_eq!(decoded2[0], (":method".to_string(), "GET".to_string()));
+        assert_eq!(decoded2[1], ("x-dynamic".to_string(), "dynamic-value".to_string()));
+        assert_eq!(decoded2[2], ("x-new-literal".to_string(), "new-literal".to_string()));
+    }
+}

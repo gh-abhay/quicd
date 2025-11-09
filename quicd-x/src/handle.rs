@@ -372,6 +372,7 @@ pub struct TransportControls {
 /// - `congestion_state`: Current congestion control state (e.g., "slow_start", "congestion_avoidance")
 /// - `packets_sent`: Total QUIC packets transmitted
 /// - `packets_received`: Total QUIC packets received
+/// - `max_stream_id`: The highest stream ID processed on this connection
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionStats {
     pub rtt_estimate_ms: Option<u32>,
@@ -381,4 +382,5 @@ pub struct ConnectionStats {
     pub congestion_state: Option<String>,
     pub packets_sent: u64,
     pub packets_received: u64,
+    pub max_stream_id: u64,
 }

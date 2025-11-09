@@ -1335,6 +1335,7 @@ impl QuicManager {
             congestion_state: None, // quiche doesn't expose congestion state in a simple way
             packets_sent: 0,        // quiche doesn't expose total packet count directly
             packets_received: 0,    // tracked separately if needed
+            max_stream_id: 0,       // TODO: track max stream ID in manager
         })
     }
 
