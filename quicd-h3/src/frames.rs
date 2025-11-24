@@ -184,39 +184,39 @@ impl H3Frame {
 
         match prefix {
             0 => {
-                // 1 byte: 00vvvvvv
+                // 1 byte: 00vvvvvv (6 bits)
                 // value already set
             }
             1 => {
-                // 2 bytes: 01vvvvvv vvvvvvvv
+                // 2 bytes: 01vvvvvv vvvvvvvv (14 bits total)
                 if buf.len() < 2 {
                     return Err(H3Error::FrameParse("incomplete 2-byte varint".into()));
                 }
-                value = (value << 8) | buf[1] as u64;
+                value = (value << 8) | (buf[1] as u64);
                 consumed = 2;
             }
             2 => {
-                // 4 bytes: 10vvvvvv vvvvvvvv vvvvvvvv vvvvvvvv
+                // 4 bytes: 10vvvvvv vvvvvvvv vvvvvvvv vvvvvvvv (30 bits total)
                 if buf.len() < 4 {
                     return Err(H3Error::FrameParse("incomplete 4-byte varint".into()));
                 }
-                value = (value << 8) | buf[1] as u64;
-                value = (value << 8) | buf[2] as u64;
-                value = (value << 8) | buf[3] as u64;
+                value = (value << 8) | (buf[1] as u64);
+                value = (value << 8) | (buf[2] as u64);
+                value = (value << 8) | (buf[3] as u64);
                 consumed = 4;
             }
             3 => {
-                // 8 bytes: 11vvvvvv ... (8 bytes total)
+                // 8 bytes: 11vvvvvv ... (62 bits total)
                 if buf.len() < 8 {
                     return Err(H3Error::FrameParse("incomplete 8-byte varint".into()));
                 }
-                value = (value << 8) | buf[1] as u64;
-                value = (value << 8) | buf[2] as u64;
-                value = (value << 8) | buf[3] as u64;
-                value = (value << 8) | buf[4] as u64;
-                value = (value << 8) | buf[5] as u64;
-                value = (value << 8) | buf[6] as u64;
-                value = (value << 8) | buf[7] as u64;
+                value = (value << 8) | (buf[1] as u64);
+                value = (value << 8) | (buf[2] as u64);
+                value = (value << 8) | (buf[3] as u64);
+                value = (value << 8) | (buf[4] as u64);
+                value = (value << 8) | (buf[5] as u64);
+                value = (value << 8) | (buf[6] as u64);
+                value = (value << 8) | (buf[7] as u64);
                 consumed = 8;
             }
             _ => unreachable!(),

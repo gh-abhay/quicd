@@ -35,6 +35,8 @@ pub struct H3Session<H: H3Handler> {
     max_push_id: u64,
     next_push_id: u64,
     push_streams: HashMap<u64, PushStreamState>,
+    // Pending control stream request
+    pending_control_stream_request: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -71,6 +73,7 @@ impl<H: H3Handler> H3Session<H> {
             max_push_id: 0, // 0 means no pushes allowed initially
             next_push_id: 0,
             push_streams: HashMap::new(),
+            pending_control_stream_request: None,
         }
     }
 
@@ -125,12 +128,17 @@ impl<H: H3Handler> H3Session<H> {
             AppEvent::ConnectionClosing { .. } => {
                 // Cleanup
             }
-            AppEvent::UniStreamOpened { request_id: _, result } => {
-                if let Ok(send_stream) = result {
-                    // Assume this is our server control stream
-                    self.server_control_send = Some(send_stream);
-                    // Send SETTINGS frame
-                    self.send_settings().await?;
+            AppEvent::UniStreamOpened { request_id, result } => {
+                if Some(request_id) == self.pending_control_stream_request {
+                    // This is our server control stream
+                    self.pending_control_stream_request = None;
+                    if let Ok(send_stream) = result {
+                        self.server_control_send = Some(send_stream);
+                        // Send SETTINGS frame immediately as required by RFC 9114
+                        self.send_settings().await?;
+                    } else {
+                        return Err(H3Error::Connection("failed to open server control stream".into()));
+                    }
                 }
             }
             _ => {}
@@ -139,28 +147,14 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     async fn initialize_session(&mut self) -> Result<(), H3Error> {
-        // Open server control stream (unidirectional)
-        let _request_id = self.handle.open_uni()
+        // Open server control stream (unidirectional, stream ID 2)
+        // This must be the first unidirectional stream opened by the server
+        let request_id = self.handle.open_uni()
             .map_err(|e| H3Error::Connection(format!("failed to open control stream: {:?}", e)))?;
         
-        // Wait for the stream to be opened
-        // For now, assume it's immediate, but in practice, we need to handle the event
-        // This is simplified; in real implementation, we'd wait for UniStreamOpened event
-        // But for this example, we'll assume the request_id is handled elsewhere
-        // Actually, since this is async, we need to handle it properly.
-        // For simplicity, let's send SETTINGS after opening.
-        // But to make it work, perhaps store the request_id and handle in event.
-
-        // For now, let's assume we get the send_stream immediately (not realistic)
-        // In proper implementation, we'd modify to handle the async opening.
-
-        // Since the API is async, we need to wait for the event.
-        // But initialize_session is called synchronously.
-        // Perhaps make initialize_session async and handle the opening there.
-
-        // To simplify, let's open the stream and assume we get the send_stream via event.
-        // But for SETTINGS, we can send it when we get the UniStreamOpened event.
-
+        // Store the request ID to correlate with the UniStreamOpened event
+        self.pending_control_stream_request = Some(request_id);
+        
         Ok(())
     }
 
@@ -200,109 +194,85 @@ impl<H: H3Handler> H3Session<H> {
     async fn handle_unidirectional_stream(
         &mut self,
         stream_id: u64,
+        recv_stream: quicd_x::RecvStream,
+    ) -> Result<(), H3Error> {
+        // Determine stream type based on stream ID (RFC 9114 Section 6.2)
+        match stream_id {
+            3 => {
+                // Client control stream
+                self.control_stream_id = Some(stream_id);
+                self.streams.insert(stream_id, StreamState::Control);
+                self.process_client_control_stream(stream_id, recv_stream).await?;
+            }
+            7 => {
+                // Client QPACK encoder stream
+                self.qpack_encoder_stream_id = Some(stream_id);
+                self.streams.insert(stream_id, StreamState::QpackEncoder);
+                self.process_qpack_stream(stream_id, recv_stream).await?;
+            }
+            11 => {
+                // Client QPACK decoder stream
+                self.qpack_decoder_stream_id = Some(stream_id);
+                self.streams.insert(stream_id, StreamState::QpackDecoder);
+                self.process_qpack_stream(stream_id, recv_stream).await?;
+            }
+            // Server-initiated streams (2, 6, 10) are handled via UniStreamOpened
+            2 | 6 | 10 => {
+                // These are our own streams, ignore
+            }
+            _ => {
+                // Push streams or unknown - for now, ignore
+                // Push streams would be IDs >= 15 with specific patterns
+            }
+        }
+        
+        Ok(())
+    }
+
+    async fn process_client_control_stream(
+        &mut self,
+        _stream_id: u64,
         mut recv_stream: quicd_x::RecvStream,
     ) -> Result<(), H3Error> {
-        // Determine stream type based on first byte or convention
-        // For HTTP/3, control stream has type 0x00
-        if let Ok(Some(quicd_x::StreamData::Data(bytes))) = recv_stream.read().await {
-            if bytes.len() >= 1 {
-                let stream_type = bytes[0];
-                match stream_type {
-                    0x00 => {
-                        self.control_stream_id = Some(stream_id);
-                        self.streams.insert(stream_id, StreamState::Control);
-                        // Process SETTINGS frame
-                        let settings_data = bytes.slice(1..);
-                        self.process_settings(settings_data)?;
-                    }
-                    0x02 => {
-                        self.qpack_encoder_stream_id = Some(stream_id);
-                        self.streams.insert(stream_id, StreamState::QpackEncoder);
-                        // Process remaining QPACK encoder instructions
-                        let encoder_data = bytes.slice(1..);
-                        if !encoder_data.is_empty() {
-                            self.process_qpack_instructions(stream_id, encoder_data).await?;
-                        }
-                    }
-                    0x03 => {
-                        self.qpack_decoder_stream_id = Some(stream_id);
-                        self.streams.insert(stream_id, StreamState::QpackDecoder);
-                        // Process remaining QPACK decoder instructions
-                        let decoder_data = bytes.slice(1..);
-                        if !decoder_data.is_empty() {
-                            self.process_qpack_instructions(stream_id, decoder_data).await?;
-                        }
-                    }
-                    _ => {}
+        // Read frames from the client control stream
+        while let Ok(Some(data)) = recv_stream.read().await {
+            match data {
+                quicd_x::StreamData::Data(bytes) => {
+                    self.process_control_frames(bytes).await?;
+                }
+                quicd_x::StreamData::Fin => {
+                    // Control stream ended - this is an error per RFC 9114
+                    return Err(H3Error::Http("client control stream ended unexpectedly".into()));
                 }
             }
         }
-        
-        // Continue reading from control and QPACK streams
-        if matches!(self.streams.get(&stream_id), Some(StreamState::Control) | Some(StreamState::QpackEncoder) | Some(StreamState::QpackDecoder)) {
-            while let Ok(Some(data)) = recv_stream.read().await {
-                match data {
-                    quicd_x::StreamData::Data(bytes) => {
-                        match self.streams.get(&stream_id) {
-                            Some(StreamState::Control) => {
-                                self.process_control_frames(bytes).await?;
-                            }
-                            Some(StreamState::QpackEncoder) | Some(StreamState::QpackDecoder) => {
-                                self.process_qpack_instructions(stream_id, bytes).await?;
-                            }
-                            _ => {}
-                        }
-                    }
-                    quicd_x::StreamData::Fin => {
-                        // Stream ended
-                        break;
-                    }
+        Ok(())
+    }
+
+    async fn process_qpack_stream(
+        &mut self,
+        _stream_id: u64,
+        mut recv_stream: quicd_x::RecvStream,
+    ) -> Result<(), H3Error> {
+        // Read QPACK instructions from the stream
+        while let Ok(Some(data)) = recv_stream.read().await {
+            match data {
+                quicd_x::StreamData::Data(bytes) => {
+                    self.process_qpack_instructions(_stream_id, bytes).await?;
+                }
+                quicd_x::StreamData::Fin => {
+                    // QPACK stream ended
+                    break;
                 }
             }
         }
-        
         Ok(())
     }
 
     async fn handle_stream_readable(&mut self, _stream_id: u64) -> Result<(), H3Error> {
-        // Stream has data available
-        // This is edge-triggered, so we can read now
-        Ok(())
-    }
-
-    fn process_settings(&mut self, data: Bytes) -> Result<(), H3Error> {
-        // Parse SETTINGS frame
-        if let Ok((H3Frame::Settings { settings }, _)) = H3Frame::parse(&data) {
-            self.client_settings_received = true;
-            // Process settings
-            for setting in settings {
-                match setting.identifier {
-                    0x1 => {
-                        // SETTINGS_QPACK_MAX_TABLE_CAPACITY
-                        self.qpack_max_table_capacity = setting.value;
-                        // Update QPACK codec
-                        if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
-                            qpack.set_max_table_capacity(setting.value as usize);
-                        }
-                    }
-                    0x6 => {
-                        // SETTINGS_MAX_FIELD_SECTION_SIZE
-                        self.max_field_section_size = setting.value;
-                    }
-                    0x7 => {
-                        // SETTINGS_QPACK_BLOCKED_STREAMS
-                        self.qpack_blocked_streams = setting.value;
-                        // Update QPACK codec
-                        if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
-                            qpack.set_max_blocked_streams(setting.value as usize);
-                        }
-                    }
-                    _ => {
-                        // Unknown setting, ignore as per RFC
-                    }
-                }
-            }
-        }
+        // Stream has data available - this is edge-triggered
+        // For now, we handle data in the main stream processing methods
+        // This could be used for more sophisticated backpressure handling
         Ok(())
     }
 
@@ -402,6 +372,38 @@ impl<H: H3Handler> H3Session<H> {
         // Parse control frames
         if let Ok((frame, _)) = H3Frame::parse(&data) {
             match frame {
+                H3Frame::Settings { settings } => {
+                    // Process client SETTINGS frame
+                    self.client_settings_received = true;
+                    // Process settings
+                    for setting in settings {
+                        match setting.identifier {
+                            0x1 => {
+                                // SETTINGS_QPACK_MAX_TABLE_CAPACITY
+                                self.qpack_max_table_capacity = setting.value;
+                                // Update QPACK codec
+                                if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
+                                    qpack.set_max_table_capacity(setting.value as usize);
+                                }
+                            }
+                            0x6 => {
+                                // SETTINGS_MAX_FIELD_SECTION_SIZE
+                                self.max_field_section_size = setting.value;
+                            }
+                            0x7 => {
+                                // SETTINGS_QPACK_BLOCKED_STREAMS
+                                self.qpack_blocked_streams = setting.value;
+                                // Update QPACK codec
+                                if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
+                                    qpack.set_max_blocked_streams(setting.value as usize);
+                                }
+                            }
+                            _ => {
+                                // Unknown setting, ignore as per RFC
+                            }
+                        }
+                    }
+                }
                 H3Frame::MaxPushId { push_id } => {
                     // Client is advertising maximum push ID it will accept
                     self.max_push_id = push_id;

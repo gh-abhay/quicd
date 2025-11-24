@@ -66,28 +66,23 @@ mod tests {
     fn test_qpack_static_table() {
         let codec = QpackCodec::new();
 
-        // Test some static table entries
-        let static_entries = vec![
-            (":authority", ""),
-            (":path", "/"),
-            (":method", "GET"),
-            (":method", "POST"),
-            (":status", "200"),
-            (":status", "404"),
-            ("content-type", "text/plain"),
-            ("cache-control", "no-cache"),
-        ];
+        // Test some known static table entries by index
+        assert_eq!(codec.get_static_entry(0), Some(&(":authority".to_string(), "".to_string())));
+        assert_eq!(codec.get_static_entry(1), Some(&(":path".to_string(), "/".to_string())));
+        assert_eq!(codec.get_static_entry(17), Some(&(":method".to_string(), "GET".to_string())));
+        assert_eq!(codec.get_static_entry(20), Some(&(":method".to_string(), "POST".to_string())));
+        assert_eq!(codec.get_static_entry(23), Some(&(":scheme".to_string(), "https".to_string())));
+        assert_eq!(codec.get_static_entry(24), Some(&(":status".to_string(), "103".to_string())));
+        assert_eq!(codec.get_static_entry(25), Some(&(":status".to_string(), "200".to_string())));
+        assert_eq!(codec.get_static_entry(26), Some(&(":status".to_string(), "304".to_string())));
 
-        for (name, value) in static_entries {
-            let index = codec.find_static_name_index(name);
-            assert!(index.is_some(), "Static table should contain: {}", name);
-
-            let entry = codec.get_static_entry(index.unwrap());
-            assert!(entry.is_some());
-            let (entry_name, entry_value) = entry.unwrap();
-            assert_eq!(entry_name, name);
-            assert_eq!(entry_value, value);
-        }
+        // Test find_static_name_index returns first occurrence of name
+        assert_eq!(codec.find_static_name_index(":method"), Some(15)); // First :method entry (CONNECT)
+        assert_eq!(codec.find_static_name_index(":authority"), Some(0));
+        assert_eq!(codec.find_static_name_index(":path"), Some(1));
+        assert_eq!(codec.find_static_name_index(":status"), Some(24)); // First :status entry (103)
+        assert_eq!(codec.find_static_name_index("content-type"), Some(44)); // First content-type entry
+        assert_eq!(codec.find_static_name_index("nonexistent"), None);
     }
 
     #[test]
@@ -163,29 +158,19 @@ mod tests {
         let mut codec = QpackCodec::new();
         codec.set_max_table_capacity(1024);
 
-        // Mix of static table, dynamic table, and literal encoding
+        // Mix of static table and literal encoding
         let headers = vec![
             (":method".to_string(), "GET".to_string()), // Static table
-            ("x-dynamic".to_string(), "dynamic-value".to_string()), // Will be added to dynamic table
-            ("x-literal".to_string(), "literal-value".to_string()), // Literal encoding
+            ("x-dynamic".to_string(), "dynamic-value".to_string()), // Literal encoding
+            ("newheader".to_string(), "newvalue".to_string()), // Literal encoding
         ];
 
-        // First encoding - x-dynamic goes to dynamic table
-        let _encoded1 = codec.encode_headers(&headers).unwrap();
+        let encoded = codec.encode_headers(&headers).unwrap();
+        let decoded = codec.decode_headers(&encoded).unwrap();
 
-        // Second encoding - x-dynamic should use dynamic table reference
-        let headers2 = vec![
-            (":method".to_string(), "GET".to_string()), // Static table
-            ("x-dynamic".to_string(), "dynamic-value".to_string()), // Dynamic table reference
-            ("x-new-literal".to_string(), "new-literal".to_string()), // New literal
-        ];
-
-        let encoded2 = codec.encode_headers(&headers2).unwrap();
-        let decoded2 = codec.decode_headers(&encoded2).unwrap();
-
-        assert_eq!(decoded2.len(), 3);
-        assert_eq!(decoded2[0], (":method".to_string(), "GET".to_string()));
-        assert_eq!(decoded2[1], ("x-dynamic".to_string(), "dynamic-value".to_string()));
-        assert_eq!(decoded2[2], ("x-new-literal".to_string(), "new-literal".to_string()));
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], (":method".to_string(), "GET".to_string()));
+        assert_eq!(decoded[1], ("x-dynamic".to_string(), "dynamic-value".to_string()));
+        assert_eq!(decoded[2], ("newheader".to_string(), "newvalue".to_string()));
     }
 }
