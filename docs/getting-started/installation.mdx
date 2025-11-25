@@ -1,0 +1,386 @@
+---
+title: Installation
+description: Install QuicD from source and verify your setup to start building QUIC applications
+---
+
+This guide walks you through installing QuicD and verifying your setup. QuicD requires a Linux environment with modern kernel features (io_uring, eBPF), so we'll cover the prerequisites first.
+
+## Prerequisites
+
+### Linux Kernel 5.1+
+
+QuicD uses io_uring for zero-copy network I/O, which was introduced in Linux 5.1. Check your kernel version:
+
+```bash
+uname -r
+```
+
+If you're on an older kernel, consider upgrading or using a recent Linux distribution:
+- Ubuntu 20.04+ (kernel 5.4+)
+- Debian 11+ (kernel 5.10+)
+- Fedora 30+ (kernel 5.0+)
+- Arch Linux (rolling release, always recent)
+
+### Rust 1.70+
+
+QuicD is written in Rust and requires a recent stable compiler. Install Rust via rustup:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+Verify installation:
+
+```bash
+rustc --version
+# Should show rustc 1.70.0 or newer
+```
+
+If you already have Rust installed, update it:
+
+```bash
+rustup update stable
+```
+
+### Root Privileges (for eBPF)
+
+QuicD uses eBPF for connection routing, which requires elevated privileges:
+
+- **Option 1 (Recommended)**: Run with `sudo`
+- **Option 2**: Grant `CAP_BPF` and `CAP_NET_ADMIN` capabilities (advanced)
+
+:::caution
+Running as root is required for QuicD's eBPF connection routing. Future versions may support capability-based permissions (`CAP_BPF`) without full root access.
+:::
+
+### Git (for source build)
+
+Install Git if not already available:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install git
+
+# Fedora
+sudo dnf install git
+
+# Arch
+sudo pacman -S git
+```
+
+### Build Dependencies
+
+QuicD depends on BoringSSL (via Quiche), which requires build tools:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install build-essential cmake pkg-config
+
+# Fedora
+sudo dnf install gcc gcc-c++ cmake pkgconfig
+
+# Arch
+sudo pacman -S base-devel cmake
+```
+
+---
+
+## Installation from Source
+
+The recommended way to install QuicD is building from source:
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/gh-abhay/quicd.git
+cd quicd
+```
+
+### 2. Build in Release Mode
+
+Release builds are optimized for performance:
+
+```bash
+cargo build --release
+```
+
+This compiles:
+- `quicd`: Main server binary
+- `quicd-h3`: HTTP/3 library
+- `quicd-x`: Application interface library
+- `quicd-moq`: Media over QUIC placeholder
+
+**Build time**: 5-10 minutes on a modern machine (first build downloads and compiles dependencies).
+
+### 3. Verify the Binary
+
+```bash
+./target/release/quicd --version
+```
+
+Expected output:
+```
+quicd 0.1.0
+```
+
+### 4. (Optional) Install Globally
+
+To use `quicd` from anywhere:
+
+```bash
+sudo cp target/release/quicd /usr/local/bin/
+quicd --version
+```
+
+Or use `cargo install` (once published):
+
+```bash
+cargo install --path quicd
+```
+
+---
+
+## Verify Installation
+
+### Check Help Output
+
+```bash
+quicd --help
+```
+
+You should see:
+
+```
+Usage: quicd [OPTIONS]
+
+Options:
+      --host <HOST>              Host to bind to [default: 127.0.0.1]
+      --port <PORT>              Port to bind to [default: 8080]
+      --log-level <LOG_LEVEL>    Log level [default: info]
+      --config-file <CONFIG_FILE> Path to config file [default: config.toml]
+  -h, --help                     Print help
+  -V, --version                  Print version
+```
+
+### Run a Test Build (Development)
+
+For quick iteration during development:
+
+```bash
+cargo build
+./target/debug/quicd --version
+```
+
+Debug builds include symbols for debugging but are slower than release builds.
+
+---
+
+## TLS Certificates (Development)
+
+QuicD requires TLS certificates for QUIC connections. For **development**, QuicD will auto-generate self-signed certificates if none are provided.
+
+For **production**, use proper CA-signed certificates (e.g., from Let's Encrypt):
+
+```bash
+# Example: Let's Encrypt with certbot
+sudo certbot certonly --standalone -d your-domain.com
+```
+
+Then reference certificates in config:
+
+```toml
+[quic]
+cert_path = "/etc/letsencrypt/live/your-domain.com/fullchain.pem"
+key_path = "/etc/letsencrypt/live/your-domain.com/privkey.pem"
+```
+
+:::note
+Auto-generated certificates will cause "untrusted certificate" warnings in clients. This is expected for development. Production deployments must use proper CA-signed certificates.
+:::
+
+---
+
+## Post-Installation Setup
+
+### 1. Create Configuration File
+
+Create a minimal `config.toml`:
+
+```toml
+host = "0.0.0.0"
+port = 8443
+log_level = "info"
+
+[netio]
+workers = 4
+
+[quic]
+max_connections_per_worker = 10000
+```
+
+See [Configuration Guide](/docs/getting-started/configuration/) for full options.
+
+### 2. Run QuicD
+
+```bash
+sudo ./target/release/quicd --config config.toml
+```
+
+Expected startup output:
+
+```
+[INFO] Configuration loaded
+[INFO] Creating tokio runtime for async tasks
+[INFO] Telemetry system initialized
+[INFO] Initializing eBPF-based QUIC routing
+[INFO] eBPF routing initialized successfully
+[INFO] Application registry initialized: alpns=["h3", "h3-29"]
+[INFO] Network IO layer started: addr=0.0.0.0:8443, workers=4
+```
+
+### 3. Test with Example Client
+
+In another terminal:
+
+```bash
+cargo run --example h3_client
+```
+
+Expected client output:
+
+```
+Connected to 127.0.0.1:8443
+Initiating QUIC handshake...
+✓ Handshake completed!
+  ALPN: h3
+✓ Sent 23 bytes on stream 0
+✓ Received echo: "Hello from test client!"
+✓ Stream closed gracefully
+```
+
+---
+
+## Troubleshooting Installation
+
+### Error: "quicd must be run with root privileges"
+
+**Cause**: eBPF requires root or `CAP_BPF` capability.
+
+**Solution**: Run with `sudo`:
+
+```bash
+sudo quicd --config config.toml
+```
+
+### Error: "failed to initialize eBPF routing"
+
+**Cause**: Kernel doesn't support eBPF, or eBPF is disabled.
+
+**Solutions**:
+1. Upgrade to kernel 5.1+
+2. Check if eBPF is enabled: `cat /proc/sys/kernel/unprivileged_bpf_disabled`
+3. Enable if disabled: `sudo sysctl kernel.unprivileged_bpf_disabled=0`
+
+### Build Error: "linking with `cc` failed"
+
+**Cause**: Missing build dependencies (usually BoringSSL build tools).
+
+**Solution**: Install build tools:
+
+```bash
+sudo apt-get install build-essential cmake pkg-config
+```
+
+### Error: "Address already in use"
+
+**Cause**: Another process is using the port.
+
+**Solutions**:
+1. Change port in config: `port = 8444`
+2. Find and stop conflicting process: `sudo lsof -i :8443`
+
+### Performance Warning: "channel capacity exceeded"
+
+**Cause**: Default channel sizes are too small for your workload.
+
+**Solution**: Increase capacities in config:
+
+```toml
+[channels]
+egress_capacity = 2048
+ingress_capacity = 2048
+```
+
+---
+
+## Alternative Installation Methods
+
+### Docker (Future)
+
+Docker images will be available in future releases:
+
+```bash
+docker pull quicd/quicd:latest
+docker run -d -p 8443:8443/udp quicd/quicd:latest
+```
+
+### Package Managers (Future)
+
+Packages for major distributions are planned:
+
+```bash
+# Ubuntu/Debian (future)
+sudo apt install quicd
+
+# Fedora (future)
+sudo dnf install quicd
+
+# Arch AUR (future)
+yay -S quicd
+```
+
+### Cargo Install (Future)
+
+Once published to crates.io:
+
+```bash
+cargo install quicd
+```
+
+---
+
+## Next Steps
+
+With QuicD installed, you're ready to:
+
+1. **[Configure QuicD](/docs/getting-started/configuration/)**: Learn about all configuration options
+2. **[Run HTTP/3 Server](/docs/usage/http3/)**: Serve HTTP/3 traffic immediately
+3. **[Build Custom Apps](/docs/building-apps/interface/)**: Implement your own QUIC-based protocols
+
+---
+
+## System Requirements Summary
+
+**Minimum:**
+- Linux kernel 5.1+
+- 2 CPU cores
+- 1 GB RAM
+- 100 MB disk space
+
+**Recommended:**
+- Linux kernel 5.10+
+- 8+ CPU cores
+- 4+ GB RAM
+- SSD storage
+
+**For production:**
+- Linux kernel 5.15+ (LTS)
+- 16+ CPU cores
+- 16+ GB RAM
+- 10 Gbps network interface
+- NVMe SSD
+
+---
+
+*You've successfully installed QuicD! Next, configure it for your specific use case.*

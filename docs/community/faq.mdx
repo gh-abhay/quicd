@@ -1,0 +1,362 @@
+---
+title: Frequently Asked Questions
+description: Common questions about QuicD, QUIC protocol, performance, and troubleshooting
+---
+
+Answers to common questions about QuicD, QUIC, deployment, and troubleshooting.
+
+## General
+
+### What is QuicD?
+
+QuicD is a high-performance QUIC server implementation in Rust designed for building modern internet applications like HTTP/3, media streaming, and custom protocols. It combines io_uring for zero-copy I/O and eBPF for connection routing to achieve exceptional performance.
+
+### Why does QuicD require root privileges?
+
+QuicD uses eBPF (Extended Berkeley Packet Filter) for connection routing, which ensures packets for the same connection always reach the same worker thread (connection affinity). eBPF programs require `CAP_BPF` capability or root access to load.
+
+**Future:** We plan to support capability-based permissions (`CAP_BPF` + `CAP_NET_ADMIN`) so you can run QuicD without full root access.
+
+### Can QuicD run on macOS or Windows?
+
+Not currently. QuicD depends on Linux-specific technologies:
+- **io_uring**: Linux 5.1+ only
+- **eBPF**: Linux kernel feature
+
+**Future:** Cross-platform support is on the roadmap, possibly using io-uring-compatible libraries for other platforms.
+
+---
+
+## Installation & Setup
+
+### How do I install QuicD?
+
+See the [Installation Guide](/getting-started/installation/). In summary:
+
+```bash
+git clone https://github.com/gh-abhay/quicd.git
+cd quicd
+cargo build --release
+sudo ./target/release/quicd --config config.toml
+```
+
+### What are the minimum system requirements?
+
+- **OS**: Linux with kernel 5.1+ (5.10+ recommended)
+- **CPU**: 2+ cores (8+ for production)
+- **RAM**: 1GB minimum (4GB+ recommended)
+- **Rust**: 1.70+ stable
+
+### Do I need to compile with specific features?
+
+No special features required. Default build includes everything:
+
+```bash
+cargo build --release
+```
+
+---
+
+## Configuration
+
+### How many workers should I configure?
+
+**Rule of thumb**: 1 worker per physical CPU core (not hyperthreads).
+
+```bash
+# Check physical cores
+lscpu | grep "Core(s) per socket"
+```
+
+Example: 8-core CPU → set `workers = 8` in `[netio]` section.
+
+### What causes "channel full" errors?
+
+This means the bounded channel between application tasks and worker threads has reached capacity. Either:
+
+1. **App is too slow**: Processing events slower than they arrive
+2. **Channel too small**: Increase capacity in config
+
+**Solution:**
+
+```toml
+[channels]
+egress_capacity = 2048   # Increase from default 1024
+ingress_capacity = 2048
+```
+
+Then profile your app to find bottlenecks.
+
+### How do I tune for low latency vs high throughput?
+
+**Low Latency:**
+```toml
+[netio]
+io_uring_entries = 1024  # Smaller queue, less batching
+
+[channels]
+stream_data_capacity = 128  # Smaller buffers
+```
+
+**High Throughput:**
+```toml
+[netio]
+io_uring_entries = 8192  # Larger queue, more batching
+
+[quic]
+initial_max_data = 50000000  # Larger flow control windows
+```
+
+---
+
+## Performance
+
+### What throughput can QuicD achieve?
+
+Depends on hardware and workload:
+- **Per worker**: 100K+ concurrent connections
+- **Per server**: 10+ Gbps (multi-worker on 10GbE NIC)
+- **Latency**: Sub-millisecond processing for small requests
+
+Real-world performance varies based on:
+- CPU speed and core count
+- Network interface (1GbE vs 10GbE vs 100GbE)
+- Application logic complexity
+- Connection duration and request rate
+
+### How do I reduce latency?
+
+1. **Use fewer workers** (reduce context switching)
+2. **Pin workers to CPU cores** (enabled by default)
+3. **Enable NUMA** (on multi-socket systems)
+4. **Reduce io_uring queue depth** (less batching)
+5. **Minimize allocation** in application code
+
+### Why is CPU usage high?
+
+Common causes:
+- **Too many workers**: More workers than CPU cores causes context switching
+- **Logging overhead**: Set `log_level = "warn"` in production
+- **Application bottleneck**: Profile your app code
+
+**Debug:**
+```bash
+# CPU profiling
+sudo perf record -g ./target/release/quicd
+sudo perf report
+```
+
+---
+
+## Protocol & Features
+
+### What QUIC version does QuicD support?
+
+QUIC v1 (RFC 9000) via Cloudflare's Quiche library. This is the standardized version of QUIC used by modern browsers and servers.
+
+### Does QuicD support HTTP/3?
+
+Yes, built-in via `quicd-h3` crate. Registered automatically for ALPN `"h3"` and `"h3-29"`.
+
+See [HTTP/3 Usage Guide](/usage/http3/).
+
+### Is HTTP/3 server push supported?
+
+Implementation is started but not complete. Server push is a complex feature rarely used in practice. Priority is lower than other features.
+
+### What about Media over QUIC (MOQ)?
+
+MOQ is planned and in development. The `quicd-moq` crate is currently a placeholder.
+
+See [MOQ documentation](/usage/moq/) for roadmap.
+
+### Can I implement custom protocols?
+
+Yes! This is QuicD's main strength. Implement the `QuicAppFactory` trait and register with an ALPN.
+
+See [Custom Applications Guide](/usage/custom/) and [Application Interface](/building-apps/interface/).
+
+---
+
+## Troubleshooting
+
+### Connection handshake fails
+
+**Symptoms:** Client can't connect, handshake times out.
+
+**Causes:**
+1. **TLS certificate issues**: Self-signed certs not trusted by client
+2. **Port blocked**: Firewall blocking UDP port
+3. **ALPN mismatch**: Client requests unsupported ALPN
+
+**Solutions:**
+- Use proper CA-signed certificates (e.g., Let's Encrypt)
+- Check firewall: `sudo ufw allow 8443/udp`
+- Verify ALPN in logs: `[INFO] Application registry initialized: alpns=[...]`
+
+### "Worker unavailable or overloaded" errors
+
+**Cause:** Egress channel from app task to worker is full.
+
+**Solutions:**
+1. Increase channel capacity:
+   ```toml
+   [channels]
+   egress_capacity = 4096
+   ```
+2. Profile application: Is it sending too many commands?
+3. Check worker count: Might need more workers
+
+### eBPF initialization fails
+
+**Error:** `failed to initialize eBPF routing`
+
+**Causes:**
+1. **Not running as root**: eBPF requires elevated privileges
+2. **Kernel too old**: Need kernel 5.1+
+3. **eBPF disabled**: Some systems disable unprivileged BPF
+
+**Solutions:**
+- Run with `sudo`
+- Check kernel: `uname -r` (should be 5.1+)
+- Enable eBPF: `sudo sysctl kernel.unprivileged_bpf_disabled=0`
+
+### High memory usage
+
+**Normal behavior:** QuicD pre-allocates buffer pools for performance.
+
+**Expected memory:**
+```
+workers × buffer_pool_size × buffer_size + connection_state
+Example: 8 × 8192 × 2048 = 128MB for buffers
+Plus: ~1KB per connection for state
+```
+
+**If excessive:**
+1. Reduce buffer pool size:
+   ```toml
+   [netio]
+   buffer_pool_size = 4096  # Halve the default
+   ```
+2. Check for connection leaks (connections not closing)
+
+### Build errors
+
+**Error:** `linking with cc failed`
+
+**Cause:** Missing build dependencies for BoringSSL (via Quiche).
+
+**Solution:**
+```bash
+# Ubuntu/Debian
+sudo apt-get install build-essential cmake pkg-config
+
+# Fedora
+sudo dnf install gcc gcc-c++ cmake
+```
+
+---
+
+## Development
+
+### How do I debug my custom protocol?
+
+1. **Enable debug logging:**
+   ```toml
+   log_level = "debug"
+   ```
+
+2. **Add tracing to your code:**
+   ```rust
+   use tracing::{info, debug, error};
+   
+   debug!("Processing stream {}", stream_id);
+   ```
+
+3. **Use the example client** to test:
+   ```bash
+   cargo run --example h3_client
+   ```
+
+4. **Profile with perf:**
+   ```bash
+   sudo perf record -g ./target/release/quicd
+   ```
+
+### How do I contribute to QuicD?
+
+See the [Contributing Guide](/community/contributing/). We welcome:
+- Bug reports
+- Feature requests
+- Code contributions
+- Documentation improvements
+
+### Where can I ask questions?
+
+- **GitHub Discussions**: https://github.com/gh-abhay/quicd/discussions
+- **GitHub Issues**: For bug reports
+- **Documentation**: This site!
+
+---
+
+## Deployment
+
+### Is QuicD production-ready?
+
+QuicD is in early stages (v0.1.0) with these considerations:
+
+**Ready:**
+- Core QUIC and HTTP/3 implementation
+- Performance architecture
+- Basic telemetry
+
+**Not ready:**
+- MOQ implementation incomplete
+- Limited deployment tooling (no Docker images yet)
+- Needs more real-world testing
+
+**Recommendation:** Suitable for early adopters and testing. Not recommended for business-critical production yet.
+
+### How do I deploy QuicD in production?
+
+1. **Use proper certificates**: Let's Encrypt or corporate CA
+2. **Tune configuration**: See [Performance Guide](/reference/performance/)
+3. **Monitor metrics**: OpenTelemetry export to Prometheus/Grafana
+4. **Set up logging**: Centralized log collection
+5. **Load balancing**: Multiple QuicD instances behind DNS round-robin or ECMP
+6. **Firewall rules**: Allow UDP on your port
+
+### Can I run QuicD in containers (Docker)?
+
+Yes, with considerations:
+- **Needs privileged mode** for eBPF (or `CAP_BPF` capability)
+- **Host networking recommended** for performance
+
+Example Dockerfile (basic):
+```dockerfile
+FROM rust:1.75 as builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release
+
+FROM ubuntu:22.04
+COPY --from=builder /build/target/release/quicd /usr/local/bin/
+CMD ["quicd", "--config", "/etc/quicd/config.toml"]
+```
+
+Run with:
+```bash
+docker run --privileged --network=host -v ./config.toml:/etc/quicd/config.toml quicd
+```
+
+---
+
+## Still Have Questions?
+
+- Browse the [full documentation](/introduction/)
+- Ask in [GitHub Discussions](https://github.com/gh-abhay/quicd/discussions)
+- Check [troubleshooting guide](/reference/troubleshooting/)
+
+---
+
+*This FAQ is continuously updated. If your question isn't answered, please ask!*

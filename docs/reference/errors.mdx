@@ -1,0 +1,732 @@
+---
+title: Error Reference
+description: Complete guide to QuicD error types, codes, and troubleshooting
+---
+
+Comprehensive reference for all error types in QuicD, including error codes, causes, and solutions.
+
+## Error Categories
+
+QuicD errors fall into several categories:
+
+1. **Transport Errors**: QUIC protocol-level errors
+2. **Application Errors**: Application-defined error codes
+3. **I/O Errors**: System-level I/O failures
+4. **Configuration Errors**: Invalid configuration
+5. **Resource Errors**: System resource limitations
+
+## QuicError
+
+Main error type for QUIC operations defined in `quicd-x`.
+
+### StreamStopped
+
+Stream was stopped by peer with STOP_SENDING frame.
+
+```rust
+QuicError::StreamStopped { error_code: u64 }
+```
+
+**Cause**: Peer sent STOP_SENDING frame for this stream
+
+**When**: During `write_all()` or other send operations
+
+**Solution**: Stop sending on this stream, close gracefully
+
+**Example**:
+
+```rust
+match send.write_all(&data).await {
+    Err(QuicError::StreamStopped { error_code }) => {
+        log::info!("Peer stopped stream with code {}", error_code);
+        // Clean up and exit
+    }
+    Ok(_) => { /* Success */ }
+    Err(e) => { /* Other error */ }
+}
+```
+
+### StreamReset
+
+Stream was reset by peer with RESET_STREAM frame.
+
+```rust
+QuicError::StreamReset { error_code: u64 }
+```
+
+**Cause**: Peer sent RESET_STREAM frame
+
+**When**: During `read()` or other receive operations
+
+**Solution**: Stop processing this stream
+
+**Example**:
+
+```rust
+match recv.read(&mut buf).await {
+    Err(QuicError::StreamReset { error_code }) => {
+        log::warn!("Stream reset by peer: code {}", error_code);
+        return Ok(()); // Exit handler
+    }
+    Ok(n) => { /* Process n bytes */ }
+    Err(e) => { /* Other error */ }
+}
+```
+
+### ConnectionClosed
+
+Connection was closed (gracefully or due to error).
+
+```rust
+QuicError::ConnectionClosed { 
+    error_code: u64, 
+    reason: Vec<u8> 
+}
+```
+
+**Cause**: 
+- Peer called `close()`
+- Idle timeout
+- Transport error
+- Application error
+
+**When**: Any connection operation after closure
+
+**Solution**: Clean up resources, connection cannot be recovered
+
+**Example**:
+
+```rust
+match handle.open_bidirectional_stream().await {
+    Err(QuicError::ConnectionClosed { error_code, reason }) => {
+        let reason_str = String::from_utf8_lossy(&reason);
+        log::info!("Connection closed: {} (code {})", reason_str, error_code);
+        return;
+    }
+    Ok(stream) => { /* Use stream */ }
+    Err(e) => { /* Other error */ }
+}
+```
+
+### InvalidStreamId
+
+Invalid stream ID provided.
+
+```rust
+QuicError::InvalidStreamId(u64)
+```
+
+**Cause**: 
+- Stream ID doesn't exist
+- Stream was already closed
+- Wrong stream type (bidi vs unidi)
+
+**Solution**: Check stream IDs, ensure stream is open
+
+### StreamLimitReached
+
+Maximum concurrent streams limit reached.
+
+```rust
+QuicError::StreamLimitReached
+```
+
+**Cause**: Attempted to open more streams than allowed by peer
+
+**When**: `open_bidirectional_stream()` or `open_unidirectional_stream()`
+
+**Solution**: 
+- Wait for existing streams to complete
+- Increase `max_streams_bidi` / `max_streams_uni` in config
+- Use fewer concurrent streams
+
+**Example**:
+
+```rust
+match handle.open_bidirectional_stream().await {
+    Err(QuicError::StreamLimitReached) => {
+        log::warn!("Stream limit reached, waiting...");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Retry or queue request
+    }
+    Ok(stream) => { /* Use stream */ }
+    Err(e) => { /* Other error */ }
+}
+```
+
+### FlowControl
+
+Flow control limit violated.
+
+```rust
+QuicError::FlowControl
+```
+
+**Cause**: 
+- Attempted to send more data than flow control window allows
+- Peer hasn't increased window with MAX_DATA/MAX_STREAM_DATA
+
+**Solution**: 
+- Wait for peer to increase window
+- Send smaller chunks
+- Increase initial flow control windows in config
+
+### Transport
+
+Generic transport protocol error.
+
+```rust
+QuicError::Transport(String)
+```
+
+**Cause**: Various QUIC transport errors
+
+**Common causes**:
+- Invalid packet format
+- Protocol violation
+- Crypto error
+- Version negotiation failure
+
+**Example messages**:
+- `"InvalidPacket"`
+- `"CryptoFail"`
+- `"FlowControl"`
+- `"StreamState"`
+
+### Io
+
+System I/O error.
+
+```rust
+QuicError::Io(std::io::Error)
+```
+
+**Cause**: Underlying I/O operation failed
+
+**Common causes**:
+- Socket errors
+- File descriptor limits
+- Network unreachable
+- Permission denied
+
+**Example**:
+
+```rust
+match handle.open_bidirectional_stream().await {
+    Err(QuicError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+        log::error!("Permission denied: {}", e);
+    }
+    Err(QuicError::Io(e)) => {
+        log::error!("I/O error: {}", e);
+    }
+    Ok(stream) => { /* Success */ }
+    Err(e) => { /* Other QuicError */ }
+}
+```
+
+## H3Error
+
+HTTP/3-specific errors from `quicd-h3` crate.
+
+### InvalidFrame
+
+Invalid HTTP/3 frame received.
+
+```rust
+H3Error::InvalidFrame
+```
+
+**Cause**: 
+- Malformed frame
+- Unknown frame type on wrong stream
+- Frame ordering violation
+
+**Example**: DATA frame on control stream
+
+### InvalidHeader
+
+Invalid HTTP header.
+
+```rust
+H3Error::InvalidHeader
+```
+
+**Cause**:
+- Malformed header block
+- Invalid pseudo-headers
+- Forbidden headers
+
+**Example**: Missing `:method` pseudo-header
+
+### Qpack
+
+QPACK encoding/decoding error.
+
+```rust
+H3Error::Qpack(QpackError)
+```
+
+**Cause**:
+- Invalid QPACK instruction
+- Encoder/decoder stream error
+- Table synchronization error
+
+**Solution**: Check QPACK configuration, may indicate peer bug
+
+### StreamClosed
+
+HTTP/3 stream closed unexpectedly.
+
+```rust
+H3Error::StreamClosed
+```
+
+**Cause**: Stream closed before complete request/response
+
+**Solution**: Check for clean stream closure in your handler
+
+### Quic
+
+Underlying QUIC error.
+
+```rust
+H3Error::Quic(QuicError)
+```
+
+**Cause**: QUIC transport error during HTTP/3 operation
+
+**Solution**: See QuicError section above
+
+## QUIC Transport Error Codes
+
+Standard QUIC error codes from RFC 9000.
+
+### NO_ERROR (0x0)
+
+No error, normal closure.
+
+```rust
+handle.close(0x0, b"Normal closure");
+```
+
+### INTERNAL_ERROR (0x1)
+
+Implementation error.
+
+**Cause**: Bug in QuicD or application
+
+**Action**: Report bug with logs
+
+### CONNECTION_REFUSED (0x2)
+
+Server refusing connection.
+
+**Cause**: 
+- No application registered for ALPN
+- Server overloaded
+- Connection limit reached
+
+### FLOW_CONTROL_ERROR (0x3)
+
+Flow control limit violated.
+
+**Cause**: Peer sent more data than allowed
+
+**Action**: May indicate peer bug
+
+### STREAM_LIMIT_ERROR (0x4)
+
+Stream limit violated.
+
+**Cause**: Peer opened too many streams
+
+### STREAM_STATE_ERROR (0x5)
+
+Stream in wrong state for operation.
+
+**Cause**: Protocol violation (e.g., sending on receive-only stream)
+
+### FINAL_SIZE_ERROR (0x6)
+
+Final stream size inconsistent.
+
+**Cause**: Peer changed stream final size
+
+### FRAME_ENCODING_ERROR (0x7)
+
+Malformed frame.
+
+**Cause**: Invalid frame format
+
+### TRANSPORT_PARAMETER_ERROR (0x8)
+
+Invalid transport parameters.
+
+**Cause**: Invalid parameters in handshake
+
+### CONNECTION_ID_LIMIT_ERROR (0x9)
+
+Too many connection IDs.
+
+### PROTOCOL_VIOLATION (0xA)
+
+Generic protocol violation.
+
+### INVALID_TOKEN (0xB)
+
+Invalid stateless reset token.
+
+### APPLICATION_ERROR (0xC)
+
+Application-specific error.
+
+**Use**: Application-defined error codes
+
+### CRYPTO_BUFFER_EXCEEDED (0xD)
+
+Crypto handshake buffer overflow.
+
+### KEY_UPDATE_ERROR (0xE)
+
+Key update error.
+
+### AEAD_LIMIT_REACHED (0xF)
+
+AEAD confidentiality/integrity limit reached.
+
+### NO_VIABLE_PATH (0x10)
+
+No viable network path.
+
+**Cause**: All paths failed, connection migration not possible
+
+## Application Error Codes
+
+Application-specific error codes (user-defined).
+
+### HTTP/3 Error Codes
+
+Standard HTTP/3 application errors:
+
+- **H3_NO_ERROR (0x0100)**: No error
+- **H3_GENERAL_PROTOCOL_ERROR (0x0101)**: General protocol error
+- **H3_INTERNAL_ERROR (0x0102)**: Internal error
+- **H3_STREAM_CREATION_ERROR (0x0103)**: Stream creation error
+- **H3_CLOSED_CRITICAL_STREAM (0x0104)**: Critical stream closed
+- **H3_FRAME_UNEXPECTED (0x0105)**: Unexpected frame
+- **H3_FRAME_ERROR (0x0106)**: Frame error
+- **H3_EXCESSIVE_LOAD (0x0107)**: Excessive load
+- **H3_ID_ERROR (0x0108)**: ID error
+- **H3_SETTINGS_ERROR (0x0109)**: Settings error
+- **H3_MISSING_SETTINGS (0x010A)**: Missing settings
+- **H3_REQUEST_REJECTED (0x010B)**: Request rejected
+- **H3_REQUEST_CANCELLED (0x010C)**: Request cancelled
+- **H3_REQUEST_INCOMPLETE (0x010D)**: Request incomplete
+- **H3_MESSAGE_ERROR (0x010E)**: Message error
+- **H3_CONNECT_ERROR (0x010F)**: Connect error
+- **H3_VERSION_FALLBACK (0x0110)**: Version fallback
+
+### Custom Error Codes
+
+Define your own for custom protocols:
+
+```rust
+// Define application error codes
+const APP_ERROR_INVALID_REQUEST: u64 = 0x1000;
+const APP_ERROR_UNAUTHORIZED: u64 = 0x1001;
+const APP_ERROR_RATE_LIMITED: u64 = 0x1002;
+
+// Use in your application
+if !authorized {
+    handle.close(APP_ERROR_UNAUTHORIZED, b"Unauthorized");
+    return;
+}
+```
+
+**Convention**: Use high values (0x1000+) to avoid conflicts
+
+## Common Error Scenarios
+
+### Handshake Failures
+
+**Symptom**: Connection fails to establish
+
+**Errors**: 
+- `CRYPTO_ERROR`
+- `TRANSPORT_PARAMETER_ERROR`
+- `CONNECTION_REFUSED`
+
+**Causes**:
+- TLS certificate issues
+- ALPN mismatch
+- Version mismatch
+- Invalid transport parameters
+
+**Solutions**:
+
+```bash
+# Check certificate
+openssl x509 -in cert.pem -text -noout
+
+# Verify ALPN configuration
+# Client and server must have matching ALPN
+
+# Check QuicD logs
+tail -f /var/log/quicd.log
+```
+
+### Stream Errors
+
+**Symptom**: Stream operations fail
+
+**Errors**:
+- `StreamReset`
+- `StreamStopped`
+- `InvalidStreamId`
+
+**Causes**:
+- Peer closing stream early
+- Application error in handler
+- Stream ID mismatch
+
+**Solutions**:
+
+```rust
+// Graceful error handling
+match recv.read(&mut buf).await {
+    Ok(0) => {
+        // Normal end of stream
+        log::info!("Stream finished normally");
+    }
+    Ok(n) => {
+        // Process n bytes
+    }
+    Err(QuicError::StreamReset { error_code }) => {
+        // Peer reset - not necessarily an error
+        log::info!("Stream reset by peer: {}", error_code);
+    }
+    Err(e) => {
+        // Actual error
+        log::error!("Stream error: {}", e);
+    }
+}
+```
+
+### Flow Control Errors
+
+**Symptom**: Sends block or fail
+
+**Errors**: 
+- `FlowControl`
+- `FLOW_CONTROL_ERROR`
+
+**Causes**:
+- Sending faster than peer can receive
+- Flow control windows too small
+- Peer not reading data
+
+**Solutions**:
+
+```toml
+# Increase flow control windows
+[quic]
+initial_max_data = 10485760          # 10MB
+initial_max_stream_data_bidi = 1048576  # 1MB
+```
+
+```rust
+// Implement backpressure
+let stats = handle.stats();
+if stats.bytes_sent - stats.bytes_acked > THRESHOLD {
+    // Wait for peer to read
+    tokio::time::sleep(Duration::from_millis(10)).await;
+}
+```
+
+### Connection Timeouts
+
+**Symptom**: Connection drops after idle period
+
+**Errors**: 
+- `ConnectionClosed` with `NO_ERROR` or `IDLE_TIMEOUT`
+
+**Causes**:
+- No activity for `max_idle_timeout`
+- Network path failure
+- Peer crashed
+
+**Solutions**:
+
+```toml
+# Increase idle timeout
+[quic]
+max_idle_timeout = 60000  # 60 seconds
+```
+
+```rust
+// Send keep-alive pings
+tokio::spawn(async move {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        if let Err(e) = handle.ping().await {
+            log::error!("Ping failed: {}", e);
+            break;
+        }
+    }
+});
+```
+
+### Resource Exhaustion
+
+**Symptom**: Operations fail with resource errors
+
+**Errors**:
+- `StreamLimitReached`
+- `Io(ErrorKind::OutOfMemory)`
+- `Io(ErrorKind::TooManyFiles)`
+
+**Causes**:
+- Too many concurrent streams/connections
+- System resource limits
+- Memory exhaustion
+
+**Solutions**:
+
+```bash
+# Increase file descriptor limit
+ulimit -n 100000
+
+# Increase system limits
+sudo sysctl -w fs.file-max=2097152
+```
+
+```toml
+# Limit concurrent streams
+[quic]
+max_streams_bidi = 100
+max_streams_uni = 100
+max_connections = 10000
+```
+
+```rust
+// Implement connection limiting
+if active_connections >= MAX_CONNECTIONS {
+    log::warn!("Connection limit reached");
+    // Reject new connections or queue
+}
+```
+
+## Debugging Errors
+
+### Enable Debug Logging
+
+```bash
+RUST_LOG=debug quicd --config config.toml
+```
+
+```toml
+# In config.toml
+[telemetry]
+enabled = true
+log_level = "debug"
+```
+
+### Error Context
+
+Add context to errors:
+
+```rust
+use anyhow::{Context, Result};
+
+async fn handle_request(handle: ConnectionHandle) -> Result<()> {
+    let (send, recv) = handle
+        .open_bidirectional_stream()
+        .await
+        .context("Failed to open stream")?;
+    
+    let data = recv
+        .read_to_end()
+        .await
+        .context("Failed to read request")?;
+    
+    Ok(())
+}
+```
+
+### Error Recovery
+
+Implement retry logic:
+
+```rust
+async fn send_with_retry(
+    handle: &ConnectionHandle,
+    data: &[u8],
+    max_retries: u32,
+) -> Result<(), QuicError> {
+    for attempt in 0..max_retries {
+        match handle.open_unidirectional_stream().await {
+            Ok(mut send) => {
+                return send.write_all(data).await;
+            }
+            Err(QuicError::StreamLimitReached) if attempt < max_retries - 1 => {
+                log::warn!("Stream limit reached, retrying...");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(QuicError::StreamLimitReached)
+}
+```
+
+### Metrics
+
+Monitor error rates:
+
+```rust
+metrics::counter!("quicd.errors.stream_reset").increment(1);
+metrics::counter!("quicd.errors.connection_closed").increment(1);
+```
+
+## Related Documentation
+
+- [API Reference](/reference/api/) - Complete API documentation
+- [Configuration](/reference/configuration/) - Configuration options
+- [Troubleshooting FAQ](/community/faq/) - Common issues
+- [Architecture](/architecture/) - System design
+
+## Error Handling Best Practices
+
+1. **Always handle errors**: Don't use `.unwrap()` in production
+2. **Add context**: Use `anyhow` or `thiserror` for error context
+3. **Log errors**: Include relevant details for debugging
+4. **Graceful degradation**: Handle errors without crashing
+5. **Monitor error rates**: Track errors in metrics/telemetry
+6. **Retry transient errors**: Implement backoff for retryable errors
+7. **Clean up resources**: Use RAII patterns, `Drop` trait
+8. **Document error codes**: Define and document your application errors
+
+```rust
+// Good error handling example
+async fn handle_connection(handle: ConnectionHandle) {
+    if let Err(e) = process_connection(handle).await {
+        match e {
+            QuicError::ConnectionClosed { .. } => {
+                // Expected, clean shutdown
+                log::info!("Connection closed");
+            }
+            QuicError::StreamReset { error_code } => {
+                // Possibly expected
+                log::warn!("Stream reset: {}", error_code);
+                metrics::counter!("stream_resets").increment(1);
+            }
+            _ => {
+                // Unexpected error
+                log::error!("Connection error: {}", e);
+                metrics::counter!("connection_errors").increment(1);
+            }
+        }
+    }
+}
+```

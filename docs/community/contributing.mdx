@@ -1,0 +1,359 @@
+---
+title: Contributing to QuicD
+description: Guidelines for contributing code, documentation, and bug reports to the QuicD project
+---
+
+QuicD is an open-source project and welcomes contributions from the community. Whether you're fixing bugs, adding features, improving documentation, or reporting issues, your help is appreciated!
+
+## Ways to Contribute
+
+### Code Contributions
+- Implement new features
+- Fix bugs
+- Improve performance
+- Add tests
+- Refactor code
+
+### Documentation
+- Fix typos or clarify explanations
+- Add examples
+- Write tutorials
+- Translate documentation
+
+### Testing
+- Report bugs with detailed reproduction steps
+- Test on different platforms
+- Performance benchmarking
+- Interoperability testing
+
+### Community
+- Answer questions in discussions
+- Review pull requests
+- Help triage issues
+
+---
+
+## Getting Started
+
+### 1. Set Up Development Environment
+
+```bash
+# Fork the repository on GitHub
+# Clone your fork
+git clone https://github.com/YOUR_USERNAME/quicd.git
+cd quicd
+
+# Add upstream remote
+git remote add upstream https://github.com/gh-abhay/quicd.git
+
+# Build the project
+cargo build
+
+# Run tests
+cargo test
+```
+
+### 2. Find Something to Work On
+
+- Browse [open issues](https://github.com/gh-abhay/quicd/issues)
+- Look for issues labeled `good-first-issue` or `help-wanted`
+- Check the [roadmap](/community/roadmap/) for planned features
+- Propose your own ideas in discussions
+
+### 3. Create a Branch
+
+```bash
+git checkout -b feature/my-awesome-feature
+# or
+git checkout -b fix/issue-123
+```
+
+---
+
+## Development Workflow
+
+### Code Style
+
+QuicD follows standard Rust conventions:
+
+```bash
+# Format code
+cargo fmt
+
+# Check for common mistakes
+cargo clippy
+
+# Run all checks
+cargo fmt -- --check && cargo clippy -- -D warnings && cargo test
+```
+
+**Guidelines:**
+- Use meaningful variable and function names
+- Add doc comments (`///`) to public APIs
+- Follow existing code patterns
+- Keep functions small and focused
+
+### Testing
+
+All new code should include tests:
+
+```bash
+# Run all tests
+cargo test
+
+# Run tests for specific crate
+cargo test -p quicd-h3
+
+# Run specific test
+cargo test test_name
+
+# Run with output
+cargo test -- --nocapture
+```
+
+**Test Guidelines:**
+- Unit tests in same file as code (in `#[cfg(test)]` module)
+- Integration tests in `tests/` directory
+- Benchmark tests in `benches/` directory
+- Test both success and failure cases
+
+### Documentation
+
+Update documentation for any API changes:
+
+```rust
+/// Opens a new bidirectional stream.
+///
+/// # Returns
+///
+/// Returns the request ID which will be used to correlate the response.
+///
+/// # Errors
+///
+/// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+///
+/// # Example
+///
+/// ```
+/// let request_id = handle.open_bi()?;
+/// ```
+pub fn open_bi(&self) -> Result<u64, ConnectionError> {
+    // ...
+}
+```
+
+Generate and preview docs:
+
+```bash
+cargo doc --open
+```
+
+---
+
+## Pull Request Process
+
+### 1. Commit Your Changes
+
+Write clear, concise commit messages:
+
+```bash
+git commit -m "feat: add support for HTTP/3 server push"
+git commit -m "fix: resolve connection leak in worker shutdown"
+git commit -m "docs: clarify ALPN negotiation in README"
+```
+
+**Commit message format:**
+- `feat:` New feature
+- `fix:` Bug fix
+- `docs:` Documentation only
+- `test:` Adding tests
+- `refactor:` Code change without feature/bug fix
+- `perf:` Performance improvement
+- `chore:` Build/tooling changes
+
+### 2. Push to Your Fork
+
+```bash
+git push origin feature/my-awesome-feature
+```
+
+### 3. Create Pull Request
+
+- Go to [github.com/gh-abhay/quicd](https://github.com/gh-abhay/quicd)
+- Click "New Pull Request"
+- Select your branch
+- Fill out the PR template:
+  - **Description**: What does this PR do?
+  - **Related Issues**: Link to issues (e.g., "Fixes #123")
+  - **Testing**: How did you test this?
+  - **Breaking Changes**: Any API changes?
+
+### 4. Code Review
+
+- Maintainers will review your code
+- Address feedback by pushing new commits
+- CI checks must pass (tests, linting, formatting)
+- Approval from at least one maintainer required
+
+### 5. Merge
+
+Once approved, a maintainer will merge your PR. Thank you!
+
+---
+
+## Coding Standards
+
+### Rust Best Practices
+
+- **Prefer composition over inheritance** (use traits)
+- **Use the type system** (make invalid states unrepresentable)
+- **Avoid `unwrap()` in library code** (use proper error handling)
+- **Use `#[must_use]`** for important return values
+- **Avoid allocations in hot paths** (use buffer pools, zero-copy patterns)
+
+### Performance Considerations
+
+- **Profile before optimizing**: Use `cargo bench` and profiling tools
+- **Avoid premature optimization**: Clarity first, then optimize
+- **Document performance invariants**: Note O(n) complexity, allocation behavior
+- **Benchmark critical paths**: Add benchmark tests for hot code
+
+### Error Handling
+
+```rust
+// Good: Descriptive error messages
+return Err(ConnectionError::Closed(
+    format!("worker {} unavailable or overloaded", worker_id)
+));
+
+// Bad: Generic error
+return Err(ConnectionError::Closed("error".into()));
+```
+
+### Unsafe Code
+
+Use `unsafe` sparingly and document invariants:
+
+```rust
+/// SAFETY: `ptr` is guaranteed to be valid for `len` bytes because
+/// it was allocated from our buffer pool which pre-allocates aligned
+/// memory blocks of size 2048 bytes.
+unsafe {
+    std::ptr::copy_nonoverlapping(src, ptr, len);
+}
+```
+
+---
+
+## Reporting Bugs
+
+### Before Reporting
+
+1. **Search existing issues**: Your bug may already be reported
+2. **Test on latest version**: Bug might be fixed
+3. **Minimal reproduction**: Create smallest example that reproduces the issue
+
+### Bug Report Template
+
+```markdown
+**Description**
+A clear description of the bug.
+
+**To Reproduce**
+Steps to reproduce:
+1. Configure QuicD with X
+2. Send Y request
+3. Observe Z behavior
+
+**Expected Behavior**
+What should happen instead.
+
+**Environment**
+- OS: Ubuntu 22.04
+- Kernel: 5.15.0
+- Rust version: 1.75.0
+- QuicD version: 0.1.0
+
+**Logs**
+```
+[Paste relevant logs here]
+```
+
+**Additional Context**
+Any other relevant information.
+```
+
+---
+
+## Feature Requests
+
+We welcome feature suggestions! Before requesting:
+
+1. **Check roadmap**: Feature might be planned
+2. **Search existing requests**: Avoid duplicates
+3. **Describe use case**: Why is this feature needed?
+4. **Provide examples**: How would the API look?
+
+### Feature Request Template
+
+```markdown
+**Problem**
+Describe the problem this feature would solve.
+
+**Proposed Solution**
+Your suggested implementation.
+
+**Alternatives Considered**
+Other approaches you considered.
+
+**Use Cases**
+Real-world scenarios where this would be useful.
+
+**Additional Context**
+Any other relevant information.
+```
+
+---
+
+## Community Guidelines
+
+### Code of Conduct
+
+- **Be respectful**: Treat all contributors with respect
+- **Be constructive**: Provide actionable feedback
+- **Be inclusive**: Welcome diverse perspectives
+- **Be patient**: Remember everyone is learning
+
+### Communication Channels
+
+- **GitHub Issues**: Bug reports and feature requests
+- **GitHub Discussions**: Questions, ideas, showcases
+- **Pull Requests**: Code contributions
+
+---
+
+## Recognition
+
+Contributors are recognized in:
+
+- **CONTRIBUTORS.md**: List of all contributors
+- **Changelog**: Credit for specific contributions
+- **Release notes**: Major contributions highlighted
+
+---
+
+## Questions?
+
+- **Documentation**: Read the [docs](/introduction/)
+- **Discussions**: Ask in [GitHub Discussions](https://github.com/gh-abhay/quicd/discussions)
+- **Issues**: Open an issue if you're stuck
+
+---
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the same license as the project (check LICENSE file in repository).
+
+---
+
+*Thank you for contributing to QuicD! Every contribution, no matter how small, makes a difference.*

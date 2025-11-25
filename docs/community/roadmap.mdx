@@ -1,0 +1,319 @@
+---
+title: Roadmap
+description: QuicD development roadmap and planned features
+---
+
+QuicD development roadmap showing planned features, improvements, and future direction.
+
+## Current Status
+
+QuicD is actively developed and production-ready for HTTP/3 and custom protocol use cases.
+
+**Stable**:
+- ✅ QUIC v1 (RFC 9000) transport
+- ✅ HTTP/3 (RFC 9114) server
+- ✅ Custom application interface
+- ✅ Multi-threaded worker architecture
+- ✅ io_uring zero-copy I/O
+- ✅ eBPF connection routing
+- ✅ OpenTelemetry observability
+
+**In Development**:
+- 🚧 Media over QUIC (MOQ)
+- 🚧 Connection migration support
+- 🚧 QUIC datagrams
+- 🚧 Advanced congestion control (BBR)
+
+## Short-Term (Next 3-6 Months)
+
+### Media over QUIC (MOQ)
+
+Full implementation of Media over QUIC for low-latency live streaming.
+
+**Status**: Design phase, basic framework in `quicd-moq` crate
+
+**Features**:
+- Track-based publish/subscribe model
+- Multiple delivery modes (streaming, datagram, fetch)
+- Integration with media pipelines (FFmpeg, GStreamer)
+- Low-latency streaming (< 1 second glass-to-glass)
+
+**Timeline**: Q1 2025
+
+**Use cases**: Live streaming, video conferencing, gaming
+
+### Connection Migration
+
+Complete QUIC connection migration support.
+
+**Current**: Basic CID management implemented
+
+**Planned**:
+- Active path validation
+- Automatic failover on path failure
+- Multi-path support
+- NAT rebinding detection
+
+**Timeline**: Q2 2025
+
+**Use cases**: Mobile clients, network changes, WiFi to cellular handoff
+
+### QUIC Datagrams
+
+Full support for unreliable datagrams (RFC 9221).
+
+**Current**: Partial implementation
+
+**Planned**:
+- Send/receive datagram API
+- Flow control integration
+- Application-level datagram framing
+
+**Timeline**: Q1 2025
+
+**Use cases**: Gaming, VoIP, real-time telemetry
+
+## Medium-Term (6-12 Months)
+
+### Advanced Congestion Control
+
+Pluggable congestion control with BBR and custom algorithms.
+
+**Current**: CUBIC only
+
+**Planned**:
+- BBR v2 implementation
+- Pluggable congestion control API
+- Per-application congestion control selection
+- Congestion control tuning UI
+
+**Timeline**: Q2-Q3 2025
+
+### WebTransport
+
+WebTransport server for browser clients.
+
+**Planned**:
+- WebTransport protocol implementation
+- Browser-compatible API
+- Certificate management for dev/prod
+- Integration with existing HTTP/3 server
+
+**Timeline**: Q3 2025
+
+**Use cases**: Browser-based applications, WebRTC alternatives
+
+### Performance Optimizations
+
+Continuous performance improvements.
+
+**Planned**:
+- DPDK integration for kernel bypass
+- Hardware offload (crypto, checksumming)
+- Improved memory allocator
+- Better cache locality
+- Profile-guided optimization (PGO)
+
+**Timeline**: Ongoing
+
+**Targets**: 40+ Gbps per instance, < 10μs tail latency
+
+### Enhanced Observability
+
+Extended telemetry and debugging capabilities.
+
+**Planned**:
+- Distributed tracing with OpenTelemetry
+- eBPF-based profiling integration
+- Per-connection performance metrics
+- Live debugging interface
+- Performance regression detection
+
+**Timeline**: Q2-Q3 2025
+
+## Long-Term (12+ Months)
+
+### Multi-Protocol Support
+
+Unified server for multiple protocols.
+
+**Planned**:
+- HTTP/2 over QUIC
+- DNS over QUIC (DoQ)
+- RTP over QUIC
+- Custom protocol templates
+- Protocol negotiation framework
+
+**Timeline**: 2026
+
+### Load Balancing & Clustering
+
+Native load balancing and clustering support.
+
+**Planned**:
+- Connection migration for load balancing
+- Consistent hashing for routing
+- Health checking and failover
+- State synchronization
+- Anycast support
+
+**Timeline**: 2026
+
+### Security Enhancements
+
+Advanced security features.
+
+**Planned**:
+- Post-quantum cryptography
+- Certificate transparency
+- Advanced DDoS mitigation
+- Rate limiting framework
+- Security audit mode
+
+**Timeline**: 2026+
+
+### Developer Experience
+
+Improved developer tools and experience.
+
+**Planned**:
+- QuicD CLI tool with scaffolding
+- Hot-reload for development
+- Built-in testing framework
+- Protocol simulation/fuzzing
+- Visual debugging tools
+- IDE integrations
+
+**Timeline**: Ongoing
+
+## Feature Requests
+
+Vote on features or request new ones:
+
+- **GitHub Discussions**: [github.com/gh-abhay/quicd/discussions](https://github.com/gh-abhay/quicd/discussions)
+- **Feature Requests**: Open an issue with the `enhancement` label
+
+### Most Requested Features
+
+Based on community feedback:
+
+1. **WebTransport** (12 votes) - In planning
+2. **Windows Support** (8 votes) - Blocked by io_uring dependency
+3. **HTTP/2 Compatibility** (7 votes) - Planned for 2026
+4. **Docker Support** (6 votes) - Planned for Q1 2025
+5. **Connection Pooling** (5 votes) - Under consideration
+
+## Version History
+
+### Current: v0.3.0 (December 2024)
+
+- HTTP/3 server implementation
+- Multi-threaded worker architecture
+- io_uring integration
+- eBPF routing
+- OpenTelemetry metrics
+
+### v0.2.0 (September 2024)
+
+- Custom application interface (`quicd-x`)
+- Event-driven connection handling
+- Stream management API
+
+### v0.1.0 (June 2024)
+
+- Initial QUIC v1 transport
+- Basic connection handling
+- Single-threaded architecture
+
+## Contributing to Roadmap
+
+We welcome input on the roadmap! Here's how to contribute:
+
+1. **Discuss**: Comment on GitHub Discussions
+2. **Vote**: React to issues with 👍
+3. **Propose**: Open enhancement issues
+4. **Implement**: Submit PRs for planned features
+
+See [Contributing Guide](/community/contributing/) for details.
+
+## Versioning
+
+QuicD follows Semantic Versioning (SemVer):
+
+- **Major (1.0.0)**: Breaking API changes
+- **Minor (0.x.0)**: New features, backward compatible
+- **Patch (0.0.x)**: Bug fixes
+
+We aim for:
+- Minor releases every 3 months
+- Patch releases as needed
+- Major releases when API is stable (v1.0 planned for 2025)
+
+## Stability Guarantees
+
+### Stable APIs
+
+APIs that won't change without major version bump:
+
+- `QuicAppFactory` trait
+- `ConnectionHandle` core methods
+- Configuration file format
+- QUIC protocol compliance
+
+### Unstable Features
+
+Features that may change in minor versions:
+
+- MOQ implementation (marked experimental)
+- Internal APIs (not part of public API)
+- Performance tuning parameters
+- Telemetry metric names
+
+### Deprecation Policy
+
+- Features marked deprecated in release N
+- Deprecated features removed in release N+2
+- Minimum 6 months between deprecation and removal
+- Clear migration path documented
+
+## Platform Support
+
+### Current Support
+
+- ✅ **Linux 5.1+**: Full support (io_uring required)
+- ✅ **x86_64**: Primary platform
+- ✅ **ARM64**: Tested and supported
+
+### Planned Support
+
+- 🚧 **macOS**: Planned (will use kqueue instead of io_uring)
+- 🚧 **Windows**: Under consideration (io_uring alternative needed)
+- 🚧 **FreeBSD**: Community request
+
+### Architecture Support
+
+- ✅ **x86_64**: Fully tested
+- ✅ **ARM64**: Supported and tested
+- 🔄 **RISC-V**: Experimental
+
+## Release Cadence
+
+- **Feature Releases**: Every 3 months
+- **Patch Releases**: As needed for bugs/security
+- **LTS Releases**: Planned starting with v1.0
+
+## Related Documentation
+
+- [Changelog](/community/changelog/) - Detailed version history
+- [Contributing](/community/contributing/) - How to contribute
+- [FAQ](/community/faq/) - Frequently asked questions
+
+## Contact
+
+- **GitHub**: [github.com/gh-abhay/quicd](https://github.com/gh-abhay/quicd)
+- **Discussions**: [github.com/gh-abhay/quicd/discussions](https://github.com/gh-abhay/quicd/discussions)
+- **Issues**: [github.com/gh-abhay/quicd/issues](https://github.com/gh-abhay/quicd/issues)
+
+---
+
+*Last updated: December 2024*

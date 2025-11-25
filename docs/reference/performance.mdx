@@ -1,0 +1,617 @@
+---
+title: Performance Tuning
+description: Guide to optimizing QuicD performance for high-throughput and low-latency applications
+---
+
+Comprehensive guide to tuning QuicD for maximum performance. Learn how to optimize for throughput, latency, CPU usage, and memory consumption.
+
+## Performance Overview
+
+QuicD is designed for high performance with:
+
+- **Zero-copy I/O**: Direct buffer passing via io_uring
+- **CPU affinity**: Pin workers to specific cores
+- **NUMA awareness**: Allocate memory on correct NUMA node
+- **Multi-threading**: Scale across all CPU cores
+- **eBPF routing**: Hardware-accelerated connection steering
+
+**Typical Performance**:
+- **Throughput**: 10+ Gbps per worker on modern hardware
+- **Latency**: Sub-millisecond connection setup
+- **Connections**: 100K+ concurrent connections per instance
+- **CPU**: Near-linear scaling up to core count
+
+## Quick Wins
+
+Start with these high-impact optimizations:
+
+```toml
+# config.toml - High-performance baseline
+
+[runtime]
+worker_count = 8              # Match physical CPU cores
+enable_cpu_affinity = true    # Pin workers to cores
+
+[netio]
+recv_buffer_size = 2097152    # 2MB receive buffers
+send_buffer_size = 2097152    # 2MB send buffers
+batch_size = 64               # Process 64 packets per batch
+
+[quic]
+max_streams_bidi = 1000       # Increase for concurrent streams
+initial_max_data = 10485760   # 10MB initial flow control
+max_ack_delay = 10            # Reduce for low latency
+```
+
+**Expected Impact**: 2-3x throughput improvement over defaults
+
+## Worker Thread Tuning
+
+### Worker Count
+
+**Rule of thumb**: One worker per physical CPU core (not hyperthreads).
+
+```toml
+[runtime]
+worker_count = 8  # For 8-core CPU
+```
+
+**Finding optimal count**:
+
+```bash
+# Test different worker counts
+for workers in 4 8 16; do
+    quicd --worker-count $workers &
+    PID=$!
+    # Run your benchmark
+    kill $PID
+done
+```
+
+**Guidelines**:
+- **< Physical cores**: Underutilization, lower throughput
+- **= Physical cores**: Optimal for most workloads
+- **> Physical cores**: Contention, context switching overhead
+
+### CPU Affinity
+
+Pin workers to specific cores to improve cache locality:
+
+```toml
+[runtime]
+enable_cpu_affinity = true
+```
+
+**Benefits**:
+- Better L1/L2 cache hit rates
+- Reduced context switching
+- More predictable latency
+
+**Verify affinity**:
+
+```bash
+# Check worker thread CPU binding
+ps -eLo pid,tid,psr,comm | grep quicd
+```
+
+### NUMA Configuration
+
+For multi-socket systems, ensure memory is allocated on the correct NUMA node:
+
+```toml
+[netio]
+numa_aware = true
+```
+
+**Check NUMA topology**:
+
+```bash
+numactl --hardware
+```
+
+**Manual NUMA binding** (if needed):
+
+```bash
+# Bind to NUMA node 0
+numactl --cpunodebind=0 --membind=0 quicd --config config.toml
+```
+
+## Network I/O Tuning
+
+### Buffer Sizes
+
+Larger buffers reduce syscalls but increase memory usage:
+
+```toml
+[netio]
+recv_buffer_size = 2097152  # 2MB
+send_buffer_size = 2097152  # 2MB
+```
+
+**Tuning**:
+- **Throughput**: Increase to 4-8MB for bulk transfers
+- **Latency**: Decrease to 256-512KB for interactive traffic
+- **Memory**: Each connection uses these buffers
+
+**System limits**:
+
+```bash
+# Increase system UDP buffer limits
+sudo sysctl -w net.core.rmem_max=8388608
+sudo sysctl -w net.core.wmem_max=8388608
+```
+
+### Batch Processing
+
+Process multiple packets per syscall:
+
+```toml
+[netio]
+batch_size = 64  # Process 64 packets at once
+```
+
+**Guidelines**:
+- **High throughput**: 64-128
+- **Low latency**: 16-32
+- **CPU-bound**: Lower values reduce latency spikes
+
+### io_uring Configuration
+
+Tune io_uring submission/completion queue sizes:
+
+```toml
+[netio]
+io_uring_entries = 4096  # SQ/CQ size
+```
+
+**Guidelines**:
+- **High load**: 4096-8192 entries
+- **Low load**: 1024-2048 entries
+- **Memory**: Each entry uses ~64 bytes
+
+## QUIC Protocol Tuning
+
+### Connection Limits
+
+Control maximum concurrent connections:
+
+```toml
+[quic]
+max_connections = 100000
+```
+
+**Memory impact**: Each connection uses ~10KB baseline + buffer sizes.
+
+**Per-connection limits**:
+
+```toml
+max_streams_bidi = 1000    # Bidirectional streams per connection
+max_streams_uni = 1000     # Unidirectional streams per connection
+```
+
+### Flow Control
+
+Tune initial flow control windows:
+
+```toml
+[quic]
+initial_max_data = 10485760          # 10MB connection window
+initial_max_stream_data_bidi = 1048576  # 1MB per bidi stream
+initial_max_stream_data_uni = 1048576   # 1MB per uni stream
+```
+
+**Guidelines**:
+- **High BDP networks**: Increase to RTT × bandwidth
+- **Many small streams**: Decrease per-stream, increase connection
+- **Few large streams**: Increase per-stream
+
+**Calculate optimal window**:
+
+```
+Window = RTT × Bandwidth
+Example: 50ms × 1Gbps = 50ms × 125MB/s = 6.25MB
+```
+
+### Congestion Control
+
+Choose congestion control algorithm:
+
+```toml
+[quic]
+congestion_control = "cubic"  # or "bbr"
+```
+
+**Options**:
+- **CUBIC**: Default, good for most use cases
+- **BBR**: Optimized for high-latency or loss-prone networks
+
+### ACK Handling
+
+Tune ACK frequency and delay:
+
+```toml
+[quic]
+max_ack_delay = 10  # milliseconds
+```
+
+**Guidelines**:
+- **Low latency**: 5-10ms
+- **High throughput**: 25ms (default)
+- **Satellite/high RTT**: 50-100ms
+
+## Application-Level Optimization
+
+### Stream Management
+
+**Use unidirectional streams** when possible:
+
+```rust
+// Faster - unidirectional
+let mut send = handle.open_unidirectional_stream().await?;
+send.write_all(&data).await?;
+
+// Slower - bidirectional
+let (mut send, _recv) = handle.open_bidirectional_stream().await?;
+send.write_all(&data).await?;
+```
+
+**Reuse streams** instead of opening many:
+
+```rust
+// Bad - many streams
+for item in items {
+    let mut stream = handle.open_unidirectional_stream().await?;
+    stream.write_all(&item).await?;
+}
+
+// Good - one stream
+let mut stream = handle.open_unidirectional_stream().await?;
+for item in items {
+    stream.write_all(&item).await?;
+}
+```
+
+### Batching
+
+**Batch small writes** to reduce overhead:
+
+```rust
+// Bad - many small writes
+for byte in data {
+    stream.write_all(&[byte]).await?;
+}
+
+// Good - batch writes
+stream.write_all(&data).await?;
+```
+
+### Async Task Spawning
+
+**Spawn tasks for concurrent streams**:
+
+```rust
+while let Some(AppEvent::NewStream { stream_id, .. }) = events.next().await {
+    let (send, recv) = handle.accept_bidirectional_stream().await?;
+    
+    // Spawn task to handle concurrently
+    tokio::spawn(async move {
+        handle_stream(send, recv).await
+    });
+}
+```
+
+### Memory Management
+
+**Use zero-copy where possible**:
+
+```rust
+// Avoid copying
+let data = recv.read_to_end().await?;
+send.write_all(&data).await?;  // Copies data
+
+// Better - stream directly
+let mut buf = [0u8; 4096];
+loop {
+    let n = recv.read(&mut buf).await?;
+    if n == 0 { break; }
+    send.write_all(&buf[..n]).await?;
+}
+```
+
+## Monitoring Performance
+
+### Built-in Metrics
+
+Enable telemetry for performance monitoring:
+
+```toml
+[telemetry]
+enabled = true
+metrics_port = 9090
+```
+
+**Key metrics**:
+- `quicd_packets_sent_total` - Packet send rate
+- `quicd_bytes_sent_total` - Throughput
+- `quicd_connections_active` - Concurrent connections
+- `quicd_connection_handshake_duration_seconds` - Handshake latency
+
+### Connection Stats
+
+Query per-connection statistics:
+
+```rust
+let stats = handle.stats();
+println!("RTT: {:?}", stats.rtt);
+println!("Throughput: {} bytes/s", stats.bytes_sent);
+println!("Packet loss: {}%", 
+    (stats.packets_lost as f64 / stats.packets_sent as f64) * 100.0);
+```
+
+### System Monitoring
+
+**Monitor CPU usage**:
+
+```bash
+top -H -p $(pgrep quicd)
+```
+
+**Monitor network utilization**:
+
+```bash
+iftop -i eth0
+```
+
+**Monitor memory**:
+
+```bash
+pmap -x $(pgrep quicd)
+```
+
+## Benchmarking
+
+### Connection Throughput
+
+Test maximum throughput per connection:
+
+```bash
+# Server
+quicd --config high-throughput.toml
+
+# Client (using example client)
+cargo run --release --example h3_client -- \
+    --url https://server:4433/large-file \
+    --connections 1
+```
+
+### Concurrent Connections
+
+Test maximum concurrent connections:
+
+```bash
+# Load testing with many connections
+wrk2 -t 8 -c 10000 -d 60s --latency https://server:4433/
+```
+
+### Request Latency
+
+Measure request latency distribution:
+
+```bash
+# Histogram of request latencies
+hey -n 100000 -c 100 https://server:4433/
+```
+
+## Performance Profiles
+
+### High-Throughput Profile
+
+Optimize for maximum data transfer rate:
+
+```toml
+[runtime]
+worker_count = 16
+enable_cpu_affinity = true
+
+[netio]
+recv_buffer_size = 8388608   # 8MB
+send_buffer_size = 8388608
+batch_size = 128
+io_uring_entries = 8192
+
+[quic]
+initial_max_data = 52428800         # 50MB
+initial_max_stream_data_bidi = 10485760  # 10MB
+max_ack_delay = 25
+congestion_control = "bbr"
+```
+
+**Use case**: Large file transfers, video streaming, bulk data
+
+### Low-Latency Profile
+
+Optimize for minimum request latency:
+
+```toml
+[runtime]
+worker_count = 8
+enable_cpu_affinity = true
+
+[netio]
+recv_buffer_size = 524288    # 512KB
+send_buffer_size = 524288
+batch_size = 16
+io_uring_entries = 1024
+
+[quic]
+initial_max_data = 1048576          # 1MB
+initial_max_stream_data_bidi = 262144   # 256KB
+max_ack_delay = 5
+congestion_control = "cubic"
+```
+
+**Use case**: Interactive applications, gaming, API servers
+
+### High-Concurrency Profile
+
+Optimize for maximum concurrent connections:
+
+```toml
+[runtime]
+worker_count = 32
+enable_cpu_affinity = true
+
+[netio]
+recv_buffer_size = 262144    # 256KB
+send_buffer_size = 262144
+batch_size = 32
+
+[quic]
+max_connections = 500000
+max_streams_bidi = 100
+initial_max_data = 1048576
+initial_max_stream_data_bidi = 131072  # 128KB
+```
+
+**Use case**: IoT gateways, connection brokers, massive multiplexing
+
+## System-Level Tuning
+
+### Linux Kernel Parameters
+
+Optimize system limits:
+
+```bash
+# /etc/sysctl.conf
+
+# Increase file descriptor limit
+fs.file-max = 2097152
+
+# Increase network buffer limits
+net.core.rmem_max = 134217728        # 128MB
+net.core.wmem_max = 134217728
+net.core.rmem_default = 16777216     # 16MB
+net.core.wmem_default = 16777216
+
+# Increase connection tracking table
+net.netfilter.nf_conntrack_max = 1048576
+
+# Enable TCP/UDP tuning
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.udp_mem = 102400 873800 16777216
+
+# Disable IPv6 if not needed
+net.ipv6.conf.all.disable_ipv6 = 1
+```
+
+Apply changes:
+
+```bash
+sudo sysctl -p
+```
+
+### Resource Limits
+
+Increase process limits:
+
+```bash
+# /etc/security/limits.conf
+* soft nofile 1048576
+* hard nofile 1048576
+* soft memlock unlimited
+* hard memlock unlimited
+```
+
+### CPU Governor
+
+Set CPU governor to performance mode:
+
+```bash
+# Set all CPUs to performance mode
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance | sudo tee $cpu
+done
+```
+
+## Troubleshooting Performance Issues
+
+### Low Throughput
+
+**Symptoms**: Below expected Gbps throughput
+
+**Diagnosis**:
+1. Check CPU usage: Should be 70-90% per worker
+2. Check network utilization: `iftop -i eth0`
+3. Check packet loss: Look at connection stats
+
+**Solutions**:
+- Increase buffer sizes
+- Enable CPU affinity
+- Increase batch_size
+- Check for packet loss (tune congestion control)
+
+### High Latency
+
+**Symptoms**: Slow request response times
+
+**Diagnosis**:
+1. Check RTT in connection stats
+2. Look for high ACK delays
+3. Check for CPU saturation
+
+**Solutions**:
+- Reduce max_ack_delay
+- Reduce batch_size
+- Use low-latency profile
+- Check system load
+
+### Memory Issues
+
+**Symptoms**: High memory usage or OOM
+
+**Diagnosis**:
+1. Check connection count
+2. Check buffer sizes
+3. Look for memory leaks (use valgrind)
+
+**Solutions**:
+- Reduce buffer sizes
+- Limit max_connections
+- Check application for leaks
+
+### CPU Saturation
+
+**Symptoms**: 100% CPU usage, low throughput
+
+**Diagnosis**:
+1. Profile with `perf`: `perf record -g --call-graph dwarf -- quicd`
+2. Check for lock contention
+3. Look for hot loops
+
+**Solutions**:
+- Increase worker_count
+- Enable CPU affinity
+- Reduce per-worker load
+
+## Related Documentation
+
+- [Configuration Reference](/reference/configuration/) - All configuration options
+- [Architecture](/architecture/) - System design and threading
+- [Errors](/reference/errors/) - Troubleshooting errors
+- [API Reference](/reference/api/) - Application API
+
+## Performance Checklist
+
+Before deploying to production:
+
+- [ ] Worker count matches physical CPU cores
+- [ ] CPU affinity enabled
+- [ ] Buffer sizes tuned for workload
+- [ ] System limits increased (ulimit, sysctl)
+- [ ] Telemetry enabled for monitoring
+- [ ] Benchmarked under load
+- [ ] Tested with expected traffic patterns
+- [ ] CPU governor set to performance
+- [ ] NUMA configured for multi-socket
+- [ ] Application uses async/concurrent patterns
