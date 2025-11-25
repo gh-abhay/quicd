@@ -1,0 +1,241 @@
+---
+title: Media over QUIC (MOQ)
+description: Build low-latency media streaming applications with Media over QUIC protocol (upcoming feature)
+---
+
+Media over QUIC (MOQ) is a protocol for low-latency media delivery over QUIC, designed for live video streaming, audio distribution, and real-time communication applications.
+
+:::caution[Under Development]
+MOQ support in QuicD is currently under development. The `quicd-moq` crate is a placeholder. This page describes planned features and architecture.
+:::
+
+## What is Media over QUIC?
+
+Media over QUIC is an IETF draft standard that leverages QUIC's features for efficient media delivery:
+
+- **Low latency**: Sub-second glass-to-glass latency for live streams
+- **Datagram support**: Unreliable delivery for real-time frames
+- **Stream support**: Reliable delivery for critical metadata
+- **Congestion awareness**: Adaptive bitrate based on network conditions
+- **Connection migration**: Seamless handoff between networks
+
+### Use Cases
+
+- **Live sports streaming**: Ultra-low latency for interactive viewing
+- **Video conferencing**: Real-time audio/video with WebRTC-like latency
+- **Gaming streams**: Live gameplay with minimal delay
+- **Remote production**: Professional broadcast workflows over internet
+
+---
+
+## Planned Architecture
+
+The MOQ implementation will follow QuicD's pluggable application pattern:
+
+```rust
+// Planned API (not yet implemented)
+pub struct MOQFactory {
+    handler: Arc<dyn MOQHandler>,
+}
+
+#[async_trait]
+pub trait MOQHandler: Send + Sync + 'static {
+    async fn handle_subscribe(
+        &self,
+        track: TrackId,
+        subscriber: Subscriber,
+    ) -> Result<(), MOQError>;
+    
+    async fn handle_publish(
+        &self,
+        track: TrackId,
+        publisher: Publisher,
+    ) -> Result<(), MOQError>;
+}
+```
+
+### Track Model
+
+MOQ organizes media into **tracks**:
+
+- **Track**: Logical media stream (e.g., "camera-1-video", "audio-main")
+- **Group**: Independently decodable segment (e.g., video GOP)
+- **Object**: Individual media sample (e.g., video frame, audio packet)
+
+```
+Track "live-video"
+  ├── Group 0 (GOP)
+  │   ├── Object 0 (I-frame)
+  │   ├── Object 1 (P-frame)
+  │   └── Object 2 (P-frame)
+  ├── Group 1 (GOP)
+  │   ├── Object 0 (I-frame)
+  │   └── ...
+```
+
+### Delivery Modes
+
+**Datagram Mode** (low latency, lossy):
+- Each object sent as QUIC datagram
+- No retransmission on loss
+- Ideal for real-time video (loss concealment)
+
+**Stream Mode** (reliable):
+- Each object sent on dedicated stream
+- Automatic retransmission
+- Ideal for critical metadata, key frames
+
+---
+
+## Planned Features
+
+### Phase 1: Core Protocol
+- [ ] Track subscription/unsubscription
+- [ ] Object delivery (datagram + stream modes)
+- [ ] Basic flow control
+- [ ] ALPN: `"moq-transport-00"`
+
+### Phase 2: Advanced Features
+- [ ] Congestion-aware bitrate adaptation
+- [ ] Forwarding/relay support (CDN use case)
+- [ ] Track priorities
+- [ ] Partial reliability (selective retransmission)
+
+### Phase 3: Production Readiness
+- [ ] Performance benchmarking
+- [ ] Interoperability testing
+- [ ] Integration examples (FFmpeg, GStreamer)
+
+---
+
+## Example Usage (Planned)
+
+### Publishing Media
+
+```rust
+// Conceptual API
+use quicd_moq::{MOQFactory, Publisher, Track};
+
+struct MyMediaHandler;
+
+impl MOQHandler for MyMediaHandler {
+    async fn handle_publish(
+        &self,
+        track: TrackId,
+        mut publisher: Publisher,
+    ) -> Result<(), MOQError> {
+        // Read media from source (camera, file, etc.)
+        let mut video_source = open_video_source().await?;
+        
+        loop {
+            let frame = video_source.read_frame().await?;
+            
+            // Publish frame as object
+            publisher.publish_object(
+                track,
+                ObjectMetadata {
+                    group_id: frame.gop_id,
+                    object_id: frame.frame_number,
+                    priority: if frame.is_keyframe { 0 } else { 1 },
+                },
+                frame.data,
+            ).await?;
+        }
+    }
+}
+```
+
+### Subscribing to Media
+
+```rust
+impl MOQHandler for MyMediaHandler {
+    async fn handle_subscribe(
+        &self,
+        track: TrackId,
+        mut subscriber: Subscriber,
+    ) -> Result<(), MOQError> {
+        // Receive objects from track
+        while let Some(object) = subscriber.recv_object().await? {
+            // Decode and render frame
+            decode_and_display(object.data).await?;
+        }
+        Ok(())
+    }
+}
+```
+
+---
+
+## Integration with Existing Tools
+
+### FFmpeg (Planned)
+
+```bash
+# Publish stream to QuicD MOQ server
+ffmpeg -i input.mp4 \
+  -c:v libx264 -preset ultrafast \
+  -f moq moq://localhost:8443/live-stream
+
+# Subscribe and play
+ffplay moq://localhost:8443/live-stream
+```
+
+### GStreamer (Planned)
+
+```bash
+# Publish pipeline
+gst-launch-1.0 videotestsrc ! \
+  x264enc ! \
+  moqsink location=moq://localhost:8443/test-stream
+
+# Playback pipeline
+gst-launch-1.0 moqsrc location=moq://localhost:8443/test-stream ! \
+  decodebin ! \
+  autovideosink
+```
+
+---
+
+## Performance Targets
+
+Planned performance characteristics:
+
+- **Latency**: < 500ms glass-to-glass (source to display)
+- **Throughput**: 10+ Gbps per server
+- **Scalability**: 100K+ concurrent subscribers
+- **Quality**: Adaptive bitrate 240p to 4K
+
+---
+
+## Get Involved
+
+MOQ development is tracked on GitHub. We welcome:
+
+- **Feedback**: What features are most important for your use case?
+- **Testing**: Help test early implementations
+- **Code contributions**: Implement protocol features
+- **Interop testing**: Test with other MOQ implementations
+
+[GitHub Issues: MOQ Development](https://github.com/gh-abhay/quicd/labels/moq)
+
+---
+
+## Related Specifications
+
+- [IETF MOQ Working Group](https://datatracker.ietf.org/wg/moq/about/)
+- [MOQ Transport Draft](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)
+- [WebTransport](https://www.w3.org/TR/webtransport/) (related web API)
+
+---
+
+## Timeline
+
+**Q1 2025**: Core protocol implementation  
+**Q2 2025**: FFmpeg/GStreamer integration  
+**Q3 2025**: Production-ready release  
+
+Stay updated: [Roadmap](/community/roadmap/)
+
+---
+
+*MOQ on QuicD will enable ultra-low-latency live streaming at scale. Watch this space!*

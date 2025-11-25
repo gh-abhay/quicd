@@ -1,0 +1,9 @@
+# robots.txt for QuicD Documentation
+User-agent: *
+Allow: /
+
+# Sitemap
+Sitemap: https://quicd.dev/sitemap-index.xml
+
+# Crawl-delay for polite bots
+Crawl-delay: 1

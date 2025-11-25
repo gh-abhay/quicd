@@ -1,0 +1,511 @@
+---
+title: Glossary
+description: Comprehensive glossary of QUIC and QuicD terminology
+---
+
+Complete reference of terms used throughout the QuicD documentation. Includes QUIC protocol concepts, QuicD-specific terminology, and general networking terms.
+
+## QUIC Protocol Terms
+
+### ACK (Acknowledgment)
+
+A frame sent by a receiver to inform the sender which packets have been successfully received. QUIC ACKs are sent on a per-packet-number-space basis and include ranges of acknowledged packet numbers.
+
+**Related**: ACK Delay, Max ACK Delay
+
+### ACK Delay
+
+The time between when a packet is received and when the corresponding ACK is sent. QUIC allows tuning this delay to batch ACKs and reduce overhead.
+
+**Configuration**: `max_ack_delay` in QUIC config
+
+### Active Connection ID
+
+A Connection ID that is currently in use for a connection. QUIC allows multiple Connection IDs per connection to support connection migration.
+
+**See also**: Connection Migration
+
+### ALPN (Application-Layer Protocol Negotiation)
+
+TLS extension that allows the client and server to negotiate which application protocol (HTTP/3, custom protocol, etc.) to use during the TLS handshake.
+
+**Example**: `h3` for HTTP/3, `h3-29` for draft-29
+
+### Bidirectional Stream
+
+A stream that allows data to flow in both directions. Either endpoint can send data and both can close their sending side independently.
+
+**API**: `open_bidirectional_stream()`, `accept_bidirectional_stream()`
+
+### CIDS (Connection IDs)
+
+See Connection ID.
+
+### Congestion Control
+
+Algorithm that adjusts the sending rate based on network conditions to avoid overwhelming the network. QUIC supports pluggable congestion control (CUBIC, BBR, etc.).
+
+**Configuration**: `congestion_control` in QUIC config
+
+### Congestion Window (CWND)
+
+The maximum amount of data that can be in flight (sent but not acknowledged) at any given time. Dynamically adjusted by the congestion control algorithm.
+
+**Monitoring**: Available in connection stats
+
+### Connection ID (CID)
+
+A randomly generated identifier for a QUIC connection. QUIC uses Connection IDs to identify connections, allowing migration across network changes (TCP uses 4-tuple: src IP, src port, dst IP, dst port).
+
+**Length**: 0-20 bytes (typically 8-16 bytes)
+
+### Connection Migration
+
+QUIC feature that allows a connection to survive network changes (IP address or port changes) by using Connection IDs instead of the 4-tuple.
+
+**Example**: Mobile device switching from WiFi to cellular
+
+### Crypto Frame
+
+QUIC frame carrying TLS handshake data. Used during connection establishment to perform the TLS 1.3 handshake.
+
+### Datagram
+
+Unreliable, unordered message sent over QUIC. Datagrams don't guarantee delivery or ordering but have lower latency than streams.
+
+**Use case**: Gaming, VoIP, real-time data
+
+**API**: `send_datagram()`, `AppEvent::DatagramReceived`
+
+### Flow Control
+
+Mechanism to prevent a sender from overwhelming a receiver with data. QUIC has flow control at both stream and connection levels.
+
+**Types**: 
+- Stream flow control: Per-stream limits
+- Connection flow control: Aggregate limit across all streams
+
+**Configuration**: `initial_max_data`, `initial_max_stream_data_*`
+
+### Frame
+
+The basic unit of QUIC communication. Packets contain one or more frames. Frame types include STREAM, ACK, CRYPTO, RESET_STREAM, etc.
+
+**Examples**: STREAM frame (carries stream data), ACK frame (acknowledges packets)
+
+### Handshake
+
+The process of establishing a QUIC connection, including TLS 1.3 handshake, connection parameter exchange, and initial key establishment.
+
+**Phases**: Initial, Handshake, Application Data
+
+**Latency**: Typically 1-RTT, 0-RTT possible with resumption
+
+### HTTP/3
+
+Major revision of HTTP protocol that uses QUIC instead of TCP. Combines features of HTTP/2 (multiplexing, server push) with QUIC's benefits (0-RTT, improved loss recovery, connection migration).
+
+**ALPN**: `h3`
+
+**QuicD support**: Via `quicd-h3` crate
+
+### Initial Keys
+
+Cryptographic keys used to protect the first packets of a QUIC connection. Derived deterministically from the connection ID.
+
+### Initial Packet
+
+The first packet type in a QUIC connection, protected with Initial Keys. Contains CRYPTO frames with the client's TLS ClientHello.
+
+### Loss Detection
+
+Process of determining when packets have been lost and need retransmission. QUIC uses time-based and ACK-based loss detection.
+
+**Mechanisms**:
+- Time threshold: Packet lost if not ACKed within RTT + threshold
+- Packet threshold: Lost if 3 subsequent packets are ACKed
+
+### Max Stream Data
+
+Flow control limit for a single stream. Specifies how many bytes can be sent on a stream.
+
+**Configuration**: `initial_max_stream_data_bidi`, `initial_max_stream_data_uni`
+
+### MAX_DATA Frame
+
+Frame that increases the connection-level flow control limit.
+
+### MAX_STREAM_DATA Frame
+
+Frame that increases the stream-level flow control limit.
+
+### NEW_CONNECTION_ID Frame
+
+Frame that provides additional Connection IDs for the peer to use, supporting connection migration.
+
+### 0-RTT (Zero Round-Trip Time)
+
+QUIC feature allowing application data to be sent in the first flight of packets, before the handshake completes. Requires previous connection to the same server.
+
+**Benefits**: Eliminates handshake latency
+
+**Limitations**: Less secure, not all data allowed (must be idempotent)
+
+**API**: Resume tickets, early data
+
+### 1-RTT
+
+Normal handshake mode where application data can be sent after one round trip (client sends Initial, server responds with Handshake).
+
+### Packet
+
+The unit of data sent over UDP. A QUIC packet contains a header and one or more frames. Protected with authenticated encryption.
+
+**Types**: Initial, Handshake, 0-RTT, 1-RTT
+
+### Packet Number
+
+Monotonically increasing number assigned to each packet. Used for ACKs and loss detection. Starts at 0 for each packet number space.
+
+### Packet Number Space
+
+Separate sequence of packet numbers. QUIC has three: Initial, Handshake, and Application Data.
+
+### Path MTU
+
+Maximum Transmission Unit for a network path. QUIC performs Path MTU Discovery (PMTUD) to find the maximum packet size that can be sent without fragmentation.
+
+**Default**: 1200 bytes (safe minimum)
+
+**Typical**: 1472 bytes (Ethernet MTU 1500 - IP 20 - UDP 8)
+
+### QPACK
+
+Header compression scheme used by HTTP/3, similar to HTTP/2's HPACK but designed for QUIC's unordered delivery.
+
+**QuicD support**: Implemented in `quicd-h3` crate
+
+### QUIC (Quick UDP Internet Connections)
+
+Modern transport protocol built on UDP, standardized as RFC 9000. Combines features of TCP (reliability, congestion control) with improvements (0-RTT, stream multiplexing, connection migration).
+
+**Developed by**: Google (originally), standardized by IETF
+
+**Version**: QuicD implements QUIC v1 (RFC 9000)
+
+### RESET_STREAM Frame
+
+Frame that abruptly terminates a stream with an error code. Used when the sender wants to stop sending on a stream.
+
+**API**: `SendStream::reset()`
+
+### RTT (Round-Trip Time)
+
+Time for a packet to travel from sender to receiver and back. Used by congestion control and loss detection.
+
+**Monitoring**: Available in connection stats
+
+**Typical**: 10-100ms (local network to internet)
+
+### Server Name Indication (SNI)
+
+TLS extension that allows a client to indicate which hostname it's connecting to, enabling virtual hosting.
+
+**Use case**: Multiple domains on same IP address
+
+### STOP_SENDING Frame
+
+Frame that requests the peer to stop sending data on a stream. Sent by a receiver that no longer wants to receive data.
+
+**API**: `RecvStream::stop()`
+
+### Stream
+
+Ordered, reliable byte stream within a QUIC connection. Multiple streams can be multiplexed over a single connection.
+
+**Types**: Bidirectional, Unidirectional
+
+**Benefits**: Independent streams don't block each other (head-of-line blocking solved)
+
+### Stream Frame
+
+Frame that carries stream data. Contains stream ID, offset, and payload.
+
+### Stream ID
+
+64-bit identifier for a stream. Encoding indicates:
+- Bit 0: Initiator (0 = client, 1 = server)
+- Bit 1: Direction (0 = bidirectional, 1 = unidirectional)
+- Remaining bits: Stream number
+
+**Example**: Stream ID 4 = client-initiated, bidirectional, stream number 1
+
+### Stream Limit
+
+Maximum number of concurrent streams allowed. Separate limits for bidirectional and unidirectional streams.
+
+**Configuration**: `max_streams_bidi`, `max_streams_uni`
+
+### TLS 1.3
+
+Latest version of Transport Layer Security protocol, required by QUIC for encryption and authentication.
+
+**Benefits**: 1-RTT handshake, 0-RTT resumption, modern cipher suites
+
+### Transport Parameters
+
+Connection-level parameters exchanged during the handshake. Includes flow control limits, max stream counts, max idle timeout, etc.
+
+### Unidirectional Stream
+
+Stream that only allows data flow in one direction. The initiator can only send, the peer can only receive.
+
+**Benefits**: Lower overhead than bidirectional
+
+**API**: `open_unidirectional_stream()`, `accept_unidirectional_stream()`
+
+## QuicD-Specific Terms
+
+### App Task
+
+Asynchronous task spawned by a `QuicAppFactory` to handle a single connection. Interacts with QuicD via `ConnectionHandle` and events.
+
+**Pattern**: One task per connection
+
+### Application Interface
+
+The API provided by `quicd-x` crate for building applications on QuicD. Includes `QuicAppFactory`, `ConnectionHandle`, and event types.
+
+**Crate**: `quicd-x`
+
+### AppEvent
+
+Events delivered to applications to notify them of connection/stream state changes.
+
+**Types**: NewStream, StreamReadable, StreamFinished, StreamReset, ConnectionClosing
+
+### Channel
+
+Communication mechanism between worker threads and app tasks. Uses `tokio::mpsc` channels for async message passing.
+
+**Configuration**: `channel_buffer_size` in runtime config
+
+### ConnectionHandle
+
+Handle provided to applications for interacting with a QUIC connection. Allows opening streams, reading events, closing connections, etc.
+
+**API**: See [API Reference](/reference/api/)
+
+### eBPF Routing
+
+Performance optimization using eBPF (Extended Berkeley Packet Filter) to route incoming connections to the correct worker thread at the kernel level.
+
+**Benefits**: Reduces cache thrashing, improves locality
+
+**Requirement**: Requires root privileges
+
+### Event Loop
+
+The core loop in each worker thread that processes I/O events from io_uring and dispatches them to appropriate handlers.
+
+**Location**: `worker/mod.rs`
+
+### H3Handler
+
+Trait for implementing HTTP/3 request handlers in the `quicd-h3` crate.
+
+**Method**: `handle_request(request, stream)`
+
+### io_uring
+
+Linux kernel interface for asynchronous I/O. QuicD uses io_uring for zero-copy UDP socket operations.
+
+**Requirements**: Linux kernel 5.1+
+
+**Benefits**: Reduced syscalls, true zero-copy, batch operations
+
+### NUMA (Non-Uniform Memory Access)
+
+Memory architecture in multi-socket systems where memory access time depends on memory location relative to processor. QuicD can allocate memory on the correct NUMA node for best performance.
+
+**Configuration**: `numa_aware` in netio config
+
+### QuicAppFactory
+
+Main trait for creating QUIC applications. Implemented by application developers to handle new connections.
+
+**Method**: `create_app(handle: ConnectionHandle)`
+
+**Pattern**: Factory creates app tasks for each connection
+
+### QuicD
+
+Open-source, high-performance QUIC server implementation written in Rust. Supports HTTP/3, custom protocols, and application-layer multiplexing.
+
+**Pronunciation**: "quick-dee"
+
+### Registry
+
+Central registry mapping protocol names to application factories. Allows running multiple application types in a single QuicD instance.
+
+**Example**: `registry.register("http3", h3_factory)`
+
+### Runtime
+
+The QuicD runtime manages worker threads, task scheduling, and coordination between components.
+
+**Configuration**: `[runtime]` section in config
+
+### Telemetry
+
+Observability features including metrics (Prometheus), logging, and tracing (OpenTelemetry).
+
+**Configuration**: `[telemetry]` section in config
+
+### Worker Thread
+
+OS thread dedicated to handling I/O for a subset of connections. Each worker has its own event loop, io_uring instance, and connection table.
+
+**Benefits**: Lock-free per-worker, CPU cache locality
+
+**Configuration**: `worker_count` in runtime config
+
+### Zero-Copy
+
+Technique where data is transferred without copying between buffers. QuicD achieves zero-copy through io_uring and careful buffer management.
+
+**Benefits**: Reduced CPU usage, higher throughput
+
+## Networking Terms
+
+### BDP (Bandwidth-Delay Product)
+
+The product of a network's bandwidth and its RTT. Represents the amount of data that can be in flight.
+
+**Formula**: BDP = Bandwidth × RTT
+
+**Use**: Determines optimal flow control window size
+
+### Handoff
+
+Process of transferring a packet or connection from one worker thread to another. QuicD minimizes handoffs for performance.
+
+### Head-of-Line Blocking
+
+Problem where one blocked stream delays all others. TCP suffers from this; QUIC solves it with independent streams.
+
+**Example**: In TCP, one lost packet blocks all data. In QUIC, only that stream is blocked.
+
+### Jitter
+
+Variation in packet arrival times. High jitter degrades real-time applications (VoIP, gaming).
+
+### MTU (Maximum Transmission Unit)
+
+Maximum packet size that can be sent on a network. Ethernet typical MTU is 1500 bytes.
+
+### NAT (Network Address Translation)
+
+Technique for mapping private IP addresses to public ones. QUIC's Connection IDs help with NAT rebinding.
+
+### Retransmission
+
+Resending data that was lost or not acknowledged. QUIC retransmits data in new packets with new packet numbers.
+
+### Socket
+
+Endpoint for network communication. QuicD uses UDP sockets.
+
+### Throughput
+
+Amount of data transferred per unit time. Measured in bps (bits per second) or Gbps.
+
+### TLS (Transport Layer Security)
+
+Cryptographic protocol for secure communication. QUIC uses TLS 1.3.
+
+### UDP (User Datagram Protocol)
+
+Connectionless transport protocol. QUIC is built on top of UDP.
+
+**Benefits**: No kernel connection state, easier deployment through NATs/firewalls than new IP protocols
+
+## Performance Terms
+
+### Batching
+
+Processing multiple operations together to amortize overhead. QuicD batches packet processing.
+
+**Configuration**: `batch_size` in netio config
+
+### Cache Locality
+
+Keeping data in CPU caches for fast access. CPU affinity and NUMA awareness improve cache locality.
+
+### CPU Affinity
+
+Binding threads to specific CPU cores to improve cache locality.
+
+**Configuration**: `enable_cpu_affinity` in runtime config
+
+### Hot Path
+
+Code path that is executed frequently and is critical for performance. QuicD optimizes hot paths with zero-copy and lock-free data structures.
+
+### Latency
+
+Time delay between when data is sent and when it's received or processed.
+
+**Types**: Network latency (RTT), processing latency
+
+### Lock-Free
+
+Data structure or algorithm that doesn't use locks. QuicD workers are mostly lock-free for performance.
+
+### Multiplexing
+
+Sending multiple streams over a single connection. QUIC natively supports multiplexing.
+
+### Syscall
+
+System call to the kernel. Expensive due to context switch. io_uring reduces syscalls.
+
+### Tail Latency
+
+Latency at high percentiles (p99, p99.9). Often more important than average latency for user experience.
+
+## Acronyms
+
+- **ACK**: Acknowledgment
+- **ALPN**: Application-Layer Protocol Negotiation  
+- **BBR**: Bottleneck Bandwidth and RTT (congestion control algorithm)
+- **BDP**: Bandwidth-Delay Product
+- **CID**: Connection ID
+- **CWND**: Congestion Window
+- **eBPF**: Extended Berkeley Packet Filter
+- **FIN**: Finish (stream closing)
+- **HTTP**: Hypertext Transfer Protocol
+- **IETF**: Internet Engineering Task Force
+- **MTU**: Maximum Transmission Unit
+- **NAT**: Network Address Translation
+- **NUMA**: Non-Uniform Memory Access
+- **PMTUD**: Path MTU Discovery
+- **QPACK**: QUIC-aware header compression
+- **QUIC**: Quick UDP Internet Connections
+- **RFC**: Request for Comments (IETF standards)
+- **RTT**: Round-Trip Time
+- **SNI**: Server Name Indication
+- **TCP**: Transmission Control Protocol
+- **TLS**: Transport Layer Security
+- **UDP**: User Datagram Protocol
+
+## Related Documentation
+
+- [Core Concepts](/concepts/) - Detailed concept explanations
+- [Architecture](/architecture/) - System architecture
+- [API Reference](/reference/api/) - Complete API documentation
+- [Configuration Reference](/reference/configuration/) - Configuration options
+
+## Contributing
+
+Found a term that should be in the glossary? See our [Contributing Guide](/community/contributing/) to suggest additions.

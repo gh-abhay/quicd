@@ -1,0 +1,282 @@
+---
+title: Custom Applications
+description: Build custom QUIC-based protocols beyond HTTP/3 and MOQ
+---
+
+QuicD's pluggable architecture makes it straightforward to implement custom QUIC-based protocols. This guide shows you when and how to build your own application.
+
+## When to Build Custom
+
+Consider building a custom QUIC application when:
+
+- **Existing protocols don't fit**: HTTP/3 is request/response, but you need pub/sub or streaming semantics
+- **Domain-specific optimizations**: Gaming, IoT, or proprietary protocols with specific requirements
+- **Research and experimentation**: Exploring new protocol designs or QUIC features
+- **Legacy protocol migration**: Modernizing existing TCP-based protocols over QUIC
+
+**Examples:**
+- DNS over QUIC (DOQ)
+- Gaming protocols with custom framing
+- IoT sensor data collection
+- Financial trading protocols
+
+---
+
+## Quick Example: Echo Protocol
+
+The simplest custom protocol echoes data back to the client:
+
+```rust
+use async_trait::async_trait;
+use futures::StreamExt;
+use quicd_x::*;
+
+struct EchoFactory;
+
+#[async_trait]
+impl QuicAppFactory for EchoFactory {
+    fn accepts_alpn(&self, alpn: &str) -> bool {
+        alpn == "echo"
+    }
+    
+    async fn spawn_app(
+        &self,
+        _alpn: String,
+        _handle: ConnectionHandle,
+        mut events: AppEventStream,
+        _transport: TransportControls,
+        mut shutdown: ShutdownFuture,
+    ) -> Result<(), ConnectionError> {
+        loop {
+            tokio::select! {
+                Some(event) = events.next() => {
+                    match event {
+                        AppEvent::NewStream { mut recv_stream, send_stream, .. } => {
+                            if let Some(send) = send_stream {
+                                // Echo loop
+                                while let Ok(Some(data)) = recv_stream.read().await {
+                                    match data {
+                                        StreamData::Data(bytes) => {
+                                            send.write(bytes, false).await?;
+                                        }
+                                        StreamData::Fin => break,
+                                    }
+                                }
+                                send.finish().await?;
+                            }
+                        }
+                        AppEvent::ConnectionClosing { .. } => break,
+                        _ => {}
+                    }
+                }
+                _ = &mut shutdown => break,
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+**Register in `main.rs`:**
+
+```rust
+let registry = AppRegistry::new()
+    .register("echo", Arc::new(EchoFactory));
+```
+
+**Test:**
+
+```bash
+# Client sends "Hello" on stream, expects "Hello" back
+```
+
+---
+
+## Best Practices
+
+### 1. Handle Shutdown Gracefully
+
+Always monitor the `shutdown` future:
+
+```rust
+tokio::select! {
+    Some(event) = events.next() => { /* handle event */ }
+    _ = &mut shutdown => {
+        // Clean up resources
+        break;
+    }
+}
+```
+
+### 2. Spawn Per-Stream Tasks
+
+For protocols with many concurrent streams:
+
+```rust
+AppEvent::NewStream { stream_id, recv_stream, send_stream, .. } => {
+    tokio::spawn(async move {
+        handle_stream(stream_id, recv_stream, send_stream).await;
+    });
+}
+```
+
+### 3. Use Zero-Copy Patterns
+
+Avoid unnecessary allocations:
+
+```rust
+// Good: Zero-copy
+let data = recv_stream.read().await?;
+send_stream.write(data, false).await?;
+
+// Bad: Extra copy
+let data = recv_stream.read().await?;
+let vec = data.to_vec(); // Unnecessary copy
+let bytes = Bytes::from(vec);
+send_stream.write(bytes, false).await?;
+```
+
+### 4. Log Errors, Don't Panic
+
+```rust
+match recv_stream.read().await {
+    Ok(data) => { /* process */ }
+    Err(e) => {
+        eprintln!("Stream error: {:?}", e);
+        // Don't panic - handle gracefully
+    }
+}
+```
+
+---
+
+## Example: Request/Response Protocol
+
+A simple request/response protocol with custom framing:
+
+```rust
+use bytes::{Bytes, BytesMut, Buf, BufMut};
+
+// Frame format: [type: u8][length: u32][payload: bytes]
+
+async fn read_frame(recv: &mut RecvStream) -> Result<Option<Frame>, Error> {
+    // Read frame header (5 bytes)
+    let mut header = BytesMut::with_capacity(5);
+    
+    // Read until we have full header
+    while header.len() < 5 {
+        match recv.read().await? {
+            Some(StreamData::Data(chunk)) => header.put(chunk),
+            Some(StreamData::Fin) | None => return Ok(None),
+        }
+    }
+    
+    let frame_type = header.get_u8();
+    let length = header.get_u32();
+    
+    // Read payload
+    let mut payload = BytesMut::with_capacity(length as usize);
+    while payload.len() < length as usize {
+        match recv.read().await? {
+            Some(StreamData::Data(chunk)) => payload.put(chunk),
+            Some(StreamData::Fin) | None => return Err(Error::UnexpectedEnd),
+        }
+    }
+    
+    Ok(Some(Frame { frame_type, payload: payload.freeze() }))
+}
+
+async fn write_frame(send: &SendStream, frame: Frame) -> Result<(), Error> {
+    let mut buffer = BytesMut::with_capacity(5 + frame.payload.len());
+    buffer.put_u8(frame.frame_type);
+    buffer.put_u32(frame.payload.len() as u32);
+    buffer.put(frame.payload);
+    
+    send.write(buffer.freeze(), false).await?;
+    Ok(())
+}
+```
+
+---
+
+## Advanced: Pub/Sub Protocol
+
+```rust
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+struct PubSubState {
+    subscriptions: Arc<RwLock<HashMap<String, Vec<SendStream>>>>,
+}
+
+impl PubSubState {
+    async fn publish(&self, topic: &str, message: Bytes) {
+        let subs = self.subscriptions.read().await;
+        if let Some(subscribers) = subs.get(topic) {
+            for sub in subscribers {
+                let _ = sub.write(message.clone(), false).await;
+            }
+        }
+    }
+    
+    async fn subscribe(&self, topic: String, stream: SendStream) {
+        let mut subs = self.subscriptions.write().await;
+        subs.entry(topic).or_insert_with(Vec::new).push(stream);
+    }
+}
+```
+
+---
+
+## Testing Custom Protocols
+
+### Unit Tests
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_alpn_matching() {
+        let factory = EchoFactory;
+        assert!(factory.accepts_alpn("echo"));
+        assert!(!factory.accepts_alpn("h3"));
+    }
+}
+```
+
+### Integration Tests
+
+Create a test client to verify protocol behavior:
+
+```rust
+#[tokio::test]
+async fn test_echo_protocol() {
+    // Start server with EchoFactory
+    // Connect client
+    // Send data, verify echo
+}
+```
+
+---
+
+## Performance Tips
+
+1. **Batch writes**: Use `send_data()` fluent API
+2. **Pre-allocate buffers**: Reuse `BytesMut` instances
+3. **Avoid locks**: Use channels instead of shared mutable state
+4. **Monitor backpressure**: Watch for "channel full" warnings
+
+---
+
+## Next Steps
+
+- **[Application Interface](/docs/building-apps/interface/)**: Complete API reference
+- **[HTTP/3 Example](/docs/usage/http3/)**: Learn from a full implementation
+- **[Architecture](/docs/architecture/)**: Understand how it works
+
+---
+
+*Building custom protocols on QuicD is powerful and flexible. Start simple, iterate, and scale.*

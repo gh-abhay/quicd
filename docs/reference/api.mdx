@@ -1,0 +1,724 @@
+---
+title: API Reference
+description: Complete API reference for building applications on QuicD
+---
+
+Complete API documentation for building applications with QuicD. This reference covers all public traits, types, and methods available to application developers.
+
+## Core Traits
+
+### `QuicAppFactory`
+
+The main trait for creating QUIC applications.
+
+```rust
+pub trait QuicAppFactory: Send + Sync + 'static {
+    /// Called when a new connection is established
+    fn create_app(&self, handle: ConnectionHandle) -> BoxFuture<'static, Result<(), QuicError>>;
+}
+```
+
+**Methods**
+
+- **`create_app`**: Called for each new incoming connection
+  - **Parameters**: 
+    - `handle`: `ConnectionHandle` - Handle to the new connection
+  - **Returns**: `BoxFuture<'static, Result<(), QuicError>>`
+  - **Notes**: Should spawn your application logic as an async task
+
+**Example**
+
+```rust
+use quicd_x::{QuicAppFactory, ConnectionHandle, QuicError};
+use async_trait::async_trait;
+
+struct MyApp;
+
+#[async_trait]
+impl QuicAppFactory for MyApp {
+    async fn create_app(&self, handle: ConnectionHandle) -> Result<(), QuicError> {
+        tokio::spawn(async move {
+            // Handle the connection
+            handle_connection(handle).await
+        });
+        Ok(())
+    }
+}
+```
+
+### `H3Handler`
+
+Handler trait for HTTP/3 applications (from `quicd-h3` crate).
+
+```rust
+pub trait H3Handler: Send + Sync + 'static {
+    /// Handle an HTTP/3 request
+    fn handle_request(
+        &self,
+        request: Request,
+        stream: SendStream,
+    ) -> BoxFuture<'static, Result<(), H3Error>>;
+}
+```
+
+**Methods**
+
+- **`handle_request`**: Called for each HTTP/3 request
+  - **Parameters**:
+    - `request`: `Request` - HTTP request with method, URI, headers
+    - `stream`: `SendStream` - Stream to send the response on
+  - **Returns**: `BoxFuture<'static, Result<(), H3Error>>`
+
+**Example**
+
+```rust
+use quicd_h3::{H3Handler, Request, SendStream, H3Error};
+use async_trait::async_trait;
+
+struct MyHandler;
+
+#[async_trait]
+impl H3Handler for MyHandler {
+    async fn handle_request(&self, request: Request, mut stream: SendStream) 
+        -> Result<(), H3Error> 
+    {
+        let response = format!("Hello from {}", request.uri);
+        stream.send_response(200, &[], response.as_bytes()).await?;
+        Ok(())
+    }
+}
+```
+
+## Connection Handle
+
+### `ConnectionHandle`
+
+Main interface for interacting with a QUIC connection.
+
+```rust
+pub struct ConnectionHandle {
+    // Internal fields omitted
+}
+```
+
+**Methods**
+
+#### `event_stream`
+
+Get the event stream for this connection.
+
+```rust
+pub fn event_stream(&self) -> impl Stream<Item = AppEvent>
+```
+
+**Returns**: Stream of `AppEvent` items
+
+**Example**
+
+```rust
+use futures::StreamExt;
+
+let mut events = handle.event_stream();
+while let Some(event) = events.next().await {
+    match event {
+        AppEvent::NewStream { stream_id, is_unidi } => {
+            // Handle new stream
+        }
+        AppEvent::StreamReadable { stream_id } => {
+            // Read data
+        }
+        // ...
+    }
+}
+```
+
+#### `peer_addr`
+
+Get the peer's socket address.
+
+```rust
+pub fn peer_addr(&self) -> SocketAddr
+```
+
+**Returns**: `SocketAddr` - Remote peer address
+
+#### `connection_id`
+
+Get the connection ID as a hex string.
+
+```rust
+pub fn connection_id(&self) -> String
+```
+
+**Returns**: `String` - Hex-encoded connection ID
+
+#### `open_bidirectional_stream`
+
+Open a new bidirectional stream.
+
+```rust
+pub async fn open_bidirectional_stream(&self) -> Result<(SendStream, RecvStream), QuicError>
+```
+
+**Returns**: Tuple of `(SendStream, RecvStream)`
+
+**Errors**: Returns `QuicError` if stream cannot be opened
+
+**Example**
+
+```rust
+let (mut send, mut recv) = handle.open_bidirectional_stream().await?;
+send.write_all(b"Hello").await?;
+let response = recv.read_to_end().await?;
+```
+
+#### `open_unidirectional_stream`
+
+Open a new unidirectional stream (send-only).
+
+```rust
+pub async fn open_unidirectional_stream(&self) -> Result<SendStream, QuicError>
+```
+
+**Returns**: `SendStream` - Send-only stream
+
+**Errors**: Returns `QuicError` if stream cannot be opened
+
+#### `accept_bidirectional_stream`
+
+Accept an incoming bidirectional stream from peer.
+
+```rust
+pub async fn accept_bidirectional_stream(&self) -> Result<(SendStream, RecvStream), QuicError>
+```
+
+**Returns**: Tuple of `(SendStream, RecvStream)`
+
+**Errors**: Returns `QuicError` if no streams available or connection closed
+
+**Example**
+
+```rust
+loop {
+    match handle.accept_bidirectional_stream().await {
+        Ok((send, recv)) => {
+            tokio::spawn(handle_stream(send, recv));
+        }
+        Err(e) => {
+            log::error!("Accept failed: {}", e);
+            break;
+        }
+    }
+}
+```
+
+#### `accept_unidirectional_stream`
+
+Accept an incoming unidirectional stream (receive-only).
+
+```rust
+pub async fn accept_unidirectional_stream(&self) -> Result<RecvStream, QuicError>
+```
+
+**Returns**: `RecvStream` - Receive-only stream
+
+#### `close`
+
+Close the connection gracefully with an optional error code and reason.
+
+```rust
+pub fn close(&self, error_code: u64, reason: &[u8])
+```
+
+**Parameters**:
+- `error_code`: Application error code
+- `reason`: Human-readable reason (up to 1024 bytes)
+
+**Example**
+
+```rust
+handle.close(0, b"Normal shutdown");
+```
+
+#### `stats`
+
+Get connection statistics.
+
+```rust
+pub fn stats(&self) -> ConnectionStats
+```
+
+**Returns**: `ConnectionStats` with packet counts, bytes transferred, RTT, etc.
+
+#### `set_metadata`
+
+Set application-specific metadata on the connection.
+
+```rust
+pub fn set_metadata(&self, key: String, value: String)
+```
+
+**Parameters**:
+- `key`: Metadata key
+- `value`: Metadata value
+
+#### `get_metadata`
+
+Get application-specific metadata.
+
+```rust
+pub fn get_metadata(&self, key: &str) -> Option<String>
+```
+
+**Parameters**:
+- `key`: Metadata key
+
+**Returns**: `Option<String>` - Value if key exists
+
+## Stream Types
+
+### `SendStream`
+
+Handle for sending data on a QUIC stream.
+
+```rust
+pub struct SendStream {
+    // Internal fields
+}
+```
+
+**Methods**
+
+#### `write_all`
+
+Write all bytes to the stream.
+
+```rust
+pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), QuicError>
+```
+
+**Parameters**:
+- `buf`: Data to write
+
+**Errors**: Returns `QuicError::StreamStopped` if stream was stopped by peer
+
+#### `finish`
+
+Signal that no more data will be sent on this stream.
+
+```rust
+pub async fn finish(self) -> Result<(), QuicError>
+```
+
+**Example**
+
+```rust
+send.write_all(b"Hello").await?;
+send.write_all(b" World").await?;
+send.finish().await?;
+```
+
+#### `reset`
+
+Abruptly terminate sending with an error code.
+
+```rust
+pub fn reset(&mut self, error_code: u64)
+```
+
+**Parameters**:
+- `error_code`: Application error code
+
+#### `priority`
+
+Set the stream priority (0-255, higher is more important).
+
+```rust
+pub fn set_priority(&mut self, priority: u8)
+```
+
+**Parameters**:
+- `priority`: Priority level (0-255)
+
+### `RecvStream`
+
+Handle for receiving data from a QUIC stream.
+
+```rust
+pub struct RecvStream {
+    // Internal fields
+}
+```
+
+**Methods**
+
+#### `read`
+
+Read data from the stream into a buffer.
+
+```rust
+pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, QuicError>
+```
+
+**Parameters**:
+- `buf`: Buffer to read into
+
+**Returns**: Number of bytes read (0 indicates end of stream)
+
+**Errors**: Returns `QuicError::StreamReset` if stream was reset by peer
+
+**Example**
+
+```rust
+let mut buf = vec![0u8; 4096];
+loop {
+    match recv.read(&mut buf).await? {
+        0 => break, // End of stream
+        n => {
+            process_data(&buf[..n]);
+        }
+    }
+}
+```
+
+#### `read_exact`
+
+Read exact number of bytes from the stream.
+
+```rust
+pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), QuicError>
+```
+
+**Parameters**:
+- `buf`: Buffer to fill completely
+
+**Errors**: Returns error if stream ends before buffer is filled
+
+#### `read_to_end`
+
+Read all remaining data from the stream.
+
+```rust
+pub async fn read_to_end(&mut self) -> Result<Vec<u8>, QuicError>
+```
+
+**Returns**: `Vec<u8>` - All data from the stream
+
+**Warning**: Only use if you know the stream size is reasonable
+
+#### `stop`
+
+Stop reading from the stream and send STOP_SENDING to peer.
+
+```rust
+pub fn stop(&mut self, error_code: u64)
+```
+
+**Parameters**:
+- `error_code`: Application error code
+
+## Events
+
+### `AppEvent`
+
+Events delivered to applications via `event_stream()`.
+
+```rust
+pub enum AppEvent {
+    /// New stream opened by peer
+    NewStream {
+        stream_id: u64,
+        is_unidi: bool,
+    },
+    
+    /// Stream has data available to read
+    StreamReadable {
+        stream_id: u64,
+    },
+    
+    /// Stream is writable (flow control window available)
+    StreamWritable {
+        stream_id: u64,
+    },
+    
+    /// Stream finished by peer (FIN received)
+    StreamFinished {
+        stream_id: u64,
+    },
+    
+    /// Stream reset by peer
+    StreamReset {
+        stream_id: u64,
+        error_code: u64,
+    },
+    
+    /// Datagram received
+    DatagramReceived {
+        data: Vec<u8>,
+    },
+    
+    /// Connection closing
+    ConnectionClosing {
+        error_code: u64,
+        reason: Vec<u8>,
+    },
+}
+```
+
+**Example**
+
+```rust
+use futures::StreamExt;
+
+let mut events = handle.event_stream();
+while let Some(event) = events.next().await {
+    match event {
+        AppEvent::NewStream { stream_id, is_unidi } => {
+            if is_unidi {
+                let recv = handle.accept_unidirectional_stream().await?;
+                tokio::spawn(handle_recv(recv));
+            } else {
+                let (send, recv) = handle.accept_bidirectional_stream().await?;
+                tokio::spawn(handle_bidirectional(send, recv));
+            }
+        }
+        AppEvent::StreamFinished { stream_id } => {
+            log::info!("Stream {} finished", stream_id);
+        }
+        AppEvent::ConnectionClosing { error_code, reason } => {
+            log::info!("Connection closing: {}", String::from_utf8_lossy(&reason));
+            break;
+        }
+        _ => {}
+    }
+}
+```
+
+## Error Types
+
+### `QuicError`
+
+Main error type for QUIC operations.
+
+```rust
+pub enum QuicError {
+    /// Stream was stopped by peer
+    StreamStopped { error_code: u64 },
+    
+    /// Stream was reset by peer
+    StreamReset { error_code: u64 },
+    
+    /// Connection was closed
+    ConnectionClosed { error_code: u64, reason: Vec<u8> },
+    
+    /// Invalid stream ID
+    InvalidStreamId(u64),
+    
+    /// Stream limit reached
+    StreamLimitReached,
+    
+    /// Flow control error
+    FlowControl,
+    
+    /// Transport error
+    Transport(String),
+    
+    /// I/O error
+    Io(std::io::Error),
+}
+```
+
+**Common Patterns**
+
+```rust
+match stream.read(&mut buf).await {
+    Ok(0) => {
+        // End of stream
+    }
+    Ok(n) => {
+        // Got n bytes
+    }
+    Err(QuicError::StreamReset { error_code }) => {
+        // Peer reset stream
+        log::warn!("Stream reset with code {}", error_code);
+    }
+    Err(QuicError::ConnectionClosed { reason, .. }) => {
+        // Connection closed
+        log::info!("Connection closed: {}", String::from_utf8_lossy(&reason));
+    }
+    Err(e) => {
+        // Other error
+        log::error!("Error: {}", e);
+    }
+}
+```
+
+### `H3Error`
+
+HTTP/3-specific errors (from `quicd-h3` crate).
+
+```rust
+pub enum H3Error {
+    /// Invalid frame type
+    InvalidFrame,
+    
+    /// Invalid header
+    InvalidHeader,
+    
+    /// QPACK encoding/decoding error
+    Qpack(QpackError),
+    
+    /// Stream closed unexpectedly
+    StreamClosed,
+    
+    /// Underlying QUIC error
+    Quic(QuicError),
+}
+```
+
+## HTTP/3 Types
+
+### `Request`
+
+HTTP/3 request representation.
+
+```rust
+pub struct Request {
+    pub method: String,
+    pub uri: String,
+    pub headers: Vec<(String, String)>,
+}
+```
+
+**Example**
+
+```rust
+let method = &request.method;
+let path = &request.uri;
+let user_agent = request.headers.iter()
+    .find(|(k, _)| k == "user-agent")
+    .map(|(_, v)| v.as_str());
+```
+
+### `Response`
+
+HTTP/3 response builder.
+
+```rust
+impl SendStream {
+    pub async fn send_response(
+        &mut self,
+        status: u16,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<(), H3Error>
+}
+```
+
+**Parameters**:
+- `status`: HTTP status code (200, 404, etc.)
+- `headers`: Additional response headers
+- `body`: Response body
+
+**Example**
+
+```rust
+stream.send_response(
+    200,
+    &[("content-type".to_string(), "text/html".to_string())],
+    b"<html><body>Hello</body></html>",
+).await?;
+```
+
+## Statistics
+
+### `ConnectionStats`
+
+Connection statistics structure.
+
+```rust
+pub struct ConnectionStats {
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub rtt: Duration,
+    pub cwnd: u64,
+    pub streams_active: usize,
+}
+```
+
+**Example**
+
+```rust
+let stats = handle.stats();
+log::info!(
+    "Connection stats: sent={} recv={} rtt={:?}",
+    stats.bytes_sent,
+    stats.bytes_received,
+    stats.rtt
+);
+```
+
+## Registry
+
+### `AppRegistry`
+
+Registry for managing multiple application types.
+
+```rust
+pub struct AppRegistry {
+    // Internal fields
+}
+
+impl AppRegistry {
+    pub fn new() -> Self;
+    
+    pub fn register(&mut self, name: &str, factory: Arc<dyn QuicAppFactory>);
+    
+    pub fn get(&self, name: &str) -> Option<Arc<dyn QuicAppFactory>>;
+}
+```
+
+**Example**
+
+```rust
+let mut registry = AppRegistry::new();
+registry.register("http3", Arc::new(H3Factory::new(handler)));
+registry.register("echo", Arc::new(EchoFactory));
+```
+
+## Configuration Types
+
+### `QuicConfig`
+
+QUIC protocol configuration.
+
+```rust
+pub struct QuicConfig {
+    pub max_idle_timeout: Duration,
+    pub max_streams_bidi: u64,
+    pub max_streams_uni: u64,
+    pub max_stream_data: u64,
+    pub max_connection_data: u64,
+    pub disable_active_migration: bool,
+}
+```
+
+See [Configuration Reference](/reference/configuration/) for details.
+
+## Related Documentation
+
+- [Building Applications](/building-apps/interface/) - Complete guide to building apps
+- [HTTP/3 Usage](/usage/http3/) - HTTP/3 server implementation
+- [Custom Protocols](/usage/custom/) - Building custom protocols
+- [Configuration Reference](/reference/configuration/) - Configuration options
+- [Error Reference](/reference/errors/) - Error handling guide
+
+## Type Aliases
+
+```rust
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+```
+
+Used for async trait methods.

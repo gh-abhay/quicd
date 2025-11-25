@@ -1,0 +1,19 @@
+<!-- TODO: Replace with actual 1200x630 PNG image for social media sharing -->
+<!-- This placeholder should be replaced with a properly designed Open Graph image showing:
+     - QuicD logo
+     - Tagline: "High-Performance QUIC Server"
+     - Key features or visual representation
+     - Brand colors: #00f5d4, #007b6a
+     
+     Recommended tools: Canva, Figma, or ImageMagick
+     
+     Example command to create a basic one:
+     convert -size 1200x630 xc:'#001e18' \
+       -fill '#00f5d4' -pointsize 72 -gravity center \
+       -annotate +0-100 'QuicD' \
+       -fill '#87d3c2' -pointsize 36 \
+       -annotate +0+0 'High-Performance QUIC Server' \
+       -fill '#a4d4c9' -pointsize 24 \
+       -annotate +0+60 'Build HTTP/3 and Custom Protocols on QUIC' \
+       og-image.png
+-->
