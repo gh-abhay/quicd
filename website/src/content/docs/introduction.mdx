@@ -1,1 +1,125 @@
-/home/abhay/quicd/docs/introduction.mdx
+---
+title: Introduction to QuicD
+description: Learn about QuicD - a high-performance QUIC server for building modern internet applications like HTTP/3 and media streaming protocols
+---
+
+QuicD is a high-performance QUIC server implementation written in Rust, designed to enable developers to build modern internet applications on a solid, scalable foundation. Whether you're serving HTTP/3 content, streaming low-latency media, or building custom protocols, QuicD provides the performance and flexibility you need.
+
+## What is QuicD?
+
+QuicD is an **open-source QUIC server** that combines cutting-edge Linux technologies with Rust's safety guarantees to deliver exceptional performance. It's built on three key pillars:
+
+- **Performance**: Leverages io_uring for zero-copy I/O and eBPF for intelligent connection routing
+- **Extensibility**: Pluggable application layer lets you implement any QUIC-based protocol
+- **Safety**: Written in Rust, ensuring memory safety without sacrificing performance
+
+At its core, QuicD orchestrates network I/O, QUIC protocol handling, and application logic in a carefully designed architecture that eliminates contention and maximizes throughput.
+
+## What is QUIC?
+
+QUIC (Quick UDP Internet Connections) is a modern transport protocol that addresses the limitations of traditional TCP/TLS stacks:
+
+- **UDP-based**: Built on UDP for flexibility and reduced kernel overhead
+- **Always encrypted**: TLS 1.3 is built into the protocol, not layered on top
+- **Multiplexed**: Multiple independent streams share a single connection without head-of-line blocking
+- **Connection migration**: Connections survive network changes (Wi-Fi to cellular)
+- **0-RTT**: Resume connections instantly with zero round-trip time
+
+QuicD implements **QUIC v1** (RFC 9000) via the battle-tested [Cloudflare Quiche](https://docs.quic.tech/quiche/) library, ensuring compliance with the latest standards.
+
+## Use Cases
+
+QuicD excels at building applications that demand low latency, high throughput, or both:
+
+### HTTP/3 Web Serving
+Serve modern web applications with HTTP/3 support built-in. QuicD includes a complete HTTP/3 implementation (RFC 9114) with QPACK header compression, ready to handle production traffic.
+
+```rust
+// HTTP/3 is registered by default
+let registry = AppRegistry::new()
+    .register("h3", Arc::new(H3Factory::new(YourHandler)));
+```
+
+### Low-Latency Media Streaming
+Build Media over QUIC (MOQ) applications for live video, audio, or real-time communication. QUIC's datagram support enables ultra-low-latency delivery with graceful degradation.
+
+### Custom QUIC Protocols
+Implement domain-specific protocols for gaming, IoT, DNS over QUIC, or research. QuicD's `QuicAppFactory` trait makes it straightforward to add new protocols without modifying the core server.
+
+### Real-Time Communications
+Take advantage of QUIC's connection migration and 0-RTT features to build robust real-time applications that gracefully handle network changes.
+
+## Why Choose QuicD?
+
+### Uncompromising Performance
+
+QuicD is built for speed from the ground up:
+
+- **io_uring**: Zero-copy network I/O eliminates syscall overhead
+- **eBPF routing**: Intelligent connection affinity ensures packets reach the right worker thread
+- **Zero-contention architecture**: Native worker threads operate independently with no locks in the hot path
+- **CPU affinity**: Workers pinned to specific cores for optimal cache locality
+- **Pre-allocated buffers**: Eliminates allocation overhead in packet processing
+
+Real-world performance: **100,000+ concurrent connections per worker**, **10+ Gbps throughput** (hardware-dependent).
+
+### True Flexibility
+
+QuicD is designed for extensibility:
+
+- **Pluggable application layer**: Implement `QuicAppFactory` to add new protocols
+- **Zero-copy interfaces**: Applications integrate via efficient channel-based APIs
+- **Multiple protocols**: Run HTTP/3, MOQ, and custom protocols on a single server
+- **Configurable**: Tune every aspect from buffer pool sizes to flow control parameters
+
+### Rust Safety Guarantees
+
+Built in Rust, QuicD provides memory safety without garbage collection overhead. The borrow checker ensures thread-safe concurrent access, eliminating entire classes of security vulnerabilities.
+
+## Architecture at a Glance
+
+QuicD's architecture separates concerns for optimal performance:
+
+```mermaid
+graph LR
+    A[UDP Packets] --> B[io_uring]
+    B --> C[Worker Threads]
+    C --> D[QUIC Manager]
+    D --> E[Connection]
+    E --> F[App Task]
+    F --> G[Your Protocol Logic]
+```
+
+- **Native worker threads**: Handle all network I/O and QUIC protocol processing
+- **Tokio async tasks**: Run application logic (one task per connection)
+- **Zero-copy channels**: Efficient communication between layers
+- **eBPF routing**: Ensures connection affinity for cache efficiency
+
+Learn more in the [Architecture](/docs/architecture/) guide.
+
+## Getting Started
+
+Ready to build with QuicD? Here's how to get started:
+
+1. **[Install QuicD](/docs/getting-started/installation/)**: Build from source or use cargo install
+2. **[Configure your server](/docs/getting-started/configuration/)**: Set up workers, buffers, and QUIC parameters
+3. **[Run HTTP/3](/docs/usage/http3/)**: Start serving HTTP/3 traffic immediately
+4. **[Build custom apps](/docs/building-apps/interface/)**: Implement your own QUIC-based protocols
+
+## Community and Support
+
+QuicD is an open-source project welcoming contributions:
+
+- **GitHub**: [Report issues, contribute code](https://github.com/gh-abhay/quicd)
+- **Documentation**: You're here! Explore the guides and API reference
+- **Contributing**: See the [Contributing Guide](/docs/community/contributing/)
+
+## Next Steps
+
+- **New to QUIC?** Start with [Core Concepts](/docs/concepts/) to understand the fundamentals
+- **Want to see code?** Check out [HTTP/3 Usage](/docs/usage/http3/) for a complete example
+- **Building a custom protocol?** Jump to [Building Apps](/docs/building-apps/interface/)
+
+---
+
+*QuicD is designed and built for developers who demand both performance and flexibility. Let's build the next generation of internet applications together.*
