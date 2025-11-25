@@ -56,7 +56,7 @@ export default defineConfig({
 				},
 			],
 			editLink: {
-				baseUrl: 'https://github.com/gh-abhay/quicd/edit/main/website/src/content/docs/',
+				baseUrl: 'https://github.com/gh-abhay/quicd/edit/main/website/src/content/',
 			},
 			lastUpdated: true,
 			favicon: '/favicon.svg',
