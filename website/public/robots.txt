@@ -3,7 +3,7 @@ User-agent: *
 Allow: /
 
 # Sitemap
-Sitemap: https://quicd.dev/sitemap-index.xml
+Sitemap: https://quicd.com/sitemap-index.xml
 
 # Crawl-delay for polite bots
 Crawl-delay: 1
