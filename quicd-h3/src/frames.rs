@@ -114,6 +114,16 @@ impl H3Frame {
         // Verify redundant length encoding is minimal (RFC 9114 Section 7.1)
         Self::validate_varint_encoding(&buf[cursor - len_len..cursor], length)?;
 
+        // GAP #5 FIX: Validate frame size to prevent DoS (RFC 9114 Section 7.1)
+        // Maximum frame payload size: 16 MB (configurable in production)
+        const MAX_FRAME_SIZE: u64 = 16 * 1024 * 1024;
+        if length > MAX_FRAME_SIZE {
+            return Err(H3Error::Connection(format!(
+                "H3_EXCESSIVE_LOAD: Frame size {} exceeds maximum {}",
+                length, MAX_FRAME_SIZE
+            )));
+        }
+
         let length = length as usize;
         if buf.len() < cursor + length {
             return Err(H3Error::FrameParse("buffer too small for frame payload".into()));

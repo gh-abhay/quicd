@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use crate::error::H3Error;
 use crate::validation::RequestPseudoHeaders;
+use tokio::net::TcpStream;
 
 /// State of a CONNECT tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +31,8 @@ pub struct ConnectTunnel {
     protocol: Option<String>,
     /// Buffered data waiting to be sent through tunnel
     pending_data: Vec<Bytes>,
+    /// TCP connection to target authority
+    tcp_stream: Option<TcpStream>,
 }
 
 impl ConnectTunnel {
@@ -52,7 +55,98 @@ impl ConnectTunnel {
             authority,
             protocol: pseudo_headers.protocol.clone(),
             pending_data: Vec::new(),
+            tcp_stream: None,
         })
+    }
+
+    /// Establish the TCP connection to the target authority.
+    ///
+    /// Per RFC 9114 Section 4.4, the proxy establishes a TCP connection to the
+    /// server identified in the :authority pseudo-header field.
+    ///
+    /// Returns Ok(()) if connection established successfully.
+    /// Returns H3Error::ConnectError if TCP connection fails (should be sent as H3_CONNECT_ERROR).
+    pub async fn establish_connection(&mut self) -> Result<(), H3Error> {
+        if self.state != ConnectState::Pending {
+            return Err(H3Error::Http("tunnel not in pending state".into()));
+        }
+
+        // Establish TCP connection to authority
+        match TcpStream::connect(&self.authority).await {
+            Ok(stream) => {
+                self.tcp_stream = Some(stream);
+                Ok(())
+            }
+            Err(e) => {
+                self.state = ConnectState::Closed;
+                Err(H3Error::ConnectError(format!(
+                    "failed to connect to {}: {}",
+                    self.authority, e
+                )))
+            }
+        }
+    }
+
+    /// Get a mutable reference to the TCP stream, if established.
+    pub fn tcp_stream_mut(&mut self) -> Option<&mut TcpStream> {
+        self.tcp_stream.as_mut()
+    }
+
+    /// Take ownership of the TCP stream.
+    /// This is used when spawning a forwarding task that needs exclusive access.
+    pub fn take_tcp_stream(&mut self) -> Option<TcpStream> {
+        self.tcp_stream.take()
+    }
+
+    /// Write data to the TCP connection.
+    ///
+    /// Per RFC 9114 Section 4.4: "The payload of any DATA frame sent by the client
+    /// is transmitted by the proxy to the TCP server."
+    pub async fn write_to_tcp(&mut self, data: &[u8]) -> Result<(), H3Error> {
+        if self.state != ConnectState::Established {
+            return Err(H3Error::Http("tunnel not established".into()));
+        }
+
+        if let Some(tcp) = &mut self.tcp_stream {
+            use tokio::io::AsyncWriteExt;
+            tcp.write_all(data).await.map_err(|e| {
+                H3Error::ConnectError(format!("TCP write failed: {}", e))
+            })?;
+            Ok(())
+        } else {
+            Err(H3Error::Http("no TCP connection".into()))
+        }
+    }
+
+    /// Read data from the TCP connection.
+    ///
+    /// Per RFC 9114 Section 4.4: "data received from the TCP server is packaged
+    /// into DATA frames by the proxy."
+    ///
+    /// Returns Some(data) if data was read, None if EOF (FIN received from TCP).
+    pub async fn read_from_tcp(&mut self, buf: &mut [u8]) -> Result<Option<usize>, H3Error> {
+        if self.state != ConnectState::Established {
+            return Err(H3Error::Http("tunnel not established".into()));
+        }
+
+        if let Some(tcp) = &mut self.tcp_stream {
+            use tokio::io::AsyncReadExt;
+            match tcp.read(buf).await {
+                Ok(0) => {
+                    // EOF - TCP connection closed by peer
+                    // Per RFC 9114: "When the proxy receives a packet with the FIN bit set,
+                    // it will close the send stream that it sends to the client."
+                    Ok(None)
+                }
+                Ok(n) => Ok(Some(n)),
+                Err(e) => {
+                    // TCP read error - should abort stream with H3_CONNECT_ERROR
+                    Err(H3Error::ConnectError(format!("TCP read failed: {}", e)))
+                }
+            }
+        } else {
+            Err(H3Error::Http("no TCP connection".into()))
+        }
     }
 
     /// Get the stream ID.

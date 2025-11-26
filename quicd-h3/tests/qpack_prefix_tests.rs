@@ -3,7 +3,7 @@ use quicd_h3::qpack::QpackCodec;
 
 #[test]
 fn test_encode_headers_with_prefix() {
-    let codec = QpackCodec::new();
+    let mut codec = QpackCodec::new();
     let headers = vec![
         (":method".to_string(), "GET".to_string()),
         (":path".to_string(), "/".to_string()),
@@ -11,7 +11,7 @@ fn test_encode_headers_with_prefix() {
         (":authority".to_string(), "example.com".to_string()),
     ];
     
-    let encoded = codec.encode_headers(&headers).unwrap();
+    let (encoded, _instructions, _refs) = codec.encode_headers(&headers).unwrap();
     
     // Verify encoded data has prefix (at least 2 bytes for Required Insert Count and Base)
     assert!(encoded.len() >= 2);
@@ -24,19 +24,19 @@ fn test_encode_headers_with_prefix() {
 
 #[test]
 fn test_decode_headers_with_prefix() {
-    let codec = QpackCodec::new();
+    let mut codec = QpackCodec::new();
     let headers = vec![
         (":method".to_string(), "POST".to_string()),
         (":path".to_string(), "/api".to_string()),
     ];
     
-    let encoded = codec.encode_headers(&headers).unwrap();
-    let decoded = codec.decode_headers(&encoded).unwrap();
+    let (encoded, _instructions, _refs) = codec.encode_headers(&headers).unwrap();
+    let (decoded, _dec_refs) = codec.decode_headers(&encoded).unwrap();
     
     // Verify round-trip
     assert_eq!(decoded.len(), headers.len());
-    for (original, decoded) in headers.iter().zip(decoded.iter()) {
-        assert_eq!(original, decoded);
+    for (original, decoded_item) in headers.iter().zip(decoded.iter()) {
+        assert_eq!(original, decoded_item);
     }
 }
 
@@ -66,14 +66,14 @@ fn test_qpack_varint_encoding() {
 
 #[test]
 fn test_static_table_references() {
-    let codec = QpackCodec::new();
+    let mut codec = QpackCodec::new();
     
     // Common headers should use static table
     let headers = vec![
         (":method".to_string(), "GET".to_string()),
     ];
     
-    let encoded = codec.encode_headers(&headers).unwrap();
+    let (encoded, _instructions, _refs) = codec.encode_headers(&headers).unwrap();
     
     // Encoded size should be small (using indexed representation)
     // Prefix (2 bytes) + indexed field (1-2 bytes)

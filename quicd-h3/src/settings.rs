@@ -55,6 +55,8 @@ pub enum SettingsState {
 pub struct SettingsValidator {
     state: SettingsState,
     settings: HashMap<SettingId, u64>,
+    /// Settings from previous session for 0-RTT validation (RFC 9114 Section 7.2.4.2)
+    remembered_settings: Option<HashMap<SettingId, u64>>,
 }
 
 impl SettingsValidator {
@@ -63,6 +65,18 @@ impl SettingsValidator {
         Self {
             state: SettingsState::AwaitingSettings,
             settings: HashMap::new(),
+            remembered_settings: None,
+        }
+    }
+
+    /// Create a settings validator with remembered settings from a previous session.
+    ///
+    /// Used for 0-RTT connections per RFC 9114 Section 7.2.4.2.
+    pub fn with_remembered_settings(remembered_settings: HashMap<SettingId, u64>) -> Self {
+        Self {
+            state: SettingsState::AwaitingSettings,
+            settings: HashMap::new(),
+            remembered_settings: Some(remembered_settings),
         }
     }
 
@@ -131,6 +145,87 @@ impl SettingsValidator {
     /// Check if settings have been received.
     pub fn is_received(&self) -> bool {
         self.state == SettingsState::Received
+    }
+
+    /// Validate 0-RTT settings compatibility per RFC 9114 Section 7.2.4.2.
+    ///
+    /// When a server accepts 0-RTT data, its SETTINGS frame MUST NOT reduce any limits
+    /// or alter any values that might be violated by the client with its 0-RTT data.
+    ///
+    /// This method checks that new settings are compatible with remembered settings:
+    /// - Limits (max values) cannot be reduced
+    /// - Boolean flags cannot be disabled if previously enabled
+    ///
+    /// Returns Err(H3Error::SettingsError) if incompatible.
+    pub fn validate_0rtt_compatibility(
+        &self,
+        new_settings: &HashMap<SettingId, u64>,
+    ) -> Result<(), H3Error> {
+        let Some(remembered) = &self.remembered_settings else {
+            // No remembered settings, 0-RTT validation not applicable
+            return Ok(());
+        };
+
+        // Check each setting from previous session
+        for (&setting_id, &remembered_value) in remembered.iter() {
+            let new_value = new_settings.get(&setting_id).copied();
+
+            // RFC 9114 Section 7.2.4.2: If a server accepts 0-RTT but then sends settings
+            // that are not compatible with the previously specified settings, this MUST be
+            // treated as a connection error of type H3_SETTINGS_ERROR.
+            match setting_id {
+                // Limit settings: new value must not be less than remembered value
+                known::MAX_FIELD_SECTION_SIZE
+                | known::QPACK_MAX_TABLE_CAPACITY
+                | known::QPACK_BLOCKED_STREAMS => {
+                    if let Some(new_val) = new_value {
+                        if new_val < remembered_value {
+                            return Err(H3Error::SettingsError);
+                        }
+                    } else if remembered_value > 0 {
+                        // Omitted setting that was previously non-default
+                        // RFC 9114: "The server MUST include all settings that differ from their default values"
+                        return Err(H3Error::SettingsError);
+                    }
+                }
+                // Boolean settings: cannot be disabled if previously enabled
+                known::ENABLE_CONNECT_PROTOCOL => {
+                    if remembered_value == 1 {
+                        if new_value.unwrap_or(0) != 1 {
+                            return Err(H3Error::SettingsError);
+                        }
+                    }
+                }
+                // Other settings: validate they haven't changed in incompatible ways
+                _ => {
+                    // For unknown/extension settings, require exact match if non-default
+                    if let Some(new_val) = new_value {
+                        if new_val != remembered_value {
+                            // Value changed - potentially incompatible
+                            return Err(H3Error::SettingsError);
+                        }
+                    } else if remembered_value != 0 {
+                        // Omitted setting that was previously non-default
+                        return Err(H3Error::SettingsError);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remember settings for future 0-RTT connections.
+    ///
+    /// Call this when receiving settings from a peer to store them for potential
+    /// 0-RTT use in future connections.
+    pub fn remember_settings(&mut self) {
+        self.remembered_settings = Some(self.settings.clone());
+    }
+
+    /// Get the remembered settings from a previous session.
+    pub fn get_remembered_settings(&self) -> Option<&HashMap<SettingId, u64>> {
+        self.remembered_settings.as_ref()
     }
 }
 
@@ -263,5 +358,135 @@ mod tests {
         assert_eq!(settings.get(&known::ENABLE_CONNECT_PROTOCOL), Some(&1));
         assert_eq!(settings.get(&known::QPACK_MAX_TABLE_CAPACITY), Some(&4096));
         assert_eq!(settings.get(&known::QPACK_BLOCKED_STREAMS), Some(&50));
+    }
+
+    #[test]
+    fn test_0rtt_settings_validation_no_remembered_settings() {
+        // RFC 9114 Section 7.2.4.2: No validation if no remembered settings
+        let validator = SettingsValidator::new();
+        
+        let mut new_settings = HashMap::new();
+        new_settings.insert(known::MAX_FIELD_SECTION_SIZE, 8192);
+        
+        // Should succeed since there are no remembered settings to validate against
+        assert!(validator.validate_0rtt_compatibility(&new_settings).is_ok());
+    }
+
+    #[test]
+    fn test_0rtt_settings_validation_compatible_limits() {
+        // RFC 9114 Section 7.2.4.2: New settings must not reduce limits
+        let mut remembered = HashMap::new();
+        remembered.insert(known::MAX_FIELD_SECTION_SIZE, 8192);
+        remembered.insert(known::QPACK_MAX_TABLE_CAPACITY, 4096);
+        remembered.insert(known::QPACK_BLOCKED_STREAMS, 100);
+        
+        let validator = SettingsValidator::with_remembered_settings(remembered);
+        
+        let mut new_settings = HashMap::new();
+        new_settings.insert(known::MAX_FIELD_SECTION_SIZE, 16384); // Increased - OK
+        new_settings.insert(known::QPACK_MAX_TABLE_CAPACITY, 4096); // Same - OK
+        new_settings.insert(known::QPACK_BLOCKED_STREAMS, 200); // Increased - OK
+        
+        assert!(validator.validate_0rtt_compatibility(&new_settings).is_ok());
+    }
+
+    #[test]
+    fn test_0rtt_settings_validation_reduced_limit_rejected() {
+        // RFC 9114 Section 7.2.4.2: Reducing limits violates 0-RTT compatibility
+        let mut remembered = HashMap::new();
+        remembered.insert(known::MAX_FIELD_SECTION_SIZE, 16384);
+        
+        let validator = SettingsValidator::with_remembered_settings(remembered);
+        
+        let mut new_settings = HashMap::new();
+        new_settings.insert(known::MAX_FIELD_SECTION_SIZE, 8192); // Reduced - ERROR
+        
+        assert!(matches!(
+            validator.validate_0rtt_compatibility(&new_settings),
+            Err(H3Error::SettingsError)
+        ));
+    }
+
+    #[test]
+    fn test_0rtt_settings_validation_omitted_non_default_rejected() {
+        // RFC 9114 Section 7.2.4.2: Server MUST include all non-default settings
+        let mut remembered = HashMap::new();
+        remembered.insert(known::MAX_FIELD_SECTION_SIZE, 8192); // Non-default value
+        
+        let validator = SettingsValidator::with_remembered_settings(remembered);
+        
+        let new_settings = HashMap::new(); // Omitted the setting - ERROR
+        
+        assert!(matches!(
+            validator.validate_0rtt_compatibility(&new_settings),
+            Err(H3Error::SettingsError)
+        ));
+    }
+
+    #[test]
+    fn test_0rtt_settings_validation_boolean_flag_cannot_disable() {
+        // RFC 9114 Section 7.2.4.2: Cannot disable a previously enabled flag
+        let mut remembered = HashMap::new();
+        remembered.insert(known::ENABLE_CONNECT_PROTOCOL, 1); // Enabled
+        
+        let validator = SettingsValidator::with_remembered_settings(remembered);
+        
+        let mut new_settings = HashMap::new();
+        new_settings.insert(known::ENABLE_CONNECT_PROTOCOL, 0); // Disabled - ERROR
+        
+        assert!(matches!(
+            validator.validate_0rtt_compatibility(&new_settings),
+            Err(H3Error::SettingsError)
+        ));
+    }
+
+    #[test]
+    fn test_0rtt_settings_validation_boolean_flag_stays_enabled() {
+        // RFC 9114 Section 7.2.4.2: Flag can stay enabled
+        let mut remembered = HashMap::new();
+        remembered.insert(known::ENABLE_CONNECT_PROTOCOL, 1);
+        
+        let validator = SettingsValidator::with_remembered_settings(remembered);
+        
+        let mut new_settings = HashMap::new();
+        new_settings.insert(known::ENABLE_CONNECT_PROTOCOL, 1); // Still enabled - OK
+        
+        assert!(validator.validate_0rtt_compatibility(&new_settings).is_ok());
+    }
+
+    #[test]
+    fn test_0rtt_remember_settings() {
+        let mut validator = SettingsValidator::new();
+        
+        let mut settings = HashMap::new();
+        settings.insert(known::MAX_FIELD_SECTION_SIZE, 8192);
+        settings.insert(known::ENABLE_CONNECT_PROTOCOL, 1);
+        
+        validator.validate_settings(settings.clone()).unwrap();
+        validator.remember_settings();
+        
+        let remembered = validator.get_remembered_settings().unwrap();
+        assert_eq!(remembered.get(&known::MAX_FIELD_SECTION_SIZE), Some(&8192));
+        assert_eq!(remembered.get(&known::ENABLE_CONNECT_PROTOCOL), Some(&1));
+    }
+
+    #[test]
+    fn test_0rtt_validation_with_all_settings() {
+        // Test comprehensive scenario with multiple settings
+        let mut remembered = HashMap::new();
+        remembered.insert(known::MAX_FIELD_SECTION_SIZE, 8192);
+        remembered.insert(known::QPACK_MAX_TABLE_CAPACITY, 4096);
+        remembered.insert(known::QPACK_BLOCKED_STREAMS, 100);
+        remembered.insert(known::ENABLE_CONNECT_PROTOCOL, 1);
+        
+        let validator = SettingsValidator::with_remembered_settings(remembered);
+        
+        let mut new_settings = HashMap::new();
+        new_settings.insert(known::MAX_FIELD_SECTION_SIZE, 16384); // Increased
+        new_settings.insert(known::QPACK_MAX_TABLE_CAPACITY, 8192); // Increased
+        new_settings.insert(known::QPACK_BLOCKED_STREAMS, 150); // Increased
+        new_settings.insert(known::ENABLE_CONNECT_PROTOCOL, 1); // Same
+        
+        assert!(validator.validate_0rtt_compatibility(&new_settings).is_ok());
     }
 }

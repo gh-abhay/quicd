@@ -23,6 +23,7 @@ pub enum StreamState {
 }
 
 /// Context for parsing frames on a stream, with buffering for partial frames.
+/// PERF #32: Limits buffer size to prevent memory exhaustion attacks
 pub struct StreamFrameParser {
     /// Buffered data waiting to be parsed
     buffer: BytesMut,
@@ -38,11 +39,18 @@ pub struct StreamFrameParser {
     stream_id: u64,
 }
 
+/// Maximum buffer size per stream to prevent memory exhaustion
+/// Default: 1 MB (configurable in production)
+const MAX_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
+
 impl StreamFrameParser {
     /// Create a new parser for a stream.
+    /// PERF #30: Pre-allocate buffer to reduce reallocations
     pub fn new(stream_id: u64) -> Self {
+        // Pre-allocate 16KB for typical frame sizes (HEADERS ~4KB, DATA varies)
+        const INITIAL_BUFFER_CAPACITY: usize = 16 * 1024;
         Self {
-            buffer: BytesMut::new(),
+            buffer: BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY),
             state: StreamState::Idle,
             headers_received: false,
             data_received: false,
@@ -82,8 +90,25 @@ impl StreamFrameParser {
     }
 
     /// Add data to the buffer for parsing.
-    pub fn add_data(&mut self, data: Bytes) {
+    /// PERF #31: Minimize copies by using efficient extension
+    /// PERF #32: Enforces buffer size limit
+    pub fn add_data(&mut self, data: Bytes) -> Result<(), H3Error> {
+        // PERF #32: Check buffer size limit before adding data
+        let new_size = self.buffer.len() + data.len();
+        if new_size > MAX_STREAM_BUFFER_SIZE {
+            return Err(H3Error::Connection(format!(
+                "Stream {} buffer size {} exceeds maximum {}",
+                self.stream_id, new_size, MAX_STREAM_BUFFER_SIZE
+            )));
+        }
+        
+        // Reserve space if needed to avoid multiple reallocations
+        let remaining_cap = self.buffer.capacity() - self.buffer.len();
+        if remaining_cap < data.len() {
+            self.buffer.reserve(data.len());
+        }
         self.buffer.extend_from_slice(&data);
+        Ok(())
     }
 
     /// Try to parse the next complete frame from the buffer.
@@ -219,10 +244,18 @@ impl StreamFrameParser {
     pub fn buffered_bytes(&self) -> usize {
         self.buffer.len()
     }
+    
+    /// Get the remaining capacity before reallocation.
+    /// PERF #30: Useful for monitoring buffer efficiency
+    pub fn remaining_capacity(&self) -> usize {
+        self.buffer.capacity() - self.buffer.len()
+    }
 
     /// Clear all buffered data (for error recovery).
+    /// PERF #30: Retains capacity to avoid reallocation on next use
     pub fn clear_buffer(&mut self) {
         self.buffer.clear();
+        // Note: clear() retains capacity, which is what we want
     }
 }
 
@@ -248,7 +281,7 @@ mod tests {
         };
         let headers_data = headers.encode();
 
-        parser.add_data(headers_data);
+        parser.add_data(headers_data).unwrap();
         let result = parser.parse_next_frame();
         assert!(result.is_ok());
 
@@ -258,7 +291,7 @@ mod tests {
         };
         let data_bytes = data.encode();
 
-        parser.add_data(data_bytes);
+        parser.add_data(data_bytes).unwrap();
         let result = parser.parse_next_frame();
         assert!(result.is_ok());
 
@@ -268,7 +301,7 @@ mod tests {
         };
         let trailers_data = trailers.encode();
 
-        parser.add_data(trailers_data);
+        parser.add_data(trailers_data).unwrap();
         let result = parser.parse_next_frame();
         assert!(result.is_ok());
         assert!(parser.trailers_received);
@@ -285,7 +318,7 @@ mod tests {
         };
         let data_bytes = data.encode();
 
-        parser.add_data(data_bytes);
+        parser.add_data(data_bytes).unwrap();
         let result = parser.parse_next_frame();
         assert!(result.is_err());
     }
@@ -302,7 +335,7 @@ mod tests {
 
         // Add only part of the frame
         let partial = full_data.slice(0..full_data.len() / 2);
-        parser.add_data(partial);
+        parser.add_data(partial).unwrap();
 
         // Should return None (need more data)
         let result = parser.parse_next_frame();
@@ -311,7 +344,7 @@ mod tests {
 
         // Add remaining data
         let remaining = full_data.slice(full_data.len() / 2..);
-        parser.add_data(remaining);
+        parser.add_data(remaining).unwrap();
 
         // Now should parse successfully
         let result = parser.parse_next_frame();

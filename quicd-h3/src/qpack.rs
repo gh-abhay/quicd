@@ -631,28 +631,77 @@ impl QpackCodec {
         ]
     }
 
-    pub fn encode_headers(&self, headers: &[(String, String)]) -> Result<Bytes, H3Error> {
+    /// Encode headers with dynamic table support
+    /// Returns (encoded_headers, encoder_instructions, referenced_dynamic_entries)
+    /// The caller is responsible for adding references for the returned indices
+    pub fn encode_headers(&mut self, headers: &[(String, String)]) -> Result<(Bytes, Vec<Bytes>, Vec<usize>), H3Error> {
         // Pre-allocate buffer: rough estimate is 2 bytes prefix + 32 bytes per header
         let estimated_size = 2 + headers.len() * 32;
         let mut buf = BytesMut::with_capacity(estimated_size);
+        let mut encoder_instructions = Vec::new();
+        let mut referenced_dynamic_entries = Vec::new(); // Track which entries we reference
+        
+        // First pass: decide which headers to insert into dynamic table
+        // Heuristic: insert headers that are not in static table and likely to repeat
+        for (name, value) in headers {
+            // Skip if already in dynamic table
+            if self.find_dynamic_entry(name, value).is_some() {
+                continue;
+            }
+            
+            // Check if exact name-value pair is in static table
+            let exact_static_match = self.static_table.iter()
+                .any(|(n, v)| n == name && v == value);
+            
+            if exact_static_match {
+                continue;
+            }
+            
+            // Decide if we should insert based on header characteristics
+            // Insert if:
+            // 1. Name-value is large (> 64 bytes total) - likely to benefit from compression
+            // 2. Name is not in static table at all - custom header likely to repeat
+            // 3. Name is in static table but value differs - can use name reference encoding
+            let total_size = name.len() + value.len();
+            let name_in_static = self.find_static_name_index(name).is_some();
+            let should_insert = total_size > 64 
+                || !name_in_static 
+                || name_in_static; // Always insert if name in static but value differs
+            
+            if should_insert {
+                // Generate encoder instruction
+                let instruction = self.create_insert_instruction(name, value)?;
+                encoder_instructions.push(instruction);
+                
+                // Actually insert into our local dynamic table
+                self.insert(name.clone(), value.clone());
+            }
+        }
         
         // RFC 9204 Section 4.5.1: Encoded field section prefix
-        // Required Insert Count (8-bit prefix)
-        // TODO: Properly calculate based on dynamic table references
-        // Currently using 0 (no dynamic table) for safety
-        let required_insert_count = 0u64;
-        buf.put_u8(required_insert_count as u8);
+        // Required Insert Count = highest insert count referenced + 1
+        let required_insert_count = self.insert_count;
+        self.encode_varint_with_prefix(&mut buf, required_insert_count as u64, 0x00);
         
-        // Base (7-bit prefix with sign bit in bit 7)
-        // TODO: Calculate proper base for dynamic table references
-        // Currently using 0 (no dynamic table)
+        // Base = current insert count (most common case - referencing recent entries)
         let base_delta = 0u64;
         let sign = false; // positive (S=0)
-        let base_byte = if sign { 0x80 } else { 0x00 } | (base_delta as u8 & 0x7F);
-        buf.put_u8(base_byte);
+        self.encode_varint_with_prefix(&mut buf, base_delta, if sign { 0x80 } else { 0x00 });
         
         for (name, value) in headers {
-            // First, check if the exact name-value pair is in the dynamic table
+            // First, check if the exact name-value pair is in the static table
+            if let Some(static_index) = self.find_static_exact_match(name, value) {
+                // Indexed header field - static table
+                // Format: 1 1 IIIIIIIIII (T=0 for static)
+                let index_byte = 0x80 | ((static_index & 0x3F) as u8);
+                buf.put_u8(index_byte);
+                if static_index >= 64 {
+                    self.encode_varint(&mut buf, (static_index - 63) as u64);
+                }
+                continue;
+            }
+            
+            // Check if the exact name-value pair is in the dynamic table
             if let Some(dynamic_index) = self.find_dynamic_entry(name, value) {
                 // Indexed header field - dynamic table
                 // Format: 1 1 IIIIIIIIII (T=1 for dynamic, S=1 for never-indexed)
@@ -662,6 +711,8 @@ impl QpackCodec {
                     // Need more bytes for index
                     self.encode_varint(&mut buf, dynamic_index as u64);
                 }
+                // RFC 9204 Section 2.1.2: Track reference to dynamic table entry
+                referenced_dynamic_entries.push(dynamic_index);
                 continue;
             }
             
@@ -675,6 +726,8 @@ impl QpackCodec {
                     if dynamic_name_index >= 64 {
                         self.encode_varint(&mut buf, dynamic_name_index as u64);
                     }
+                    // RFC 9204 Section 2.1.2: Track reference to dynamic table entry
+                    referenced_dynamic_entries.push(dynamic_name_index);
                 } else {
                     // Literal Field Line with Name Reference (dynamic)
                     // Format: 01 0 0 IIIIIIIIII H LLLLLLLL VVVVVVVV
@@ -687,6 +740,8 @@ impl QpackCodec {
                         self.encode_varint(&mut buf, (dynamic_name_index - 31) as u64);
                     }
                     self.encode_string(&mut buf, value);
+                    // RFC 9204 Section 2.1.2: Track reference to dynamic table entry (name only)
+                    referenced_dynamic_entries.push(dynamic_name_index);
                 }
                 continue;
             }
@@ -714,6 +769,32 @@ impl QpackCodec {
             self.encode_string(&mut buf, value);
         }
 
+        Ok((buf.freeze(), encoder_instructions, referenced_dynamic_entries))
+    }
+    
+    /// Create an encoder instruction to insert a header into the dynamic table
+    fn create_insert_instruction(&self, name: &str, value: &str) -> Result<Bytes, H3Error> {
+        let mut buf = BytesMut::new();
+        
+        // Check if name is in static table
+        if let Some(static_index) = self.find_static_name_index(name) {
+            // Insert with Name Reference (static table)
+            // Format: 1 1 IIIIIIII H LLLLLLLL VVVVVVVV
+            // Bit pattern: 11TTTTTT where T=0 (static), then index
+            let first_byte = 0xC0 | if static_index < 64 { static_index as u8 } else { 0x3F };
+            buf.put_u8(first_byte);
+            if static_index >= 64 {
+                self.encode_varint(&mut buf, (static_index - 63) as u64);
+            }
+            self.encode_string(&mut buf, value);
+        } else {
+            // Insert with Literal Name
+            // Format: 01 H LLLLLLLL NNNNNNNN H LLLLLLLL VVVVVVVV
+            buf.put_u8(0x40); // 01000000
+            self.encode_string(&mut buf, name);
+            self.encode_string(&mut buf, value);
+        }
+        
         Ok(buf.freeze())
     }
     
@@ -721,6 +802,16 @@ impl QpackCodec {
     pub fn find_static_name_index(&self, name: &str) -> Option<usize> {
         for (i, (n, _)) in self.static_table.iter().enumerate() {
             if n == name {
+                return Some(i);
+            }
+        }
+        None
+    }
+    
+    /// Find an exact name-value match in the static table
+    fn find_static_exact_match(&self, name: &str, value: &str) -> Option<usize> {
+        for (i, (n, v)) in self.static_table.iter().enumerate() {
+            if n == name && v == value {
                 return Some(i);
             }
         }
@@ -750,10 +841,12 @@ impl QpackCodec {
     }
 
     /// Decodes QPACK encoded headers (basic implementation).
-    pub fn decode_headers(&self, encoded: &[u8]) -> Result<Vec<(String, String)>, H3Error> {
+    /// Returns (headers, referenced_dynamic_entries) for reference tracking.
+    pub fn decode_headers(&self, encoded: &[u8]) -> Result<(Vec<(String, String)>, Vec<usize>), H3Error> {
         let mut headers = Vec::new();
         let mut cursor = 0;
         let mut field_section_size: usize = 0; // Track size per RFC 9114 Section 7.2.4.2
+        let mut referenced_dynamic_entries = Vec::new(); // Track references for cleanup
 
         // RFC 9204 Section 4.5.1: Decode field section prefix
         // Required Insert Count (8-bit prefix)
@@ -765,13 +858,9 @@ impl QpackCodec {
         
         // RFC 9204 Section 2.1.4: Check if stream would be blocked
         if required_insert_count > self.insert_count as u64 {
-            // Stream would be blocked - check limit (note: actual blocking tracked in h3_session)
-            if self.current_blocked_streams >= self.max_blocked_streams {
-                return Err(H3Error::Qpack(
-                    format!("H3_QPACK_DECOMPRESSION_FAILED: would exceed SETTINGS_QPACK_BLOCKED_STREAMS limit of {}",
-                            self.max_blocked_streams)
-                ));
-            }
+            // Stream is blocked - decoder needs to wait for dynamic table updates
+            // Return special error that H3Session will handle by queueing the stream
+            return Err(H3Error::QpackBlocked(required_insert_count as usize));
         }
         
         // Base (7-bit prefix with sign bit)
@@ -810,9 +899,16 @@ impl QpackCodec {
                 
                 let (name, value) = if (first_byte & 0x40) != 0 {
                     // Dynamic table
-                    self.get_relative(index)
-                        .ok_or_else(|| H3Error::Qpack("invalid dynamic table index".into()))?
-                        .clone()
+                    referenced_dynamic_entries.push(index); // Track reference
+                    // RFC 9204 Section 2.1.2: Check draining entries first
+                    if let Some(entry) = self.get_relative(index) {
+                        entry.clone()
+                    } else {
+                        // Entry might be in draining state
+                        let insert_count = self.insert_count.saturating_sub(index);
+                        self.get_draining_entry(insert_count)
+                            .ok_or_else(|| H3Error::Qpack("invalid dynamic table index".into()))?
+                    }
                 } else {
                     // Static table
                     self.static_table.get(index)
@@ -861,10 +957,16 @@ impl QpackCodec {
                         .0
                         .clone()
                 } else {
-                    self.get_relative(name_index)
-                        .ok_or_else(|| H3Error::Qpack("invalid dynamic table index".into()))?
-                        .0
-                        .clone()
+                    referenced_dynamic_entries.push(name_index); // Track reference
+                    // RFC 9204 Section 2.1.2: Check draining entries
+                    if let Some(entry) = self.get_relative(name_index) {
+                        entry.0.clone()
+                    } else {
+                        let insert_count = self.insert_count.saturating_sub(name_index);
+                        self.get_draining_entry(insert_count)
+                            .ok_or_else(|| H3Error::Qpack("invalid dynamic table index".into()))?
+                            .0
+                    }
                 };
                 
                 let (value, consumed) = self.decode_string(&encoded[cursor..])?;
@@ -896,7 +998,7 @@ impl QpackCodec {
             }
         }
 
-        Ok(headers)
+        Ok((headers, referenced_dynamic_entries))
     }
 
     /// Encode bytes using Huffman coding (public for testing)

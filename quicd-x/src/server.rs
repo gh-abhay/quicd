@@ -65,6 +65,21 @@ pub enum EgressCommand {
         request_id: u64,
         connection_id: ConnectionId,
     },
+
+    /// Query connection state (e.g., is_in_early_data).
+    ///
+    /// Response delivered via oneshot channel
+    QueryConnectionState {
+        connection_id: ConnectionId,
+        reply: tokio::sync::oneshot::Sender<ConnectionState>,
+    },
+}
+
+/// Connection state information for queries.
+#[derive(Debug, Clone)]
+pub struct ConnectionState {
+    /// Whether the connection is currently in early data (0-RTT) state
+    pub is_in_early_data: bool,
 }
 
 /// Low-level stream write command consumed by the worker side of a send stream.
