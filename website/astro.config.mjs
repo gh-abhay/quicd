@@ -19,6 +19,23 @@ export default defineConfig({
 				'./src/styles/custom.css',
 			],
 			head: [
+				// Google Tag Manager
+				{
+					tag: 'script',
+					attrs: {
+						async: true,
+						src: 'https://www.googletagmanager.com/gtag/js?id=G-6N9LKSJFW4',
+					},
+				},
+				{
+					tag: 'script',
+					content: `
+						window.dataLayer = window.dataLayer || [];
+						function gtag(){dataLayer.push(arguments);}
+						gtag('js', new Date());
+						gtag('config', 'G-6N9LKSJFW4');
+					`,
+				},
 				{
 					tag: 'meta',
 					attrs: {
