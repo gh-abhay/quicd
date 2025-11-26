@@ -7,6 +7,8 @@ pub enum H3Error {
     FrameParse(String),
     #[error("QPACK error: {0}")]
     Qpack(String),
+    #[error("QPACK stream blocked waiting for insert count {0}")]
+    QpackBlocked(usize),
     #[error("HTTP error: {0}")]
     Http(String),
     #[error("stream error: {0}")]
@@ -23,6 +25,8 @@ pub enum H3Error {
     ClosedCriticalStream,
     #[error("message error")]
     MessageError,
+    #[error("CONNECT error: {0}")]
+    ConnectError(String),
 }
 
 impl H3Error {
@@ -48,7 +52,12 @@ impl H3Error {
                 } else {
                     H3ErrorCode::GeneralProtocolError
                 }
-            }
+            },
+            H3Error::QpackBlocked(_) => {
+                // Blocked streams are not errors - this should not reach the error code mapping
+                // But if it does, treat as internal issue
+                H3ErrorCode::InternalError
+            },
             H3Error::Http(msg) => {
                 if msg.contains("malformed") || msg.contains("invalid") {
                     H3ErrorCode::MessageError
@@ -77,6 +86,7 @@ impl H3Error {
             H3Error::FrameUnexpected => H3ErrorCode::FrameUnexpected,
             H3Error::ClosedCriticalStream => H3ErrorCode::ClosedCriticalStream,
             H3Error::MessageError => H3ErrorCode::MessageError,
+            H3Error::ConnectError(_) => H3ErrorCode::ConnectError,
         }
     }
 }
