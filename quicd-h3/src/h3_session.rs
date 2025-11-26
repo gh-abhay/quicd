@@ -27,14 +27,16 @@ pub struct H3Session<H: H3Handler> {
     max_stream_id: u64,
     handler: Arc<H>,
     client_settings_received: bool,
+    control_stream_first_frame_received: bool,
     max_field_section_size: u64,
     // QPACK settings
     qpack_max_table_capacity: u64,
     qpack_blocked_streams: u64,
     // Server push state
     max_push_id: u64,
-    next_push_id: u64,
-    push_streams: HashMap<u64, PushStreamState>,
+    _next_push_id: u64,
+    _push_streams: HashMap<u64, PushStreamState>,
+    push_handler: Arc<tokio::sync::Mutex<crate::session::PushHandler>>,
     // Pending control stream request
     pending_control_stream_request: Option<u64>,
 }
@@ -48,6 +50,7 @@ enum StreamState {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum PushStreamState {
     Promised { headers: Vec<(String, String)>, send_stream: Option<quicd_x::SendStream> },
     Pushed { headers_sent: bool, body: Vec<Bytes> },
@@ -56,6 +59,13 @@ enum PushStreamState {
 
 impl<H: H3Handler> H3Session<H> {
     pub fn new(handle: ConnectionHandle, handler: H) -> Self {
+        // Create push handler for server push support
+        let push_handler = Arc::new(tokio::sync::Mutex::new(crate::session::PushHandler {
+            handle: handle.clone(),
+            next_push_id: 0,
+            max_push_id: 0,
+        }));
+        
         Self {
             handle,
             qpack: Arc::new(QpackCodec::new()),
@@ -67,13 +77,15 @@ impl<H: H3Handler> H3Session<H> {
             max_stream_id: 0,
             handler: Arc::new(handler),
             client_settings_received: false,
+            control_stream_first_frame_received: false,
             max_field_section_size: 0, // 0 means no limit
             qpack_max_table_capacity: 0, // 0 means no dynamic table
             qpack_blocked_streams: 0, // 0 means no blocked streams allowed
             max_push_id: 0, // 0 means no pushes allowed initially
-            next_push_id: 0,
-            push_streams: HashMap::new(),
+            _next_push_id: 0,
+            _push_streams: HashMap::new(),
             pending_control_stream_request: None,
+            push_handler,
         }
     }
 
@@ -194,35 +206,64 @@ impl<H: H3Handler> H3Session<H> {
     async fn handle_unidirectional_stream(
         &mut self,
         stream_id: u64,
-        recv_stream: quicd_x::RecvStream,
+        mut recv_stream: quicd_x::RecvStream,
     ) -> Result<(), H3Error> {
-        // Determine stream type based on stream ID (RFC 9114 Section 6.2)
-        match stream_id {
-            3 => {
-                // Client control stream
+        // RFC 9114 Section 6.2: Read stream type from first bytes
+        // "The purpose is indicated by a stream type, which is sent as a 
+        // variable-length integer at the start of the stream."
+        
+        let stream_type = self.read_stream_type(&mut recv_stream).await?;
+        
+        match stream_type {
+            0x00 => {
+                // Control stream (RFC 9114 Section 6.2.1)
+                if self.control_stream_id.is_some() {
+                    return Err(H3Error::Connection(
+                        "duplicate control stream".into()
+                    ));
+                }
                 self.control_stream_id = Some(stream_id);
                 self.streams.insert(stream_id, StreamState::Control);
                 self.process_client_control_stream(stream_id, recv_stream).await?;
             }
-            7 => {
-                // Client QPACK encoder stream
+            0x01 => {
+                // Push stream (RFC 9114 Section 6.2.2)
+                // Read push ID and process push stream
+                self.process_push_stream(stream_id, recv_stream).await?;
+            }
+            0x02 => {
+                // QPACK encoder stream (RFC 9204 Section 4.2)
+                if self.qpack_encoder_stream_id.is_some() {
+                    return Err(H3Error::Connection(
+                        "duplicate QPACK encoder stream".into()
+                    ));
+                }
                 self.qpack_encoder_stream_id = Some(stream_id);
                 self.streams.insert(stream_id, StreamState::QpackEncoder);
                 self.process_qpack_stream(stream_id, recv_stream).await?;
             }
-            11 => {
-                // Client QPACK decoder stream
+            0x03 => {
+                // QPACK decoder stream (RFC 9204 Section 4.2)
+                if self.qpack_decoder_stream_id.is_some() {
+                    return Err(H3Error::Connection(
+                        "duplicate QPACK decoder stream".into()
+                    ));
+                }
                 self.qpack_decoder_stream_id = Some(stream_id);
                 self.streams.insert(stream_id, StreamState::QpackDecoder);
                 self.process_qpack_stream(stream_id, recv_stream).await?;
             }
-            // Server-initiated streams (2, 6, 10) are handled via UniStreamOpened
-            2 | 6 | 10 => {
-                // These are our own streams, ignore
+            0x21..=0x3f if (stream_type - 0x21) % 0x1f == 0 => {
+                // Reserved stream types (RFC 9114 Section 6.2)
+                // MUST be ignored but stream still consumes resources
+                eprintln!("received reserved stream type: {:#x}", stream_type);
+                self.consume_stream_silently(recv_stream).await;
             }
             _ => {
-                // Push streams or unknown - for now, ignore
-                // Push streams would be IDs >= 15 with specific patterns
+                // Unknown stream type (RFC 9114 Section 6.2)
+                // MUST be consumed but not processed
+                eprintln!("received unknown stream type: {:#x}, consuming silently", stream_type);
+                self.consume_stream_silently(recv_stream).await;
             }
         }
         
@@ -356,6 +397,7 @@ impl<H: H3Handler> H3Session<H> {
             let mut sender = H3ResponseSender {
                 send_stream,
                 qpack: self.qpack.clone(),
+                push_handler: Some(self.push_handler.clone()),
             };
             self.handler.handle_request(request, &mut sender).await?;
         }
@@ -371,10 +413,33 @@ impl<H: H3Handler> H3Session<H> {
     async fn process_control_frames(&mut self, data: Bytes) -> Result<(), H3Error> {
         // Parse control frames
         if let Ok((frame, _)) = H3Frame::parse(&data) {
+            // RFC 9114 Section 6.2.1: SETTINGS MUST be first frame on control stream
+            if !self.control_stream_first_frame_received {
+                match &frame {
+                    H3Frame::Settings { .. } => {
+                        self.control_stream_first_frame_received = true;
+                    }
+                    _ => {
+                        return Err(H3Error::Connection(format!(
+                            "H3_MISSING_SETTINGS: first frame on control stream was not SETTINGS, got {:?}",
+                            frame
+                        )));
+                    }
+                }
+            }
+            
             match frame {
                 H3Frame::Settings { settings } => {
+                    // RFC 9114 Section 7.2.4: Receipt of duplicate SETTINGS is an error
+                    if self.client_settings_received {
+                        return Err(H3Error::Connection(
+                            "H3_FRAME_UNEXPECTED: duplicate SETTINGS frame received".into()
+                        ));
+                    }
+                    
                     // Process client SETTINGS frame
                     self.client_settings_received = true;
+                    
                     // Process settings
                     for setting in settings {
                         match setting.identifier {
@@ -399,7 +464,7 @@ impl<H: H3Handler> H3Session<H> {
                                 }
                             }
                             _ => {
-                                // Unknown setting, ignore as per RFC
+                                // Unknown setting, ignore as per RFC 9114 Section 7.2.4
                             }
                         }
                     }
@@ -407,6 +472,10 @@ impl<H: H3Handler> H3Session<H> {
                 H3Frame::MaxPushId { push_id } => {
                     // Client is advertising maximum push ID it will accept
                     self.max_push_id = push_id;
+                    // Update push handler
+                    if let Ok(mut handler) = self.push_handler.try_lock() {
+                        handler.max_push_id = push_id;
+                    }
                 }
                 H3Frame::CancelPush { push_id } => {
                     // Client wants to cancel a push
@@ -425,7 +494,7 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     async fn cancel_push(&mut self, push_id: u64) -> Result<(), H3Error> {
-        if let Some(push_state) = self.push_streams.get_mut(&push_id) {
+        if let Some(push_state) = self._push_streams.get_mut(&push_id) {
             *push_state = PushStreamState::Cancelled;
             // TODO: Close the push stream if it's active
         }
@@ -576,6 +645,90 @@ impl<H: H3Handler> H3Session<H> {
             headers: header_vec,
             body: None,
         })
+    }
+
+    /// Read stream type from the first bytes of a unidirectional stream (RFC 9114 Section 6.2)
+    async fn read_stream_type(&self, recv_stream: &mut quicd_x::RecvStream) -> Result<u64, H3Error> {
+        // Read first bytes for stream type varint
+        let data = match recv_stream.read().await {
+            Ok(Some(quicd_x::StreamData::Data(bytes))) => bytes,
+            Ok(Some(quicd_x::StreamData::Fin)) => {
+                return Err(H3Error::Connection("stream ended before stream type".into()));
+            }
+            Ok(None) => {
+                return Err(H3Error::Connection("no data on stream".into()));
+            }
+            Err(e) => {
+                return Err(H3Error::Stream(format!("failed to read stream type: {:?}", e)));
+            }
+        };
+
+        let (stream_type, _consumed) = crate::frames::H3Frame::decode_varint(&data)
+            .map_err(|e| H3Error::FrameParse(format!("invalid stream type varint: {:?}", e)))?;
+        
+        Ok(stream_type)
+    }
+
+    /// Process a push stream (RFC 9114 Section 6.2.2)
+    async fn process_push_stream(&mut self, _stream_id: u64, mut recv_stream: quicd_x::RecvStream) -> Result<(), H3Error> {
+        // Read push ID (varint)
+        let data = match recv_stream.read().await {
+            Ok(Some(quicd_x::StreamData::Data(bytes))) => bytes,
+            _ => return Err(H3Error::Connection("failed to read push ID".into())),
+        };
+
+        let (push_id, _consumed) = crate::frames::H3Frame::decode_varint(&data)
+            .map_err(|e| H3Error::FrameParse(format!("invalid push ID: {:?}", e)))?;
+
+        // TODO: Properly handle push promise state and stream processing
+        // Push streams are unidirectional, so we can't send responses back on them
+        // They need to be associated with a push promise sent on a bidirectional stream
+        eprintln!("Push stream with push ID {}: not fully implemented", push_id);
+        
+        // For now, consume the stream silently
+        self.consume_stream_silently(recv_stream).await;
+        
+        Ok(())
+    }
+
+    /// Consume a stream silently (for reserved or unknown stream types)
+    async fn consume_stream_silently(&self, mut recv_stream: quicd_x::RecvStream) {
+        // Read and discard all data from the stream
+        loop {
+            match recv_stream.read().await {
+                Ok(Some(quicd_x::StreamData::Data(_))) => {
+                    // Discard data
+                    continue;
+                }
+                Ok(Some(quicd_x::StreamData::Fin)) | Ok(None) | Err(_) => {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4.1)
+    async fn _send_section_acknowledgment(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        // TODO: Open and track decoder stream to send acknowledgments
+        // For now, this is a placeholder
+        eprintln!("TODO: Send Section Acknowledgment for stream {}", stream_id);
+        Ok(())
+    }
+
+    /// Send Stream Cancellation on decoder stream (RFC 9204 Section 4.4.2)
+    async fn _send_stream_cancellation(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        // TODO: Open and track decoder stream to send cancellations
+        // For now, this is a placeholder
+        eprintln!("TODO: Send Stream Cancellation for stream {}", stream_id);
+        Ok(())
+    }
+
+    /// Send Insert Count Increment on decoder stream (RFC 9204 Section 4.4.3)
+    async fn _send_insert_count_increment(&mut self, increment: u64) -> Result<(), H3Error> {
+        // TODO: Open and track decoder stream to send increments
+        // For now, this is a placeholder
+        eprintln!("TODO: Send Insert Count Increment: {}", increment);
+        Ok(())
     }
 }
 

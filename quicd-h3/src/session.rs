@@ -17,6 +17,14 @@ pub struct H3Request {
 pub struct H3ResponseSender {
     pub(crate) send_stream: quicd_x::SendStream,
     pub(crate) qpack: std::sync::Arc<crate::qpack::QpackCodec>,
+    pub(crate) push_handler: Option<std::sync::Arc<tokio::sync::Mutex<PushHandler>>>,
+}
+
+/// Handle for managing server push operations
+pub struct PushHandler {
+    pub(crate) handle: quicd_x::ConnectionHandle,
+    pub(crate) next_push_id: u64,
+    pub(crate) max_push_id: u64,
 }
 
 impl H3ResponseSender {
@@ -48,10 +56,68 @@ impl H3ResponseSender {
 
     /// Send a PUSH_PROMISE frame to initiate server push.
     /// Returns the push ID that was assigned to this push.
-    pub async fn send_push_promise(&mut self, _headers: Vec<(String, String)>) -> Result<u64, H3Error> {
-        // TODO: This needs access to the session to get the next push ID
-        // For now, return an error indicating this is not implemented
-        Err(H3Error::Http("PUSH_PROMISE not yet implemented".into()))
+    ///
+    /// RFC 9114 Section 4.6: Server push allows a server to send responses for
+    /// requests that the client has not yet made.
+    pub async fn send_push_promise(&mut self, headers: Vec<(String, String)>) -> Result<u64, H3Error> {
+        let push_handler = self.push_handler.as_ref()
+            .ok_or_else(|| H3Error::Http("server push not available".into()))?;
+        
+        let mut handler = push_handler.lock().await;
+        
+        // Allocate a new push ID
+        if handler.next_push_id > handler.max_push_id {
+            return Err(H3Error::Http("max push ID exceeded".into()));
+        }
+        
+        let push_id = handler.next_push_id;
+        handler.next_push_id += 1;
+        
+        // Encode headers
+        let encoded_headers = self.qpack.encode_headers(&headers)
+            .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
+        
+        // Send PUSH_PROMISE frame on the request stream
+        let push_promise = crate::frames::H3Frame::PushPromise {
+            push_id,
+            encoded_headers,
+        };
+        let frame_data = push_promise.encode();
+        self.send_stream.write(frame_data, false).await
+            .map_err(|e| H3Error::Stream(format!("write failed: {:?}", e)))?;
+        
+        // TODO: Open push stream and send push response
+        // This would require opening a unidirectional stream and sending:
+        // 1. Stream type 0x01 (push stream)
+        // 2. Push ID varint
+        // 3. HEADERS and DATA frames
+        
+        Ok(push_id)
+    }
+    
+    /// Send a response on a push stream (must be called after send_push_promise)
+    pub async fn send_push_response(&mut self, push_id: u64, _status: u16, _headers: Vec<(String, String)>, _body: Bytes) -> Result<(), H3Error> {
+        let push_handler = self.push_handler.as_ref()
+            .ok_or_else(|| H3Error::Http("server push not available".into()))?;
+        
+        let handler = push_handler.lock().await;
+        
+        // Validate push ID
+        if push_id >= handler.next_push_id {
+            return Err(H3Error::Http("invalid push ID".into()));
+        }
+        
+        // Open a unidirectional stream for the push
+        let _request_id = handler.handle.open_uni()
+            .map_err(|e| H3Error::Connection(format!("failed to open push stream: {:?}", e)))?;
+        
+        // Wait for the stream to be opened
+        // TODO: This is simplified - in a real implementation, we'd need to wait for
+        // the UniStreamOpened event and correlate with request_id
+        drop(handler); // Release lock
+        
+        // For now, return an error since we need async coordination
+        Err(H3Error::Http("push response sending requires async coordination - not yet implemented".into()))
     }
 }
 
