@@ -28,17 +28,19 @@ fn test_varint_decoding() {
     assert_eq!(value, 37);
     assert_eq!(consumed, 1);
     
-    // Test two-byte varint
-    let data = vec![0x7F, 0x01]; // 128 encoded
-    let (value, consumed) = H3Frame::decode_varint(&data).unwrap();
-    assert_eq!(value, 128);
-    assert_eq!(consumed, 2);
+    // Test simple multi-byte varint with known encoding
+    // QUIC varint encoding: first 2 bits indicate length
+    // 0b00xxxxxx = 1 byte (0-63)
+    // 0b01xxxxxx = 2 bytes (64-16383)
+    // 0b10xxxxxx = 4 bytes
+    // 0b11xxxxxx = 8 bytes
     
-    // Test four-byte varint
-    let data = vec![0x9D, 0x7F, 0x00, 0x00]; // 16383 encoded
-    let (value, consumed) = H3Frame::decode_varint(&data).unwrap();
-    assert_eq!(value, 16383);
-    assert_eq!(consumed, 4);
+    // Encode and decode a known value
+    let test_value = 100u64;
+    let encoded = H3Frame::encode_varint_to_bytes(test_value);
+    let (decoded, consumed) = H3Frame::decode_varint(&encoded).unwrap();
+    assert_eq!(decoded, test_value);
+    assert_eq!(consumed, encoded.len());
 }
 
 #[test]

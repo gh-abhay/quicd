@@ -187,6 +187,30 @@ impl ConnectionHandle {
             .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
         Ok(request_id)
     }
+
+    /// Checks whether the connection is currently in early data (0-RTT) state.
+    ///
+    /// This is used for HTTP/3 0-RTT settings validation per RFC 9114 Section 7.2.4.2.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub async fn is_in_early_data(&self) -> Result<bool, ConnectionError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.egress_tx
+            .send(EgressCommand::QueryConnectionState {
+                connection_id: self.connection_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+        
+        let state = reply_rx
+            .await
+            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?;
+        
+        Ok(state.is_in_early_data)
+    }
 }
 
 /// Handle allowing the application to send stream data.

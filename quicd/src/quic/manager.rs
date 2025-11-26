@@ -1886,6 +1886,24 @@ impl QuicManager {
         let _ = ingress_tx.try_send(event);
     }
 
+    fn process_query_connection_state(
+        &mut self,
+        _worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<quicd_x::ConnectionState>,
+    ) {
+        // Look up the connection by connection_id
+        let dcid = self.connection_id_map.get(&connection_id);
+
+        let is_in_early_data = dcid
+            .and_then(|dcid| self.connections.get(dcid))
+            .map(|conn| conn.is_in_early_data())
+            .unwrap_or(false);
+
+        let state = quicd_x::ConnectionState { is_in_early_data };
+        let _ = reply.send(state);
+    }
+
     /// Process an egress command from an application task and return packets to send.
     ///
     /// This is called from the worker's event loop when processing egress commands.
@@ -1911,6 +1929,7 @@ impl QuicManager {
             EgressCommand::ResetStream { connection_id, .. } => *connection_id,
             EgressCommand::Close { connection_id, .. } => *connection_id,
             EgressCommand::RequestStats { connection_id, .. } => *connection_id,
+            EgressCommand::QueryConnectionState { connection_id, .. } => *connection_id,
         };
 
         match command {
@@ -1993,6 +2012,16 @@ impl QuicManager {
                     connection_id, request_id, "Processing RequestStats command"
                 );
                 self.process_request_stats(worker_id, connection_id, request_id);
+            }
+            EgressCommand::QueryConnectionState {
+                connection_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, "Processing QueryConnectionState command"
+                );
+                self.process_query_connection_state(worker_id, connection_id, reply);
             }
         }
 

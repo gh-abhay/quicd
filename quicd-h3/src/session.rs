@@ -21,6 +21,7 @@ pub struct H3ResponseSender {
     pub(crate) push_manager: Option<std::sync::Arc<tokio::sync::Mutex<PushManager>>>,
     pub(crate) connection_handle: Option<quicd_x::ConnectionHandle>,
     pub(crate) stream_id: u64, // The request stream ID for push promises
+    pub(crate) encoder_send_stream: std::sync::Arc<tokio::sync::Mutex<Option<quicd_x::SendStream>>>,
 }
 
 impl H3ResponseSender {
@@ -32,8 +33,36 @@ impl H3ResponseSender {
         ];
         all_headers.extend(headers);
 
-        let encoded_headers = self.qpack.lock().await.encode_headers(&all_headers)
-            .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
+        let (encoded_headers, encoder_instructions, _referenced_entries) = {
+            let mut qpack = self.qpack.lock().await;
+            let result = qpack.encode_headers(&all_headers)
+                .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
+            // RFC 9204 Section 2.1.2: Add references (will be released when stream completes)
+            for index in &result.2 {
+                qpack.add_reference(*index);
+            }
+            result
+        };
+
+        // Send encoder instructions to encoder stream if any
+        // PERF #29: Batch all instructions into a single write
+        if !encoder_instructions.is_empty() {
+            let mut encoder_stream_guard = self.encoder_send_stream.lock().await;
+            if let Some(encoder_stream) = encoder_stream_guard.as_mut() {
+                // Combine all instructions into a single buffer
+                let total_size: usize = encoder_instructions.iter().map(|b| b.len()).sum();
+                let mut combined = bytes::BytesMut::with_capacity(total_size);
+                
+                for instruction in encoder_instructions {
+                    combined.extend_from_slice(&instruction);
+                }
+                
+                // Single write for all instructions - reduces system calls
+                encoder_stream.write(combined.freeze(), false).await
+                    .map_err(|e| H3Error::Stream(format!("failed to write encoder instructions: {:?}", e)))?;
+            }
+            // If encoder stream not available, we skip (during initialization)
+        }
 
         // Send HEADERS frame
         let headers_frame = crate::frames::H3Frame::Headers { encoded_headers };
@@ -76,8 +105,28 @@ impl H3ResponseSender {
         manager.register_promise(push_id, self.stream_id, headers.clone())?;
         
         // Encode headers for PUSH_PROMISE frame
-        let encoded_headers = self.qpack.lock().await.encode_headers(&headers)
-            .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
+        let (encoded_headers, encoder_instructions, _referenced_entries) = {
+            let mut qpack = self.qpack.lock().await;
+            let result = qpack.encode_headers(&headers)
+                .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
+            // RFC 9204 Section 2.1.2: Add references
+            for index in &result.2 {
+                qpack.add_reference(*index);
+            }
+            result
+        };
+        
+        // Send encoder instructions to encoder stream if any
+        if !encoder_instructions.is_empty() {
+            let mut encoder_stream_guard = self.encoder_send_stream.lock().await;
+            if let Some(encoder_stream) = encoder_stream_guard.as_mut() {
+                for instruction in encoder_instructions {
+                    encoder_stream.write(instruction, false).await
+                        .map_err(|e| H3Error::Stream(format!("failed to write encoder instruction: {:?}", e)))?;
+                }
+            }
+            // If encoder stream not available, we skip (during initialization)
+        }
         
         drop(manager); // Release lock before async operation
         
@@ -167,6 +216,7 @@ impl H3ResponseSender {
         
         Ok(())
     }
+
 }
 
 /// Trait that applications implement to handle HTTP/3 requests.

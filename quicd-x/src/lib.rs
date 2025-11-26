@@ -148,5 +148,6 @@ pub use crate::handle::{
     StreamData, StreamId, TransportControls,
 };
 pub use crate::server::{
-    new_connection_handle, new_recv_stream, new_send_stream, EgressCommand, StreamWriteCmd,
+    new_connection_handle, new_recv_stream, new_send_stream, ConnectionState, EgressCommand,
+    StreamWriteCmd,
 };
