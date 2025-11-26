@@ -521,7 +521,21 @@ impl QpackCodec {
     }
 
     pub fn encode_headers(&self, headers: &[(String, String)]) -> Result<Bytes, H3Error> {
-        let mut buf = BytesMut::new();
+        // Pre-allocate buffer: rough estimate is 2 bytes prefix + 32 bytes per header
+        let estimated_size = 2 + headers.len() * 32;
+        let mut buf = BytesMut::with_capacity(estimated_size);
+        
+        // RFC 9204 Section 4.5.1: Encoded field section prefix
+        // Required Insert Count (8-bit prefix)
+        let required_insert_count = self.encode_required_insert_count();
+        buf.put_u8(required_insert_count as u8); // For now, always fits in 1 byte
+        
+        // Base (7-bit prefix with sign bit in bit 7)
+        // For now, use Base = 0 (no dynamic table references in this encoding)
+        let base_delta = 0u64;
+        let sign = false; // positive (S=0)
+        let base_byte = if sign { 0x80 } else { 0x00 } | (base_delta as u8 & 0x7F);
+        buf.put_u8(base_byte);
         
         for (name, value) in headers {
             // First, check if the exact name-value pair is in the dynamic table
@@ -626,6 +640,21 @@ impl QpackCodec {
         let mut headers = Vec::new();
         let mut cursor = 0;
 
+        // RFC 9204 Section 4.5.1: Decode field section prefix
+        // Required Insert Count (8-bit prefix)
+        if cursor >= encoded.len() {
+            return Err(H3Error::Qpack("empty encoded field section".into()));
+        }
+        let (_required_insert_count, consumed) = self.decode_qpack_prefix_int(&encoded[cursor..], 8)?;
+        cursor += consumed;
+        
+        // Base (7-bit prefix with sign bit)
+        if cursor >= encoded.len() {
+            return Err(H3Error::Qpack("missing base in field section prefix".into()));
+        }
+        let (_base, consumed) = self.decode_qpack_prefix_int(&encoded[cursor..], 7)?;
+        cursor += consumed;
+
         while cursor < encoded.len() {
             let first_byte = encoded[cursor];
             cursor += 1;
@@ -723,9 +752,34 @@ impl QpackCodec {
     }
 
     /// Encode bytes using Huffman coding (public for testing)
-    pub fn encode_huffman(&self, _input: &[u8]) -> Option<Vec<u8>> {
-        // Temporarily disable Huffman encoding to avoid bugs
-        None
+    pub fn encode_huffman(&self, input: &[u8]) -> Option<Vec<u8>> {
+        let mut bit_buffer = 0u64;
+        let mut bits_in_buffer = 0u8;
+        let mut output = Vec::new();
+        
+        for &byte in input {
+            let huffman_code = &HUFFMAN_CODES[byte as usize];
+            
+            // Add the code to the bit buffer
+            bit_buffer = (bit_buffer << huffman_code.length) | (huffman_code.code as u64);
+            bits_in_buffer += huffman_code.length;
+            
+            // Write out complete bytes
+            while bits_in_buffer >= 8 {
+                bits_in_buffer -= 8;
+                let byte_to_write = ((bit_buffer >> bits_in_buffer) & 0xFF) as u8;
+                output.push(byte_to_write);
+            }
+        }
+        
+        // Handle remaining bits - pad with 1s (EOS symbol)
+        if bits_in_buffer > 0 {
+            let padding_bits = 8 - bits_in_buffer;
+            bit_buffer = (bit_buffer << padding_bits) | ((1u64 << padding_bits) - 1);
+            output.push((bit_buffer & 0xFF) as u8);
+        }
+        
+        Some(output)
     }
 
     /// Encode a string with Huffman compression (public for testing)
@@ -850,7 +904,8 @@ impl QpackCodec {
 
     /// Encode a QPACK instruction into bytes
     pub fn encode_instruction(&self, instruction: &QpackInstruction) -> Result<Bytes, H3Error> {
-        let mut buf = BytesMut::new();
+        // Pre-allocate buffer: instructions are typically small, 64 bytes is conservative
+        let mut buf = BytesMut::with_capacity(64);
         
         match instruction {
             QpackInstruction::SetDynamicTableCapacity { capacity } => {
@@ -962,7 +1017,6 @@ impl QpackCodec {
                     return Err(H3Error::Qpack("unknown instruction".into()));
                 }
             }
-            _ => Err(H3Error::Qpack("unknown instruction".into())),
         }
     }
 
@@ -1007,5 +1061,125 @@ impl QpackCodec {
         }
         
         Ok((value, cursor))
+    }
+
+    /// Decode a QPACK prefix integer (RFC 9204 Section 4.1.1)
+    fn decode_qpack_prefix_int(&self, data: &[u8], prefix_bits: u8) -> Result<(u64, usize), H3Error> {
+        if data.is_empty() {
+            return Err(H3Error::Qpack("empty data for prefix int".into()));
+        }
+        
+        let first_byte = data[0];
+        let mask = if prefix_bits >= 8 {
+            0xFF
+        } else {
+            ((1u16 << prefix_bits) - 1) as u8
+        };
+        let mut value = (first_byte & mask) as u64;
+        let max_first = ((1u64 << prefix_bits) - 1).min(255);
+        
+        if value < max_first {
+            // Value fits in prefix
+            return Ok((value, 1));
+        }
+        
+        // Need to read continuation bytes
+        let mut cursor = 1;
+        let mut m = 0;
+        
+        loop {
+            if cursor >= data.len() {
+                return Err(H3Error::Qpack("incomplete prefix integer".into()));
+            }
+            
+            let byte = data[cursor];
+            cursor += 1;
+            
+            value += ((byte & 0x7F) as u64) << m;
+            m += 7;
+            
+            if (byte & 0x80) == 0 {
+                break;
+            }
+            
+            if m >= 64 {
+                return Err(H3Error::Qpack("prefix integer overflow".into()));
+            }
+        }
+        
+        Ok((value, cursor))
+    }
+
+    /// Encode a QPACK prefix integer (RFC 9204 Section 4.1.1)
+    /// This is different from the 7-bit continuation encoding used for instructions
+    /// (exposed for testing)
+    pub fn encode_qpack_varint(&self, buf: &mut BytesMut, mut value: u64, prefix_bits: u8) {
+        let max_first = (1u64 << prefix_bits) - 1;
+        
+        if value < max_first {
+            // Value fits in the prefix
+            let existing_byte = if buf.is_empty() {
+                0
+            } else {
+                let len = buf.len();
+                buf[len - 1]
+            };
+            
+            if buf.is_empty() {
+                buf.put_u8(value as u8);
+            } else {
+                let len = buf.len();
+                buf[len - 1] = existing_byte | (value as u8);
+            }
+        } else {
+            // Value doesn't fit, use continuation bytes
+            let existing_byte = if buf.is_empty() {
+                0
+            } else {
+                let len = buf.len();
+                buf[len - 1]
+            };
+            
+            if buf.is_empty() {
+                buf.put_u8(max_first as u8);
+            } else {
+                let len = buf.len();
+                buf[len - 1] = existing_byte | (max_first as u8);
+            }
+            
+            value -= max_first;
+            
+            // Encode remainder in 7-bit chunks
+            while value >= 128 {
+                buf.put_u8(((value % 128) as u8) | 0x80);
+                value /= 128;
+            }
+            buf.put_u8(value as u8);
+        }
+    }
+
+    /// Encode Required Insert Count per RFC 9204 Section 4.5.1.1 (exposed for testing)
+    pub fn encode_required_insert_count(&self) -> u64 {
+        // For now, if we haven't used dynamic table, return 0
+        // TODO: Track actual required insert count based on dynamic table references
+        let req_insert_count = 0u64;
+        
+        if req_insert_count == 0 {
+            return 0;
+        }
+        
+        // RFC 9204 Section 4.5.1.1 encoding algorithm
+        // MaxEntries = 2 * max_table_capacity / 32 (assuming 32 bytes per entry)
+        let max_entries = ((self.max_dynamic_table_capacity * 2) / 32) as u64;
+        if max_entries == 0 {
+            return 0;
+        }
+        
+        let full_range = 2 * max_entries;
+        if req_insert_count > full_range {
+            return (req_insert_count % full_range) + full_range;
+        }
+        
+        req_insert_count % full_range
     }
 }

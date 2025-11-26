@@ -1,5 +1,4 @@
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::io::Cursor;
+use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::error::H3Error;
 
@@ -33,7 +32,7 @@ pub struct Setting {
 }
 
 impl H3Frame {
-    /// Parses a frame from the given buffer.
+    /// Parses a frame from the given buffer (slice-based, makes copies).
     pub fn parse(buf: &[u8]) -> Result<(H3Frame, usize), H3Error> {
         let mut cursor = 0;
 
@@ -58,41 +57,30 @@ impl H3Frame {
             0x1 => H3Frame::Headers { encoded_headers: Bytes::copy_from_slice(payload) },
             0x2 => H3Frame::Priority { priority: Priority::parse(payload)? },
             0x3 => {
-                if payload.len() < 8 {
-                    return Err(H3Error::FrameParse("CANCEL_PUSH payload too small".into()));
-                }
-                let push_id = Cursor::new(payload).get_u64();
+                let (push_id, _) = Self::decode_varint(payload)
+                    .map_err(|_| H3Error::FrameParse("CANCEL_PUSH push_id parse error".into()))?;
                 H3Frame::CancelPush { push_id }
             }
             0x4 => H3Frame::Settings { settings: Setting::parse_settings(payload)? },
             0x5 => {
-                if payload.len() < 8 {
-                    return Err(H3Error::FrameParse("PUSH_PROMISE payload too small".into()));
-                }
-                let mut cursor = Cursor::new(payload);
-                let push_id = cursor.get_u64();
-                let encoded_headers = Bytes::copy_from_slice(&payload[8..]);
+                let (push_id, consumed) = Self::decode_varint(payload)
+                    .map_err(|_| H3Error::FrameParse("PUSH_PROMISE push_id parse error".into()))?;
+                let encoded_headers = Bytes::copy_from_slice(&payload[consumed..]);
                 H3Frame::PushPromise { push_id, encoded_headers }
             }
             0x7 => {
-                if payload.len() < 8 {
-                    return Err(H3Error::FrameParse("GOAWAY payload too small".into()));
-                }
-                let stream_id = Cursor::new(payload).get_u64();
+                let (stream_id, _) = Self::decode_varint(payload)
+                    .map_err(|_| H3Error::FrameParse("GOAWAY stream_id parse error".into()))?;
                 H3Frame::GoAway { stream_id }
             }
             0xD => {
-                if payload.len() < 8 {
-                    return Err(H3Error::FrameParse("MAX_PUSH_ID payload too small".into()));
-                }
-                let push_id = Cursor::new(payload).get_u64();
+                let (push_id, _) = Self::decode_varint(payload)
+                    .map_err(|_| H3Error::FrameParse("MAX_PUSH_ID push_id parse error".into()))?;
                 H3Frame::MaxPushId { push_id }
             }
             0xE => {
-                if payload.len() < 8 {
-                    return Err(H3Error::FrameParse("DUPLICATE_PUSH payload too small".into()));
-                }
-                let push_id = Cursor::new(payload).get_u64();
+                let (push_id, _) = Self::decode_varint(payload)
+                    .map_err(|_| H3Error::FrameParse("DUPLICATE_PUSH push_id parse error".into()))?;
                 H3Frame::DuplicatePush { push_id }
             }
             _ => H3Frame::Reserved { frame_type, payload: Bytes::copy_from_slice(payload) },
@@ -101,9 +89,81 @@ impl H3Frame {
         Ok((frame, consumed))
     }
 
+    /// Parses a frame from a Bytes buffer (zero-copy using Bytes::slice).
+    /// This is more efficient than parse() when the input is already a Bytes buffer.
+    pub fn parse_bytes(buf: &Bytes) -> Result<(H3Frame, usize), H3Error> {
+        let mut cursor = 0;
+
+        // Parse frame type (variable-length integer)
+        let (frame_type, type_len) = Self::decode_varint(&buf[cursor..])?;
+        cursor += type_len;
+
+        // Parse length (variable-length integer)
+        let (length, len_len) = Self::decode_varint(&buf[cursor..])?;
+        cursor += len_len;
+
+        let length = length as usize;
+        if buf.len() < cursor + length {
+            return Err(H3Error::FrameParse("buffer too small for frame payload".into()));
+        }
+
+        let payload_start = cursor;
+        let payload_end = cursor + length;
+        let consumed = payload_end;
+
+        let frame = match frame_type {
+            0x0 => H3Frame::Data { 
+                data: buf.slice(payload_start..payload_end) 
+            },
+            0x1 => H3Frame::Headers { 
+                encoded_headers: buf.slice(payload_start..payload_end) 
+            },
+            0x2 => H3Frame::Priority { 
+                priority: Priority::parse(&buf[payload_start..payload_end])? 
+            },
+            0x3 => {
+                let (push_id, _) = Self::decode_varint(&buf[payload_start..payload_end])
+                    .map_err(|_| H3Error::FrameParse("CANCEL_PUSH push_id parse error".into()))?;
+                H3Frame::CancelPush { push_id }
+            }
+            0x4 => H3Frame::Settings { 
+                settings: Setting::parse_settings(&buf[payload_start..payload_end])? 
+            },
+            0x5 => {
+                let (push_id, header_start) = Self::decode_varint(&buf[payload_start..payload_end])
+                    .map_err(|_| H3Error::FrameParse("PUSH_PROMISE push_id parse error".into()))?;
+                let encoded_headers = buf.slice(payload_start + header_start..payload_end);
+                H3Frame::PushPromise { push_id, encoded_headers }
+            }
+            0x7 => {
+                let (stream_id, _) = Self::decode_varint(&buf[payload_start..payload_end])
+                    .map_err(|_| H3Error::FrameParse("GOAWAY stream_id parse error".into()))?;
+                H3Frame::GoAway { stream_id }
+            }
+            0xD => {
+                let (push_id, _) = Self::decode_varint(&buf[payload_start..payload_end])
+                    .map_err(|_| H3Error::FrameParse("MAX_PUSH_ID push_id parse error".into()))?;
+                H3Frame::MaxPushId { push_id }
+            }
+            0xE => {
+                let (push_id, _) = Self::decode_varint(&buf[payload_start..payload_end])
+                    .map_err(|_| H3Error::FrameParse("DUPLICATE_PUSH push_id parse error".into()))?;
+                H3Frame::DuplicatePush { push_id }
+            }
+            _ => H3Frame::Reserved { 
+                frame_type, 
+                payload: buf.slice(payload_start..payload_end) 
+            },
+        };
+
+        Ok((frame, consumed))
+    }
+
     /// Encodes the frame into bytes.
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::new();
+        // Pre-allocate buffer based on frame type to reduce reallocations
+        let estimated_size = self.estimate_encoded_size();
+        let mut buf = BytesMut::with_capacity(estimated_size);
 
         match self {
             H3Frame::Data { data } => {
@@ -125,8 +185,10 @@ impl H3Frame {
             }
             H3Frame::CancelPush { push_id } => {
                 Self::encode_varint(&mut buf, 0x3);
-                Self::encode_varint(&mut buf, 8);
-                buf.put_u64(*push_id);
+                let mut payload = BytesMut::new();
+                Self::encode_varint(&mut payload, *push_id);
+                Self::encode_varint(&mut buf, payload.len() as u64);
+                buf.extend_from_slice(&payload);
             }
             H3Frame::Settings { settings } => {
                 Self::encode_varint(&mut buf, 0x4);
@@ -140,25 +202,32 @@ impl H3Frame {
             }
             H3Frame::PushPromise { push_id, encoded_headers } => {
                 Self::encode_varint(&mut buf, 0x5);
-                let payload_len = 8 + encoded_headers.len();
-                Self::encode_varint(&mut buf, payload_len as u64);
-                buf.put_u64(*push_id);
-                buf.extend_from_slice(encoded_headers);
+                let mut payload = BytesMut::new();
+                Self::encode_varint(&mut payload, *push_id);
+                payload.extend_from_slice(encoded_headers);
+                Self::encode_varint(&mut buf, payload.len() as u64);
+                buf.extend_from_slice(&payload);
             }
             H3Frame::GoAway { stream_id } => {
                 Self::encode_varint(&mut buf, 0x7);
-                Self::encode_varint(&mut buf, 8);
-                buf.put_u64(*stream_id);
+                let mut payload = BytesMut::new();
+                Self::encode_varint(&mut payload, *stream_id);
+                Self::encode_varint(&mut buf, payload.len() as u64);
+                buf.extend_from_slice(&payload);
             }
             H3Frame::MaxPushId { push_id } => {
                 Self::encode_varint(&mut buf, 0xD);
-                Self::encode_varint(&mut buf, 8);
-                buf.put_u64(*push_id);
+                let mut payload = BytesMut::new();
+                Self::encode_varint(&mut payload, *push_id);
+                Self::encode_varint(&mut buf, payload.len() as u64);
+                buf.extend_from_slice(&payload);
             }
             H3Frame::DuplicatePush { push_id } => {
                 Self::encode_varint(&mut buf, 0xE);
-                Self::encode_varint(&mut buf, 8);
-                buf.put_u64(*push_id);
+                let mut payload = BytesMut::new();
+                Self::encode_varint(&mut payload, *push_id);
+                Self::encode_varint(&mut buf, payload.len() as u64);
+                buf.extend_from_slice(&payload);
             }
             H3Frame::Reserved { frame_type, payload } => {
                 Self::encode_varint(&mut buf, *frame_type);
@@ -170,9 +239,52 @@ impl H3Frame {
         buf.freeze()
     }
 
+    /// Estimate the encoded size of a frame for buffer pre-allocation.
+    /// This provides a conservative upper bound to avoid reallocations.
+    fn estimate_encoded_size(&self) -> usize {
+        match self {
+            H3Frame::Data { data } => {
+                // type (1) + length varint (max 8) + data
+                16 + data.len()
+            }
+            H3Frame::Headers { encoded_headers } => {
+                // type (1) + length varint (max 8) + headers
+                16 + encoded_headers.len()
+            }
+            H3Frame::Priority { .. } => {
+                // type + length + priority fields (small)
+                32
+            }
+            H3Frame::CancelPush { .. } | H3Frame::GoAway { .. } 
+            | H3Frame::MaxPushId { .. } | H3Frame::DuplicatePush { .. } => {
+                // type + length + varint push_id/stream_id
+                32
+            }
+            H3Frame::Settings { settings } => {
+                // type + length + (id + value) per setting
+                16 + settings.len() * 16
+            }
+            H3Frame::PushPromise { encoded_headers, .. } => {
+                // type + length + push_id + headers
+                32 + encoded_headers.len()
+            }
+            H3Frame::Reserved { payload, .. } => {
+                // type + length + payload
+                16 + payload.len()
+            }
+        }
+    }
+
+    /// Encode a varint to bytes (for testing)
+    pub fn encode_varint_to_bytes(value: u64) -> Vec<u8> {
+        let mut buf = bytes::BytesMut::new();
+        Self::encode_varint(&mut buf, value);
+        buf.to_vec()
+    }
+
     /// Decodes a variable-length integer from the buffer.
     /// Returns (value, bytes_consumed)
-    fn decode_varint(buf: &[u8]) -> Result<(u64, usize), H3Error> {
+    pub fn decode_varint(buf: &[u8]) -> Result<(u64, usize), H3Error> {
         if buf.is_empty() {
             return Err(H3Error::FrameParse("empty buffer for varint".into()));
         }

@@ -15,6 +15,57 @@ pub enum H3Error {
     Connection(String),
 }
 
+impl H3Error {
+    /// Map H3Error to the appropriate H3ErrorCode for QUIC layer
+    pub fn to_error_code(&self) -> H3ErrorCode {
+        match self {
+            H3Error::FrameParse(msg) => {
+                if msg.contains("MISSING_SETTINGS") {
+                    H3ErrorCode::MissingSettings
+                } else if msg.contains("FRAME_UNEXPECTED") {
+                    H3ErrorCode::FrameUnexpected
+                } else {
+                    H3ErrorCode::FrameError
+                }
+            }
+            H3Error::Qpack(msg) => {
+                if msg.contains("decompression") {
+                    H3ErrorCode::QpackDecompressionFailed
+                } else if msg.contains("encoder stream") {
+                    H3ErrorCode::QpackEncoderStreamError
+                } else if msg.contains("decoder stream") {
+                    H3ErrorCode::QpackDecoderStreamError
+                } else {
+                    H3ErrorCode::GeneralProtocolError
+                }
+            }
+            H3Error::Http(msg) => {
+                if msg.contains("malformed") || msg.contains("invalid") {
+                    H3ErrorCode::MessageError
+                } else if msg.contains("SETTINGS") {
+                    H3ErrorCode::MissingSettings
+                } else {
+                    H3ErrorCode::GeneralProtocolError
+                }
+            }
+            H3Error::Stream(_) => H3ErrorCode::StreamCreationError,
+            H3Error::Connection(msg) => {
+                if msg.contains("MISSING_SETTINGS") {
+                    H3ErrorCode::MissingSettings
+                } else if msg.contains("FRAME_UNEXPECTED") {
+                    H3ErrorCode::FrameUnexpected
+                } else if msg.contains("duplicate control") || msg.contains("duplicate QPACK") {
+                    H3ErrorCode::StreamCreationError
+                } else if msg.contains("critical stream") {
+                    H3ErrorCode::ClosedCriticalStream
+                } else {
+                    H3ErrorCode::GeneralProtocolError
+                }
+            }
+        }
+    }
+}
+
 /// HTTP/3 error codes as defined in RFC 9114 Section 8.1.
 /// These are in the range 0x100-0x110.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +96,11 @@ pub enum H3ErrorCode {
     
     // 0x110: Push-related error
     WrongStream = 0x110,
+    
+    // QPACK-specific error codes (RFC 9204 Section 6)
+    QpackDecompressionFailed = 0x200,
+    QpackEncoderStreamError = 0x201,
+    QpackDecoderStreamError = 0x202,
 }
 
 impl H3ErrorCode {
@@ -68,6 +124,9 @@ impl H3ErrorCode {
             0x10E => Some(H3ErrorCode::ConnectError),
             0x10F => Some(H3ErrorCode::VersionFallback),
             0x110 => Some(H3ErrorCode::WrongStream),
+            0x200 => Some(H3ErrorCode::QpackDecompressionFailed),
+            0x201 => Some(H3ErrorCode::QpackEncoderStreamError),
+            0x202 => Some(H3ErrorCode::QpackDecoderStreamError),
             _ => None,
         }
     }
@@ -97,6 +156,9 @@ impl H3ErrorCode {
             H3ErrorCode::ConnectError => "Connect error",
             H3ErrorCode::VersionFallback => "Version fallback",
             H3ErrorCode::WrongStream => "Wrong stream",
+            H3ErrorCode::QpackDecompressionFailed => "QPACK decompression failed",
+            H3ErrorCode::QpackEncoderStreamError => "QPACK encoder stream error",
+            H3ErrorCode::QpackDecoderStreamError => "QPACK decoder stream error",
         }
     }
 }
