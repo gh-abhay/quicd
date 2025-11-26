@@ -3,7 +3,6 @@ use bytes::Bytes;
 use http::{Method, Uri};
 
 use crate::error::H3Error;
-use crate::push::{PushManager, validate_push_promise_headers};
 
 /// Represents an HTTP/3 request received from the client.
 #[derive(Debug)]
@@ -18,9 +17,14 @@ pub struct H3Request {
 pub struct H3ResponseSender {
     pub(crate) send_stream: quicd_x::SendStream,
     pub(crate) qpack: std::sync::Arc<crate::qpack::QpackCodec>,
-    pub(crate) push_manager: Option<std::sync::Arc<tokio::sync::Mutex<PushManager>>>,
-    pub(crate) connection_handle: Option<quicd_x::ConnectionHandle>,
-    pub(crate) stream_id: u64, // The request stream ID for push promises
+    pub(crate) push_handler: Option<std::sync::Arc<tokio::sync::Mutex<PushHandler>>>,
+}
+
+/// Handle for managing server push operations
+pub struct PushHandler {
+    pub(crate) handle: quicd_x::ConnectionHandle,
+    pub(crate) next_push_id: u64,
+    pub(crate) max_push_id: u64,
 }
 
 impl H3ResponseSender {
@@ -51,35 +55,27 @@ impl H3ResponseSender {
     }
 
     /// Send a PUSH_PROMISE frame to initiate server push.
+    /// Returns the push ID that was assigned to this push.
     ///
-    /// Per RFC 9114 Section 4.6: Server push allows a server to send responses
-    /// for requests that the client has not yet made.
-    ///
-    /// # Arguments
-    /// - `headers`: The request headers being promised (must include all pseudo-headers)
-    ///
-    /// # Returns
-    /// The push ID assigned to this push
+    /// RFC 9114 Section 4.6: Server push allows a server to send responses for
+    /// requests that the client has not yet made.
     pub async fn send_push_promise(&mut self, headers: Vec<(String, String)>) -> Result<u64, H3Error> {
-        // Validate push promise headers
-        validate_push_promise_headers(&headers)?;
-
-        let push_manager = self.push_manager.as_ref()
+        let push_handler = self.push_handler.as_ref()
             .ok_or_else(|| H3Error::Http("server push not available".into()))?;
         
-        let mut manager = push_manager.lock().await;
+        let mut handler = push_handler.lock().await;
         
         // Allocate a new push ID
-        let push_id = manager.allocate_push_id()?;
+        if handler.next_push_id > handler.max_push_id {
+            return Err(H3Error::Http("max push ID exceeded".into()));
+        }
         
-        // Register the push promise
-        manager.register_promise(push_id, self.stream_id, headers.clone())?;
+        let push_id = handler.next_push_id;
+        handler.next_push_id += 1;
         
-        // Encode headers for PUSH_PROMISE frame
+        // Encode headers
         let encoded_headers = self.qpack.encode_headers(&headers)
             .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
-        
-        drop(manager); // Release lock before async operation
         
         // Send PUSH_PROMISE frame on the request stream
         let push_promise = crate::frames::H3Frame::PushPromise {
@@ -90,64 +86,38 @@ impl H3ResponseSender {
         self.send_stream.write(frame_data, false).await
             .map_err(|e| H3Error::Stream(format!("write failed: {:?}", e)))?;
         
+        // TODO: Open push stream and send push response
+        // This would require opening a unidirectional stream and sending:
+        // 1. Stream type 0x01 (push stream)
+        // 2. Push ID varint
+        // 3. HEADERS and DATA frames
+        
         Ok(push_id)
     }
     
-    /// Send a response on a push stream.
-    ///
-    /// Per RFC 9114 Section 4.6: After sending PUSH_PROMISE, the server opens
-    /// a unidirectional push stream to send the response.
-    ///
-    /// # Arguments
-    /// - `push_id`: The push ID from send_push_promise()
-    /// - `status`: HTTP status code
-    /// - `headers`: Response headers
-    /// - `body`: Response body
-    pub async fn send_push_response(
-        &mut self,
-        push_id: u64,
-        status: u16,
-        headers: Vec<(String, String)>,
-        body: Bytes,
-    ) -> Result<(), H3Error> {
-        use crate::push::PushResponse;
-        
-        let push_manager = self.push_manager.as_ref()
+    /// Send a response on a push stream (must be called after send_push_promise)
+    pub async fn send_push_response(&mut self, push_id: u64, _status: u16, _headers: Vec<(String, String)>, _body: Bytes) -> Result<(), H3Error> {
+        let push_handler = self.push_handler.as_ref()
             .ok_or_else(|| H3Error::Http("server push not available".into()))?;
         
-        let handle = self.connection_handle.as_ref()
-            .ok_or_else(|| H3Error::Http("connection handle not available".into()))?;
+        let handler = push_handler.lock().await;
         
-        // Check if push is cancelled and store response
-        {
-            let mut manager = push_manager.lock().await;
-            if let Some(promise) = manager.get_promise_mut(push_id) {
-                if promise.is_cancelled() {
-                    return Err(H3Error::Http("push was cancelled".into()));
-                }
-                // Store the response data for when the stream opens
-                promise.set_response(PushResponse {
-                    status,
-                    headers,
-                    body,
-                });
-            } else {
-                return Err(H3Error::Http(format!("push ID {} not found", push_id)));
-            }
+        // Validate push ID
+        if push_id >= handler.next_push_id {
+            return Err(H3Error::Http("invalid push ID".into()));
         }
         
         // Open a unidirectional stream for the push
-        let request_id = handle.open_uni()
+        let _request_id = handler.handle.open_uni()
             .map_err(|e| H3Error::Connection(format!("failed to open push stream: {:?}", e)))?;
         
-        // Register the pending stream
-        {
-            let mut manager = push_manager.lock().await;
-            manager.register_pending_stream(request_id, push_id);
-        }
+        // Wait for the stream to be opened
+        // TODO: This is simplified - in a real implementation, we'd need to wait for
+        // the UniStreamOpened event and correlate with request_id
+        drop(handler); // Release lock
         
-        // Note: The actual stream writing happens in h3_session when UniStreamOpened event is received
-        Ok(())
+        // For now, return an error since we need async coordination
+        Err(H3Error::Http("push response sending requires async coordination - not yet implemented".into()))
     }
 }
 

@@ -10,6 +10,12 @@ pub mod frames;
 pub mod qpack;
 pub mod session;
 pub mod h3_session;
+pub mod stream_state;
+pub mod validation;
+pub mod qpack_streams;
+pub mod connect;
+pub mod settings;
+pub mod push;
 
 pub use error::{H3Error, H3ErrorCode};
 pub use frames::H3Frame;
