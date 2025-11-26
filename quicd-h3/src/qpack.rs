@@ -292,6 +292,13 @@ pub struct QpackCodec {
     insert_count: usize,
     known_received_count: usize,
     max_blocked_streams: usize,
+    max_field_section_size: Option<usize>, // RFC 9114 Section 7.2.4.2
+    // Phase 2: Blocked streams tracking (RFC 9204 Section 2.1.4)
+    current_blocked_streams: usize,
+    // Phase 2: Reference counting for eviction safety (RFC 9204 Section 2.1.2)
+    dynamic_table_ref_counts: Vec<usize>, // Tracks in-flight references per entry
+    // Phase 2: Draining entries that were evicted but still referenced
+    draining_entries: Vec<(usize, String, String)>, // (insert_count_when_evicted, name, value)
 }
 
 impl QpackCodec {
@@ -305,6 +312,13 @@ impl QpackCodec {
             insert_count: 0,
             known_received_count: 0,
             max_blocked_streams: 0,
+            max_field_section_size: None, // No limit by default
+            // Phase 2: Initialize blocked streams tracking
+            current_blocked_streams: 0,
+            // Phase 2: Initialize reference counting
+            dynamic_table_ref_counts: Vec::new(),
+            // Phase 2: Initialize draining entries
+            draining_entries: Vec::new(),
         }
     }
 
@@ -322,6 +336,11 @@ impl QpackCodec {
     /// Set the maximum number of blocked streams
     pub fn set_max_blocked_streams(&mut self, max_blocked: usize) {
         self.max_blocked_streams = max_blocked;
+    }
+    
+    /// Set the maximum field section size (RFC 9114 Section 7.2.4.2)
+    pub fn set_max_field_section_size(&mut self, max_size: Option<usize>) {
+        self.max_field_section_size = max_size;
     }
     
     /// Set the dynamic table capacity
@@ -351,7 +370,10 @@ impl QpackCodec {
         }
         
         self.dynamic_table.insert(0, (name, value)); // Insert at beginning (most recent)
-        self.insert_count += 1;
+        // Phase 2: Initialize reference count for new entry
+        self.dynamic_table_ref_counts.insert(0, 0);
+        // Phase 2: Handle wraparound for insert_count (RFC 9204 Section 4.5.1.1)
+        self.insert_count = self.insert_count.wrapping_add(1);
         Some(0) // Return relative index
     }
     
@@ -392,14 +414,85 @@ impl QpackCodec {
         self.known_received_count
     }
     
+    /// RFC 9204 Section 2.1.4: Check if we can block another stream
+    pub fn can_block_stream(&self) -> bool {
+        self.current_blocked_streams < self.max_blocked_streams
+    }
+    
+    /// RFC 9204 Section 2.1.4: Mark a stream as blocked
+    pub fn block_stream(&mut self) -> Result<(), H3Error> {
+        if !self.can_block_stream() {
+            return Err(H3Error::Qpack(
+                format!("H3_QPACK_DECOMPRESSION_FAILED: exceeded SETTINGS_QPACK_BLOCKED_STREAMS limit of {}", 
+                        self.max_blocked_streams)
+            ));
+        }
+        self.current_blocked_streams += 1;
+        Ok(())
+    }
+    
+    /// RFC 9204 Section 2.1.4: Unblock a stream (when decoding completes or stream is cancelled)
+    pub fn unblock_stream(&mut self) {
+        if self.current_blocked_streams > 0 {
+            self.current_blocked_streams -= 1;
+        }
+    }
+    
+    /// Get current blocked streams count (for telemetry/debugging)
+    pub fn blocked_streams_count(&self) -> usize {
+        self.current_blocked_streams
+    }
+    
     /// Update known received count
     pub fn update_known_received_count(&mut self, count: usize) {
         self.known_received_count = count;
+        // RFC 9204 Section 2.1.2: Clean up draining entries that are now acknowledged
+        self.cleanup_draining_entries();
+    }
+    
+    /// RFC 9204 Section 2.1.2: Add reference to a dynamic table entry
+    pub fn add_reference(&mut self, index: usize) {
+        // Ensure ref_counts vec is large enough
+        while self.dynamic_table_ref_counts.len() <= index {
+            self.dynamic_table_ref_counts.push(0);
+        }
+        self.dynamic_table_ref_counts[index] += 1;
+    }
+    
+    /// RFC 9204 Section 2.1.2: Release reference to a dynamic table entry
+    pub fn release_reference(&mut self, index: usize) {
+        if index < self.dynamic_table_ref_counts.len() && self.dynamic_table_ref_counts[index] > 0 {
+            self.dynamic_table_ref_counts[index] -= 1;
+        }
+    }
+    
+    /// RFC 9204 Section 2.1.2: Check if an entry can be safely evicted
+    fn can_evict(&self, index: usize) -> bool {
+        // Entry can be evicted if it has no outstanding references
+        index >= self.dynamic_table_ref_counts.len() || self.dynamic_table_ref_counts[index] == 0
+    }
+    
+    /// RFC 9204 Section 2.1.2: Clean up draining entries that have been acknowledged
+    fn cleanup_draining_entries(&mut self) {
+        // Remove draining entries where insert_count <= known_received_count
+        self.draining_entries.retain(|(insert_count, _, _)| {
+            *insert_count > self.known_received_count
+        });
     }
     
     /// Get a static table entry by index
     pub fn get_static_entry(&self, index: usize) -> Option<&(String, String)> {
         self.static_table.get(index)
+    }
+    
+    /// RFC 9204 Section 2.1.2: Get an entry from draining state by insert count
+    pub fn get_draining_entry(&self, target_insert_count: usize) -> Option<(String, String)> {
+        for (insert_count, name, value) in &self.draining_entries {
+            if *insert_count == target_insert_count {
+                return Some((name.clone(), value.clone()));
+            }
+        }
+        None
     }
     
     /// Calculate the size of the dynamic table
@@ -410,9 +503,27 @@ impl QpackCodec {
     }
     
     /// Evict entries until the table fits within capacity
+    /// RFC 9204 Section 2.1.2: Entries with outstanding references move to draining
     fn evict_entries_to_fit_capacity(&mut self) {
         while self.dynamic_table_size() > self.dynamic_table_capacity && !self.dynamic_table.is_empty() {
-            self.dynamic_table.pop(); // Remove oldest entry
+            let oldest_index = self.dynamic_table.len() - 1;
+            
+            // RFC 9204 Section 2.1.2: Check if entry can be safely evicted
+            if self.can_evict(oldest_index) {
+                // Safe to evict - no outstanding references
+                self.dynamic_table.pop();
+                if oldest_index < self.dynamic_table_ref_counts.len() {
+                    self.dynamic_table_ref_counts.pop();
+                }
+            } else {
+                // Entry still referenced - move to draining
+                if let Some(entry) = self.dynamic_table.pop() {
+                    self.draining_entries.push((self.insert_count, entry.0, entry.1));
+                    if oldest_index < self.dynamic_table_ref_counts.len() {
+                        self.dynamic_table_ref_counts.pop();
+                    }
+                }
+            }
         }
     }
     fn build_static_table() -> Vec<(String, String)> {
@@ -527,11 +638,14 @@ impl QpackCodec {
         
         // RFC 9204 Section 4.5.1: Encoded field section prefix
         // Required Insert Count (8-bit prefix)
-        let required_insert_count = self.encode_required_insert_count();
-        buf.put_u8(required_insert_count as u8); // For now, always fits in 1 byte
+        // TODO: Properly calculate based on dynamic table references
+        // Currently using 0 (no dynamic table) for safety
+        let required_insert_count = 0u64;
+        buf.put_u8(required_insert_count as u8);
         
         // Base (7-bit prefix with sign bit in bit 7)
-        // For now, use Base = 0 (no dynamic table references in this encoding)
+        // TODO: Calculate proper base for dynamic table references
+        // Currently using 0 (no dynamic table)
         let base_delta = 0u64;
         let sign = false; // positive (S=0)
         let base_byte = if sign { 0x80 } else { 0x00 } | (base_delta as u8 & 0x7F);
@@ -639,14 +753,26 @@ impl QpackCodec {
     pub fn decode_headers(&self, encoded: &[u8]) -> Result<Vec<(String, String)>, H3Error> {
         let mut headers = Vec::new();
         let mut cursor = 0;
+        let mut field_section_size: usize = 0; // Track size per RFC 9114 Section 7.2.4.2
 
         // RFC 9204 Section 4.5.1: Decode field section prefix
         // Required Insert Count (8-bit prefix)
         if cursor >= encoded.len() {
             return Err(H3Error::Qpack("empty encoded field section".into()));
         }
-        let (_required_insert_count, consumed) = self.decode_qpack_prefix_int(&encoded[cursor..], 8)?;
+        let (required_insert_count, consumed) = self.decode_qpack_prefix_int(&encoded[cursor..], 8)?;
         cursor += consumed;
+        
+        // RFC 9204 Section 2.1.4: Check if stream would be blocked
+        if required_insert_count > self.insert_count as u64 {
+            // Stream would be blocked - check limit (note: actual blocking tracked in h3_session)
+            if self.current_blocked_streams >= self.max_blocked_streams {
+                return Err(H3Error::Qpack(
+                    format!("H3_QPACK_DECOMPRESSION_FAILED: would exceed SETTINGS_QPACK_BLOCKED_STREAMS limit of {}",
+                            self.max_blocked_streams)
+                ));
+            }
+        }
         
         // Base (7-bit prefix with sign bit)
         if cursor >= encoded.len() {
@@ -693,6 +819,14 @@ impl QpackCodec {
                         .ok_or_else(|| H3Error::Qpack("invalid static table index".into()))?
                         .clone()
                 };
+                // RFC 9114 Section 7.2.4.2: Track field section size
+                // Size = name.len() + value.len() + 32 per field line
+                field_section_size += name.len() + value.len() + 32;
+                if let Some(max_size) = self.max_field_section_size {
+                    if field_section_size > max_size {
+                        return Err(H3Error::Http("field section size exceeds MAX_FIELD_SECTION_SIZE".into()));
+                    }
+                }
                 headers.push((name, value));
             } else if (first_byte & 0x40) != 0 {
                 // Literal with name reference
@@ -735,6 +869,13 @@ impl QpackCodec {
                 
                 let (value, consumed) = self.decode_string(&encoded[cursor..])?;
                 cursor += consumed;
+                // RFC 9114 Section 7.2.4.2: Track field section size
+                field_section_size += name.len() + value.len() + 32;
+                if let Some(max_size) = self.max_field_section_size {
+                    if field_section_size > max_size {
+                        return Err(H3Error::Http("field section size exceeds MAX_FIELD_SECTION_SIZE".into()));
+                    }
+                }
                 headers.push((name, value));
             } else if (first_byte & 0x20) != 0 {
                 // Literal header field
@@ -742,6 +883,13 @@ impl QpackCodec {
                 cursor += consumed;
                 let (value, consumed) = self.decode_string(&encoded[cursor..])?;
                 cursor += consumed;
+                // RFC 9114 Section 7.2.4.2: Track field section size
+                field_section_size += name.len() + value.len() + 32;
+                if let Some(max_size) = self.max_field_section_size {
+                    if field_section_size > max_size {
+                        return Err(H3Error::Http("field section size exceeds MAX_FIELD_SECTION_SIZE".into()));
+                    }
+                }
                 headers.push((name, value));
             } else {
                 return Err(H3Error::Qpack("unknown field representation".into()));

@@ -79,7 +79,6 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
                 }
             }
         } else {
-            // Regular header field
             seen_regular_header = true;
 
             // RFC 9114 Section 4.2: Connection-specific fields MUST NOT be present
@@ -99,6 +98,9 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
             }
         }
     }
+    
+    // Phase 3: Validate Content-Length is not duplicated (RFC 9110 Section 8.6)
+    validate_content_length_uniqueness(headers)?;
 
     // Determine if this is a CONNECT request
     let is_connect = method.as_ref().map(|m| m == "CONNECT").unwrap_or(false);
@@ -278,6 +280,32 @@ impl RequestPseudoHeaders {
         uri_string.parse()
             .map_err(|_| H3Error::Http(format!("invalid URI construction: {}", uri_string)))
     }
+}
+
+/// Phase 3: Validate Content-Length header uniqueness (RFC 9110 Section 8.6)
+fn validate_content_length_uniqueness(headers: &[(String, String)]) -> Result<(), H3Error> {
+    let mut content_length_values: Vec<&str> = Vec::new();
+    
+    for (name, value) in headers {
+        if name == "content-length" {
+            content_length_values.push(value);
+        }
+    }
+    
+    if content_length_values.len() > 1 {
+        // Check if all values are identical
+        let first = content_length_values[0];
+        for value in &content_length_values[1..] {
+            if *value != first {
+                // Different Content-Length values - malformed
+                return Err(H3Error::MessageError);
+            }
+        }
+        // All values same but still reject for safety
+        return Err(H3Error::MessageError);
+    }
+    
+    Ok(())
 }
 
 /// Calculate the size of a field section per RFC 9114 Section 4.2.2.

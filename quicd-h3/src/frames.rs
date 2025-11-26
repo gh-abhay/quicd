@@ -40,9 +40,15 @@ impl H3Frame {
         let (frame_type, type_len) = Self::decode_varint(&buf[cursor..])?;
         cursor += type_len;
 
+        // Validate frame type is not HTTP/2 reserved type (RFC 9114 Section 7.2.8)
+        Self::validate_frame_type(frame_type)?;
+
         // Parse length (variable-length integer)
         let (length, len_len) = Self::decode_varint(&buf[cursor..])?;
         cursor += len_len;
+
+        // Verify redundant length encoding is minimal (RFC 9114 Section 7.1)
+        Self::validate_varint_encoding(&buf[cursor - len_len..cursor], length)?;
 
         let length = length as usize;
         if buf.len() < cursor + length {
@@ -98,9 +104,15 @@ impl H3Frame {
         let (frame_type, type_len) = Self::decode_varint(&buf[cursor..])?;
         cursor += type_len;
 
+        // Validate frame type is not HTTP/2 reserved type (RFC 9114 Section 7.2.8)
+        Self::validate_frame_type(frame_type)?;
+
         // Parse length (variable-length integer)
         let (length, len_len) = Self::decode_varint(&buf[cursor..])?;
         cursor += len_len;
+
+        // Verify redundant length encoding is minimal (RFC 9114 Section 7.1)
+        Self::validate_varint_encoding(&buf[cursor - len_len..cursor], length)?;
 
         let length = length as usize;
         if buf.len() < cursor + length {
@@ -363,6 +375,70 @@ impl H3Frame {
             buf.put_u8((value >> 8) as u8);
             buf.put_u8(value as u8);
         }
+    }
+
+    /// Validates that a frame type is not an HTTP/2 reserved type.
+    /// RFC 9114 Section 7.2.8: Frame types that were used in HTTP/2 where there is no
+    /// corresponding HTTP/3 frame have been reserved and MUST NOT be sent.
+    fn validate_frame_type(frame_type: u64) -> Result<(), H3Error> {
+        match frame_type {
+            // PRIORITY (0x02) is valid in HTTP/3 but acts differently
+            // CANCEL_PUSH (0x03) reuses RST_STREAM code point, but is valid
+            0x06 => Err(H3Error::Connection("FRAME_UNEXPECTED: PING frame from HTTP/2 not allowed in HTTP/3".into())),
+            0x08 => Err(H3Error::Connection("FRAME_UNEXPECTED: WINDOW_UPDATE frame from HTTP/2 not allowed in HTTP/3".into())),
+            0x09 => Err(H3Error::Connection("FRAME_UNEXPECTED: CONTINUATION frame from HTTP/2 not allowed in HTTP/3".into())),
+            _ => Ok(()),
+        }
+    }
+
+    /// Validates that a varint is encoded minimally (no redundant length encoding).
+    /// RFC 9114 Section 7.1: Redundant length encodings MUST be verified to be self-consistent.
+    fn validate_varint_encoding(encoded: &[u8], value: u64) -> Result<(), H3Error> {
+        if encoded.is_empty() {
+            return Err(H3Error::FrameParse("empty varint encoding".into()));
+        }
+
+        let prefix = encoded[0] >> 6;
+        let expected_len = match prefix {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            _ => unreachable!(),
+        };
+
+        if encoded.len() < expected_len {
+            return Err(H3Error::FrameParse("incomplete varint encoding".into()));
+        }
+
+        // Check if value could have been encoded in fewer bytes
+        let minimal_len = if value < (1 << 6) {
+            1
+        } else if value < (1 << 14) {
+            2
+        } else if value < (1 << 30) {
+            4
+        } else {
+            8
+        };
+
+        if expected_len > minimal_len {
+            return Err(H3Error::FrameParse(
+                format!("redundant varint encoding: value {} encoded in {} bytes, minimal is {} bytes", 
+                    value, expected_len, minimal_len)
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Checks if a frame type is reserved for greasing (0x1f * N + 0x21).
+    /// RFC 9114 Section 7.2.8: These frames have no semantics and can be sent for padding.
+    pub fn is_reserved_frame_type(frame_type: u64) -> bool {
+        if frame_type < 0x21 {
+            return false;
+        }
+        (frame_type - 0x21) % 0x1f == 0
     }
 }
 
