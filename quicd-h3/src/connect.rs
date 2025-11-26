@@ -129,12 +129,21 @@ impl ConnectTunnel {
 /// - Extended CONNECT: MUST have :method, :protocol, :scheme, :authority, :path
 pub fn validate_connect_request(
     pseudo_headers: &RequestPseudoHeaders,
+    enable_connect_protocol: bool,
 ) -> Result<(), H3Error> {
     if !pseudo_headers.is_connect() {
         return Ok(());
     }
 
     if pseudo_headers.is_extended_connect() {
+        // RFC 9114 Section 4.4: Extended CONNECT requires SETTINGS_ENABLE_CONNECT_PROTOCOL
+        // "A server MUST treat a CONNECT request with the :protocol pseudo-header field
+        // present but the SETTINGS_ENABLE_CONNECT_PROTOCOL parameter set to 0 as a
+        // request error of type H3_MESSAGE_ERROR"
+        if !enable_connect_protocol {
+            return Err(H3Error::MessageError);
+        }
+        
         // Extended CONNECT: needs all pseudo-headers
         if pseudo_headers.scheme.is_none() {
             return Err(H3Error::Http("extended CONNECT requires :scheme".into()));
@@ -175,7 +184,7 @@ mod tests {
             protocol: None,
         };
 
-        assert!(validate_connect_request(&pseudo).is_ok());
+        assert!(validate_connect_request(&pseudo, false).is_ok());
         
         let tunnel = ConnectTunnel::new(4, &pseudo);
         assert!(tunnel.is_ok());
@@ -194,7 +203,14 @@ mod tests {
             protocol: Some("websocket".to_string()),
         };
 
-        assert!(validate_connect_request(&pseudo).is_ok());
+        // Should succeed when extended CONNECT is enabled
+        assert!(validate_connect_request(&pseudo, true).is_ok());
+        
+        // Should fail when extended CONNECT is disabled
+        assert!(matches!(
+            validate_connect_request(&pseudo, false),
+            Err(H3Error::MessageError)
+        ));
         
         let tunnel = ConnectTunnel::new(4, &pseudo);
         assert!(tunnel.is_ok());
@@ -213,7 +229,7 @@ mod tests {
             protocol: None,
         };
 
-        assert!(validate_connect_request(&pseudo).is_err());
+        assert!(validate_connect_request(&pseudo, false).is_err());
     }
 
     #[test]

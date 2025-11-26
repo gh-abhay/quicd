@@ -17,7 +17,7 @@ pub struct H3Request {
 /// Handle for sending HTTP/3 responses on a specific stream.
 pub struct H3ResponseSender {
     pub(crate) send_stream: quicd_x::SendStream,
-    pub(crate) qpack: std::sync::Arc<crate::qpack::QpackCodec>,
+    pub(crate) qpack: std::sync::Arc<tokio::sync::Mutex<crate::qpack::QpackCodec>>,
     pub(crate) push_manager: Option<std::sync::Arc<tokio::sync::Mutex<PushManager>>>,
     pub(crate) connection_handle: Option<quicd_x::ConnectionHandle>,
     pub(crate) stream_id: u64, // The request stream ID for push promises
@@ -32,7 +32,7 @@ impl H3ResponseSender {
         ];
         all_headers.extend(headers);
 
-        let encoded_headers = self.qpack.encode_headers(&all_headers)
+        let encoded_headers = self.qpack.lock().await.encode_headers(&all_headers)
             .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
 
         // Send HEADERS frame
@@ -76,7 +76,7 @@ impl H3ResponseSender {
         manager.register_promise(push_id, self.stream_id, headers.clone())?;
         
         // Encode headers for PUSH_PROMISE frame
-        let encoded_headers = self.qpack.encode_headers(&headers)
+        let encoded_headers = self.qpack.lock().await.encode_headers(&headers)
             .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
         
         drop(manager); // Release lock before async operation
@@ -147,6 +147,24 @@ impl H3ResponseSender {
         }
         
         // Note: The actual stream writing happens in h3_session when UniStreamOpened event is received
+        Ok(())
+    }
+
+    /// Cancel the current request stream with an application error code.
+    ///
+    /// Per RFC 9114 Section 4.1.1: Either endpoint can abruptly terminate a stream
+    /// by sending a RESET_STREAM frame. This immediately terminates sending on the stream.
+    ///
+    /// # Arguments
+    /// - `error_code`: Application-specific error code (H3_NO_ERROR = 0x100, H3_REQUEST_CANCELLED = 0x10C, etc.)
+    pub async fn cancel(&mut self, error_code: u64) -> Result<(), H3Error> {
+        let handle = self.connection_handle.as_ref()
+            .ok_or_else(|| H3Error::Http("connection handle not available".into()))?;
+        
+        // Send RESET_STREAM to peer
+        let _request_id = handle.reset_stream(self.stream_id, error_code)
+            .map_err(|e| H3Error::Connection(format!("Failed to reset stream: {:?}", e)))?;
+        
         Ok(())
     }
 }

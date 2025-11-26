@@ -11,10 +11,9 @@ use crate::error::H3Error;
 use crate::frames::{H3Frame, Setting};
 use crate::qpack::QpackCodec;
 use crate::session::{H3Handler, H3Request, H3ResponseSender};
-use crate::stream_state::{StreamFrameParser, StreamState as FrameStreamState};
-use crate::validation::{validate_request_headers, RequestPseudoHeaders};
+use crate::stream_state::StreamFrameParser;
 use crate::qpack_streams::QpackStreamManager;
-use crate::settings::{SettingsValidator, SettingsBuilder};
+use crate::settings::SettingsValidator;
 use crate::connect::{ConnectTunnel, validate_connect_request};
 use crate::push::PushManager;
 
@@ -24,7 +23,7 @@ use crate::push::PushManager;
 /// request/response handling, and integration with the underlying QUIC transport.
 pub struct H3Session<H: H3Handler> {
     handle: ConnectionHandle,
-    qpack: Arc<QpackCodec>,
+    qpack: Arc<tokio::sync::Mutex<QpackCodec>>,
     control_stream_id: Option<u64>,
     server_control_send: Option<quicd_x::SendStream>,
     streams: HashMap<u64, StreamState>,
@@ -42,6 +41,39 @@ pub struct H3Session<H: H3Handler> {
     max_push_id: u64,
     _next_push_id: u64,
     _push_streams: HashMap<u64, PushStreamState>,
+    // Phase 2: QPACK encoder/decoder streams
+    encoder_stream_id: Option<u64>,
+    decoder_stream_id: Option<u64>,
+    pending_encoder_stream_request: Option<u64>,
+    pending_decoder_stream_request: Option<u64>,
+    encoder_send_stream: Option<quicd_x::SendStream>,
+    decoder_send_stream: Option<quicd_x::SendStream>,
+    // Phase 2: GOAWAY state
+    goaway_sent: bool,
+    goaway_received: bool,
+    last_accepted_stream_id: u64,
+    // Phase 2: Blocked streams tracking
+    blocked_streams: HashMap<u64, BlockedStream>,
+    // Phase 1: Control stream lifecycle tracking (RFC 9114 Section 6.2.1)
+    peer_control_stream_id: Option<u64>,
+    peer_control_stream_received_settings: bool,
+    peer_encoder_stream_id: Option<u64>,
+    peer_decoder_stream_id: Option<u64>,
+    // Phase 1: Stream type tracking for frame validation
+    stream_types: HashMap<u64, StreamType>,
+    // Phase 1: GOAWAY ID tracking for validation
+    last_goaway_id: Option<u64>,
+}
+
+/// Stream type context for validating frame associations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamType {
+    Control,
+    Request,
+    Push,
+    QpackEncoder,
+    QpackDecoder,
+    Unknown,
 }
 
 #[derive(Debug)]
@@ -49,7 +81,24 @@ enum StreamState {
     Control,
     QpackEncoder,
     QpackDecoder,
-    Request { headers_received: bool, body: Vec<Bytes>, send_stream: quicd_x::SendStream },
+    Request { 
+        headers_received: bool, 
+        trailers_received: bool,
+        body: Vec<Bytes>, 
+        trailers: Option<Vec<(String, String)>>,
+        send_stream: quicd_x::SendStream,
+        // Phase 3: Content-Length validation (RFC 9114 Section 4.1.2)
+        content_length: Option<u64>,  // From Content-Length header
+        bytes_received: u64,          // Sum of DATA frame payload bytes
+    },
+}
+
+/// Blocked stream waiting for dynamic table entries
+#[derive(Debug)]
+struct BlockedStream {
+    required_insert_count: usize,
+    encoded_data: Bytes,
+    send_stream: quicd_x::SendStream,
 }
 
 #[derive(Debug)]
@@ -67,7 +116,7 @@ impl<H: H3Handler> H3Session<H> {
         
         Self {
             handle,
-            qpack: Arc::new(QpackCodec::new()),
+            qpack: Arc::new(tokio::sync::Mutex::new(QpackCodec::new())),
             control_stream_id: None,
             server_control_send: None,
             streams: HashMap::new(),
@@ -85,6 +134,28 @@ impl<H: H3Handler> H3Session<H> {
             max_push_id: 0,
             _next_push_id: 0,
             _push_streams: HashMap::new(),
+            // Phase 2: QPACK encoder/decoder streams
+            encoder_stream_id: None,
+            decoder_stream_id: None,
+            pending_encoder_stream_request: None,
+            pending_decoder_stream_request: None,
+            encoder_send_stream: None,
+            decoder_send_stream: None,
+            // Phase 2: GOAWAY state
+            goaway_sent: false,
+            goaway_received: false,
+            last_accepted_stream_id: u64::MAX,
+            // Phase 2: Blocked streams tracking
+            blocked_streams: HashMap::new(),
+            // Phase 1: Control stream lifecycle tracking
+            peer_control_stream_id: None,
+            peer_control_stream_received_settings: false,
+            peer_encoder_stream_id: None,
+            peer_decoder_stream_id: None,
+            // Phase 1: Stream type tracking
+            stream_types: HashMap::new(),
+            // Phase 1: GOAWAY tracking
+            last_goaway_id: None,
         }
     }
 
@@ -105,7 +176,10 @@ impl<H: H3Handler> H3Session<H> {
                 _ = &mut shutdown => {
                     // Graceful shutdown
                     self.send_goaway().await?;
-                    self.handle.close(0, None).map_err(|e| H3Error::Connection(format!("close error: {:?}", e)))?;
+                    // RFC 9114 Section 8: Close connection with H3_NO_ERROR for graceful shutdown
+                    let error_code = crate::error::H3ErrorCode::NoError.to_u64();
+                    self.handle.close(error_code, Some(Bytes::from("graceful shutdown")))
+                        .map_err(|e| H3Error::Connection(format!("close error: {:?}", e)))?;
                     break;
                 }
             }
@@ -123,6 +197,13 @@ impl<H: H3Handler> H3Session<H> {
             }
             AppEvent::NewStream { stream_id, bidirectional, recv_stream, send_stream } => {
                 self.max_stream_id = self.max_stream_id.max(stream_id);
+                
+                // Check GOAWAY state before processing
+                if !self.should_accept_stream(stream_id) {
+                    // Silently drop streams beyond GOAWAY
+                    return Ok(());
+                }
+                
                 if bidirectional {
                     self.handle_bidirectional_stream(stream_id, recv_stream, send_stream).await?;
                 } else {
@@ -136,19 +217,60 @@ impl<H: H3Handler> H3Session<H> {
             AppEvent::StreamFinished { stream_id: _ } => {
                 // Handle stream end
             }
+            AppEvent::StreamClosed { stream_id, app_initiated, error_code } => {
+                // RFC 9114 Section 4.1.1: Stream was reset
+                // Clean up stream state and notify QPACK decoder if needed
+                self.handle_stream_closed(stream_id, app_initiated, error_code).await?;
+            }
+            AppEvent::StreamReset { request_id, result } => {
+                // Response to our reset_stream() call
+                if let Err(e) = result {
+                    eprintln!("Failed to reset stream (request {}): {:?}", request_id, e);
+                }
+            }
             AppEvent::ConnectionClosing { .. } => {
-                // Cleanup
+                // Send GOAWAY if not already sent
+                if !self.goaway_sent {
+                    let _ = self.send_goaway().await;
+                }
             }
             AppEvent::UniStreamOpened { request_id, result } => {
                 if Some(request_id) == self.pending_control_stream_request {
                     // This is our server control stream
                     self.pending_control_stream_request = None;
                     if let Ok(send_stream) = result {
+                        // RFC 9114 Section 6.2.1: Write control stream type (0x00)
+                        send_stream.write(Bytes::from(vec![0x00]), false).await
+                            .map_err(|e| H3Error::Stream(format!("failed to write control stream type: {:?}", e)))?;
                         self.server_control_send = Some(send_stream);
                         // Send SETTINGS frame immediately as required by RFC 9114
                         self.send_settings().await?;
                     } else {
                         return Err(H3Error::Connection("failed to open server control stream".into()));
+                    }
+                } else if Some(request_id) == self.pending_encoder_stream_request {
+                    // RFC 9204 Section 4.2: This is our QPACK encoder stream
+                    self.pending_encoder_stream_request = None;
+                    if let Ok(send_stream) = result {
+                        // Write encoder stream type (0x02)
+                        send_stream.write(Bytes::from(vec![0x02]), false).await
+                            .map_err(|e| H3Error::Stream(format!("failed to write encoder stream type: {:?}", e)))?;
+                        self.encoder_stream_id = Some(send_stream.stream_id);
+                        self.encoder_send_stream = Some(send_stream);
+                    } else {
+                        return Err(H3Error::Connection("failed to open encoder stream".into()));
+                    }
+                } else if Some(request_id) == self.pending_decoder_stream_request {
+                    // RFC 9204 Section 4.2: This is our QPACK decoder stream
+                    self.pending_decoder_stream_request = None;
+                    if let Ok(send_stream) = result {
+                        // Write decoder stream type (0x03)
+                        send_stream.write(Bytes::from(vec![0x03]), false).await
+                            .map_err(|e| H3Error::Stream(format!("failed to write decoder stream type: {:?}", e)))?;
+                        self.decoder_stream_id = Some(send_stream.stream_id);
+                        self.decoder_send_stream = Some(send_stream);
+                    } else {
+                        return Err(H3Error::Connection("failed to open decoder stream".into()));
                     }
                 } else if self.pending_push_streams.contains_key(&request_id) {
                     // This is a push stream
@@ -182,44 +304,100 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     async fn initialize_session(&mut self) -> Result<(), H3Error> {
-        // Open server control stream (unidirectional, stream ID 2)
-        // This must be the first unidirectional stream opened by the server
-        let request_id = self.handle.open_uni()
+        // RFC 9114 Section 6.2.1: Open server control stream (must be first)
+        let control_request_id = self.handle.open_uni()
             .map_err(|e| H3Error::Connection(format!("failed to open control stream: {:?}", e)))?;
+        self.pending_control_stream_request = Some(control_request_id);
         
-        // Store the request ID to correlate with the UniStreamOpened event
-        self.pending_control_stream_request = Some(request_id);
+        // RFC 9204 Section 4.2: Create QPACK encoder stream
+        // "Each endpoint MUST initiate, at most, one encoder stream"
+        let encoder_request_id = self.handle.open_uni()
+            .map_err(|e| H3Error::Connection(format!("failed to open encoder stream: {:?}", e)))?;
+        self.pending_encoder_stream_request = Some(encoder_request_id);
+        
+        // RFC 9204 Section 4.2: Create QPACK decoder stream
+        // "Each endpoint MUST initiate, at most, one decoder stream"
+        let decoder_request_id = self.handle.open_uni()
+            .map_err(|e| H3Error::Connection(format!("failed to open decoder stream: {:?}", e)))?;
+        self.pending_decoder_stream_request = Some(decoder_request_id);
         
         Ok(())
     }
 
+    fn should_accept_stream(&self, stream_id: u64) -> bool {
+        // RFC 9114 Section 5.2: Don't accept new streams after GOAWAY
+        if self.goaway_received && stream_id > self.last_accepted_stream_id {
+            return false;
+        }
+        true
+    }
+    
     async fn handle_bidirectional_stream(
         &mut self,
         stream_id: u64,
         mut recv_stream: quicd_x::RecvStream,
         send_stream: Option<quicd_x::SendStream>,
     ) -> Result<(), H3Error> {
+        // RFC 9114 Section 5.2: Check if we should accept this stream
+        if !self.should_accept_stream(stream_id) {
+            // Silently ignore streams beyond GOAWAY point
+            return Ok(());
+        }
+        
         // RFC 9114 Section 6.1: Server MUST NOT process requests until client SETTINGS received
         if !self.settings_validator.is_received() {
             return Err(H3Error::MissingSettings);
         }
         
-        // Initialize stream parser for this stream
+        // Track the last accepted stream for our GOAWAY
+        self.last_accepted_stream_id = self.last_accepted_stream_id.max(stream_id);
+        
+        // Initialize stream parser for proper frame buffering per RFC 9114
         self.stream_parsers.insert(stream_id, StreamFrameParser::new(stream_id));
+        let parser = self.stream_parsers.get_mut(&stream_id).unwrap();
+        parser.mark_open();
+        
+        // Track stream type for frame validation
+        self.stream_types.insert(stream_id, StreamType::Request);
         
         self.streams.insert(stream_id, StreamState::Request {
             headers_received: false,
+            trailers_received: false,
             body: Vec::new(),
+            trailers: None,
             send_stream: send_stream.unwrap(), // bidirectional, so should have send_stream
+            // Phase 3: Initialize Content-Length tracking
+            content_length: None,
+            bytes_received: 0,
         });
 
-        // Read frames from the stream
+        // Read frames from the stream with proper buffering
         while let Ok(Some(data)) = recv_stream.read().await {
             match data {
                 quicd_x::StreamData::Data(bytes) => {
-                    self.process_stream_data(stream_id, bytes).await?;
+                    // Use StreamFrameParser for proper frame buffering
+                    // Collect frames first to avoid borrow checker issues
+                    let frames = if let Some(parser) = self.stream_parsers.get_mut(&stream_id) {
+                        parser.add_data(bytes);
+                        
+                        let mut collected_frames = Vec::new();
+                        while let Some(frame) = parser.parse_next_frame()? {
+                            collected_frames.push(frame);
+                        }
+                        collected_frames
+                    } else {
+                        Vec::new()
+                    };
+                    
+                    // Process all collected frames
+                    for frame in frames {
+                        self.process_frame_on_request_stream(stream_id, frame).await?;
+                    }
                 }
                 quicd_x::StreamData::Fin => {
+                    if let Some(parser) = self.stream_parsers.get_mut(&stream_id) {
+                        parser.mark_half_closed_remote();
+                    }
                     self.handle_request_complete(stream_id).await?;
                     break;
                 }
@@ -243,12 +421,16 @@ impl<H: H3Handler> H3Session<H> {
         match stream_type {
             0x00 => {
                 // Control stream (RFC 9114 Section 6.2.1)
-                if self.control_stream_id.is_some() {
+                // "Only one control stream per peer is permitted; receipt of a second stream
+                // claiming to be a control stream MUST be treated as a connection error of
+                // type H3_STREAM_CREATION_ERROR"
+                if self.peer_control_stream_id.is_some() {
                     return Err(H3Error::Connection(
-                        "duplicate control stream".into()
+                        "duplicate control stream from peer - H3_STREAM_CREATION_ERROR".into()
                     ));
                 }
-                self.control_stream_id = Some(stream_id);
+                self.peer_control_stream_id = Some(stream_id);
+                self.stream_types.insert(stream_id, StreamType::Control);
                 self.streams.insert(stream_id, StreamState::Control);
                 self.process_client_control_stream(stream_id, recv_stream).await?;
             }
@@ -259,22 +441,26 @@ impl<H: H3Handler> H3Session<H> {
             }
             0x02 => {
                 // QPACK encoder stream (RFC 9204 Section 4.2)
-                if self.qpack_manager.has_encoder_stream() {
+                if self.peer_encoder_stream_id.is_some() {
                     return Err(H3Error::Connection(
-                        "duplicate QPACK encoder stream".into()
+                        "duplicate QPACK encoder stream from peer - H3_STREAM_CREATION_ERROR".into()
                     ));
                 }
+                self.peer_encoder_stream_id = Some(stream_id);
+                self.stream_types.insert(stream_id, StreamType::QpackEncoder);
                 self.qpack_manager.set_encoder_stream(stream_id);
                 self.streams.insert(stream_id, StreamState::QpackEncoder);
                 self.process_qpack_stream(stream_id, recv_stream).await?;
             }
             0x03 => {
                 // QPACK decoder stream (RFC 9204 Section 4.2)
-                if self.qpack_manager.has_decoder_stream() {
+                if self.peer_decoder_stream_id.is_some() {
                     return Err(H3Error::Connection(
-                        "duplicate QPACK decoder stream".into()
+                        "duplicate QPACK decoder stream from peer - H3_STREAM_CREATION_ERROR".into()
                     ));
                 }
+                self.peer_decoder_stream_id = Some(stream_id);
+                self.stream_types.insert(stream_id, StreamType::QpackDecoder);
                 self.qpack_manager.set_decoder_stream(stream_id);
                 self.streams.insert(stream_id, StreamState::QpackDecoder);
                 self.process_qpack_stream(stream_id, recv_stream).await?;
@@ -308,8 +494,9 @@ impl<H: H3Handler> H3Session<H> {
                     self.process_control_frames(bytes).await?;
                 }
                 quicd_x::StreamData::Fin => {
-                    // Control stream ended - this is an error per RFC 9114
-                    return Err(H3Error::Http("client control stream ended unexpectedly".into()));
+                    // RFC 9114 Section 6.2.1: Control stream closure MUST be treated as
+                    // a connection error of type H3_CLOSED_CRITICAL_STREAM
+                    return Err(H3Error::ClosedCriticalStream);
                 }
             }
         }
@@ -328,8 +515,10 @@ impl<H: H3Handler> H3Session<H> {
                     self.process_qpack_instructions(_stream_id, bytes).await?;
                 }
                 quicd_x::StreamData::Fin => {
-                    // QPACK stream ended
-                    break;
+                    // RFC 9114 Section 6.2.3 & RFC 9204 Section 4.2:
+                    // "Closure of either unidirectional stream type MUST be treated as a
+                    // connection error of type H3_CLOSED_CRITICAL_STREAM"
+                    return Err(H3Error::ClosedCriticalStream);
                 }
             }
         }
@@ -365,56 +554,140 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     async fn send_goaway(&mut self) -> Result<(), H3Error> {
+        // RFC 9114 Section 5.2: Graceful shutdown with GOAWAY
+        if self.goaway_sent {
+            return Ok(()); // Already sent
+        }
+        
         if let Some(send_stream) = &mut self.server_control_send {
-            // Send GOAWAY frame with last stream ID
-            let goaway = H3Frame::GoAway { stream_id: self.max_stream_id };
+            // Send GOAWAY frame with last accepted stream ID
+            let goaway = H3Frame::GoAway { stream_id: self.last_accepted_stream_id };
             let frame_data = goaway.encode();
             send_stream.write(frame_data, false).await
                 .map_err(|e| H3Error::Stream(format!("failed to send GOAWAY: {:?}", e)))?;
+            self.goaway_sent = true;
         }
         Ok(())
     }
+    
+    async fn handle_goaway_received(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        // RFC 9114 Section 5.2: "An endpoint MAY send multiple GOAWAY frames indicating
+        // different identifiers, but the identifier in each frame MUST NOT be greater than
+        // the identifier in any previous frame, since clients might already have retried
+        // unprocessed requests on another HTTP connection. Receiving a GOAWAY containing a
+        // larger identifier than previously received MUST be treated as a connection error
+        // of type H3_ID_ERROR."
+        
+        if let Some(last_id) = self.last_goaway_id {
+            if stream_id > last_id {
+                return Err(H3Error::Connection(
+                    "H3_ID_ERROR: GOAWAY stream_id increased from previous GOAWAY".into()
+                ));
+            }
+        }
+        
+        self.goaway_received = true;
+        self.last_goaway_id = Some(stream_id);
+        self.last_accepted_stream_id = stream_id;
+        
+        // Stop accepting new requests with stream_id > goaway stream_id
+        // Existing requests can continue
+        Ok(())
+    }
 
-    async fn process_stream_data(&mut self, stream_id: u64, data: Bytes) -> Result<(), H3Error> {
+    /// Process a complete frame on a request stream.
+    /// This is called after StreamFrameParser extracts a complete frame.
+    async fn process_frame_on_request_stream(&mut self, stream_id: u64, frame: H3Frame) -> Result<(), H3Error> {
+        // RFC 9114 Section 7.2: Validate frame is allowed on request stream (before any borrows)
+        self.validate_frame_on_stream(&frame, StreamType::Request)?;
+        
         let mut request_to_handle = None;
+        let mut send_ack = false;
 
-        if let Some(StreamState::Request { headers_received, body, send_stream }) = self.streams.get_mut(&stream_id) {
-            if !*headers_received {
-                // Try to parse different frame types
-                if let Ok((frame, _)) = H3Frame::parse(&data) {
-                    match frame {
-                        H3Frame::Headers { encoded_headers } => {
-                            let headers = self.qpack.decode_headers(&encoded_headers)?;
-                            *headers_received = true;
-                            // Parse request outside the borrow
-                            request_to_handle = Some((headers, send_stream.clone()));
+        if let Some(StreamState::Request { headers_received, trailers_received, body, trailers, send_stream, content_length, bytes_received }) = 
+            self.streams.get_mut(&stream_id) 
+        {
+            // RFC 9114 Section 4.1: Process frame on request stream
+            match frame {
+                H3Frame::Headers { encoded_headers } => {
+                    if !*headers_received {
+                        // Initial HEADERS frame
+                        let headers = self.qpack.lock().await.decode_headers(&encoded_headers)?;
+                        
+                        // Phase 3: Validate message semantics (RFC 9114 Section 4)
+                        Self::validate_message_headers_static(&headers)?;
+                        
+                        // Phase 3: Extract Content-Length for validation (RFC 9114 Section 4.1.2)
+                        *content_length = Self::extract_content_length_static(&headers)?;
+                        
+                        // Mark that we need to send Section Acknowledgment
+                        send_ack = true;
+                        
+                        *headers_received = true;
+                        // Parse request outside the borrow
+                        request_to_handle = Some((headers, send_stream.clone()));
+                    } else if !*trailers_received {
+                        // RFC 9114 Section 4.1: Trailing HEADERS frame (trailers)
+                        let trailer_headers = self.qpack.lock().await.decode_headers(&encoded_headers)?;
+                        
+                        // Phase 3: Validate Content-Length matches received bytes (RFC 9114 Section 4.1.2)
+                        if let Some(expected) = content_length {
+                            if *bytes_received != *expected {
+                                return Err(H3Error::MessageError);
+                            }
                         }
-                        H3Frame::Priority { priority } => {
-                            // Handle priority update
-                            self.handle_priority_frame(stream_id, priority).await?;
-                        }
-                        _ => {
-                            // Other frames on request stream - ignore for now
-                        }
+                        
+                        // Mark that we need to send Section Acknowledgment
+                        send_ack = true;
+                        
+                        *trailers_received = true;
+                        *trailers = Some(trailer_headers);
+                    } else {
+                        // Multiple trailer frames not allowed
+                        return Err(H3Error::FrameUnexpected);
                     }
                 }
-            } else {
-                // Try to parse different frame types
-                if let Ok((frame, _)) = H3Frame::parse(&data) {
-                    match frame {
-                        H3Frame::Data { data: body_data } => {
-                            body.push(body_data);
-                        }
-                        H3Frame::Priority { priority } => {
-                            // Handle priority update
-                            self.handle_priority_frame(stream_id, priority).await?;
-                        }
-                        _ => {
-                            // Other frames - ignore for now
+                H3Frame::Data { data: body_data } => {
+                    if !*headers_received {
+                        return Err(H3Error::Http("DATA before HEADERS".into()));
+                    }
+                    if *trailers_received {
+                        return Err(H3Error::Http("DATA after trailers".into()));
+                    }
+                    
+                    // Phase 3: Track received bytes (RFC 9114 Section 4.1.2)
+                    let frame_bytes = body_data.len() as u64;
+                    *bytes_received += frame_bytes;
+                    
+                    // Phase 3: Validate against Content-Length if present
+                    if let Some(expected) = content_length {
+                        if *bytes_received > *expected {
+                            return Err(H3Error::MessageError);
                         }
                     }
+                    
+                    body.push(body_data);
+                }
+                H3Frame::Priority { priority } => {
+                    // Handle priority update (can appear any time)
+                    self.handle_priority_frame(stream_id, priority).await?;
+                }
+                // RFC 9114: These frames MUST NOT appear on request streams
+                H3Frame::PushPromise { .. } => {
+                    return Err(H3Error::FrameUnexpected);
+                }
+                H3Frame::GoAway { .. } | H3Frame::MaxPushId { .. } | H3Frame::Settings { .. } => {
+                    return Err(H3Error::FrameUnexpected);
+                }
+                _ => {
+                    // Unknown/reserved frames - ignore per RFC 9114
                 }
             }
+        }
+        
+        // RFC 9204 Section 4.4.1: Send Section Acknowledgment after successful decode
+        if send_ack {
+            self.send_section_acknowledgment(stream_id).await?;
         }
 
         if let Some((headers, send_stream)) = request_to_handle {
@@ -438,12 +711,78 @@ impl<H: H3Handler> H3Session<H> {
         Ok(())
     }
 
+    /// Validates that a frame type is allowed on a given stream type.
+    /// RFC 9114 Section 7.2: Different frame types are permitted on different stream types.
+    fn validate_frame_on_stream(&self, frame: &H3Frame, stream_type: StreamType) -> Result<(), H3Error> {
+        match (frame, stream_type) {
+            // DATA and HEADERS only on request/push streams (RFC 9114 Section 7.2.1, 7.2.2)
+            (H3Frame::Data { .. }, StreamType::Request) => Ok(()),
+            (H3Frame::Data { .. }, StreamType::Push) => Ok(()),
+            (H3Frame::Headers { .. }, StreamType::Request) => Ok(()),
+            (H3Frame::Headers { .. }, StreamType::Push) => Ok(()),
+            (H3Frame::Data { .. }, _) => Err(H3Error::Connection(
+                "FRAME_UNEXPECTED: DATA frame not allowed on control stream".into()
+            )),
+            (H3Frame::Headers { .. }, _) => Err(H3Error::Connection(
+                "FRAME_UNEXPECTED: HEADERS frame not allowed on control stream".into()
+            )),
+            
+            // Control stream only frames (RFC 9114 Section 7.2.3-7.2.7)
+            (H3Frame::CancelPush { .. }, StreamType::Control) => Ok(()),
+            (H3Frame::Settings { .. }, StreamType::Control) => Ok(()),
+            (H3Frame::GoAway { .. }, StreamType::Control) => Ok(()),
+            (H3Frame::MaxPushId { .. }, StreamType::Control) => Ok(()),
+            (H3Frame::CancelPush { .. }, _) => Err(H3Error::Connection(
+                "FRAME_UNEXPECTED: CANCEL_PUSH only allowed on control stream".into()
+            )),
+            (H3Frame::Settings { .. }, _) => Err(H3Error::Connection(
+                "FRAME_UNEXPECTED: SETTINGS only allowed on control stream".into()
+            )),
+            (H3Frame::GoAway { .. }, _) => Err(H3Error::Connection(
+                "FRAME_UNEXPECTED: GOAWAY only allowed on control stream".into()
+            )),
+            (H3Frame::MaxPushId { .. }, _) => Err(H3Error::Connection(
+                "FRAME_UNEXPECTED: MAX_PUSH_ID only allowed on control stream".into()
+            )),
+            
+            // PUSH_PROMISE only on request streams (RFC 9114 Section 7.2.5)
+            (H3Frame::PushPromise { .. }, StreamType::Request) => Ok(()),
+            (H3Frame::PushPromise { .. }, _) => Err(H3Error::Connection(
+                "FRAME_UNEXPECTED: PUSH_PROMISE only allowed on request streams".into()
+            )),
+            
+            // PRIORITY can appear on request streams (RFC 9114 Section 7.2.3)
+            (H3Frame::Priority { .. }, StreamType::Request) => Ok(()),
+            
+            // Reserved and unknown frames can appear anywhere (RFC 9114 Section 7.2.8)
+            (H3Frame::Reserved { .. }, _) => Ok(()),
+            (H3Frame::DuplicatePush { .. }, _) => Ok(()), // Treated as reserved
+            
+            // Default: if not explicitly allowed, reject
+            _ => Err(H3Error::Connection(
+                format!("FRAME_UNEXPECTED: frame type not allowed on this stream type")
+            )),
+        }
+    }
+
     async fn process_control_frames(&mut self, data: Bytes) -> Result<(), H3Error> {
         // Parse control frames
         if let Ok((frame, _)) = H3Frame::parse(&data) {
+            // Validate frame is allowed on control stream
+            self.validate_frame_on_stream(&frame, StreamType::Control)?;
             // RFC 9114 Section 6.2.1: SETTINGS MUST be first frame on control stream
             match &frame {
                 H3Frame::Settings { settings } => {
+                    // RFC 9114 Section 7.2.4: "If an endpoint receives a second SETTINGS frame
+                    // on the control stream, the endpoint MUST respond with a connection error
+                    // of type H3_FRAME_UNEXPECTED"
+                    if self.peer_control_stream_received_settings {
+                        return Err(H3Error::Connection(
+                            "FRAME_UNEXPECTED: duplicate SETTINGS frame on control stream".into()
+                        ));
+                    }
+                    self.peer_control_stream_received_settings = true;
+                    
                     // Convert to HashMap for validator
                     let settings_map: HashMap<u64, u64> = settings.iter()
                         .map(|s| (s.identifier, s.value))
@@ -452,13 +791,18 @@ impl<H: H3Handler> H3Session<H> {
                     // Validate and process SETTINGS
                     self.settings_validator.validate_settings(settings_map.clone())?;
                     
-                    // Update QPACK codec with settings (requires Arc::get_mut)
-                    if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
-                        if let Some(&capacity) = settings_map.get(&0x1) {
-                            qpack.set_max_table_capacity(capacity as usize);
-                        }
-                        if let Some(&blocked) = settings_map.get(&0x7) {
-                            qpack.set_max_blocked_streams(blocked as usize);
+                    // Update QPACK codec with settings
+                    let mut qpack = self.qpack.lock().await;
+                    if let Some(&capacity) = settings_map.get(&0x1) {
+                        qpack.set_max_table_capacity(capacity as usize);
+                    }
+                    if let Some(&blocked) = settings_map.get(&0x7) {
+                        qpack.set_max_blocked_streams(blocked as usize);
+                    }
+                    // RFC 9114 Section 7.2.4.2: Enforce MAX_FIELD_SECTION_SIZE
+                    if let Some(&max_size) = settings_map.get(&0x6) {
+                        if max_size > 0 {
+                            qpack.set_max_field_section_size(Some(max_size as usize));
                         }
                     }
                 }
@@ -473,7 +817,13 @@ impl<H: H3Handler> H3Session<H> {
                     // Already processed above
                 }
                 H3Frame::MaxPushId { push_id } => {
-                    // Client is advertising maximum push ID it will accept
+                    // RFC 9114 Section 7.2.7: MAX_PUSH_ID MUST NOT decrease
+                    // "A MAX_PUSH_ID frame cannot reduce the maximum push ID; receipt of a
+                    // MAX_PUSH_ID frame that contains a smaller value than previously received
+                    // MUST be treated as a connection error of type H3_ID_ERROR"
+                    if push_id < self.max_push_id {
+                        return Err(H3Error::Connection("MAX_PUSH_ID cannot decrease".into()));
+                    }
                     self.max_push_id = push_id;
                     // Update push manager
                     if let Ok(mut manager) = self.push_manager.try_lock() {
@@ -484,9 +834,10 @@ impl<H: H3Handler> H3Session<H> {
                     // Client wants to cancel a push
                     self.cancel_push(push_id).await?;
                 }
-                H3Frame::GoAway { stream_id: _ } => {
-                    // Client is going away - stop processing new requests
-                    // TODO: Implement graceful shutdown
+                H3Frame::GoAway { stream_id } => {
+                    // RFC 9114 Section 5.2: Client is going away
+                    // "A server MUST NOT increase the stream ID indicated in a GOAWAY frame"
+                    self.handle_goaway_received(stream_id).await?;
                 }
                 _ => {
                     // Other control frames - ignore for now
@@ -526,13 +877,49 @@ impl<H: H3Handler> H3Session<H> {
         Ok(())
     }
 
+    /// RFC 9114 Section 4.1.1: Handle stream closure/reset
+    async fn handle_stream_closed(&mut self, stream_id: u64, app_initiated: bool, error_code: u64) -> Result<(), H3Error> {
+        // Clean up stream state
+        self.streams.remove(&stream_id);
+        self.stream_parsers.remove(&stream_id);
+        
+        // RFC 9204 Section 4.4.2: If stream is cancelled, send Stream Cancellation instruction
+        // to tell peer's encoder that it can release references to this stream
+        if !app_initiated && error_code != 0 {
+            // Peer reset the stream - notify via QPACK decoder stream
+            self.send_stream_cancellation(stream_id).await?;
+        }
+        
+        // Remove from blocked streams if present
+        self.blocked_streams.remove(&stream_id);
+        
+        Ok(())
+    }
+
+    /// Cancel a stream with an application error code
+    /// RFC 9114 Section 4.1.1: Applications can cancel streams via RESET_STREAM
+    pub async fn cancel_stream(&mut self, stream_id: u64, error_code: u64) -> Result<(), H3Error> {
+        // Clean up our stream state first
+        self.streams.remove(&stream_id);
+        self.blocked_streams.remove(&stream_id);
+        
+        // Send RESET_STREAM to peer (synchronous call, returns request_id)
+        let _request_id = self.handle.reset_stream(stream_id, error_code)
+            .map_err(|e| H3Error::Connection(format!("Failed to reset stream: {:?}", e)))?;
+        
+        // The StreamReset event will be delivered asynchronously
+        Ok(())
+    }
+
     async fn process_qpack_instructions(&mut self, stream_id: u64, data: Bytes) -> Result<(), H3Error> {
         let instructions = data.as_ref();
         let mut cursor = 0;
         
         while cursor < instructions.len() {
-            match self.qpack.decode_instruction(&instructions[cursor..]) {
+            let qpack = self.qpack.lock().await;
+            match qpack.decode_instruction(&instructions[cursor..]) {
                 Ok((instruction, consumed)) => {
+                    drop(qpack); // Release lock before handling
                     cursor += consumed;
                     self.handle_qpack_instruction(stream_id, instruction).await?;
                 }
@@ -548,61 +935,62 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     async fn handle_qpack_instruction(&mut self, _stream_id: u64, instruction: crate::qpack::QpackInstruction) -> Result<(), H3Error> {
+        let mut qpack = self.qpack.lock().await;
+        
         match instruction {
             crate::qpack::QpackInstruction::SetDynamicTableCapacity { capacity } => {
                 // Update dynamic table capacity
-                Arc::get_mut(&mut self.qpack)
-                    .ok_or_else(|| H3Error::Qpack("cannot modify shared QPACK codec".into()))?
-                    .set_max_table_capacity(capacity as usize);
+                qpack.set_max_table_capacity(capacity as usize);
             }
             crate::qpack::QpackInstruction::InsertWithNameReference { static_table, name_index, value } => {
                 // Insert entry into dynamic table
-                if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
-                    let name = if static_table {
-                        if let Some((name, _)) = qpack.get_static_entry(name_index as usize) {
-                            name.clone()
-                        } else {
-                            return Err(H3Error::Qpack("invalid static table index".into()));
-                        }
+                let name = if static_table {
+                    if let Some((name, _)) = qpack.get_static_entry(name_index as usize) {
+                        name.clone()
                     } else {
-                        if let Some((name, _)) = qpack.get_absolute(name_index as usize) {
-                            name.clone()
-                        } else {
-                            return Err(H3Error::Qpack("invalid dynamic table index".into()));
-                        }
-                    };
-                    
-                    qpack.insert(name, value);
-                }
+                        return Err(H3Error::Qpack("invalid static table index".into()));
+                    }
+                } else {
+                    if let Some((name, _)) = qpack.get_absolute(name_index as usize) {
+                        name.clone()
+                    } else {
+                        return Err(H3Error::Qpack("invalid dynamic table index".into()));
+                    }
+                };
+                
+                qpack.insert(name, value);
             }
             crate::qpack::QpackInstruction::InsertWithLiteralName { name, value } => {
                 // Insert entry into dynamic table
-                if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
-                    qpack.insert(name, value);
-                }
+                qpack.insert(name, value);
             }
             crate::qpack::QpackInstruction::Duplicate { index } => {
                 // Duplicate entry in dynamic table
-                if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
-                    qpack.duplicate(index as usize);
-                }
+                qpack.duplicate(index as usize);
             }
-            crate::qpack::QpackInstruction::SectionAcknowledgment { stream_id: _ } => {
-                // Acknowledge header section - for now, just update known received count
-                if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
-                    // TODO: proper section acknowledgment handling
-                    qpack.update_known_received_count(qpack.known_received_count() + 1);
-                }
+            crate::qpack::QpackInstruction::SectionAcknowledgment { stream_id: acked_stream_id } => {
+                // RFC 9204 Section 4.4.1: Section Acknowledgment
+                // Update known received count and unblock the stream
+                let count = qpack.known_received_count();
+                qpack.update_known_received_count(count + 1);
+                
+                // RFC 9204 Section 2.1.4: Unblock the stream
+                qpack.unblock_stream();
+                
+                // Remove from blocked streams
+                self.blocked_streams.remove(&acked_stream_id);
             }
-            crate::qpack::QpackInstruction::StreamCancellation { stream_id: _ } => {
-                // Cancel stream - for now, just log
-                // TODO: proper stream cancellation
+            crate::qpack::QpackInstruction::StreamCancellation { stream_id: cancelled_stream_id } => {
+                // RFC 9204 Section 4.4.2: Stream Cancellation
+                // Unblock the stream if it was blocked
+                if self.blocked_streams.remove(&cancelled_stream_id).is_some() {
+                    qpack.unblock_stream();
+                }
             }
             crate::qpack::QpackInstruction::InsertCountIncrement { increment } => {
                 // Update known received count
-                if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
-                    qpack.update_known_received_count(qpack.known_received_count() + increment as usize);
-                }
+                let count = qpack.known_received_count();
+                qpack.update_known_received_count(count + increment as usize);
             }
         }
         
@@ -612,28 +1000,46 @@ impl<H: H3Handler> H3Session<H> {
     /// Parse headers into HTTP request (public for testing)
     pub fn parse_request(&self, headers: Vec<(String, String)>) -> Result<H3Request, H3Error> {
         // Parse headers into HTTP request
-        // Simplified
         let mut method = None;
         let mut path = None;
         let mut scheme = None;
         let mut authority = None;
+        let mut protocol = None;
         let mut header_vec = Vec::new();
 
         for (name, value) in headers {
             match name.as_str() {
-                ":method" => method = Some(value.parse().map_err(|_| H3Error::Http("invalid method".into()))?),
+                ":method" => method = Some(value),
                 ":path" => {
                     path = Some(value);
                 }
                 ":scheme" => scheme = Some(value),
                 ":authority" => authority = Some(value),
+                ":protocol" => protocol = Some(value),
                 _ => {
                     header_vec.push((name, value));
                 }
             }
         }
 
-        let method = method.ok_or_else(|| H3Error::Http("missing :method".into()))?;
+        let method_str = method.ok_or_else(|| H3Error::Http("missing :method".into()))?;
+        
+        // RFC 9114 Section 4.4: CONNECT validation
+        if method_str.to_uppercase() == "CONNECT" {
+            let pseudo_headers = crate::validation::RequestPseudoHeaders {
+                method: method_str.clone(),
+                scheme: scheme.clone(),
+                authority: authority.clone(),
+                path: path.clone(),
+                protocol: protocol.clone(),
+            };
+            
+            // Check if extended CONNECT is enabled
+            let enable_connect_protocol = self.settings_validator.enable_connect_protocol();
+            validate_connect_request(&pseudo_headers, enable_connect_protocol)?;
+        }
+        
+        let method = method_str.parse().map_err(|_| H3Error::Http("invalid method".into()))?;
         let scheme = scheme.ok_or_else(|| H3Error::Http("missing :scheme".into()))?;
         let authority = authority.ok_or_else(|| H3Error::Http("missing :authority".into()))?;
         let path = path.unwrap_or_else(|| "/".to_string());
@@ -648,6 +1054,52 @@ impl<H: H3Handler> H3Session<H> {
             headers: header_vec,
             body: None,
         })
+    }
+
+    /// Phase 3: Validate message headers for HTTP/3 compliance (RFC 9114 Section 4)
+    fn validate_message_headers_static(headers: &[(String, String)]) -> Result<(), H3Error> {
+        let mut content_length_count = 0;
+        
+        for (name, value) in headers {
+            // RFC 9114 Section 4.1: Transfer-Encoding MUST NOT be present
+            if name == "transfer-encoding" {
+                return Err(H3Error::MessageError);
+            }
+            
+            // RFC 9114 Section 4.2: Connection-specific headers MUST NOT be present
+            if name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "upgrade" {
+                return Err(H3Error::MessageError);
+            }
+            
+            // RFC 9114 Section 4.2: TE header MUST only contain "trailers"
+            if name == "te" && value != "trailers" {
+                return Err(H3Error::MessageError);
+            }
+            
+            // Track Content-Length for duplicate detection (RFC 9110 Section 8.6)
+            if name == "content-length" {
+                content_length_count += 1;
+                if content_length_count > 1 {
+                    // Multiple Content-Length headers with same value is technically allowed
+                    // but we reject for simplicity and safety
+                    return Err(H3Error::MessageError);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Phase 3: Extract Content-Length value from headers (RFC 9114 Section 4.1.2)
+    fn extract_content_length_static(headers: &[(String, String)]) -> Result<Option<u64>, H3Error> {
+        for (name, value) in headers {
+            if name == "content-length" {
+                let length = value.parse::<u64>()
+                    .map_err(|_| H3Error::MessageError)?;
+                return Ok(Some(length));
+            }
+        }
+        Ok(None)
     }
 
     /// Read stream type from the first bytes of a unidirectional stream (RFC 9114 Section 6.2)
@@ -711,26 +1163,44 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     /// Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4.1)
-    async fn _send_section_acknowledgment(&mut self, stream_id: u64) -> Result<(), H3Error> {
-        // TODO: Open and track decoder stream to send acknowledgments
-        // For now, this is a placeholder
-        eprintln!("TODO: Send Section Acknowledgment for stream {}", stream_id);
+    async fn send_section_acknowledgment(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        if let Some(decoder_send) = &mut self.decoder_send_stream {
+            // Create Section Acknowledgment instruction
+            let instruction = crate::qpack::QpackInstruction::SectionAcknowledgment { stream_id };
+            let instruction_bytes = self.qpack.lock().await.encode_instruction(&instruction)?;
+            
+            // Send instruction on decoder stream
+            decoder_send.write(instruction_bytes, false).await
+                .map_err(|e| H3Error::Stream(format!("failed to send Section Acknowledgment: {:?}", e)))?;
+        }
         Ok(())
     }
 
     /// Send Stream Cancellation on decoder stream (RFC 9204 Section 4.4.2)
-    async fn _send_stream_cancellation(&mut self, stream_id: u64) -> Result<(), H3Error> {
-        // TODO: Open and track decoder stream to send cancellations
-        // For now, this is a placeholder
-        eprintln!("TODO: Send Stream Cancellation for stream {}", stream_id);
+    async fn send_stream_cancellation(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        if let Some(decoder_send) = &mut self.decoder_send_stream {
+            // Create Stream Cancellation instruction
+            let instruction = crate::qpack::QpackInstruction::StreamCancellation { stream_id };
+            let instruction_bytes = self.qpack.lock().await.encode_instruction(&instruction)?;
+            
+            // Send instruction on decoder stream
+            decoder_send.write(instruction_bytes, false).await
+                .map_err(|e| H3Error::Stream(format!("failed to send Stream Cancellation: {:?}", e)))?;
+        }
         Ok(())
     }
 
     /// Send Insert Count Increment on decoder stream (RFC 9204 Section 4.4.3)
-    async fn _send_insert_count_increment(&mut self, increment: u64) -> Result<(), H3Error> {
-        // TODO: Open and track decoder stream to send increments
-        // For now, this is a placeholder
-        eprintln!("TODO: Send Insert Count Increment: {}", increment);
+    async fn send_insert_count_increment(&mut self, increment: u64) -> Result<(), H3Error> {
+        if let Some(decoder_send) = &mut self.decoder_send_stream {
+            // Create Insert Count Increment instruction
+            let instruction = crate::qpack::QpackInstruction::InsertCountIncrement { increment };
+            let instruction_bytes = self.qpack.lock().await.encode_instruction(&instruction)?;
+            
+            // Send instruction on decoder stream
+            decoder_send.write(instruction_bytes, false).await
+                .map_err(|e| H3Error::Stream(format!("failed to send Insert Count Increment: {:?}", e)))?;
+        }
         Ok(())
     }
 
