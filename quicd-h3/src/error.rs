@@ -13,6 +13,16 @@ pub enum H3Error {
     Stream(String),
     #[error("connection error: {0}")]
     Connection(String),
+    #[error("settings error")]
+    SettingsError,
+    #[error("missing settings frame")]
+    MissingSettings,
+    #[error("frame unexpected")]
+    FrameUnexpected,
+    #[error("closed critical stream")]
+    ClosedCriticalStream,
+    #[error("message error")]
+    MessageError,
 }
 
 impl H3Error {
@@ -62,6 +72,11 @@ impl H3Error {
                     H3ErrorCode::GeneralProtocolError
                 }
             }
+            H3Error::SettingsError => H3ErrorCode::SettingsError,
+            H3Error::MissingSettings => H3ErrorCode::MissingSettings,
+            H3Error::FrameUnexpected => H3ErrorCode::FrameUnexpected,
+            H3Error::ClosedCriticalStream => H3ErrorCode::ClosedCriticalStream,
+            H3Error::MessageError => H3ErrorCode::MessageError,
         }
     }
 }

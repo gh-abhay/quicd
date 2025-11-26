@@ -11,6 +11,12 @@ use crate::error::H3Error;
 use crate::frames::{H3Frame, Setting};
 use crate::qpack::QpackCodec;
 use crate::session::{H3Handler, H3Request, H3ResponseSender};
+use crate::stream_state::{StreamFrameParser, StreamState as FrameStreamState};
+use crate::validation::{validate_request_headers, RequestPseudoHeaders};
+use crate::qpack_streams::QpackStreamManager;
+use crate::settings::{SettingsValidator, SettingsBuilder};
+use crate::connect::{ConnectTunnel, validate_connect_request};
+use crate::push::PushManager;
 
 /// Core HTTP/3 session implementation.
 ///
@@ -21,24 +27,21 @@ pub struct H3Session<H: H3Handler> {
     qpack: Arc<QpackCodec>,
     control_stream_id: Option<u64>,
     server_control_send: Option<quicd_x::SendStream>,
-    qpack_encoder_stream_id: Option<u64>,
-    qpack_decoder_stream_id: Option<u64>,
     streams: HashMap<u64, StreamState>,
     max_stream_id: u64,
     handler: Arc<H>,
-    client_settings_received: bool,
-    control_stream_first_frame_received: bool,
-    max_field_section_size: u64,
-    // QPACK settings
-    qpack_max_table_capacity: u64,
-    qpack_blocked_streams: u64,
+    push_manager: Arc<tokio::sync::Mutex<PushManager>>,
+    pending_control_stream_request: Option<u64>,
+    pending_push_streams: HashMap<u64, u64>, // request_id -> push_id
+    // New RFC-compliant components
+    settings_validator: SettingsValidator,
+    qpack_manager: QpackStreamManager,
+    stream_parsers: HashMap<u64, StreamFrameParser>,
+    connect_tunnels: HashMap<u64, ConnectTunnel>,
     // Server push state
     max_push_id: u64,
     _next_push_id: u64,
     _push_streams: HashMap<u64, PushStreamState>,
-    push_handler: Arc<tokio::sync::Mutex<crate::session::PushHandler>>,
-    // Pending control stream request
-    pending_control_stream_request: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -59,33 +62,29 @@ enum PushStreamState {
 
 impl<H: H3Handler> H3Session<H> {
     pub fn new(handle: ConnectionHandle, handler: H) -> Self {
-        // Create push handler for server push support
-        let push_handler = Arc::new(tokio::sync::Mutex::new(crate::session::PushHandler {
-            handle: handle.clone(),
-            next_push_id: 0,
-            max_push_id: 0,
-        }));
+        // Create push manager for server push support
+        let push_manager = Arc::new(tokio::sync::Mutex::new(PushManager::new()));
         
         Self {
             handle,
             qpack: Arc::new(QpackCodec::new()),
             control_stream_id: None,
             server_control_send: None,
-            qpack_encoder_stream_id: None,
-            qpack_decoder_stream_id: None,
             streams: HashMap::new(),
             max_stream_id: 0,
             handler: Arc::new(handler),
-            client_settings_received: false,
-            control_stream_first_frame_received: false,
-            max_field_section_size: 0, // 0 means no limit
-            qpack_max_table_capacity: 0, // 0 means no dynamic table
-            qpack_blocked_streams: 0, // 0 means no blocked streams allowed
-            max_push_id: 0, // 0 means no pushes allowed initially
+            push_manager,
+            pending_control_stream_request: None,
+            pending_push_streams: HashMap::new(),
+            // New RFC-compliant components
+            settings_validator: SettingsValidator::new(),
+            qpack_manager: QpackStreamManager::new(),
+            stream_parsers: HashMap::new(),
+            connect_tunnels: HashMap::new(),
+            // Server push state
+            max_push_id: 0,
             _next_push_id: 0,
             _push_streams: HashMap::new(),
-            pending_control_stream_request: None,
-            push_handler,
         }
     }
 
@@ -151,6 +150,30 @@ impl<H: H3Handler> H3Session<H> {
                     } else {
                         return Err(H3Error::Connection("failed to open server control stream".into()));
                     }
+                } else if self.pending_push_streams.contains_key(&request_id) {
+                    // This is a push stream
+                    if let Ok(send_stream) = result {
+                        let push_id = self.pending_push_streams.remove(&request_id).unwrap();
+                        
+                        // Write push stream type header (0x01) per RFC 9114 Section 6.2.2
+                        let stream_type = vec![0x01];
+                        send_stream.write(Bytes::from(stream_type), false).await
+                            .map_err(|e| H3Error::Stream(format!("failed to write stream type: {:?}", e)))?;
+                        
+                        // Write push ID as varint
+                        let push_id_bytes = self.encode_varint(push_id);
+                        send_stream.write(Bytes::from(push_id_bytes), false).await
+                            .map_err(|e| H3Error::Stream(format!("failed to write push ID: {:?}", e)))?;
+                        
+                        // Notify PushManager that stream opened
+                        if let Ok(mut manager) = self.push_manager.try_lock() {
+                            let stream_id = send_stream.stream_id;
+                            manager.handle_stream_opened(request_id, stream_id)?;
+                        }
+                        
+                        // TODO: Send the actual push response (status, headers, body)
+                        // This would require storing the response data in the PushPromise
+                    }
                 }
             }
             _ => {}
@@ -177,9 +200,12 @@ impl<H: H3Handler> H3Session<H> {
         send_stream: Option<quicd_x::SendStream>,
     ) -> Result<(), H3Error> {
         // RFC 9114 Section 6.1: Server MUST NOT process requests until client SETTINGS received
-        if !self.client_settings_received {
-            return Err(H3Error::Http("client SETTINGS not received".into()));
+        if !self.settings_validator.is_received() {
+            return Err(H3Error::MissingSettings);
         }
+        
+        // Initialize stream parser for this stream
+        self.stream_parsers.insert(stream_id, StreamFrameParser::new(stream_id));
         
         self.streams.insert(stream_id, StreamState::Request {
             headers_received: false,
@@ -233,23 +259,23 @@ impl<H: H3Handler> H3Session<H> {
             }
             0x02 => {
                 // QPACK encoder stream (RFC 9204 Section 4.2)
-                if self.qpack_encoder_stream_id.is_some() {
+                if self.qpack_manager.has_encoder_stream() {
                     return Err(H3Error::Connection(
                         "duplicate QPACK encoder stream".into()
                     ));
                 }
-                self.qpack_encoder_stream_id = Some(stream_id);
+                self.qpack_manager.set_encoder_stream(stream_id);
                 self.streams.insert(stream_id, StreamState::QpackEncoder);
                 self.process_qpack_stream(stream_id, recv_stream).await?;
             }
             0x03 => {
                 // QPACK decoder stream (RFC 9204 Section 4.2)
-                if self.qpack_decoder_stream_id.is_some() {
+                if self.qpack_manager.has_decoder_stream() {
                     return Err(H3Error::Connection(
                         "duplicate QPACK decoder stream".into()
                     ));
                 }
-                self.qpack_decoder_stream_id = Some(stream_id);
+                self.qpack_manager.set_decoder_stream(stream_id);
                 self.streams.insert(stream_id, StreamState::QpackDecoder);
                 self.process_qpack_stream(stream_id, recv_stream).await?;
             }
@@ -397,7 +423,9 @@ impl<H: H3Handler> H3Session<H> {
             let mut sender = H3ResponseSender {
                 send_stream,
                 qpack: self.qpack.clone(),
-                push_handler: Some(self.push_handler.clone()),
+                push_manager: Some(self.push_manager.clone()),
+                connection_handle: Some(self.handle.clone()),
+                stream_id,
             };
             self.handler.handle_request(request, &mut sender).await?;
         }
@@ -414,67 +442,42 @@ impl<H: H3Handler> H3Session<H> {
         // Parse control frames
         if let Ok((frame, _)) = H3Frame::parse(&data) {
             // RFC 9114 Section 6.2.1: SETTINGS MUST be first frame on control stream
-            if !self.control_stream_first_frame_received {
-                match &frame {
-                    H3Frame::Settings { .. } => {
-                        self.control_stream_first_frame_received = true;
+            match &frame {
+                H3Frame::Settings { settings } => {
+                    // Convert to HashMap for validator
+                    let settings_map: HashMap<u64, u64> = settings.iter()
+                        .map(|s| (s.identifier, s.value))
+                        .collect();
+                    
+                    // Validate and process SETTINGS
+                    self.settings_validator.validate_settings(settings_map.clone())?;
+                    
+                    // Update QPACK codec with settings (requires Arc::get_mut)
+                    if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
+                        if let Some(&capacity) = settings_map.get(&0x1) {
+                            qpack.set_max_table_capacity(capacity as usize);
+                        }
+                        if let Some(&blocked) = settings_map.get(&0x7) {
+                            qpack.set_max_blocked_streams(blocked as usize);
+                        }
                     }
-                    _ => {
-                        return Err(H3Error::Connection(format!(
-                            "H3_MISSING_SETTINGS: first frame on control stream was not SETTINGS, got {:?}",
-                            frame
-                        )));
-                    }
+                }
+                _ => {
+                    // Validate that SETTINGS was first frame
+                    self.settings_validator.validate_first_frame()?;
                 }
             }
             
             match frame {
-                H3Frame::Settings { settings } => {
-                    // RFC 9114 Section 7.2.4: Receipt of duplicate SETTINGS is an error
-                    if self.client_settings_received {
-                        return Err(H3Error::Connection(
-                            "H3_FRAME_UNEXPECTED: duplicate SETTINGS frame received".into()
-                        ));
-                    }
-                    
-                    // Process client SETTINGS frame
-                    self.client_settings_received = true;
-                    
-                    // Process settings
-                    for setting in settings {
-                        match setting.identifier {
-                            0x1 => {
-                                // SETTINGS_QPACK_MAX_TABLE_CAPACITY
-                                self.qpack_max_table_capacity = setting.value;
-                                // Update QPACK codec
-                                if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
-                                    qpack.set_max_table_capacity(setting.value as usize);
-                                }
-                            }
-                            0x6 => {
-                                // SETTINGS_MAX_FIELD_SECTION_SIZE
-                                self.max_field_section_size = setting.value;
-                            }
-                            0x7 => {
-                                // SETTINGS_QPACK_BLOCKED_STREAMS
-                                self.qpack_blocked_streams = setting.value;
-                                // Update QPACK codec
-                                if let Some(qpack) = Arc::get_mut(&mut self.qpack) {
-                                    qpack.set_max_blocked_streams(setting.value as usize);
-                                }
-                            }
-                            _ => {
-                                // Unknown setting, ignore as per RFC 9114 Section 7.2.4
-                            }
-                        }
-                    }
+                H3Frame::Settings { .. } => {
+                    // Already processed above
                 }
                 H3Frame::MaxPushId { push_id } => {
                     // Client is advertising maximum push ID it will accept
                     self.max_push_id = push_id;
-                    // Update push handler
-                    if let Ok(mut handler) = self.push_handler.try_lock() {
-                        handler.max_push_id = push_id;
+                    // Update push manager
+                    if let Ok(mut manager) = self.push_manager.try_lock() {
+                        manager.update_max_push_id(push_id);
                     }
                 }
                 H3Frame::CancelPush { push_id } => {
@@ -494,9 +497,9 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     async fn cancel_push(&mut self, push_id: u64) -> Result<(), H3Error> {
-        if let Some(push_state) = self._push_streams.get_mut(&push_id) {
-            *push_state = PushStreamState::Cancelled;
-            // TODO: Close the push stream if it's active
+        // Use PushManager to handle cancellation
+        if let Ok(mut manager) = self.push_manager.try_lock() {
+            manager.cancel_push(push_id)?;
         }
         Ok(())
     }
@@ -729,6 +732,43 @@ impl<H: H3Handler> H3Session<H> {
         // For now, this is a placeholder
         eprintln!("TODO: Send Insert Count Increment: {}", increment);
         Ok(())
+    }
+
+    /// Encode a value as a QUIC variable-length integer.
+    ///
+    /// Per RFC 9000 Section 16: Variable-length integers are encoded using
+    /// 1, 2, 4, or 8 bytes, with a 2-bit prefix indicating the length.
+    fn encode_varint(&self, value: u64) -> Vec<u8> {
+        if value < 64 {
+            // 1-byte encoding: 00xxxxxx
+            vec![value as u8]
+        } else if value < 16384 {
+            // 2-byte encoding: 01xxxxxx xxxxxxxx
+            vec![
+                (0x40 | (value >> 8)) as u8,
+                (value & 0xff) as u8,
+            ]
+        } else if value < 1073741824 {
+            // 4-byte encoding: 10xxxxxx xxxxxxxx xxxxxxxx xxxxxxxx
+            vec![
+                (0x80 | (value >> 24)) as u8,
+                ((value >> 16) & 0xff) as u8,
+                ((value >> 8) & 0xff) as u8,
+                (value & 0xff) as u8,
+            ]
+        } else {
+            // 8-byte encoding: 11xxxxxx ... (8 bytes total)
+            vec![
+                (0xc0 | (value >> 56)) as u8,
+                ((value >> 48) & 0xff) as u8,
+                ((value >> 40) & 0xff) as u8,
+                ((value >> 32) & 0xff) as u8,
+                ((value >> 24) & 0xff) as u8,
+                ((value >> 16) & 0xff) as u8,
+                ((value >> 8) & 0xff) as u8,
+                (value & 0xff) as u8,
+            ]
+        }
     }
 }
 
