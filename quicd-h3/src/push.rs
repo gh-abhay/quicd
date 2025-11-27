@@ -35,8 +35,6 @@ pub struct PushPromise {
     state: PushState,
     /// Stream ID of the push stream (once opened)
     push_stream_id: Option<u64>,
-    /// The request stream this push was promised on
-    promised_on_stream: u64,
     /// Promised request headers
     headers: Vec<(String, String)>,
     /// Response data to send when stream opens
@@ -45,12 +43,11 @@ pub struct PushPromise {
 
 impl PushPromise {
     /// Create a new push promise.
-    pub fn new(push_id: u64, promised_on_stream: u64, headers: Vec<(String, String)>) -> Self {
+    pub fn new(push_id: u64, headers: Vec<(String, String)>) -> Self {
         Self {
             push_id,
             state: PushState::Promised,
             push_stream_id: None,
-            promised_on_stream,
             headers,
             response: None,
         }
@@ -171,7 +168,6 @@ impl PushManager {
     pub fn register_promise(
         &mut self,
         push_id: u64,
-        stream_id: u64,
         headers: Vec<(String, String)>,
     ) -> Result<(), H3Error> {
         if self.promises.contains_key(&push_id) {
@@ -183,7 +179,7 @@ impl PushManager {
 
         self.promises.insert(
             push_id,
-            PushPromise::new(push_id, stream_id, headers),
+            PushPromise::new(push_id, headers),
         );
         Ok(())
     }
@@ -319,7 +315,7 @@ mod tests {
             (":path".to_string(), "/style.css".to_string()),
         ];
 
-        manager.register_promise(push_id, 4, headers).unwrap();
+        manager.register_promise(push_id, headers).unwrap();
 
         let promise = manager.get_promise(push_id).unwrap();
         assert_eq!(promise.state(), PushState::Promised);
@@ -339,7 +335,7 @@ mod tests {
             (":path".to_string(), "/style.css".to_string()),
         ];
 
-        manager.register_promise(push_id, 4, headers).unwrap();
+        manager.register_promise(push_id, headers).unwrap();
         manager.cancel_push(push_id).unwrap();
 
         let promise = manager.get_promise(push_id).unwrap();
@@ -360,7 +356,7 @@ mod tests {
             (":path".to_string(), "/style.css".to_string()),
         ];
 
-        manager.register_promise(push_id, 4, headers).unwrap();
+        manager.register_promise(push_id, headers).unwrap();
 
         // Simulate opening push stream
         let request_id = 1234;
@@ -415,10 +411,10 @@ mod tests {
             (":path".to_string(), "/style.css".to_string()),
         ];
 
-        manager.register_promise(push_id, 4, headers.clone()).unwrap();
+        manager.register_promise(push_id, headers.clone()).unwrap();
 
         // Duplicate should fail
-        assert!(manager.register_promise(push_id, 4, headers).is_err());
+        assert!(manager.register_promise(push_id, headers).is_err());
     }
 
     #[test]
@@ -437,9 +433,9 @@ mod tests {
             (":path".to_string(), "/style.css".to_string()),
         ];
 
-        manager.register_promise(push_id1, 4, headers.clone()).unwrap();
-        manager.register_promise(push_id2, 4, headers.clone()).unwrap();
-        manager.register_promise(push_id3, 4, headers).unwrap();
+        manager.register_promise(push_id1, headers.clone()).unwrap();
+        manager.register_promise(push_id2, headers.clone()).unwrap();
+        manager.register_promise(push_id3, headers).unwrap();
 
         manager.get_promise_mut(push_id1).unwrap().mark_completed();
         manager.get_promise_mut(push_id2).unwrap().mark_cancelled();

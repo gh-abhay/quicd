@@ -14,11 +14,3 @@ http = "0.2"
 
 [dev-dependencies]
 criterion = "0.5"
-
-[[bench]]
-name = "huffman_benchmark"
-harness = false
-
-[[bench]]
-name = "h3_benchmarks"
-harness = false

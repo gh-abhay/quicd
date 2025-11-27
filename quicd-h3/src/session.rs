@@ -102,7 +102,7 @@ impl H3ResponseSender {
         let push_id = manager.allocate_push_id()?;
         
         // Register the push promise
-        manager.register_promise(push_id, self.stream_id, headers.clone())?;
+        manager.register_promise(push_id, headers.clone())?;
         
         // Encode headers for PUSH_PROMISE frame
         let (encoded_headers, encoder_instructions, _referenced_entries) = {
