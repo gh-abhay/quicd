@@ -5,6 +5,7 @@
 //! frame parsing/encoding, and provides a clean API for applications to handle
 //! HTTP requests and send responses.
 
+pub mod config;
 pub mod error;
 pub mod frames;
 pub mod qpack;
@@ -17,6 +18,7 @@ pub mod connect;
 pub mod settings;
 pub mod push;
 
+pub use config::H3Config;
 pub use error::{H3Error, H3ErrorCode};
 pub use frames::H3Frame;
 pub use qpack::QpackCodec;
