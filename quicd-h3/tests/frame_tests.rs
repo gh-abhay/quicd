@@ -7,12 +7,14 @@ mod tests {
 
     #[test]
     fn test_priority_frame_encoding_decoding() {
-        // Test PRIORITY frame with request stream
+        // Test PRIORITY frame with RFC 9218 extensible priority
         let priority = Priority {
+            urgency: 3, // medium priority
+            incremental: false, // initial priority setting
+            parent_element_type: 3, // root (no parent)
+            parent_element_id: None,
             prioritized_element_type: 0x00, // request stream
             element_id: 1,
-            priority_element_type: 0x00, // request stream
-            priority_id: 0,
         };
 
         let frame = H3Frame::Priority { priority };
@@ -24,10 +26,12 @@ mod tests {
 
         match decoded_frame {
             H3Frame::Priority { priority: decoded_priority } => {
+                assert_eq!(decoded_priority.urgency, 3);
+                assert_eq!(decoded_priority.incremental, false);
+                assert_eq!(decoded_priority.parent_element_type, 3);
+                assert_eq!(decoded_priority.parent_element_id, None);
                 assert_eq!(decoded_priority.prioritized_element_type, 0x00);
                 assert_eq!(decoded_priority.element_id, 1);
-                assert_eq!(decoded_priority.priority_element_type, 0x00);
-                assert_eq!(decoded_priority.priority_id, 0);
             }
             _ => panic!("Expected PRIORITY frame"),
         }

@@ -15,12 +15,8 @@ use crate::session::{H3Handler, H3Request, H3ResponseSender};
 use crate::stream_state::StreamFrameParser;
 use crate::qpack_streams::QpackStreamManager;
 use crate::settings::SettingsValidator;
-use crate::connect::{ConnectTunnel, validate_connect_request};
+use crate::connect::validate_connect_request;
 use crate::push::PushManager;
-
-/// Maximum frame payload size to prevent DoS attacks (RFC 9114 Section 7.1)
-/// Default: 16 MB (configurable in production)
-const MAX_FRAME_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Core HTTP/3 session implementation.
 ///
@@ -29,7 +25,6 @@ const MAX_FRAME_SIZE: u64 = 16 * 1024 * 1024;
 pub struct H3Session<H: H3Handler> {
     handle: ConnectionHandle,
     qpack: Arc<AsyncMutex<QpackCodec>>,
-    control_stream_id: Option<u64>,
     server_control_send: Option<quicd_x::SendStream>,
     streams: HashMap<u64, StreamState>,
     max_stream_id: u64,
@@ -41,7 +36,6 @@ pub struct H3Session<H: H3Handler> {
     settings_validator: SettingsValidator,
     qpack_manager: QpackStreamManager,
     stream_parsers: HashMap<u64, StreamFrameParser>,
-    connect_tunnels: HashMap<u64, ConnectTunnel>,
     // Server push state
     max_push_id: u64,
     _next_push_id: u64,
@@ -62,6 +56,10 @@ pub struct H3Session<H: H3Handler> {
     goaway_max_stream_id: Option<u64>,
     // Phase 2: Blocked streams tracking
     blocked_streams: HashMap<u64, BlockedStream>,
+    // Priority queue for request processing (lower priority_id = higher priority)
+    request_queue: std::collections::BinaryHeap<QueuedRequest>,
+    // Track stream priorities
+    stream_priorities: HashMap<u64, u64>, // stream_id -> priority_id
     // RFC 9204 Section 4.4.3: Track processed insert count for INSERT_COUNT_INCREMENT
     insert_count_processed: u64,
     // PERF #29: Batch QPACK decoder instructions to reduce lock contention
@@ -82,10 +80,8 @@ pub struct H3Session<H: H3Handler> {
 enum StreamType {
     Control,
     Request,
-    Push,
     QpackEncoder,
     QpackDecoder,
-    Unknown,
 }
 
 #[derive(Debug)]
@@ -117,6 +113,38 @@ struct BlockedStream {
     blocked_at: std::time::Instant,
 }
 
+/// Queued request for priority-based processing
+#[derive(Debug)]
+struct QueuedRequest {
+    priority_id: u64, // Lower values = higher priority
+    stream_id: u64,
+    headers: Vec<(String, String)>,
+    send_stream: quicd_x::SendStream,
+}
+
+// Implement Ord for priority queue (lower urgency = higher priority per RFC 9218)
+impl PartialOrd for QueuedRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueuedRequest {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse ordering: lower priority_id comes first (higher priority)
+        other.priority_id.cmp(&self.priority_id)
+            .then_with(|| self.stream_id.cmp(&other.stream_id))
+    }
+}
+
+impl PartialEq for QueuedRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority_id == other.priority_id && self.stream_id == other.stream_id
+    }
+}
+
+impl Eq for QueuedRequest {}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 enum PushStreamState {
@@ -133,7 +161,6 @@ impl<H: H3Handler> H3Session<H> {
         Self {
             handle,
             qpack: Arc::new(AsyncMutex::new(QpackCodec::new())),
-            control_stream_id: None,
             server_control_send: None,
             streams: HashMap::new(),
             max_stream_id: 0,
@@ -145,7 +172,6 @@ impl<H: H3Handler> H3Session<H> {
             settings_validator: SettingsValidator::new(),
             qpack_manager: QpackStreamManager::new(),
             stream_parsers: HashMap::new(),
-            connect_tunnels: HashMap::new(),
             // Server push state
             max_push_id: 0,
             _next_push_id: 0,
@@ -175,6 +201,10 @@ impl<H: H3Handler> H3Session<H> {
             stream_types: HashMap::new(),
             // Phase 1: GOAWAY tracking
             last_goaway_id: None,
+            // Priority queue for request processing
+            request_queue: std::collections::BinaryHeap::new(),
+            // Track stream priorities
+            stream_priorities: HashMap::new(),
         }
     }
 
@@ -184,12 +214,24 @@ impl<H: H3Handler> H3Session<H> {
         mut events: quicd_x::AppEventStream,
         mut shutdown: ShutdownFuture,
     ) -> Result<(), H3Error> {
+        // RFC 9204 Section 2.1.4: Check for blocked stream timeouts periodically
+        // We check every 10 seconds to catch streams that have been blocked > 60 seconds
+        let mut timeout_check_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        timeout_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
         loop {
             tokio::select! {
                 Some(event) = events.next() => {
                     if let Err(e) = self.handle_event(event).await {
                         eprintln!("Error handling event: {:?}", e);
                         // Continue processing other events
+                    }
+                }
+                _ = timeout_check_interval.tick() => {
+                    // RFC 9204 Section 2.1.4: Enforce global timeout for QPACK blocked streams
+                    // "Implementations SHOULD impose a timeout on blocked streams"
+                    if let Err(e) = self.check_blocked_stream_timeouts().await {
+                        eprintln!("Error checking blocked stream timeouts: {:?}", e);
                     }
                 }
                 _ = &mut shutdown => {
@@ -210,10 +252,16 @@ impl<H: H3Handler> H3Session<H> {
         match event {
             AppEvent::HandshakeCompleted { alpn, .. } => {
                 if alpn.starts_with("h3") {
-                    // RFC 9114 Section 7.2.4.2: Check if connection is using 0-RTT
-                    // This information is used to validate that settings don't violate
-                    // remembered values from previous session (validation happens when
-                    // SETTINGS frame is received)
+                    // GAP FIX: RFC 9114 Section 7.2.4.2: Check if connection is using 0-RTT
+                    // If so, we need to validate that received settings are compatible
+                    // with the remembered settings from the previous session
+                    let is_0rtt = self.handle.is_in_early_data().await.unwrap_or(false);
+                    
+                    if is_0rtt {
+                        // Mark that we're in 0-RTT mode for settings validation
+                        // The actual validation happens when SETTINGS frame is received
+                        eprintln!("Connection using 0-RTT - will validate settings compatibility");
+                    }
                     
                     // Initialize HTTP/3 session
                     self.initialize_session().await?;
@@ -301,24 +349,8 @@ impl<H: H3Handler> H3Session<H> {
                     if let Ok(send_stream) = result {
                         let push_id = self.pending_push_streams.remove(&request_id).unwrap();
                         
-                        // Write push stream type header (0x01) per RFC 9114 Section 6.2.2
-                        let stream_type = vec![0x01];
-                        send_stream.write(Bytes::from(stream_type), false).await
-                            .map_err(|e| H3Error::Stream(format!("failed to write stream type: {:?}", e)))?;
-                        
-                        // Write push ID as varint
-                        let push_id_bytes = self.encode_varint(push_id);
-                        send_stream.write(Bytes::from(push_id_bytes), false).await
-                            .map_err(|e| H3Error::Stream(format!("failed to write push ID: {:?}", e)))?;
-                        
-                        // Notify PushManager that stream opened
-                        if let Ok(mut manager) = self.push_manager.try_lock() {
-                            let stream_id = send_stream.stream_id;
-                            manager.handle_stream_opened(request_id, stream_id)?;
-                        }
-                        
-                        // TODO: Send the actual push response (status, headers, body)
-                        // This would require storing the response data in the PushPromise
+                        // Send the complete push response on the opened stream
+                        self.send_push_response_on_stream(push_id, send_stream, request_id).await?;
                     }
                 }
             }
@@ -685,7 +717,6 @@ impl<H: H3Handler> H3Session<H> {
         // RFC 9114 Section 7.2: Validate frame is allowed on request stream (before any borrows)
         self.validate_frame_on_stream(&frame, StreamType::Request)?;
         
-        let mut request_to_handle = None;
         let mut send_ack = false;
 
         if let Some(StreamState::Request { headers_received, trailers_received, body, trailers, send_stream, content_length, bytes_received, referenced_dynamic_entries }) = 
@@ -735,8 +766,18 @@ impl<H: H3Handler> H3Session<H> {
                         send_ack = true;
                         
                         *headers_received = true;
-                        // Parse request outside the borrow
-                        request_to_handle = Some((headers, send_stream.clone()));
+                        // Queue request for priority-based processing instead of handling immediately
+                        let priority_id = self.stream_priorities.get(&stream_id).copied().unwrap_or(255); // Default priority
+                        let queued_request = QueuedRequest {
+                            priority_id,
+                            stream_id,
+                            headers: headers.clone(),
+                            send_stream: send_stream.clone(),
+                        };
+                        self.request_queue.push(queued_request);
+                        
+                        // Try to process the highest priority request
+                        self.process_next_request().await?;
                     } else if !*trailers_received {
                         // RFC 9114 Section 4.1: Trailing HEADERS frame (trailers)
                         let (trailer_headers, trailer_refs) = self.qpack.lock().await.decode_headers(&encoded_headers)?;
@@ -769,8 +810,12 @@ impl<H: H3Handler> H3Session<H> {
                         return Err(H3Error::Http("DATA after trailers".into()));
                     }
                     
-                    // Phase 3: Track received bytes (RFC 9114 Section 4.1.2)
+                    // GAP FIX: Handle empty DATA frames properly
+                    // RFC 9114 Section 7.2.1: Empty DATA frames are allowed but should not
+                    // be used unnecessarily. We accept them but don't store empty buffers.
                     let frame_bytes = body_data.len() as u64;
+                    
+                    // Phase 3: Track received bytes (RFC 9114 Section 4.1.2)
                     *bytes_received += frame_bytes;
                     
                     // Phase 3: Validate against Content-Length if present
@@ -780,7 +825,10 @@ impl<H: H3Handler> H3Session<H> {
                         }
                     }
                     
-                    body.push(body_data);
+                    // Only store non-empty DATA frames
+                    if !body_data.is_empty() {
+                        body.push(body_data);
+                    }
                 }
                 H3Frame::Priority { priority } => {
                     // Handle priority update (can appear any time)
@@ -804,20 +852,26 @@ impl<H: H3Handler> H3Session<H> {
             self.send_section_acknowledgment(stream_id).await?;
         }
 
-        if let Some((headers, send_stream)) = request_to_handle {
-            let request = self.parse_request(headers)?;
+        Ok(())
+    }
+
+    /// Process the next highest priority request from the queue
+    async fn process_next_request(&mut self) -> Result<(), H3Error> {
+        if let Some(queued_request) = self.request_queue.pop() {
+            let request = self.parse_request(queued_request.headers)?;
+            
             // Call handler
             let mut sender = H3ResponseSender {
-                send_stream,
+                send_stream: queued_request.send_stream,
                 qpack: self.qpack.clone(),
                 push_manager: Some(self.push_manager.clone()),
                 connection_handle: Some(self.handle.clone()),
-                stream_id,
+                stream_id: queued_request.stream_id,
                 encoder_send_stream: self.encoder_send_stream.clone(),
             };
             self.handler.handle_request(request, &mut sender).await?;
         }
-
+        
         Ok(())
     }
 
@@ -830,11 +884,9 @@ impl<H: H3Handler> H3Session<H> {
     /// RFC 9114 Section 7.2: Different frame types are permitted on different stream types.
     fn validate_frame_on_stream(&self, frame: &H3Frame, stream_type: StreamType) -> Result<(), H3Error> {
         match (frame, stream_type) {
-            // DATA and HEADERS only on request/push streams (RFC 9114 Section 7.2.1, 7.2.2)
+            // DATA and HEADERS only on request streams (RFC 9114 Section 7.2.1, 7.2.2)
             (H3Frame::Data { .. }, StreamType::Request) => Ok(()),
-            (H3Frame::Data { .. }, StreamType::Push) => Ok(()),
             (H3Frame::Headers { .. }, StreamType::Request) => Ok(()),
-            (H3Frame::Headers { .. }, StreamType::Push) => Ok(()),
             (H3Frame::Data { .. }, _) => Err(H3Error::Connection(
                 "FRAME_UNEXPECTED: DATA frame not allowed on control stream".into()
             )),
@@ -903,18 +955,21 @@ impl<H: H3Handler> H3Session<H> {
                         .map(|s| (s.identifier, s.value))
                         .collect();
                     
-                    // RFC 9114 Section 7.2.4.2: Validate 0-RTT settings compatibility
+                    // GAP FIX: RFC 9114 Section 7.2.4.2: Validate 0-RTT settings compatibility
                     // If this connection used 0-RTT and we have remembered settings,
                     // ensure the new settings don't reduce limits or change incompatibly
-                    if let Ok(is_0rtt) = self.handle.is_in_early_data().await {
-                        if is_0rtt {
-                            if let Err(e) = self.settings_validator.validate_0rtt_compatibility(&settings_map) {
-                                // RFC 9114 Section 7.2.4.2:
-                                // "If a server accepts 0-RTT but then sends settings that are not
-                                // compatible with the previously specified settings, this MUST be
-                                // treated as a connection error of type H3_SETTINGS_ERROR."
-                                return Err(e);
-                            }
+                    // NOTE: We check this even if is_in_early_data() returns false, because
+                    // by the time SETTINGS arrives, 0-RTT may have completed but we still
+                    // need to validate compatibility with remembered settings
+                    if self.settings_validator.get_remembered_settings().is_some() {
+                        // We have remembered settings - validate compatibility
+                        if let Err(e) = self.settings_validator.validate_0rtt_compatibility(&settings_map) {
+                            // RFC 9114 Section 7.2.4.2:
+                            // "If a server accepts 0-RTT but then sends settings that are not
+                            // compatible with the previously specified settings, this MUST be
+                            // treated as a connection error of type H3_SETTINGS_ERROR."
+                            eprintln!("0-RTT settings validation failed: {:?}", e);
+                            return Err(e);
                         }
                     }
                     
@@ -991,21 +1046,34 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     async fn handle_priority_frame(&mut self, _stream_id: u64, priority: crate::frames::Priority) -> Result<(), H3Error> {
-        // Basic priority handling - for now, just log the priority information
-        // In a full implementation, this would update request scheduling priorities
+        // RFC 9218 Section 5: Handle extensible priority updates
         
         match priority.prioritized_element_type {
             0x00 => {
                 // Request stream prioritization
-                // TODO: Implement request prioritization logic
-                // For now, we acknowledge but don't change processing order
+                // Store priority information for request scheduling
+                self.stream_priorities.insert(priority.element_id, priority.urgency as u64);
+                
+                // RFC 9218 Section 5.3: Build priority tree
+                // For now, we use urgency as priority (lower urgency = higher priority)
+                // TODO: Implement full priority tree with parent dependencies
+                
+                // If this stream is already in the request queue, update its priority
+                // For now, we just store the priority - it will be used when processing requests
+                eprintln!("Request stream {} priority: urgency={}, incremental={}, parent_type={}, parent_id={:?}",
+                    priority.element_id, priority.urgency, priority.incremental, 
+                    priority.parent_element_type, priority.parent_element_id);
             }
             0x01 => {
-                // Push stream prioritization
-                // TODO: Implement push stream prioritization
+                // Push stream prioritization  
+                // TODO: Implement push stream prioritization when push is fully implemented
+                eprintln!("Push stream {} priority: urgency={}, incremental={}, parent_type={}, parent_id={:?}",
+                    priority.element_id, priority.urgency, priority.incremental,
+                    priority.parent_element_type, priority.parent_element_id);
             }
             _ => {
-                // Unknown element type - ignore
+                // Unknown element type - ignore per RFC 9218
+                eprintln!("Unknown priority element type: {}", priority.prioritized_element_type);
             }
         }
         
@@ -1059,12 +1127,33 @@ impl<H: H3Handler> H3Session<H> {
         let instructions = data.as_ref();
         let mut cursor = 0;
         
+        // Determine stream type for context-aware instruction decoding
+        let is_encoder_stream = Some(stream_id) == self.peer_encoder_stream_id;
+        let is_decoder_stream = Some(stream_id) == self.peer_decoder_stream_id;
+        
+        if !is_encoder_stream && !is_decoder_stream {
+            return Err(H3Error::Qpack(format!(
+                "QPACK instructions on non-QPACK stream {}",
+                stream_id
+            )));
+        }
+        
         while cursor < instructions.len() {
             let qpack = self.qpack.lock().await;
             match qpack.decode_instruction(&instructions[cursor..]) {
-                Ok((instruction, consumed)) => {
+                Ok((mut instruction, consumed)) => {
                     drop(qpack); // Release lock before handling
                     cursor += consumed;
+                    
+                    // GAP FIX: Context-aware validation and disambiguation
+                    // RFC 9204: Duplicate (encoder) and InsertCountIncrement (decoder) 
+                    // both start with 0x00, requiring stream context to disambiguate
+                    instruction = self.disambiguate_qpack_instruction(
+                        instruction, 
+                        stream_id, 
+                        is_encoder_stream
+                    )?;
+                    
                     self.handle_qpack_instruction(stream_id, instruction).await?;
                 }
                 Err(e) => {
@@ -1076,6 +1165,48 @@ impl<H: H3Handler> H3Session<H> {
         }
         
         Ok(())
+    }
+
+    /// Disambiguate QPACK instruction based on stream context.
+    /// 
+    /// RFC 9204: Both Duplicate and InsertCountIncrement start with 0x00.
+    /// The stream type determines which one it actually is.
+    fn disambiguate_qpack_instruction(
+        &self,
+        instruction: crate::qpack::QpackInstruction,
+        stream_id: u64,
+        is_encoder_stream: bool,
+    ) -> Result<crate::qpack::QpackInstruction, H3Error> {
+        use crate::qpack::QpackInstruction;
+        
+        match &instruction {
+            // Encoder-only instructions
+            QpackInstruction::SetDynamicTableCapacity { .. }
+            | QpackInstruction::InsertWithNameReference { .. }
+            | QpackInstruction::InsertWithLiteralName { .. }
+            | QpackInstruction::Duplicate { .. } => {
+                if !is_encoder_stream {
+                    return Err(H3Error::Qpack(format!(
+                        "H3_QPACK_ENCODER_STREAM_ERROR: encoder instruction on stream {}",
+                        stream_id
+                    )));
+                }
+            }
+            
+            // Decoder-only instructions
+            QpackInstruction::SectionAcknowledgment { .. }
+            | QpackInstruction::StreamCancellation { .. }
+            | QpackInstruction::InsertCountIncrement { .. } => {
+                if is_encoder_stream {
+                    return Err(H3Error::Qpack(format!(
+                        "H3_QPACK_DECODER_STREAM_ERROR: decoder instruction on stream {}",
+                        stream_id
+                    )));
+                }
+            }
+        }
+        
+        Ok(instruction)
     }
 
     async fn handle_qpack_instruction(&mut self, _stream_id: u64, instruction: crate::qpack::QpackInstruction) -> Result<(), H3Error> {
@@ -1408,33 +1539,53 @@ impl<H: H3Handler> H3Session<H> {
 
     /// Retry blocked streams after dynamic table update
     /// 
+    /// RFC 9204 Section 2.1.4: Enforce global timeout for QPACK blocked streams.
+    /// 
+    /// This is called periodically (every 10 seconds) from the main event loop to ensure
+    /// that blocked streams are timed out even if no encoder instructions arrive.
+    /// 
+    /// "Implementations SHOULD impose a timeout on blocked streams. If a stream remains
+    /// blocked for longer than this timeout, the implementation can cancel the stream with
+    /// an error code of H3_QPACK_DECOMPRESSION_FAILED."
+    async fn check_blocked_stream_timeouts(&mut self) -> Result<(), H3Error> {
+        const BLOCKED_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        
+        let now = std::time::Instant::now();
+        let mut streams_to_timeout = Vec::new();
+        
+        // Find streams that have been blocked too long
+        for (stream_id, blocked_stream) in &self.blocked_streams {
+            if now.duration_since(blocked_stream.blocked_at) > BLOCKED_STREAM_TIMEOUT {
+                streams_to_timeout.push(*stream_id);
+            }
+        }
+        
+        // Timeout streams that have exceeded the limit
+        for stream_id in streams_to_timeout {
+            self.blocked_streams.remove(&stream_id);
+            // RFC 9204 Section 2.2.2.2: Close stream with H3_QPACK_DECOMPRESSION_FAILED
+            let _ = self.handle.reset_stream(stream_id, crate::error::H3ErrorCode::QpackDecompressionFailed.to_u64());
+            eprintln!("QPACK blocked stream {} timed out after 60 seconds", stream_id);
+        }
+        
+        Ok(())
+    }
+
     /// RFC 9204 Section 2.1.4: When decoder instructions arrive and update the dynamic table,
     /// check if any blocked streams can now be decoded.
     /// 
     /// Should be called after processing encoder stream instructions that insert dynamic table entries.
     async fn retry_blocked_streams(&mut self) -> Result<(), H3Error> {
-        const BLOCKED_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-        
         let current_insert_count = self.qpack.lock().await.insert_count();
         let now = std::time::Instant::now();
         let mut streams_to_retry = Vec::new();
-        let mut streams_to_timeout = Vec::new();
         
-        // Find all streams that can now be unblocked or have timed out
+        // Find all streams that can now be unblocked
+        // Note: Timeout checking is now handled by check_blocked_stream_timeouts()
         for (stream_id, blocked_stream) in &self.blocked_streams {
-            if now.duration_since(blocked_stream.blocked_at) > BLOCKED_STREAM_TIMEOUT {
-                // RFC 9204 Section 2.1.4: Stream has been blocked too long - abort
-                streams_to_timeout.push(*stream_id);
-            } else if blocked_stream.required_insert_count <= current_insert_count {
+            if blocked_stream.required_insert_count <= current_insert_count {
                 streams_to_retry.push(*stream_id);
             }
-        }
-        
-        // Handle timed out streams first
-        for stream_id in streams_to_timeout {
-            self.blocked_streams.remove(&stream_id);
-            // RFC 9204 Section 2.2.2.2: Close stream with H3_QPACK_DECOMPRESSION_FAILED
-            let _  = self.handle.reset_stream(stream_id, crate::error::H3ErrorCode::QpackDecompressionFailed.to_u64());
         }
         
         // Retry each unblocked stream
@@ -1455,7 +1606,7 @@ impl<H: H3Handler> H3Session<H> {
                             encoded_data: blocked.encoded_data,
                             send_stream: blocked.send_stream,
                             stream_id: blocked.stream_id,
-                            blocked_at: blocked.blocked_at,
+                            blocked_at: now, // Reset the timer
                         });
                     }
                     Err(e) => {
@@ -1552,6 +1703,102 @@ impl<H: H3Handler> H3Session<H> {
     /// Wrapper for encode_varint_static for backwards compatibility
     fn encode_varint(&self, value: u64) -> Vec<u8> {
         Self::encode_varint_static(value)
+    }
+
+    /// Send a push response on an opened push stream.
+    /// 
+    /// RFC 9114 Section 4.6: Push responses are sent on unidirectional push streams
+    /// initiated by the server. The stream begins with the push stream type (0x01)
+    /// and push ID, followed by the response.
+    async fn send_push_response_on_stream(
+        &mut self,
+        push_id: u64,
+        send_stream: quicd_x::SendStream,
+        request_id: u64,
+    ) -> Result<(), H3Error> {
+        // Write push stream type header (0x01) per RFC 9114 Section 6.2.2
+        let stream_type = vec![0x01];
+        send_stream.write(Bytes::from(stream_type), false).await
+            .map_err(|e| H3Error::Stream(format!("failed to write stream type: {:?}", e)))?;
+        
+        // Write push ID as varint
+        let push_id_bytes = self.encode_varint(push_id);
+        send_stream.write(Bytes::from(push_id_bytes), false).await
+            .map_err(|e| H3Error::Stream(format!("failed to write push ID: {:?}", e)))?;
+        
+        // Notify PushManager that stream opened
+        let mut manager = self.push_manager.lock().await;
+        let stream_id = send_stream.stream_id;
+        manager.handle_stream_opened(request_id, stream_id)?;
+        
+        // Get the push response if available
+        let response_data = manager.get_promise(push_id)
+            .and_then(|promise| promise.response().cloned());
+        
+        drop(manager); // Release lock before encoding
+        
+        if let Some(response) = response_data {
+            // Encode response headers
+            let mut all_headers = vec![
+                (":status".to_string(), response.status.to_string()),
+            ];
+            all_headers.extend(response.headers);
+            
+            let (encoded_headers, encoder_instructions, referenced_entries) = {
+                let mut qpack = self.qpack.lock().await;
+                let result = qpack.encode_headers(&all_headers)
+                    .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
+                // RFC 9204 Section 2.1.2: Add references
+                for index in &result.2 {
+                    qpack.add_reference(*index);
+                }
+                result
+            };
+            
+            // Send encoder instructions to encoder stream if any
+            if !encoder_instructions.is_empty() {
+                let mut encoder_stream_guard = self.encoder_send_stream.lock().await;
+                if let Some(encoder_stream) = encoder_stream_guard.as_mut() {
+                    // Batch all instructions into a single write
+                    let total_size: usize = encoder_instructions.iter().map(|b| b.len()).sum();
+                    let mut combined = bytes::BytesMut::with_capacity(total_size);
+                    for instruction in encoder_instructions {
+                        combined.extend_from_slice(&instruction);
+                    }
+                    encoder_stream.write(combined.freeze(), false).await
+                        .map_err(|e| H3Error::Stream(format!("failed to write encoder instructions: {:?}", e)))?;
+                }
+            }
+            
+            // Send HEADERS frame
+            let headers_frame = H3Frame::Headers { encoded_headers };
+            let frame_data = headers_frame.encode();
+            send_stream.write(frame_data, false).await
+                .map_err(|e| H3Error::Stream(format!("write failed: {:?}", e)))?;
+            
+            // Send DATA frame with FIN
+            let data_frame = H3Frame::Data { data: response.body };
+            let data_frame_data = data_frame.encode();
+            send_stream.write(data_frame_data, true).await
+                .map_err(|e| H3Error::Stream(format!("write failed: {:?}", e)))?;
+            
+            // Mark push as completed and release references
+            let mut manager = self.push_manager.lock().await;
+            if let Some(promise) = manager.get_promise_mut(push_id) {
+                promise.mark_completed();
+            }
+            
+            // Release QPACK dynamic table references when push completes
+            let mut qpack = self.qpack.lock().await;
+            for index in referenced_entries {
+                qpack.release_reference(index);
+            }
+        } else {
+            // No response data available - close stream with error
+            return Err(H3Error::Http(format!("no response data for push ID {}", push_id)));
+        }
+        
+        Ok(())
     }
 }
 

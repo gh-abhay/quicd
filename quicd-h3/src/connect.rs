@@ -216,6 +216,110 @@ impl ConnectTunnel {
     }
 }
 
+/// Bidirectional TCP<->QUIC forwarding for CONNECT tunnels.
+///
+/// RFC 9114 Section 4.4: "The payload of any DATA frame sent by the client
+/// is transmitted by the proxy to the TCP server; data received from the TCP
+/// server is packaged into DATA frames by the proxy."
+///
+/// This function spawns tasks to forward data in both directions and handles
+/// FIN propagation correctly.
+pub async fn forward_connect_tunnel(
+    mut tcp_stream: TcpStream,
+    mut h3_recv_stream: quicd_x::RecvStream,
+    h3_send_stream: quicd_x::SendStream,
+) -> Result<(), H3Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use crate::frames::H3Frame;
+    
+    // Split TCP stream for simultaneous read/write
+    let (mut tcp_read, mut tcp_write) = tcp_stream.split();
+    
+    // Task 1: Forward QUIC -> TCP (client to server)
+    let quic_to_tcp = async move {
+        loop {
+            match h3_recv_stream.read().await {
+                Ok(Some(quicd_x::StreamData::Data(data))) => {
+                    // Parse DATA frames from QUIC stream
+                    let mut cursor = 0;
+                    while cursor < data.len() {
+                        match H3Frame::parse(&data[cursor..]) {
+                            Ok((H3Frame::Data { data: payload }, consumed)) => {
+                                cursor += consumed;
+                                // Write payload to TCP
+                                if let Err(e) = tcp_write.write_all(&payload).await {
+                                    return Err(H3Error::ConnectError(
+                                        format!("TCP write failed: {}", e)
+                                    ));
+                                }
+                            }
+                            Ok((_, consumed)) => {
+                                // Non-DATA frame - skip (should be validated elsewhere)
+                                cursor += consumed;
+                            }
+                            Err(e) => {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                Ok(Some(quicd_x::StreamData::Fin)) => {
+                    // Client sent FIN - close TCP write side
+                    let _ = tcp_write.shutdown().await;
+                    break;
+                }
+                Ok(None) => {
+                    // Stream closed
+                    break;
+                }
+                Err(e) => {
+                    return Err(H3Error::Stream(format!("QUIC read failed: {:?}", e)));
+                }
+            }
+        }
+        Ok(())
+    };
+    
+    // Task 2: Forward TCP -> QUIC (server to client)
+    let tcp_to_quic = async move {
+        let mut buffer = vec![0u8; 16384]; // 16KB buffer for TCP reads
+        
+        loop {
+            match tcp_read.read(&mut buffer).await {
+                Ok(0) => {
+                    // TCP FIN received - send FIN on QUIC stream
+                    if let Err(e) = h3_send_stream.write(Bytes::new(), true).await {
+                        return Err(H3Error::Stream(format!("QUIC FIN write failed: {:?}", e)));
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    // Wrap in DATA frame and send
+                    let data_frame = H3Frame::Data {
+                        data: Bytes::copy_from_slice(&buffer[..n]),
+                    };
+                    let frame_data = data_frame.encode();
+                    
+                    if let Err(e) = h3_send_stream.write(frame_data, false).await {
+                        return Err(H3Error::Stream(format!("QUIC write failed: {:?}", e)));
+                    }
+                }
+                Err(e) => {
+                    // TCP read error - abort QUIC stream with H3_CONNECT_ERROR
+                    return Err(H3Error::ConnectError(format!("TCP read failed: {}", e)));
+                }
+            }
+        }
+        Ok(())
+    };
+    
+    // Run both forwarding tasks concurrently
+    tokio::select! {
+        result = quic_to_tcp => result,
+        result = tcp_to_quic => result,
+    }
+}
+
 /// Validate CONNECT request pseudo-headers.
 ///
 /// Per RFC 9114 Section 4.4:

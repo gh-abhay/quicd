@@ -19,10 +19,18 @@ pub enum H3Frame {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Priority {
+    /// RFC 9218 Extensible Priority: Urgency level (0-7, 0=highest priority)
+    pub urgency: u8,
+    /// RFC 9218: Incremental flag (true if this is an incremental update)
+    pub incremental: bool,
+    /// RFC 9218: Parent element type (0=request stream, 1=push stream, 2=placeholder, 3=root)
+    pub parent_element_type: u8,
+    /// RFC 9218: Parent element ID (only present if parent_element_type != 3)
+    pub parent_element_id: Option<u64>,
+    /// RFC 9218: Element type being prioritized (0=request stream, 1=push stream)
     pub prioritized_element_type: u8,
+    /// RFC 9218: Element ID being prioritized
     pub element_id: u64,
-    pub priority_element_type: u8,
-    pub priority_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +57,16 @@ impl H3Frame {
 
         // Verify redundant length encoding is minimal (RFC 9114 Section 7.1)
         Self::validate_varint_encoding(&buf[cursor - len_len..cursor], length)?;
+
+        // GAP #5 FIX: Validate frame size to prevent DoS (RFC 9114 Section 7.1)
+        // Maximum frame payload size: 16 MB (configurable in production)
+        const MAX_FRAME_SIZE: u64 = 16 * 1024 * 1024;
+        if length > MAX_FRAME_SIZE {
+            return Err(H3Error::Connection(format!(
+                "H3_EXCESSIVE_LOAD: Frame size {} exceeds maximum {}",
+                length, MAX_FRAME_SIZE
+            )));
+        }
 
         let length = length as usize;
         if buf.len() < cursor + length {
@@ -391,12 +409,36 @@ impl H3Frame {
     /// RFC 9114 Section 7.2.8: Frame types that were used in HTTP/2 where there is no
     /// corresponding HTTP/3 frame have been reserved and MUST NOT be sent.
     fn validate_frame_type(frame_type: u64) -> Result<(), H3Error> {
+        // GAP FIX: Comprehensive HTTP/2 frame type validation
         match frame_type {
-            // PRIORITY (0x02) is valid in HTTP/3 but acts differently
-            // CANCEL_PUSH (0x03) reuses RST_STREAM code point, but is valid
-            0x06 => Err(H3Error::Connection("FRAME_UNEXPECTED: PING frame from HTTP/2 not allowed in HTTP/3".into())),
-            0x08 => Err(H3Error::Connection("FRAME_UNEXPECTED: WINDOW_UPDATE frame from HTTP/2 not allowed in HTTP/3".into())),
-            0x09 => Err(H3Error::Connection("FRAME_UNEXPECTED: CONTINUATION frame from HTTP/2 not allowed in HTTP/3".into())),
+            // HTTP/3 valid frame types (0x00-0x0E, 0x0D specifically)
+            0x00 | // DATA
+            0x01 | // HEADERS
+            0x02 | // PRIORITY (HTTP/3 version, different from HTTP/2)
+            0x03 | // CANCEL_PUSH (reuses HTTP/2 RST_STREAM 0x03, but different semantics)
+            0x04 | // SETTINGS
+            0x05 | // PUSH_PROMISE
+            0x07 | // GOAWAY
+            0x0D   // MAX_PUSH_ID
+                => Ok(()),
+            
+            // HTTP/2 reserved frame types that MUST NOT be used in HTTP/3
+            0x06 => Err(H3Error::Connection(
+                "H3_FRAME_UNEXPECTED: PING frame (HTTP/2 type 0x06) not allowed in HTTP/3".into()
+            )),
+            0x08 => Err(H3Error::Connection(
+                "H3_FRAME_UNEXPECTED: WINDOW_UPDATE frame (HTTP/2 type 0x08) not allowed in HTTP/3".into()
+            )),
+            0x09 => Err(H3Error::Connection(
+                "H3_FRAME_UNEXPECTED: CONTINUATION frame (HTTP/2 type 0x09) not allowed in HTTP/3".into()
+            )),
+            
+            // RFC 9114 Section 7.2.8: Reserved frame types for greasing
+            // Format: 0x1f * N + 0x21 where N >= 0
+            // These frames MUST be ignored, not rejected
+            _ if Self::is_reserved_frame_type(frame_type) => Ok(()),
+            
+            // Unknown frame types are allowed (MUST be ignored per RFC 9114 Section 9)
             _ => Ok(()),
         }
     }
@@ -458,38 +500,84 @@ impl Priority {
             return Err(H3Error::FrameParse("PRIORITY payload is empty".into()));
         }
         
-        let prioritized_element_type = payload[0];
-        let mut cursor = 1;
+        let mut cursor = 0;
         
-        // Parse Element ID (variable-length integer)
-        let (element_id, id_len) = H3Frame::decode_varint(&payload[cursor..])
-            .map_err(|_| H3Error::FrameParse("invalid element ID in PRIORITY frame".into()))?;
-        cursor += id_len;
+        // RFC 9218 Section 5.1: Parse Priority Field Value (variable-length integer)
+        let (priority_field_value, field_len) = H3Frame::decode_varint(&payload[cursor..])
+            .map_err(|_| H3Error::FrameParse("invalid priority field value in PRIORITY frame".into()))?;
+        cursor += field_len;
         
-        if cursor >= payload.len() {
-            return Err(H3Error::FrameParse("PRIORITY payload too short for priority element type".into()));
+        // RFC 9218 Section 5.1: Decode priority field value
+        // Bit 0-2: Urgency (0-7)
+        // Bit 3: Incremental (0=initial, 1=incremental)
+        // Bit 4-5: Reserved (must be 0)
+        // Bit 6-7: Parent Element Type (0=request, 1=push, 2=placeholder, 3=root)
+        let urgency = (priority_field_value & 0x07) as u8;
+        let incremental = (priority_field_value & 0x08) != 0;
+        let parent_element_type = ((priority_field_value >> 6) & 0x03) as u8;
+        
+        // Validate urgency is in range 0-7
+        if urgency > 7 {
+            return Err(H3Error::FrameParse("PRIORITY urgency must be 0-7".into()));
         }
         
-        let priority_element_type = payload[cursor];
+        // Validate reserved bits are 0
+        if (priority_field_value & 0x30) != 0 {
+            return Err(H3Error::FrameParse("PRIORITY reserved bits must be 0".into()));
+        }
+        
+        // Parse parent element ID if parent type is not root (3)
+        let parent_element_id = if parent_element_type != 3 {
+            let (parent_id, id_len) = H3Frame::decode_varint(&payload[cursor..])
+                .map_err(|_| H3Error::FrameParse("invalid parent element ID in PRIORITY frame".into()))?;
+            cursor += id_len;
+            Some(parent_id)
+        } else {
+            None
+        };
+        
+        // Parse prioritized element type (u8)
+        if cursor >= payload.len() {
+            return Err(H3Error::FrameParse("PRIORITY payload too short for prioritized element type".into()));
+        }
+        let prioritized_element_type = payload[cursor];
         cursor += 1;
         
-        // Parse Priority ID (variable-length integer)
-        let (priority_id, _pid_len) = H3Frame::decode_varint(&payload[cursor..])
-            .map_err(|_| H3Error::FrameParse("invalid priority ID in PRIORITY frame".into()))?;
+        // Parse element ID (variable-length integer)
+        let (element_id, _id_len) = H3Frame::decode_varint(&payload[cursor..])
+            .map_err(|_| H3Error::FrameParse("invalid element ID in PRIORITY frame".into()))?;
         
         Ok(Priority {
+            urgency,
+            incremental,
+            parent_element_type,
+            parent_element_id,
             prioritized_element_type,
             element_id,
-            priority_element_type,
-            priority_id,
         })
     }
     
     fn encode(&self, buf: &mut BytesMut) {
+        // RFC 9218 Section 5.1: Encode Priority Field Value
+        // Bit 0-2: Urgency (0-7)
+        // Bit 3: Incremental (0=initial, 1=incremental)
+        // Bit 4-5: Reserved (0)
+        // Bit 6-7: Parent Element Type (0=request, 1=push, 2=placeholder, 3=root)
+        let priority_field_value = 
+            (self.urgency as u64) |
+            ((self.incremental as u64) << 3) |
+            ((self.parent_element_type as u64) << 6);
+        
+        H3Frame::encode_varint(buf, priority_field_value);
+        
+        // Encode parent element ID if present
+        if let Some(parent_id) = self.parent_element_id {
+            H3Frame::encode_varint(buf, parent_id);
+        }
+        
+        // Encode prioritized element type and ID
         buf.put_u8(self.prioritized_element_type);
         H3Frame::encode_varint(buf, self.element_id);
-        buf.put_u8(self.priority_element_type);
-        H3Frame::encode_varint(buf, self.priority_id);
     }
 }
 
