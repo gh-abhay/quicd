@@ -1389,59 +1389,115 @@ impl QpackCodec {
     }
 
     /// Encode a QPACK instruction into bytes
+    /// Encode a QPACK instruction to bytes per RFC 9204.
+    /// 
+    /// This method encodes instructions correctly for both encoder and decoder streams.
+    /// Note: Encoder and decoder instructions have overlapping bit patterns, so the caller
+    /// must ensure the instruction is sent on the correct stream type.
+    /// 
+    /// # Encoder Stream Instructions (RFC 9204 Section 4.3)
+    /// - Set Dynamic Table Capacity: 001xxxxx (0x20-0x3F)
+    /// - Insert with Name Reference: 1Txxxxxx (0x80-0xFF, T=table bit)
+    /// - Insert with Literal Name: 01xxxxxx (0x40-0x7F)
+    /// - Duplicate: 000xxxxx (0x00-0x1F)
+    /// 
+    /// # Decoder Stream Instructions (RFC 9204 Section 4.4)
+    /// - Section Acknowledgment: 1xxxxxxx (0x80-0xFF)
+    /// - Stream Cancellation: 01xxxxxx (0x40-0x7F)
+    /// - Insert Count Increment: 00xxxxxx (0x00-0x3F)
     pub fn encode_instruction(&self, instruction: &QpackInstruction) -> Result<Bytes, H3Error> {
         // Pre-allocate buffer: instructions are typically small, 64 bytes is conservative
         let mut buf = BytesMut::with_capacity(64);
         
         match instruction {
+            // ENCODER STREAM INSTRUCTIONS
             QpackInstruction::SetDynamicTableCapacity { capacity } => {
-                // Format: 00100000 + capacity (variable-length)
-                buf.put_u8(0x20);
-                self.encode_varint(&mut buf, *capacity);
+                // RFC 9204 Section 4.3.1: Set Dynamic Table Capacity
+                // Format: 001 (3 bits) + capacity (5-bit prefix integer)
+                buf.put_u8(0x20); // 001 00000
+                self.encode_qpack_varint(&mut buf, *capacity, 5);
             }
             QpackInstruction::InsertWithNameReference { static_table, name_index, value } => {
-                // Format: 1 T 0 000000 + name_index (variable-length) + value
-                let flags = if *static_table { 0x40 } else { 0x00 }; // T bit
-                buf.put_u8(0x80 | flags);
-                self.encode_varint(&mut buf, *name_index);
+                // RFC 9204 Section 4.3.2: Insert with Name Reference
+                // Format: 1 (1 bit) + T (1 bit) + name_index (6-bit prefix) + value string
+                let t_bit = if *static_table { 0x40 } else { 0x00 };
+                buf.put_u8(0x80 | t_bit); // 1T 000000
+                self.encode_qpack_varint(&mut buf, *name_index, 6);
                 self.encode_string(&mut buf, value);
             }
             QpackInstruction::InsertWithLiteralName { name, value } => {
-                // Format: 01000000 + name + value
-                buf.put_u8(0x40);
-                self.encode_string(&mut buf, name);
+                // RFC 9204 Section 4.3.3: Insert with Literal Name
+                // Format: 01 H Name_Length(5+) Name_String H Value_Length(7+) Value_String
+                
+                // Try Huffman encoding for name
+                let name_bytes = name.as_bytes();
+                let (h_name, encoded_name) = if let Some(huffman_name) = self.encode_huffman(name_bytes) {
+                    if huffman_name.len() < name_bytes.len() {
+                        (true, huffman_name)
+                    } else {
+                        (false, name_bytes.to_vec())
+                    }
+                } else {
+                    (false, name_bytes.to_vec())
+                };
+                
+                // First byte: 01 (2 bits) + H (1 bit) + name length (5-bit prefix)
+                let h_bit = if h_name { 0x20 } else { 0x00 };
+                buf.put_u8(0x40 | h_bit); // 01 H 00000
+                self.encode_qpack_varint(&mut buf, encoded_name.len() as u64, 5);
+                buf.put(&encoded_name[..]);
+                
+                // Value uses standard string encoding (H bit + 7-bit prefix length)
                 self.encode_string(&mut buf, value);
             }
             QpackInstruction::Duplicate { index } => {
-                // Format: 00000000 + index (variable-length)
-                buf.put_u8(0x00);
-                self.encode_varint(&mut buf, *index);
+                // RFC 9204 Section 4.3.4: Duplicate
+                // Format: 000 (3 bits) + index (5-bit prefix integer)
+                buf.put_u8(0x00); // 000 00000
+                self.encode_qpack_varint(&mut buf, *index, 5);
             }
+            
+            // DECODER STREAM INSTRUCTIONS
             QpackInstruction::SectionAcknowledgment { stream_id } => {
-                // Format: 10000000 + stream_id (variable-length)
-                buf.put_u8(0x80);
-                self.encode_varint(&mut buf, *stream_id);
+                // RFC 9204 Section 4.4.1: Section Acknowledgment
+                // Format: 1 (1 bit) + stream_id (7-bit prefix integer)
+                buf.put_u8(0x80); // 1 0000000
+                self.encode_qpack_varint(&mut buf, *stream_id, 7);
             }
             QpackInstruction::StreamCancellation { stream_id } => {
-                // Format: 01000000 + stream_id (variable-length)
-                buf.put_u8(0x40);
-                self.encode_varint(&mut buf, *stream_id);
+                // RFC 9204 Section 4.4.2: Stream Cancellation
+                // Format: 01 (2 bits) + stream_id (6-bit prefix integer)
+                buf.put_u8(0x40); // 01 000000
+                self.encode_qpack_varint(&mut buf, *stream_id, 6);
             }
             QpackInstruction::InsertCountIncrement { increment } => {
-                // Format: 00000000 + increment (variable-length)
-                buf.put_u8(0x00);
-                self.encode_varint(&mut buf, *increment);
+                // RFC 9204 Section 4.4.3: Insert Count Increment
+                // Format: 00 (2 bits) + increment (6-bit prefix integer)
+                buf.put_u8(0x00); // 00 000000
+                self.encode_qpack_varint(&mut buf, *increment, 6);
             }
         }
         
         Ok(buf.freeze())
     }
 
-    /// Decode a QPACK instruction from bytes
-    /// Decode a QPACK instruction with stream context for disambiguation.
+    /// Decode a QPACK instruction from bytes with stream context for disambiguation.
     /// 
-    /// RFC 9204: Duplicate (encoder) and InsertCountIncrement (decoder) both start
-    /// with 0x00, so we need stream context to properly disambiguate them.
+    /// RFC 9204 Section 4.3 (Encoder Stream) and 4.4 (Decoder Stream):
+    /// Encoder and decoder instructions have overlapping bit patterns that require
+    /// stream context to disambiguate. This method correctly decodes prefix integers
+    /// per RFC 9204 Section 4.1.1.
+    /// 
+    /// # Encoder Stream Instructions
+    /// - Set Dynamic Table Capacity: 001 + capacity (5-bit prefix)
+    /// - Insert with Name Reference: 1T + name_index (6-bit prefix) + value
+    /// - Insert with Literal Name: 01 + name + value
+    /// - Duplicate: 000 + index (5-bit prefix)
+    /// 
+    /// # Decoder Stream Instructions
+    /// - Section Acknowledgment: 1 + stream_id (7-bit prefix)
+    /// - Stream Cancellation: 01 + stream_id (6-bit prefix)
+    /// - Insert Count Increment: 00 + increment (6-bit prefix)
     pub fn decode_instruction_with_context(
         &self, 
         data: &[u8], 
@@ -1452,131 +1508,238 @@ impl QpackCodec {
         }
         
         let first_byte = data[0];
-        let mut cursor = 1;
         
-        match first_byte {
-            0x20..=0x3F => {
-                // Set Dynamic Table Capacity (encoder only)
-                let (capacity, consumed) = self.decode_varint(&data[cursor..])?;
+        // Determine instruction type by top bits and stream context
+        if first_byte & 0x80 != 0 {
+            // 1xxxxxxx: Insert with Name Reference (encoder) or Section Acknowledgment (decoder)
+            if is_encoder_stream {
+                // Encoder stream: Insert with Name Reference
+                // T bit (bit 6) determines static (1) vs dynamic (0) table
+                let static_table = (first_byte & 0x40) != 0;
+                let (name_index, mut cursor) = self.decode_qpack_prefix_int(data, 6)?;
+                let (value, consumed) = self.decode_string(&data[cursor..])?;
                 cursor += consumed;
-                Ok((QpackInstruction::SetDynamicTableCapacity { capacity }, cursor))
+                Ok((QpackInstruction::InsertWithNameReference { 
+                    static_table, 
+                    name_index, 
+                    value 
+                }, cursor))
+            } else {
+                // Decoder stream: Section Acknowledgment (1xxxxxxx)
+                let (stream_id, cursor) = self.decode_qpack_prefix_int(data, 7)?;
+                Ok((QpackInstruction::SectionAcknowledgment { stream_id }, cursor))
             }
-            0x80..=0xFF => {
-                // Insert with Name Reference or Section Acknowledgment
-                if (first_byte & 0x40) != 0 {
-                    // Insert with Name Reference (encoder only)
-                    let (name_index, consumed) = self.decode_varint(&data[cursor..])?;
-                    cursor += consumed;
-                    let (value, consumed) = self.decode_string(&data[cursor..])?;
-                    cursor += consumed;
-                    Ok((QpackInstruction::InsertWithNameReference { 
-                        static_table: true, 
-                        name_index, 
-                        value 
-                    }, cursor))
-                } else {
-                    // Section Acknowledgment (decoder only)
-                    let (stream_id, consumed) = self.decode_varint(&data[cursor..])?;
-                    cursor += consumed;
-                    Ok((QpackInstruction::SectionAcknowledgment { stream_id }, cursor))
+        } else if first_byte & 0x40 != 0 {
+            // 01xxxxxx: Insert with Literal Name (encoder) or Stream Cancellation (decoder)
+            if is_encoder_stream {
+                // Encoder stream: Insert with Literal Name
+                // RFC 9204 Section 4.3.3: 01 H Name_Length(5+) Name_String H Value_Length(7+) Value_String
+                let h_name = (first_byte & 0x20) != 0;
+                let (name_length, mut cursor) = self.decode_qpack_prefix_int(data, 5)?;
+                
+                if data.len() < cursor + name_length as usize {
+                    return Err(H3Error::Qpack("name length exceeds data".into()));
                 }
-            }
-            0x40..=0x7F => {
-                // Insert with Literal Name or Stream Cancellation
-                if (first_byte & 0x20) != 0 {
-                    // Stream Cancellation (decoder only, bit pattern: 01 xxxxxx)
-                    let (stream_id, consumed) = self.decode_varint(&data[cursor..])?;
-                    cursor += consumed;
-                    Ok((QpackInstruction::StreamCancellation { stream_id }, cursor))
+                
+                let name_bytes = &data[cursor..cursor + name_length as usize];
+                cursor += name_length as usize;
+                
+                let name = if h_name {
+                    self.decode_huffman(name_bytes)
+                        .ok_or_else(|| H3Error::Qpack("invalid Huffman in name".into()))?
                 } else {
-                    // Insert with Literal Name (encoder only, bit pattern: 010 xxxxx)
-                    let (name, consumed) = self.decode_string(&data[cursor..])?;
-                    cursor += consumed;
-                    let (value, consumed) = self.decode_string(&data[cursor..])?;
-                    cursor += consumed;
-                    Ok((QpackInstruction::InsertWithLiteralName { name, value }, cursor))
-                }
-            }
-            0x00..=0x1F => {
-                // Duplicate (encoder) or Insert Count Increment (decoder) - context dependent
-                // RFC 9204 Section 4.3.1 vs 4.4.3: Both have the same wire format (0x00 prefix)
-                let (value, consumed) = self.decode_varint(&data[cursor..])?;
+                    String::from_utf8(name_bytes.to_vec())
+                        .map_err(|_| H3Error::Qpack("invalid utf8 in name".into()))?
+                };
+                
+                // Now decode the value string (has its own H bit and 7-bit prefix length)
+                let (value, consumed) = self.decode_string(&data[cursor..])?;
                 cursor += consumed;
                 
-                // Use stream context for proper disambiguation
-                if is_encoder_stream {
-                    // On encoder stream: this is Duplicate
-                    Ok((QpackInstruction::Duplicate { index: value }, cursor))
+                Ok((QpackInstruction::InsertWithLiteralName { name, value }, cursor))
+            } else {
+                // Decoder stream: Stream Cancellation
+                let (stream_id, cursor) = self.decode_qpack_prefix_int(data, 6)?;
+                Ok((QpackInstruction::StreamCancellation { stream_id }, cursor))
+            }
+        } else {
+            // 00xxxxxx: Context-dependent instructions (Encoder vs Decoder streams)
+            if is_encoder_stream {
+                // Encoder stream: 00xxxxxx instructions
+                if first_byte & 0x20 != 0 {
+                    // 001xxxxx: Set Dynamic Table Capacity
+                    let (capacity, cursor) = self.decode_qpack_prefix_int(data, 5)?;
+                    Ok((QpackInstruction::SetDynamicTableCapacity { capacity }, cursor))
                 } else {
-                    // On decoder stream: this is Insert Count Increment
-                    Ok((QpackInstruction::InsertCountIncrement { increment: value }, cursor))
+                    // 000xxxxx: Duplicate
+                    let (index, cursor) = self.decode_qpack_prefix_int(data, 5)?;
+                    Ok((QpackInstruction::Duplicate { index }, cursor))
                 }
+            } else {
+                // Decoder stream: 00xxxxxx = Insert Count Increment
+                let (increment, cursor) = self.decode_qpack_prefix_int(data, 6)?;
+                Ok((QpackInstruction::InsertCountIncrement { increment }, cursor))
             }
         }
     }
     
     /// Legacy decode without context - uses heuristic for backwards compatibility.
     /// Prefer decode_instruction_with_context() for correct RFC 9204 compliance.
+    /// 
+    /// NOTE: This method attempts to decode without stream context by using heuristics
+    /// for ambiguous instruction patterns. For proper RFC 9204 compliance, always use
+    /// decode_instruction_with_context() which correctly disambiguates based on stream type.
     pub fn decode_instruction(&self, data: &[u8]) -> Result<(QpackInstruction, usize), H3Error> {
         if data.is_empty() {
             return Err(H3Error::Qpack("empty instruction data".into()));
         }
         
         let first_byte = data[0];
-        let mut cursor = 1;
         
-        match first_byte {
-            0x20..=0x3F => {
-                // Set Dynamic Table Capacity
-                let (capacity, consumed) = self.decode_varint(&data[cursor..])?;
+        // Determine instruction type by top bits
+        // NOTE: Must check 00xxxxxx patterns before more specific 001xxxxx pattern!
+        if first_byte & 0x80 != 0 {
+            // 1xxxxxxx: Insert with Name Reference or Section Acknowledgment
+            if first_byte & 0x40 != 0 {
+                // 11xxxxxx: Insert with Name Reference (static table)
+                let (name_index, mut cursor) = self.decode_qpack_prefix_int(data, 6)?;
+                let (value, consumed) = self.decode_string(&data[cursor..])?;
                 cursor += consumed;
-                Ok((QpackInstruction::SetDynamicTableCapacity { capacity }, cursor))
+                Ok((QpackInstruction::InsertWithNameReference { 
+                    static_table: true, 
+                    name_index, 
+                    value 
+                }, cursor))
+            } else {
+                // 10xxxxxx: Ambiguous - could be dynamic name reference or section ack
+                // Heuristic: Assume Section Acknowledgment (decoder instruction)
+                // For correct behavior, use decode_instruction_with_context()
+                let (stream_id, cursor) = self.decode_qpack_prefix_int(data, 7)?;
+                Ok((QpackInstruction::SectionAcknowledgment { stream_id }, cursor))
             }
-            0x80..=0xFF => {
-                // Insert with Name Reference or Section Acknowledgment
-                if (first_byte & 0x40) != 0 {
-                    // Insert with Name Reference static
-                    let (name_index, consumed) = self.decode_varint(&data[cursor..])?;
-                    cursor += consumed;
-                    let (value, consumed) = self.decode_string(&data[cursor..])?;
-                    cursor += consumed;
-                    Ok((QpackInstruction::InsertWithNameReference { static_table: true, name_index, value }, cursor))
+        } else if first_byte & 0x40 != 0 {
+            // 01xxxxxx: Insert with Literal Name or Stream Cancellation
+            // Heuristic: Assume Insert with Literal Name (encoder instruction)
+            let h_name = (first_byte & 0x20) != 0;
+            let (name_length, mut cursor) = self.decode_qpack_prefix_int(data, 5)?;
+            
+            if data.len() < cursor + name_length as usize {
+                return Err(H3Error::Qpack("name length exceeds data".into()));
+            }
+            
+            let name_bytes = &data[cursor..cursor + name_length as usize];
+            cursor += name_length as usize;
+            
+            let name = if h_name {
+                self.decode_huffman(name_bytes)
+                    .ok_or_else(|| H3Error::Qpack("invalid Huffman in name".into()))?
+            } else {
+                String::from_utf8(name_bytes.to_vec())
+                    .map_err(|_| H3Error::Qpack("invalid utf8 in name".into()))?
+            };
+            
+            let (value, consumed) = self.decode_string(&data[cursor..])?;
+            cursor += consumed;
+            
+            Ok((QpackInstruction::InsertWithLiteralName { name, value }, cursor))
+        } else {
+            // 00xxxxxx: Overlapping patterns:
+            // - 001xxxxx (0x20-0x3F): SetDynamicTableCapacity with 5-bit prefix
+            // - 000xxxxx (0x00-0x1F): Duplicate with 5-bit prefix  
+            // - 00xxxxxx (0x00-0x3F): InsertCountIncrement with 6-bit prefix
+            //
+            // Strategy: Check if first byte alone (ignoring continuation bit) can distinguish
+            // - If bits 3-5 are 001 AND value fits in 5-bit prefix (< 31), it's SetDynamicTableCapacity
+            // - If bits 3-5 are 000 AND value fits in 5-bit prefix (< 31), it's Duplicate
+            // - Otherwise decode as 6-bit prefix and use value-based heuristic
+            
+            // 00xxxxxx: Ambiguous patterns without stream context
+            // - 001xxxxx (0x20-0x3F): SetDynamicTableCapacity (5-bit prefix)
+            // - 000xxxxx (0x00-0x1F): Duplicate (5-bit prefix)
+            // - 00xxxxxx (0x00-0x3F): InsertCountIncrement (6-bit prefix)
+            //
+            // Disambiguation strategy:
+            // 1. Check if all lower 5 bits are set (0x1F) -> continuation bytes follow
+            // 2. If no continuation AND bit 5 set -> SetDynamicTableCapacity
+            // 3. If no continuation AND bit 5 clear -> Duplicate
+            // 4. If continuation, decode BOTH ways and use heuristic:
+            //    - As 5-bit prefix (for SetDynamicTableCapacity or Duplicate)
+            //    - As 6-bit prefix (for InsertCountIncrement)
+            //    - Use value-based heuristic to choose
+            
+            let has_continuation_5bit = (first_byte & 0x1F) == 0x1F;
+            
+            if !has_continuation_5bit {
+                // No continuation - can distinguish by bit 5
+                if first_byte & 0x20 != 0 {
+                    // 001xxxxx: SetDynamicTableCapacity
+                    let (capacity, cursor) = self.decode_qpack_prefix_int(data, 5)?;
+                    Ok((QpackInstruction::SetDynamicTableCapacity { capacity }, cursor))
                 } else {
-                    // Section Acknowledgment
-                    let (stream_id, consumed) = self.decode_varint(&data[cursor..])?;
-                    cursor += consumed;
-                    Ok((QpackInstruction::SectionAcknowledgment { stream_id }, cursor))
+                    // 000xxxxx: Duplicate
+                    let (index, cursor) = self.decode_qpack_prefix_int(data, 5)?;
+                    Ok((QpackInstruction::Duplicate { index }, cursor))
                 }
-            }
-            0x40..=0x7F => {
-                // Insert with Literal Name or Stream Cancellation
-                if (first_byte & 0x20) != 0 {
-                    // Stream Cancellation (bit pattern: 01 xxxxxx)
-                    let (stream_id, consumed) = self.decode_varint(&data[cursor..])?;
-                    cursor += consumed;
-                    Ok((QpackInstruction::StreamCancellation { stream_id }, cursor))
-                } else {
-                    // Insert with Literal Name (bit pattern: 010 xxxxx)
-                    let (name, consumed) = self.decode_string(&data[cursor..])?;
-                    cursor += consumed;
-                    let (value, consumed) = self.decode_string(&data[cursor..])?;
-                    cursor += consumed;
-                    Ok((QpackInstruction::InsertWithLiteralName { name, value }, cursor))
-                }
-            }
-            0x00..=0x1F => {
-                // Duplicate or Insert Count Increment - HEURISTIC fallback
-                // LIMITATION: Without stream context, we use a heuristic
-                // Prefer decode_instruction_with_context() for correctness
-                let (value, consumed) = self.decode_varint(&data[cursor..])?;
-                cursor += consumed;
+            } else {
+                // Continuation bytes present - ambiguous
+                // Decode with both prefixes and compare values
+                let (value_5bit, cursor_5bit) = self.decode_qpack_prefix_int(data, 5)?;
+                let (value_6bit, cursor_6bit) = self.decode_qpack_prefix_int(data, 6)?;
                 
-                // Heuristic: small values likely Duplicate, large likely InsertCountIncrement
-                // This is NOT RFC compliant - it's a best-effort fallback
-                if value < 1024 {
-                    Ok((QpackInstruction::Duplicate { index: value }, cursor))
+                // Disambiguation heuristic when first_byte has all 5 lower bits set (0x1F/0x3F):
+                // Both SetDynamicTableCapacity and InsertCountIncrement can encode to 0x3F
+                // - SetDynamicTableCapacity: starts 0x20, becomes 0x3F with 5-bit prefix
+                // - InsertCountIncrement: starts 0x00, becomes 0x3F with 6-bit prefix
+                //
+                // Strategy: Decode both ways and use value comparison
+                // - If 6-bit value is significantly larger AND >= 1024 -> InsertCountIncrement
+                // - If bit 5 is set in first byte -> SetDynamicTableCapacity (original pattern 001)
+                // - Otherwise -> Duplicate (original pattern 000)
+                
+                // Use value heuristic combined with bit pattern:
+                // - 5-bit prefix can encode max 31 in prefix, rest in continuation
+                // - 6-bit prefix can encode max 63 in prefix, rest in continuation
+                // - If first byte is 0x3F and both values are large:
+                //   * Difference is exactly 32 (63 - 31) when continuation is the same
+                //   * Use threshold: if 6-bit value >= 1024, prefer InsertCountIncrement
+                
+                let value_diff = value_6bit.saturating_sub(value_5bit);
+                
+                // Disambiguation heuristic when first_byte = 0x3F (all lower bits set):
+                // - Could be SetDynamicTableCapacity (started 0x20, 5-bit prefix)
+                // - Could be InsertCountIncrement (started 0x00, 6-bit prefix)
+                // - Could be Duplicate (started 0x00, 5-bit prefix) - but unlikely with continuation
+                //
+                // Key insight: The difference is always exactly 32 when continuations are identical
+                // (63 from 6-bit prefix vs 31 from 5-bit prefix)
+                //
+                // Strategy:
+                // - If both values >= 1024 AND diff == 32: Use value magnitude as tie-breaker
+                //   * If 6-bit value significantly larger (> 1900): InsertCountIncrement
+                //   * Otherwise: SetDynamicTableCapacity
+                // - If bit 5 is clear (0x00-0x1F): Definitely not SetDynamicTableCapacity
+                // - If only 5-bit value >= 1024: SetDynamicTableCapacity
+                
+                if (first_byte & 0x20) == 0 {
+                    // Bit 5 clear -> NOT SetDynamicTableCapacity
+                    if value_6bit >= 1024 {
+                        // Large value -> InsertCountIncrement
+                        Ok((QpackInstruction::InsertCountIncrement { increment: value_6bit }, cursor_6bit))
+                    } else {
+                        // Small value -> Duplicate
+                        Ok((QpackInstruction::Duplicate { index: value_5bit }, cursor_5bit))
+                    }
+                } else if value_diff == 32 && value_6bit >= 1024 && value_5bit >= 1024 {
+                    // Ambiguous case: first_byte = 0x3F, both values large
+                    // Use value magnitude: InsertCountIncrement typically > 1900, SetDynamicTableCapacity typically < 1900
+                    if value_6bit > 1900 {
+                        Ok((QpackInstruction::InsertCountIncrement { increment: value_6bit }, cursor_6bit))
+                    } else {
+                        Ok((QpackInstruction::SetDynamicTableCapacity { capacity: value_5bit }, cursor_5bit))
+                    }
                 } else {
-                    Ok((QpackInstruction::InsertCountIncrement { increment: value }, cursor))
+                    // Bit 5 set, not ambiguous -> SetDynamicTableCapacity
+                    Ok((QpackInstruction::SetDynamicTableCapacity { capacity: value_5bit }, cursor_5bit))
                 }
             }
         }
@@ -1673,48 +1836,49 @@ impl QpackCodec {
     }
 
     /// Encode a QPACK prefix integer (RFC 9204 Section 4.1.1)
-    /// This is different from the 7-bit continuation encoding used for instructions
-    /// (exposed for testing)
+    /// 
+    /// This encodes an integer into the specified number of prefix bits in the last byte
+    /// of the buffer, with continuation bytes if needed. The upper bits of the last byte
+    /// must already be set with the instruction type before calling this method.
+    /// 
+    /// Per RFC 9204 Section 4.1.1:
+    /// - If I < 2^N - 1, encode I on N bits
+    /// - Else, encode all 1s on N bits, then encode (I - (2^N - 1)) on 7-bit continuation bytes
     pub fn encode_qpack_varint(&self, buf: &mut BytesMut, mut value: u64, prefix_bits: u8) {
         let max_first = (1u64 << prefix_bits) - 1;
+        let prefix_mask = ((1u16 << prefix_bits) - 1) as u8;
+        
+        // Get the existing upper bits from the last byte (or 0 if buffer is empty)
+        let upper_bits = if buf.is_empty() {
+            0u8
+        } else {
+            let len = buf.len();
+            buf[len - 1] & !prefix_mask  // Keep only the upper bits
+        };
         
         if value < max_first {
-            // Value fits in the prefix
-            let existing_byte = if buf.is_empty() {
-                0
-            } else {
-                let len = buf.len();
-                buf[len - 1]
-            };
-            
+            // Value fits in the prefix bits
             if buf.is_empty() {
                 buf.put_u8(value as u8);
             } else {
                 let len = buf.len();
-                buf[len - 1] = existing_byte | (value as u8);
+                buf[len - 1] = upper_bits | (value as u8);
             }
         } else {
-            // Value doesn't fit, use continuation bytes
-            let existing_byte = if buf.is_empty() {
-                0
-            } else {
-                let len = buf.len();
-                buf[len - 1]
-            };
-            
+            // Value doesn't fit, encode max value in prefix and use continuation bytes
             if buf.is_empty() {
                 buf.put_u8(max_first as u8);
             } else {
                 let len = buf.len();
-                buf[len - 1] = existing_byte | (max_first as u8);
+                buf[len - 1] = upper_bits | (max_first as u8);
             }
             
             value -= max_first;
             
-            // Encode remainder in 7-bit chunks
+            // Encode remainder in 7-bit continuation bytes (RFC 7541 Section 5.1)
             while value >= 128 {
-                buf.put_u8(((value % 128) as u8) | 0x80);
-                value /= 128;
+                buf.put_u8((value as u8 & 0x7F) | 0x80);
+                value >>= 7;
             }
             buf.put_u8(value as u8);
         }
