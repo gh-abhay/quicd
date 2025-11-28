@@ -179,4 +179,54 @@ mod tests {
         assert_eq!(decoded[0], (":method".to_string(), "GET".to_string()));
         assert_eq!(decoded[1], (":path".to_string(), "/".to_string()));
     }
+
+    #[test]
+    fn test_cookie_header_splitting() {
+        // RFC 9114 Section 4.2.1: Cookie headers should be split for better compression
+        let codec = QpackCodec::new();
+
+        // Test that split_cookie_headers works correctly
+        let single_cookie = vec![
+            ("cookie".to_string(), "session=abc123".to_string()),
+        ];
+        let split_single = QpackCodec::split_cookie_headers(&single_cookie);
+        assert_eq!(split_single.len(), 1);
+        assert_eq!(split_single[0].1, "session=abc123");
+
+        // Test multiple cookies in one header - should be split
+        let multi_cookie = vec![
+            ("cookie".to_string(), "session=abc123; user=john; theme=dark".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ];
+        let split_multi = QpackCodec::split_cookie_headers(&multi_cookie);
+        
+        // After splitting, we should have 4 headers total (3 cookies + 1 content-type)
+        assert_eq!(split_multi.len(), 4, "Cookie should be split into 3 separate headers");
+        
+        // Verify all cookie values are present
+        let cookie_headers: Vec<_> = split_multi.iter()
+            .filter(|(name, _)| name == "cookie")
+            .collect();
+        assert_eq!(cookie_headers.len(), 3);
+        
+        // Verify individual cookie values (order preserved)
+        assert_eq!(cookie_headers[0].1, "session=abc123");
+        assert_eq!(cookie_headers[1].1, "user=john");
+        assert_eq!(cookie_headers[2].1, "theme=dark");
+        
+        // Verify content-type is preserved
+        let content_type = split_multi.iter()
+            .find(|(name, _)| name == "content-type");
+        assert!(content_type.is_some());
+        assert_eq!(content_type.unwrap().1, "application/json");
+
+        // Test empty cookie pairs are filtered out
+        let empty_cookies = vec![
+            ("cookie".to_string(), "a=b;;  ; c=d".to_string()),
+        ];
+        let split_empty = QpackCodec::split_cookie_headers(&empty_cookies);
+        assert_eq!(split_empty.len(), 2);
+        assert_eq!(split_empty[0].1, "a=b");
+        assert_eq!(split_empty[1].1, "c=d");
+    }
 }

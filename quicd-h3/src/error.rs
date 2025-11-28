@@ -113,14 +113,12 @@ pub enum H3ErrorCode {
     MissingSettings = 0x10A,
     RequestRejected = 0x10B,
     
-    // 0x10C-0x10F: Request/response errors
-    RequestIncomplete = 0x10C,
-    MessageError = 0x10D,
-    ConnectError = 0x10E,
-    VersionFallback = 0x10F,
-    
-    // 0x110: Push-related error
-    WrongStream = 0x110,
+    // 0x10C-0x110: Request/response errors
+    RequestCancelled = 0x10C,
+    RequestIncomplete = 0x10D,
+    MessageError = 0x10E,
+    ConnectError = 0x10F,
+    VersionFallback = 0x110,
     
     // QPACK-specific error codes (RFC 9204 Section 6)
     QpackDecompressionFailed = 0x200,
@@ -144,11 +142,11 @@ impl H3ErrorCode {
             0x109 => Some(H3ErrorCode::SettingsError),
             0x10A => Some(H3ErrorCode::MissingSettings),
             0x10B => Some(H3ErrorCode::RequestRejected),
-            0x10C => Some(H3ErrorCode::RequestIncomplete),
-            0x10D => Some(H3ErrorCode::MessageError),
-            0x10E => Some(H3ErrorCode::ConnectError),
-            0x10F => Some(H3ErrorCode::VersionFallback),
-            0x110 => Some(H3ErrorCode::WrongStream),
+            0x10C => Some(H3ErrorCode::RequestCancelled),
+            0x10D => Some(H3ErrorCode::RequestIncomplete),
+            0x10E => Some(H3ErrorCode::MessageError),
+            0x10F => Some(H3ErrorCode::ConnectError),
+            0x110 => Some(H3ErrorCode::VersionFallback),
             0x200 => Some(H3ErrorCode::QpackDecompressionFailed),
             0x201 => Some(H3ErrorCode::QpackEncoderStreamError),
             0x202 => Some(H3ErrorCode::QpackDecoderStreamError),
@@ -176,11 +174,11 @@ impl H3ErrorCode {
             H3ErrorCode::SettingsError => "Settings error",
             H3ErrorCode::MissingSettings => "Missing settings",
             H3ErrorCode::RequestRejected => "Request rejected",
+            H3ErrorCode::RequestCancelled => "Request cancelled",
             H3ErrorCode::RequestIncomplete => "Request incomplete",
             H3ErrorCode::MessageError => "Message error",
             H3ErrorCode::ConnectError => "Connect error",
             H3ErrorCode::VersionFallback => "Version fallback",
-            H3ErrorCode::WrongStream => "Wrong stream",
             H3ErrorCode::QpackDecompressionFailed => "QPACK decompression failed",
             H3ErrorCode::QpackEncoderStreamError => "QPACK encoder stream error",
             H3ErrorCode::QpackDecoderStreamError => "QPACK decoder stream error",

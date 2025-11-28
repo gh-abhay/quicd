@@ -425,3 +425,71 @@ fn test_settings_validation_0rtt_compatible() {
         _ => panic!("Expected Settings frames"),
     }
 }
+
+// ============================================================================
+// GAP FIX: PRIORITY_UPDATE Frame Handling (RFC 9218)
+// ============================================================================
+
+/// Test PRIORITY_UPDATE frame encoding and decoding
+#[test]
+fn test_priority_update_frame_encoding() {
+    let frame = H3Frame::PriorityUpdate {
+        element_id: 42,
+        priority_field_value: "u=3,i,a=10".to_string(),
+    };
+    let encoded = frame.encode();
+    
+    // Frame type 0x0F + element_id varint + priority field value
+    assert!(encoded.len() > 3);
+    assert_eq!(encoded[0], 0x0F); // PRIORITY_UPDATE frame type
+    
+    // Decode and verify
+    let (decoded, consumed) = H3Frame::parse(&encoded).unwrap();
+    assert_eq!(consumed, encoded.len());
+    match decoded {
+        H3Frame::PriorityUpdate { element_id, priority_field_value } => {
+            assert_eq!(element_id, 42);
+            assert_eq!(priority_field_value, "u=3,i,a=10");
+        }
+        _ => panic!("Expected PRIORITY_UPDATE frame"),
+    }
+}
+
+/// Test PRIORITY_UPDATE frame with minimal priority field
+#[test]
+fn test_priority_update_minimal_field() {
+    let frame = H3Frame::PriorityUpdate {
+        element_id: 1,
+        priority_field_value: "u=7".to_string(),
+    };
+    let encoded = frame.encode();
+    
+    let (decoded, _) = H3Frame::parse(&encoded).unwrap();
+    match decoded {
+        H3Frame::PriorityUpdate { element_id, priority_field_value } => {
+            assert_eq!(element_id, 1);
+            assert_eq!(priority_field_value, "u=7");
+        }
+        _ => panic!("Expected PRIORITY_UPDATE frame"),
+    }
+}
+
+/// Test PRIORITY_UPDATE frame with empty priority field (invalid)
+#[test]
+fn test_priority_update_empty_field() {
+    let frame = H3Frame::PriorityUpdate {
+        element_id: 100,
+        priority_field_value: "".to_string(),
+    };
+    let encoded = frame.encode();
+    
+    // Should still encode/decode, but session layer should reject
+    let (decoded, _) = H3Frame::parse(&encoded).unwrap();
+    match decoded {
+        H3Frame::PriorityUpdate { element_id, priority_field_value } => {
+            assert_eq!(element_id, 100);
+            assert_eq!(priority_field_value, "");
+        }
+        _ => panic!("Expected PRIORITY_UPDATE frame"),
+    }
+}
