@@ -22,6 +22,9 @@ pub struct H3ResponseSender {
     pub(crate) connection_handle: Option<quicd_x::ConnectionHandle>,
     pub(crate) stream_id: u64, // The request stream ID for push promises
     pub(crate) encoder_send_stream: std::sync::Arc<tokio::sync::Mutex<Option<quicd_x::SendStream>>>,
+    /// RFC 9204 Section 2.1.2: Track dynamic table references added by response headers
+    /// These will be released when the stream closes
+    pub(crate) response_references: std::sync::Arc<tokio::sync::Mutex<Vec<usize>>>,
 }
 
 impl H3ResponseSender {
@@ -33,7 +36,7 @@ impl H3ResponseSender {
         ];
         all_headers.extend(headers);
 
-        let (encoded_headers, encoder_instructions, _referenced_entries) = {
+        let (encoded_headers, encoder_instructions, referenced_entries) = {
             let mut qpack = self.qpack.write().await;
             let result = qpack.encode_headers(&all_headers)
                 .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
@@ -43,6 +46,12 @@ impl H3ResponseSender {
             }
             result
         };
+        
+        // Track response references for cleanup on stream close
+        {
+            let mut refs = self.response_references.lock().await;
+            refs.extend(referenced_entries);
+        }
 
         // Send encoder instructions to encoder stream if any
         // PERF #29: Batch all instructions into a single write
@@ -104,7 +113,7 @@ impl H3ResponseSender {
         crate::validation::validate_interim_response_headers(&all_headers)?;
         
         // Encode headers
-        let (encoded_headers, encoder_instructions, _referenced_entries) = {
+        let (encoded_headers, encoder_instructions, referenced_entries) = {
             let mut qpack = self.qpack.write().await;
             let result = qpack.encode_headers(&all_headers)
                 .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
@@ -114,6 +123,12 @@ impl H3ResponseSender {
             }
             result
         };
+        
+        // Track response references for cleanup on stream close
+        {
+            let mut refs = self.response_references.lock().await;
+            refs.extend(referenced_entries);
+        }
 
         // Send encoder instructions to encoder stream if any
         if !encoder_instructions.is_empty() {
@@ -166,7 +181,7 @@ impl H3ResponseSender {
         manager.register_promise(push_id, headers.clone())?;
         
         // Encode headers for PUSH_PROMISE frame
-        let (encoded_headers, encoder_instructions, _referenced_entries) = {
+        let (encoded_headers, encoder_instructions, referenced_entries) = {
             let mut qpack = self.qpack.write().await;
             let result = qpack.encode_headers(&headers)
                 .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
@@ -176,6 +191,12 @@ impl H3ResponseSender {
             }
             result
         };
+        
+        // Track response references for cleanup on stream close
+        {
+            let mut refs = self.response_references.lock().await;
+            refs.extend(referenced_entries);
+        }
         
         // Send encoder instructions to encoder stream if any
         if !encoder_instructions.is_empty() {

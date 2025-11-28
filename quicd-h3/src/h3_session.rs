@@ -346,6 +346,9 @@ impl<H: H3Handler> H3Session<H> {
                 // RFC 9114 Section 4.1.1: Stream was reset
                 // Clean up stream state and notify QPACK decoder if needed
                 self.handle_stream_closed(stream_id, app_initiated, error_code).await?;
+                
+                // Periodically clean up completed/cancelled pushes
+                self.cleanup_pushes().await;
             }
             AppEvent::StreamReset { request_id, result } => {
                 // Response to our reset_stream() call
@@ -399,11 +402,20 @@ impl<H: H3Handler> H3Session<H> {
                     }
                 } else if self.pending_push_streams.contains_key(&request_id) {
                     // This is a push stream
-                    if let Ok(send_stream) = result {
-                        let push_id = self.pending_push_streams.remove(&request_id).unwrap();
-                        
-                        // Send the complete push response on the opened stream
-                        self.send_push_response_on_stream(push_id, send_stream, request_id).await?;
+                    let push_id = self.pending_push_streams.remove(&request_id).unwrap();
+                    
+                    match result {
+                        Ok(send_stream) => {
+                            // Stream opened successfully - send push response
+                            if let Err(e) = self.send_push_response_on_stream(push_id, send_stream, request_id).await {
+                                // Push failed - already sent CANCEL_PUSH in send_push_response_on_stream if needed
+                                return Err(e);
+                            }
+                        }
+                        Err(_) => {
+                            // Failed to open push stream - send CANCEL_PUSH
+                            let _ = self.send_cancel_push_frame(push_id).await;
+                        }
                     }
                 }
             }
@@ -821,8 +833,10 @@ impl<H: H3Handler> H3Session<H> {
                             Err(e) => return Err(e),
                         };
                         
-                        // Phase 3: Validate message semantics (RFC 9114 Section 4)
-                        Self::validate_message_headers_static(&headers)?;
+                        // Phase 3: Validate request headers per RFC 9114 Section 4.1
+                        // This validates: pseudo-header ordering, uppercase rejection, connection-specific headers,
+                        // required pseudo-headers, Content-Length uniqueness, TE validation, and more
+                        let _pseudo_headers = crate::validation::validate_request_headers(&headers)?;
                         
                         // Phase 3: Extract Content-Length for validation (RFC 9114 Section 4.1.2)
                         *content_length = Self::extract_content_length_static(&headers)?;
@@ -992,6 +1006,9 @@ impl<H: H3Handler> H3Session<H> {
         if let Some(queued_request) = queued_request {
             let request = self.parse_request(queued_request.headers)?;
             
+            // RFC 9204 Section 2.1.2: Create Arc to track response header references
+            let response_references = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            
             // Call handler
             let mut sender = H3ResponseSender {
                 send_stream: queued_request.send_stream,
@@ -1000,8 +1017,15 @@ impl<H: H3Handler> H3Session<H> {
                 connection_handle: Some(self.handle.clone()),
                 stream_id: queued_request.stream_id,
                 encoder_send_stream: self.encoder_send_stream.clone(),
+                response_references: response_references.clone(),
             };
             self.handler.handle_request(request, &mut sender).await?;
+            
+            // RFC 9204 Section 2.1.2: Store response references in stream state for cleanup
+            if let Some(StreamState::Request { referenced_dynamic_entries, .. }) = self.streams.get_mut(&queued_request.stream_id) {
+                let response_refs = response_references.lock().await;
+                referenced_dynamic_entries.extend(response_refs.iter());
+            }
         }
         
         Ok(())
@@ -1068,8 +1092,8 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     async fn process_control_frames(&mut self, data: Bytes) -> Result<(), H3Error> {
-        // Parse control frames
-        if let Ok((frame, _)) = H3Frame::parse(&data) {
+        // PERF: Use parse_bytes() for zero-copy frame parsing
+        if let Ok((frame, _)) = H3Frame::parse_bytes(&data) {
             // Validate frame is allowed on control stream
             self.validate_frame_on_stream(&frame, StreamType::Control)?;
             // RFC 9114 Section 6.2.1: SETTINGS MUST be first frame on control stream
@@ -1183,6 +1207,25 @@ impl<H: H3Handler> H3Session<H> {
         if let Ok(mut manager) = self.push_manager.try_lock() {
             manager.cancel_push(push_id)?;
         }
+        Ok(())
+    }
+
+    /// Send CANCEL_PUSH frame to peer (server-initiated cancellation)
+    /// Per RFC 9114 Section 7.2.5: Either endpoint can send CANCEL_PUSH
+    async fn send_cancel_push_frame(&mut self, push_id: u64) -> Result<(), H3Error> {
+        // Send CANCEL_PUSH on control stream
+        if let Some(control_stream) = &mut self.server_control_send {
+            let cancel_frame = H3Frame::CancelPush { push_id };
+            let frame_data = cancel_frame.encode();
+            control_stream.write(frame_data, false).await
+                .map_err(|e| H3Error::Stream(format!("failed to send CANCEL_PUSH: {:?}", e)))?;
+        }
+        
+        // Mark as cancelled in PushManager
+        if let Ok(mut manager) = self.push_manager.try_lock() {
+            manager.cancel_push(push_id)?;
+        }
+        
         Ok(())
     }
 
@@ -1311,11 +1354,14 @@ impl<H: H3Handler> H3Session<H> {
         }
         
         // RFC 9204 Section 2.1.2: Release all dynamic table references held by this stream
+        // This includes both request header references and response header references
         if let Some(StreamState::Request { referenced_dynamic_entries, .. }) = self.streams.get(&stream_id) {
             let mut qpack = self.qpack.write().await;
             for index in referenced_dynamic_entries {
                 qpack.release_reference(*index);
             }
+            // Note: Response references are already merged into referenced_dynamic_entries
+            // after handle_request() completes in process_request_stream()
         }
         
         // Clean up stream state after cancellation sent and references released
@@ -1341,6 +1387,33 @@ impl<H: H3Handler> H3Session<H> {
         
         // The StreamReset event will be delivered asynchronously
         Ok(())
+    }
+
+    /// Cancel a server push and send CANCEL_PUSH frame to peer
+    /// Per RFC 9114 Section 7.2.5: Server can cancel its own promised push
+    pub async fn cancel_server_push(&mut self, push_id: u64) -> Result<(), H3Error> {
+        // Send CANCEL_PUSH frame and update state
+        self.send_cancel_push_frame(push_id).await?;
+        
+        // If push stream is already opened, reset it
+        let stream_id = {
+            let manager = self.push_manager.lock().await;
+            manager.get_promise(push_id).and_then(|p| p.push_stream_id())
+        };
+        
+        if let Some(stream_id) = stream_id {
+            // Reset the push stream with H3_REQUEST_CANCELLED error code
+            let _ = self.cancel_stream(stream_id, 0x010C).await;
+        }
+        
+        Ok(())
+    }
+
+    /// Clean up completed and cancelled push promises
+    /// Should be called periodically to prevent memory leaks
+    pub async fn cleanup_pushes(&mut self) {
+        let mut manager = self.push_manager.lock().await;
+        manager.cleanup();
     }
 
     async fn process_qpack_instructions(&mut self, stream_id: u64, data: Bytes) -> Result<(), H3Error> {
@@ -1595,40 +1668,6 @@ impl<H: H3Handler> H3Session<H> {
             headers: header_vec,
             body: None,
         })
-    }
-
-    /// Phase 3: Validate message headers for HTTP/3 compliance (RFC 9114 Section 4)
-    fn validate_message_headers_static(headers: &[(String, String)]) -> Result<(), H3Error> {
-        let mut content_length_count = 0;
-        
-        for (name, value) in headers {
-            // RFC 9114 Section 4.1: Transfer-Encoding MUST NOT be present
-            if name == "transfer-encoding" {
-                return Err(H3Error::MessageError);
-            }
-            
-            // RFC 9114 Section 4.2: Connection-specific headers MUST NOT be present
-            if name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "upgrade" {
-                return Err(H3Error::MessageError);
-            }
-            
-            // RFC 9114 Section 4.2: TE header MUST only contain "trailers"
-            if name == "te" && value != "trailers" {
-                return Err(H3Error::MessageError);
-            }
-            
-            // Track Content-Length for duplicate detection (RFC 9110 Section 8.6)
-            if name == "content-length" {
-                content_length_count += 1;
-                if content_length_count > 1 {
-                    // Multiple Content-Length headers with same value is technically allowed
-                    // but we reject for simplicity and safety
-                    return Err(H3Error::MessageError);
-                }
-            }
-        }
-        
-        Ok(())
     }
 
     /// Phase 3: Extract Content-Length value from headers (RFC 9114 Section 4.1.2)
@@ -1986,6 +2025,17 @@ impl<H: H3Handler> H3Session<H> {
         send_stream: quicd_x::SendStream,
         request_id: u64,
     ) -> Result<(), H3Error> {
+        // Check if push was cancelled before opening stream
+        {
+            let manager = self.push_manager.lock().await;
+            if let Some(promise) = manager.get_promise(push_id) {
+                if promise.is_cancelled() {
+                    // Push was cancelled - don't send anything
+                    return Err(H3Error::Http(format!("push {} was cancelled", push_id)));
+                }
+            }
+        }
+        
         // Write push stream type header (0x01) per RFC 9114 Section 6.2.2
         let stream_type = vec![0x01];
         send_stream.write(Bytes::from(stream_type), false).await
@@ -2064,7 +2114,8 @@ impl<H: H3Handler> H3Session<H> {
                 qpack.release_reference(index);
             }
         } else {
-            // No response data available - close stream with error
+            // No response data available - send CANCEL_PUSH and close stream
+            let _ = self.send_cancel_push_frame(push_id).await;
             return Err(H3Error::Http(format!("no response data for push ID {}", push_id)));
         }
         

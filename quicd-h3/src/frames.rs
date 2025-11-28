@@ -263,11 +263,11 @@ impl H3Frame {
                 buf.extend_from_slice(&payload);
             }
             H3Frame::CancelPush { push_id } => {
+                // PERF: Avoid intermediate buffer - calculate payload size first
                 Self::encode_varint(&mut buf, 0x3);
-                let mut payload = BytesMut::new();
-                Self::encode_varint(&mut payload, *push_id);
-                Self::encode_varint(&mut buf, payload.len() as u64);
-                buf.extend_from_slice(&payload);
+                let payload_len = Self::varint_encoded_len(*push_id);
+                Self::encode_varint(&mut buf, payload_len as u64);
+                Self::encode_varint(&mut buf, *push_id);
             }
             H3Frame::Settings { settings } => {
                 Self::encode_varint(&mut buf, 0x4);
@@ -288,25 +288,25 @@ impl H3Frame {
                 buf.extend_from_slice(&payload);
             }
             H3Frame::GoAway { stream_id } => {
+                // PERF: Avoid intermediate buffer - calculate payload size first
                 Self::encode_varint(&mut buf, 0x7);
-                let mut payload = BytesMut::new();
-                Self::encode_varint(&mut payload, *stream_id);
-                Self::encode_varint(&mut buf, payload.len() as u64);
-                buf.extend_from_slice(&payload);
+                let payload_len = Self::varint_encoded_len(*stream_id);
+                Self::encode_varint(&mut buf, payload_len as u64);
+                Self::encode_varint(&mut buf, *stream_id);
             }
             H3Frame::MaxPushId { push_id } => {
+                // PERF: Avoid intermediate buffer - calculate payload size first
                 Self::encode_varint(&mut buf, 0xD);
-                let mut payload = BytesMut::new();
-                Self::encode_varint(&mut payload, *push_id);
-                Self::encode_varint(&mut buf, payload.len() as u64);
-                buf.extend_from_slice(&payload);
+                let payload_len = Self::varint_encoded_len(*push_id);
+                Self::encode_varint(&mut buf, payload_len as u64);
+                Self::encode_varint(&mut buf, *push_id);
             }
             H3Frame::DuplicatePush { push_id } => {
+                // PERF: Avoid intermediate buffer - calculate payload size first
                 Self::encode_varint(&mut buf, 0xE);
-                let mut payload = BytesMut::new();
-                Self::encode_varint(&mut payload, *push_id);
-                Self::encode_varint(&mut buf, payload.len() as u64);
-                buf.extend_from_slice(&payload);
+                let payload_len = Self::varint_encoded_len(*push_id);
+                Self::encode_varint(&mut buf, payload_len as u64);
+                Self::encode_varint(&mut buf, *push_id);
             }
             H3Frame::PriorityUpdate { element_id, priority_field_value } => {
                 Self::encode_varint(&mut buf, 0xF);
@@ -453,6 +453,20 @@ impl H3Frame {
             buf.put_u8((value >> 16) as u8);
             buf.put_u8((value >> 8) as u8);
             buf.put_u8(value as u8);
+        }
+    }
+
+    /// Calculate the encoded length of a varint without allocating.
+    /// PERF: Used for pre-calculating payload sizes to avoid intermediate buffers.
+    fn varint_encoded_len(value: u64) -> usize {
+        if value < (1 << 6) {
+            1
+        } else if value < (1 << 14) {
+            2
+        } else if value < (1 << 30) {
+            4
+        } else {
+            8
         }
     }
 
