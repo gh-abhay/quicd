@@ -6,6 +6,31 @@
 use crate::error::H3Error;
 use http::Method;
 
+/// RFC 9110 Section 9.1: HTTP method token validation
+/// token = 1*tchar
+/// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." / 
+///         "0"-"9" / "A"-"Z" / "^" / "_" / "`" / "a"-"z" / "|" / "~"
+fn is_valid_method(method: &str) -> bool {
+    if method.is_empty() {
+        return false;
+    }
+    method.chars().all(|c| {
+        c.is_ascii_alphanumeric() 
+        || matches!(c, '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~')
+    })
+}
+
+/// RFC 3986 Section 3.1: Scheme validation
+/// scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+fn is_valid_scheme(scheme: &str) -> bool {
+    let mut chars = scheme.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {},
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
 /// Validate pseudo-headers and regular headers for an HTTP/3 request.
 ///
 /// RFC 9114 Section 4.3: Validates that:
@@ -21,6 +46,8 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
     let mut path = None;
     let mut protocol = None; // For extended CONNECT
     let mut seen_regular_header = false;
+    let mut has_te_header = false;
+    let mut te_value = String::new();
 
     for (name, value) in headers {
         // RFC 9114 Section 4.2: Field names MUST be lowercase
@@ -29,6 +56,36 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
                 "field name contains uppercase characters: {}",
                 name
             )));
+        }
+
+        // RFC 9114 Section 10.3 & Section 4.1.2: Field values MUST NOT contain
+        // invalid characters (CR, LF, NUL) that could enable attacks
+        // "carriage return (ASCII 0x0d), line feed (ASCII 0x0a), and the null
+        // character (ASCII 0x00) might be exploited by an attacker"
+        if value.chars().any(|c| c == '\r' || c == '\n' || c == '\0') {
+            return Err(H3Error::Http(format!(
+                "field value contains invalid characters (CR/LF/NUL): {} = {}",
+                name, value
+            )));
+        }
+
+        // RFC 9114 Section 4.2: Connection-specific headers MUST NOT be present
+        // "An endpoint MUST NOT generate an HTTP/3 field section containing
+        // connection-specific fields"
+        match name.as_str() {
+            "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade" => {
+                return Err(H3Error::Http(format!(
+                    "connection-specific header not allowed: {}",
+                    name
+                )));
+            }
+            "te" => {
+                // RFC 9114 Section 4.2: TE header MAY be present but MUST NOT
+                // contain any value other than "trailers"
+                has_te_header = true;
+                te_value = value.to_lowercase();
+            }
+            _ => {}
         }
 
         if name.starts_with(':') {
@@ -44,11 +101,19 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
                     if method.is_some() {
                         return Err(H3Error::Http("duplicate :method pseudo-header".into()));
                     }
+                    // RFC 9114 Section 4.3.1: Validate method is non-empty and valid token
+                    if value.is_empty() || !is_valid_method(value) {
+                        return Err(H3Error::Http(format!("invalid :method value: {}", value)));
+                    }
                     method = Some(value.clone());
                 }
                 ":scheme" => {
                     if scheme.is_some() {
                         return Err(H3Error::Http("duplicate :scheme pseudo-header".into()));
+                    }
+                    // RFC 9114 Section 4.3.1: Validate scheme format
+                    if value.is_empty() || !is_valid_scheme(value) {
+                        return Err(H3Error::Http(format!("invalid :scheme value: {}", value)));
                     }
                     scheme = Some(value.clone());
                 }
@@ -56,12 +121,20 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
                     if authority.is_some() {
                         return Err(H3Error::Http("duplicate :authority pseudo-header".into()));
                     }
+                    // RFC 9114 Section 4.3.1: Authority MUST NOT include deprecated userinfo
+                    if value.contains('@') {
+                        return Err(H3Error::Http(
+                            ":authority must not include userinfo subcomponent".into()
+                        ));
+                    }
                     authority = Some(value.clone());
                 }
                 ":path" => {
                     if path.is_some() {
                         return Err(H3Error::Http("duplicate :path pseudo-header".into()));
                     }
+                    // RFC 9114 Section 4.3.1: Path MUST NOT be empty for http/https
+                    // (will be validated after we know the scheme)
                     path = Some(value.clone());
                 }
                 ":protocol" => {
@@ -83,11 +156,18 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
 
             // RFC 9114 Section 4.2: Connection-specific fields MUST NOT be present
             if name == "connection" || name == "keep-alive" || name == "proxy-connection"
-                || name == "transfer-encoding" || name == "upgrade" {
+                || name == "transfer-encoding" {
                 return Err(H3Error::Http(format!(
                     "connection-specific header field not allowed: {}",
                     name
                 )));
+            }
+
+            // RFC 9114 Section 4.5: HTTP/3 does not support Upgrade
+            if name == "upgrade" {
+                return Err(H3Error::Http(
+                    "Upgrade header field not allowed in HTTP/3".into()
+                ));
             }
 
             // TE header field is allowed but MUST NOT contain anything other than "trailers"
@@ -97,6 +177,13 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
                 ));
             }
         }
+    }
+    
+    // RFC 9114 Section 4.2: Validate TE header if present
+    if has_te_header && te_value != "trailers" {
+        return Err(H3Error::Http(
+            "TE header field MUST only contain 'trailers'".into()
+        ));
     }
     
     // Phase 3: Validate Content-Length is not duplicated (RFC 9110 Section 8.6)
@@ -341,12 +428,85 @@ pub fn validate_field_section_size(
     Ok(())
 }
 
+/// Validate trailer headers per RFC 9114 Section 4.1.
+///
+/// RFC 9114 specifies that:
+/// - Trailers MUST NOT contain pseudo-headers
+/// - Trailers follow the same field name/value rules as headers
+/// - Trailers MUST NOT contain certain headers (e.g., Content-Length, Transfer-Encoding)
+pub fn validate_trailer_headers(trailers: &[(String, String)]) -> Result<(), H3Error> {
+    for (name, value) in trailers {
+        // RFC 9114 Section 4.3: Pseudo-header fields MUST NOT appear in trailer sections
+        if name.starts_with(':') {
+            return Err(H3Error::Http(format!(
+                "pseudo-header not allowed in trailers: {}",
+                name
+            )));
+        }
+
+        // RFC 9114 Section 4.2: Field names MUST be lowercase
+        if name.chars().any(|c| c.is_uppercase()) {
+            return Err(H3Error::Http(format!(
+                "field name contains uppercase characters: {}",
+                name
+            )));
+        }
+
+        // RFC 9114 Section 10.3: Field values MUST NOT contain invalid characters
+        if value.chars().any(|c| c == '\r' || c == '\n' || c == '\0') {
+            return Err(H3Error::Http(format!(
+                "field value contains invalid characters (CR/LF/NUL): {} = {}",
+                name, value
+            )));
+        }
+
+        // RFC 9110 Section 6.5: Certain headers MUST NOT appear in trailers
+        match name.as_str() {
+            "content-length" | "content-encoding" | "content-type" | 
+            "content-range" | "trailer" | "transfer-encoding" |
+            "authorization" | "set-cookie" | "content-disposition" => {
+                return Err(H3Error::Http(format!(
+                    "header not allowed in trailers: {}",
+                    name
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate that interim responses (1xx) don't contain certain headers.
+///
+/// RFC 9114 Section 4.1: Interim responses cannot contain content or trailers.
+pub fn validate_interim_response_headers(headers: &[(String, String)]) -> Result<(), H3Error> {
+    for (name, _value) in headers {
+        // RFC 9110 Section 15.2: 1xx responses MUST NOT contain:
+        // - Content-Length
+        // - Transfer-Encoding (already banned in HTTP/3)
+        // - Any representation metadata
+        match name.as_str() {
+            "content-length" | "content-type" | "content-encoding" | 
+            "content-language" | "content-location" | "content-range" => {
+                return Err(H3Error::Http(format!(
+                    "header not allowed in interim response: {}",
+                    name
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_valid_request_headers() {
+    fn test_valid_request() {
         let headers = vec![
             (":method".to_string(), "GET".to_string()),
             (":scheme".to_string(), "https".to_string()),

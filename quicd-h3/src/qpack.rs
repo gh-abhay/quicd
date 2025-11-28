@@ -348,10 +348,40 @@ impl QpackCodec {
             draining_entries: Vec::new(),
         }
     }
+    
+    /// Create a new codec with a known maximum capacity.
+    /// PERF: Pre-allocates dynamic table to avoid reallocations.
+    pub fn with_capacity(max_capacity: usize) -> Self {
+        let static_table = Self::build_static_table();
+        // Calculate max entries: RFC 9204 §4.5.1.1 MaxEntries = floor(capacity / 32)
+        let max_entries = if max_capacity > 0 { max_capacity / 32 } else { 0 };
+        
+        Self {
+            static_table,
+            dynamic_table: Vec::with_capacity(max_entries),
+            dynamic_table_capacity: 0,
+            max_dynamic_table_capacity: max_capacity,
+            insert_count: 0,
+            known_received_count: 0,
+            max_blocked_streams: 0,
+            max_field_section_size: None,
+            current_blocked_streams: 0,
+            dynamic_table_ref_counts: Vec::with_capacity(max_entries),
+            draining_entries: Vec::new(),
+        }
+    }
 
     /// Set the maximum dynamic table capacity
     pub fn set_max_table_capacity(&mut self, capacity: usize) {
         self.max_dynamic_table_capacity = capacity;
+        
+        // PERF #4: Pre-allocate dynamic table Vec to max capacity
+        let max_entries = if capacity > 0 { capacity / 32 } else { 0 };
+        if self.dynamic_table.capacity() < max_entries {
+            self.dynamic_table.reserve(max_entries - self.dynamic_table.capacity());
+            self.dynamic_table_ref_counts.reserve(max_entries - self.dynamic_table_ref_counts.capacity());
+        }
+        
         // Also set the current capacity to the maximum if it's currently 0
         if self.dynamic_table_capacity == 0 {
             self.dynamic_table_capacity = capacity;
@@ -439,6 +469,11 @@ impl QpackCodec {
     /// Get the known received count
     pub fn known_received_count(&self) -> usize {
         self.known_received_count
+    }
+    
+    /// Get the current number of blocked streams
+    pub fn current_blocked_streams(&self) -> usize {
+        self.current_blocked_streams
     }
     
     /// RFC 9204 Section 2.1.4: Check if we can block another stream
@@ -658,19 +693,53 @@ impl QpackCodec {
         ]
     }
 
+    /// Split Cookie header values for better QPACK compression.
+    /// 
+    /// RFC 9114 Section 4.2.1: "To improve compression efficiency, Cookie headers
+    /// SHOULD be split into separate header fields with single cookie-pairs before
+    /// encoding."
+    /// 
+    /// Example: "cookie: a=b; c=d" becomes two headers: "cookie: a=b" and "cookie: c=d"
+    pub fn split_cookie_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+        let mut result = Vec::with_capacity(headers.len());
+        
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("cookie") {
+                // Split by semicolon and trim whitespace
+                for cookie_pair in value.split(';') {
+                    let trimmed = cookie_pair.trim();
+                    if !trimmed.is_empty() {
+                        result.push((name.clone(), trimmed.to_string()));
+                    }
+                }
+            } else {
+                result.push((name.clone(), value.clone()));
+            }
+        }
+        
+        result
+    }
+
     /// Encode headers with dynamic table support and zero-copy optimizations
     /// Returns (encoded_headers, encoder_instructions, referenced_dynamic_entries)
     /// The caller is responsible for adding references for the returned indices
     pub fn encode_headers(&mut self, headers: &[(String, String)]) -> Result<(Bytes, Vec<Bytes>, Vec<usize>), H3Error> {
-        // Pre-allocate buffer: rough estimate is 2 bytes prefix + 32 bytes per header
-        let estimated_size = 2 + headers.len() * 32;
+        // RFC 9114 Section 4.2.1: Split Cookie headers for better compression
+        // "Before encoding, Cookie headers SHOULD be split into individual cookie-pairs"
+        let processed_headers = Self::split_cookie_headers(headers);
+        let headers_to_encode = &processed_headers;
+        
+        // PERF #1: Pre-allocate buffer with better size estimate
+        // Typical header: 20 bytes name + 50 bytes value + 3 bytes overhead = ~73 bytes
+        // Add prefix bytes and safety margin
+        let estimated_size = 8 + headers_to_encode.len() * 80;
         let mut buf = BytesMut::with_capacity(estimated_size);
         let mut encoder_instructions = Vec::new();
-        let mut referenced_dynamic_entries = Vec::new(); // Track which entries we reference
+        let mut referenced_dynamic_entries = Vec::with_capacity(headers_to_encode.len() / 4); // Assume 25% dynamic refs
         
         // First pass: decide which headers to insert into dynamic table
         // Heuristic: insert headers that are not in static table and likely to repeat
-        for (name, value) in headers {
+        for (name, value) in headers_to_encode {
             // Skip if already in dynamic table
             if self.find_dynamic_entry(name, value).is_some() {
                 continue;
@@ -684,31 +753,27 @@ impl QpackCodec {
                 continue;
             }
             
-            // Decide if we should insert based on header characteristics
-            // Insert if:
-            // 1. Name-value is large (> 64 bytes total) - likely to benefit from compression
-            // 2. Name is not in static table at all - custom header likely to repeat
-            // 3. Name is in static table but value differs - can use name reference encoding
-            let total_size = name.len() + value.len();
-            let name_in_static = self.find_static_name_index(name).is_some();
-            let should_insert = total_size > 64 
-                || !name_in_static 
-                || name_in_static; // Always insert if name in static but value differs
+            // If we reach here, the entry is not in static table (exact match) and not in dynamic table
+            // Insert it into dynamic table for potential future reuse
+            // Note: More sophisticated heuristics could be added here based on:
+            // - Header size (large headers benefit more from compression)
+            // - Header type (custom headers more likely to repeat)
+            // - Observed repetition patterns
             
-            if should_insert {
-                // Generate encoder instruction
-                let instruction = self.create_insert_instruction(name, value)?;
-                encoder_instructions.push(instruction);
-                
-                // Actually insert into our local dynamic table
-                self.insert(name.clone(), value.clone());
-            }
+            // Generate encoder instruction
+            let instruction = self.create_insert_instruction(name, value)?;
+            encoder_instructions.push(instruction);
+            
+            // Actually insert into our local dynamic table
+            self.insert(name.clone(), value.clone());
         }
         
         // RFC 9204 Section 4.5.1: Encoded field section prefix
         // Required Insert Count = highest insert count referenced + 1
+        // GAP #10 FIX: Use proper encoding with wraparound per RFC 9204 §4.5.1.1
         let required_insert_count = self.insert_count;
-        self.encode_varint_with_prefix(&mut buf, required_insert_count as u64, 0x00);
+        let encoded_insert_count = self.encode_required_insert_count(required_insert_count);
+        self.encode_varint_with_prefix(&mut buf, encoded_insert_count, 0x00);
         
         // Base = current insert count (most common case - referencing recent entries)
         let base_delta = 0u64;
@@ -870,7 +935,9 @@ impl QpackCodec {
     /// Decodes QPACK encoded headers (basic implementation).
     /// Returns (headers, referenced_dynamic_entries) for reference tracking.
     pub fn decode_headers(&self, encoded: &[u8]) -> Result<(Vec<(String, String)>, Vec<usize>), H3Error> {
-        let mut headers = Vec::new();
+        // PERF #1: Pre-allocate with estimated header count (typical: 10-20 headers)
+        let estimated_headers = 16;
+        let mut headers = Vec::with_capacity(estimated_headers);
         let mut cursor = 0;
         let mut field_section_size: usize = 0; // Track size per RFC 9114 Section 7.2.4.2
         let mut referenced_dynamic_entries = Vec::new(); // Track references for cleanup
@@ -880,14 +947,17 @@ impl QpackCodec {
         if cursor >= encoded.len() {
             return Err(H3Error::Qpack("empty encoded field section".into()));
         }
-        let (required_insert_count, consumed) = self.decode_qpack_prefix_int(&encoded[cursor..], 8)?;
+        let (encoded_insert_count, consumed) = self.decode_qpack_prefix_int(&encoded[cursor..], 8)?;
         cursor += consumed;
         
+        // GAP #10 FIX: Decode with wraparound handling per RFC 9204 §4.5.1.1
+        let required_insert_count = self.decode_required_insert_count(encoded_insert_count)?;
+        
         // RFC 9204 Section 2.1.4: Check if stream would be blocked
-        if required_insert_count > self.insert_count as u64 {
+        if required_insert_count > self.insert_count {
             // Stream is blocked - decoder needs to wait for dynamic table updates
             // Return special error that H3Session will handle by queueing the stream
-            return Err(H3Error::QpackBlocked(required_insert_count as usize));
+            return Err(H3Error::QpackBlocked(required_insert_count));
         }
         
         // Base (7-bit prefix with sign bit)
@@ -1007,7 +1077,8 @@ impl QpackCodec {
                 }
                 headers.push((name, value));
             } else if (first_byte & 0x20) != 0 {
-                // Literal header field
+                // Literal header field with literal name
+                // RFC 9204 Section 4.5.6: Format 001NHHHHH (N=never-indexed, H=huffman)
                 let (name, consumed) = self.decode_string(&encoded[cursor..])?;
                 cursor += consumed;
                 let (value, consumed) = self.decode_string(&encoded[cursor..])?;
@@ -1020,9 +1091,112 @@ impl QpackCodec {
                     }
                 }
                 headers.push((name, value));
+            } else if (first_byte & 0x10) != 0 {
+                // Post-Base Indexed Field Line
+                // RFC 9204 Section 4.5.4: Format 0001IIII (post-base index)
+                // Used to reference dynamic table entries inserted after the base
+                let index_bits = (first_byte & 0x0F) as usize;
+                let post_base_index = if index_bits == 15 {
+                    let (additional, consumed) = self.decode_varint(&encoded[cursor..])?;
+                    cursor += consumed;
+                    15 + additional as usize
+                } else {
+                    index_bits
+                };
+                
+                // Post-base index is relative to the base (most recent entries)
+                // Convert to absolute index in dynamic table
+                // RFC 9204 Section 4.5.4: Post-base index 0 refers to the entry immediately after base
+                referenced_dynamic_entries.push(post_base_index);
+                
+                let (name, value) = if let Some(entry) = self.get_relative(post_base_index) {
+                    entry.clone()
+                } else {
+                    // Entry might be in draining state
+                    let insert_count = self.insert_count.saturating_sub(post_base_index);
+                    self.get_draining_entry(insert_count)
+                        .ok_or_else(|| H3Error::Qpack("invalid post-base dynamic table index".into()))?
+                };
+                
+                // RFC 9114 Section 7.2.4.2: Track field section size
+                field_section_size += name.len() + value.len() + 32;
+                if let Some(max_size) = self.max_field_section_size {
+                    if field_section_size > max_size {
+                        return Err(H3Error::Http("field section size exceeds MAX_FIELD_SECTION_SIZE".into()));
+                    }
+                }
+                headers.push((name, value));
+            } else if (first_byte & 0x08) != 0 {
+                // This would be 00001XXX - not a valid pattern per RFC 9204
+                return Err(H3Error::Qpack("invalid field line representation".into()));
+            } else if first_byte != 0 {
+                // Post-Base Literal Field Line With Name Reference
+                // RFC 9204 Section 4.5.5: Format 0000NNNN (N=name index in post-base)
+                let name_index_bits = (first_byte & 0x0F) as usize;
+                let post_base_name_index = if name_index_bits == 15 {
+                    let (additional, consumed) = self.decode_varint(&encoded[cursor..])?;
+                    cursor += consumed;
+                    15 + additional as usize
+                } else {
+                    name_index_bits
+                };
+                
+                // Post-base name reference
+                referenced_dynamic_entries.push(post_base_name_index);
+                
+                let name = if let Some(entry) = self.get_relative(post_base_name_index) {
+                    entry.0.clone()
+                } else {
+                    let insert_count = self.insert_count.saturating_sub(post_base_name_index);
+                    self.get_draining_entry(insert_count)
+                        .ok_or_else(|| H3Error::Qpack("invalid post-base dynamic table index for name".into()))?
+                        .0
+                };
+                
+                let (value, consumed) = self.decode_string(&encoded[cursor..])?;
+                cursor += consumed;
+                
+                // RFC 9114 Section 7.2.4.2: Track field section size
+                field_section_size += name.len() + value.len() + 32;
+                if let Some(max_size) = self.max_field_section_size {
+                    if field_section_size > max_size {
+                        return Err(H3Error::Http("field section size exceeds MAX_FIELD_SECTION_SIZE".into()));
+                    }
+                }
+                headers.push((name, value));
             } else {
-                return Err(H3Error::Qpack("unknown field representation".into()));
+                // first_byte == 0x00 - could be padding or error
+                return Err(H3Error::Qpack("unexpected zero byte in field section".into()));
             }
+        }
+
+        // RFC 9204 Section 4.5.1.1: Validate Required Insert Count
+        // "A decoder MUST treat a field section that contains a Required Insert Count
+        // that is greater than the decoder's Insert Count as a connection error"
+        // This was already checked above. Additionally, we must validate the RIC is
+        // correct based on the maximum dynamic table index actually referenced.
+        if !referenced_dynamic_entries.is_empty() {
+            // Calculate the maximum dynamic table index referenced
+            let max_referenced_index = referenced_dynamic_entries.iter().max().copied().unwrap_or(0);
+            
+            // The Required Insert Count must be at least large enough to include the
+            // maximum referenced entry. Each dynamic table entry has an insert count
+            // corresponding to when it was added.
+            let expected_min_ric = self.insert_count.saturating_sub(max_referenced_index);
+            
+            // RFC 9204 Section 4.5.1.1: Verify RIC is sufficient
+            // If RIC < expected minimum, the encoder provided an incorrect value
+            if required_insert_count < expected_min_ric {
+                return Err(H3Error::Qpack(format!(
+                    "Required Insert Count {} is insufficient for referenced index {} (expected >= {})",
+                    required_insert_count, max_referenced_index, expected_min_ric
+                )));
+            }
+        } else if required_insert_count > 0 {
+            // RFC 9204 Section 4.5.1.1: If no dynamic entries referenced, RIC must be 0
+            return Err(H3Error::Qpack(
+                "Required Insert Count is non-zero but no dynamic table entries referenced".into()
+            ));
         }
 
         Ok((headers, referenced_dynamic_entries))
@@ -1090,53 +1264,88 @@ impl QpackCodec {
     }
 
     /// Decode Huffman-encoded bytes back to original bytes (public for testing)
+    /// Decode Huffman-encoded data per RFC 7541 Section 5.2.
+    /// 
+    /// RFC 9204 Section 4.1.3: QPACK uses the same Huffman code as HPACK (RFC 7541).
+    /// Returns None if the input contains invalid codes or improper padding.
     pub fn decode_huffman(&self, input: &[u8]) -> Option<String> {
-        let mut output = Vec::new();
-        let mut bit_buffer = 0u32;
+        let mut output = Vec::with_capacity(input.len() * 2); // Pre-allocate for efficiency
+        let mut bit_buffer = 0u64; // Use u64 to avoid overflow during accumulation
         let mut bits_available = 0u8;
 
         for &byte in input {
             // Shift existing bits to make room for new byte
-            bit_buffer <<= 8;
-            bit_buffer |= byte as u32;
+            bit_buffer = (bit_buffer << 8) | (byte as u64);
             bits_available += 8;
 
             // Process as many complete codes as possible
+            // RFC 7541: Huffman codes are variable length (5-30 bits)
             loop {
+                if bits_available == 0 {
+                    break;
+                }
+                
                 let mut found = false;
+                
+                // Performance optimization: try common short codes first
+                // Most ASCII characters have 5-8 bit codes
                 for (symbol, huffman_code) in HUFFMAN_CODES.iter().enumerate() {
-                    let code_length = huffman_code.length as u8;
+                    let code_length = huffman_code.length;
+                    
                     if code_length > bits_available {
-                        continue;
+                        continue; // Not enough bits to decode this code
                     }
 
-                    // Extract the code from the high bits
+                    // Extract the next code_length bits from the high end of buffer
                     let shift = bits_available - code_length;
-                    let extracted_code = (bit_buffer >> shift) & ((1u32 << code_length) - 1);
+                    let extracted_code = (bit_buffer >> shift) as u32 & ((1u32 << code_length) - 1);
 
-                    if extracted_code == huffman_code.code as u32 {
+                    if extracted_code == huffman_code.code {
+                        // RFC 7541 Section 5.2: EOS (256) must not appear in decoded output
+                        if symbol == 256 {
+                            return None; // Invalid: EOS in middle of stream
+                        }
+                        
                         output.push(symbol as u8);
-                        // Remove the used bits
-                        bit_buffer &= (1u32 << shift) - 1;
-                        bits_available -= code_length;
+                        
+                        // Remove the used bits from buffer
+                        bit_buffer &= (1u64 << shift) - 1;
+                        bits_available = shift;
                         found = true;
                         break;
                     }
                 }
 
                 if !found {
-                    break; // No more codes can be decoded
+                    break; // No complete code available with current bits
                 }
             }
         }
 
-        // Check remaining bits are all 1s (EOS padding)
+        // RFC 7541 Section 5.2: Validate padding
+        // "A padding strictly longer than 7 bits MUST be treated as a decoding error"
+        if bits_available > 7 {
+            return None; // Invalid: padding too long
+        }
+        
         if bits_available > 0 {
-            let remaining = bit_buffer & ((1u32 << bits_available) - 1);
+            // RFC 7541: Padding bits must all be 1s (corresponds to EOS prefix)
+            let remaining = bit_buffer as u32 & ((1u32 << bits_available) - 1);
             let eos_mask = (1u32 << bits_available) - 1;
+            
             if remaining != eos_mask {
+                // Invalid: padding bits are not all 1s
                 return None;
             }
+            
+            // Additional check: padding must not be decodable as a complete symbol
+            // RFC 7541: "A padding not corresponding to the most significant bits
+            // of the code for the EOS symbol MUST be treated as a decoding error"
+            // EOS is 0x3fffffff (30 bits all 1s)
+            // So any trailing 1-bits that could form a valid code prefix are invalid
+            
+            // This is already covered by the "no complete code" check above,
+            // but we document it for clarity
         }
 
         String::from_utf8(output).ok()
@@ -1229,6 +1438,85 @@ impl QpackCodec {
     }
 
     /// Decode a QPACK instruction from bytes
+    /// Decode a QPACK instruction with stream context for disambiguation.
+    /// 
+    /// RFC 9204: Duplicate (encoder) and InsertCountIncrement (decoder) both start
+    /// with 0x00, so we need stream context to properly disambiguate them.
+    pub fn decode_instruction_with_context(
+        &self, 
+        data: &[u8], 
+        is_encoder_stream: bool
+    ) -> Result<(QpackInstruction, usize), H3Error> {
+        if data.is_empty() {
+            return Err(H3Error::Qpack("empty instruction data".into()));
+        }
+        
+        let first_byte = data[0];
+        let mut cursor = 1;
+        
+        match first_byte {
+            0x20..=0x3F => {
+                // Set Dynamic Table Capacity (encoder only)
+                let (capacity, consumed) = self.decode_varint(&data[cursor..])?;
+                cursor += consumed;
+                Ok((QpackInstruction::SetDynamicTableCapacity { capacity }, cursor))
+            }
+            0x80..=0xFF => {
+                // Insert with Name Reference or Section Acknowledgment
+                if (first_byte & 0x40) != 0 {
+                    // Insert with Name Reference (encoder only)
+                    let (name_index, consumed) = self.decode_varint(&data[cursor..])?;
+                    cursor += consumed;
+                    let (value, consumed) = self.decode_string(&data[cursor..])?;
+                    cursor += consumed;
+                    Ok((QpackInstruction::InsertWithNameReference { 
+                        static_table: true, 
+                        name_index, 
+                        value 
+                    }, cursor))
+                } else {
+                    // Section Acknowledgment (decoder only)
+                    let (stream_id, consumed) = self.decode_varint(&data[cursor..])?;
+                    cursor += consumed;
+                    Ok((QpackInstruction::SectionAcknowledgment { stream_id }, cursor))
+                }
+            }
+            0x40..=0x7F => {
+                // Insert with Literal Name or Stream Cancellation
+                if (first_byte & 0x20) != 0 {
+                    // Stream Cancellation (decoder only, bit pattern: 01 xxxxxx)
+                    let (stream_id, consumed) = self.decode_varint(&data[cursor..])?;
+                    cursor += consumed;
+                    Ok((QpackInstruction::StreamCancellation { stream_id }, cursor))
+                } else {
+                    // Insert with Literal Name (encoder only, bit pattern: 010 xxxxx)
+                    let (name, consumed) = self.decode_string(&data[cursor..])?;
+                    cursor += consumed;
+                    let (value, consumed) = self.decode_string(&data[cursor..])?;
+                    cursor += consumed;
+                    Ok((QpackInstruction::InsertWithLiteralName { name, value }, cursor))
+                }
+            }
+            0x00..=0x1F => {
+                // Duplicate (encoder) or Insert Count Increment (decoder) - context dependent
+                // RFC 9204 Section 4.3.1 vs 4.4.3: Both have the same wire format (0x00 prefix)
+                let (value, consumed) = self.decode_varint(&data[cursor..])?;
+                cursor += consumed;
+                
+                // Use stream context for proper disambiguation
+                if is_encoder_stream {
+                    // On encoder stream: this is Duplicate
+                    Ok((QpackInstruction::Duplicate { index: value }, cursor))
+                } else {
+                    // On decoder stream: this is Insert Count Increment
+                    Ok((QpackInstruction::InsertCountIncrement { increment: value }, cursor))
+                }
+            }
+        }
+    }
+    
+    /// Legacy decode without context - uses heuristic for backwards compatibility.
+    /// Prefer decode_instruction_with_context() for correct RFC 9204 compliance.
     pub fn decode_instruction(&self, data: &[u8]) -> Result<(QpackInstruction, usize), H3Error> {
         if data.is_empty() {
             return Err(H3Error::Qpack("empty instruction data".into()));
@@ -1277,24 +1565,18 @@ impl QpackCodec {
                 }
             }
             0x00..=0x1F => {
-                // Duplicate or Insert Count Increment - context dependent
+                // Duplicate or Insert Count Increment - HEURISTIC fallback
+                // LIMITATION: Without stream context, we use a heuristic
+                // Prefer decode_instruction_with_context() for correctness
                 let (value, consumed) = self.decode_varint(&data[cursor..])?;
                 cursor += consumed;
                 
-                if first_byte == 0x00 {
-                    // Both Duplicate and Insert Count Increment start with 0x00
-                    // The distinction is made by the caller based on stream type
-                    // For now, return both possibilities and let caller decide
-                    // This is a limitation of the current API design
-                    // In practice, encoder streams send Duplicate, decoder streams send Insert Count Increment
-                    // For backward compatibility, assume small values are Duplicate, large are Insert Count Increment
-                    if value < 1024 {
-                        Ok((QpackInstruction::Duplicate { index: value }, cursor))
-                    } else {
-                        Ok((QpackInstruction::InsertCountIncrement { increment: value }, cursor))
-                    }
+                // Heuristic: small values likely Duplicate, large likely InsertCountIncrement
+                // This is NOT RFC compliant - it's a best-effort fallback
+                if value < 1024 {
+                    Ok((QpackInstruction::Duplicate { index: value }, cursor))
                 } else {
-                    return Err(H3Error::Qpack("unknown instruction".into()));
+                    Ok((QpackInstruction::InsertCountIncrement { increment: value }, cursor))
                 }
             }
         }
@@ -1438,14 +1720,80 @@ impl QpackCodec {
         }
     }
 
-    /// Encode Required Insert Count per RFC 9204 Section 4.5.1.1 (exposed for testing)
-    pub fn encode_required_insert_count(&self) -> u64 {
-        // RFC 9204 Section 4.5.1.1: Required Insert Count is the highest absolute index
-        // referenced in the field section, or 0 if no references
+    /// Encode Required Insert Count per RFC 9204 Section 4.5.1.1
+    /// 
+    /// This function encodes the Required Insert Count value with wraparound handling.
+    /// The encoding ensures that the decoder can reconstruct the value even when it wraps.
+    /// 
+    /// Algorithm from RFC 9204 §4.5.1.1:
+    /// ```text
+    /// if ReqInsertCount == 0:
+    ///    EncodedInsertCount = 0
+    /// else:
+    ///    EncodedInsertCount = (ReqInsertCount mod (2 * MaxEntries)) + 1
+    /// ```
+    pub fn encode_required_insert_count(&self, req_insert_count: usize) -> u64 {
+        if req_insert_count == 0 {
+            return 0;
+        }
         
-        // For now, we return the current insert count as a conservative estimate
-        // In a full implementation, this would track the actual maximum referenced index
-        // during encoding and return that value
-        self.insert_count as u64
+        // MaxEntries is the maximum number of entries the dynamic table can hold
+        // RFC 9204 §4.5.1.1: MaxEntries = floor(max_table_capacity / 32)
+        let max_entries = self.max_dynamic_table_capacity / 32;
+        if max_entries == 0 {
+            // Edge case: if table capacity is too small, can't use dynamic table
+            return 0;
+        }
+        
+        let full_range = 2 * max_entries;
+        let encoded = (req_insert_count % full_range) + 1;
+        encoded as u64
+    }
+    
+    /// Decode Required Insert Count per RFC 9204 Section 4.5.1.1
+    /// 
+    /// This function decodes the Required Insert Count value with wraparound handling.
+    /// 
+    /// Algorithm from RFC 9204 §4.5.1.1:
+    /// ```text
+    /// FullRange = 2 * MaxEntries
+    /// if EncodedInsertCount == 0:
+    ///    ReqInsertCount = 0
+    /// else:
+    ///    MaxValue = TotalNumInserted + MaxEntries
+    ///    MaxWrapped = (MaxValue / FullRange) * FullRange
+    ///    ReqInsertCount = MaxWrapped + EncodedInsertCount - 1
+    ///    if ReqInsertCount > MaxValue:
+    ///       if ReqInsertCount <= FullRange:
+    ///          return Error
+    ///       ReqInsertCount -= FullRange
+    /// ```
+    pub fn decode_required_insert_count(&self, encoded_insert_count: u64) -> Result<usize, H3Error> {
+        if encoded_insert_count == 0 {
+            return Ok(0);
+        }
+        
+        // MaxEntries is the maximum number of entries the dynamic table can hold
+        let max_entries = self.max_dynamic_table_capacity / 32;
+        if max_entries == 0 {
+            return Err(H3Error::Qpack("dynamic table capacity too small".into()));
+        }
+        
+        let full_range = 2 * max_entries;
+        let total_num_inserted = self.insert_count;
+        let max_value = total_num_inserted + max_entries;
+        
+        // MaxWrapped = floor(MaxValue / FullRange) * FullRange
+        let max_wrapped = (max_value / full_range) * full_range;
+        let mut req_insert_count = max_wrapped + encoded_insert_count as usize - 1;
+        
+        if req_insert_count > max_value {
+            if req_insert_count <= full_range {
+                return Err(H3Error::Qpack("invalid required insert count encoding".into()));
+            }
+            req_insert_count -= full_range;
+        }
+        
+        Ok(req_insert_count)
     }
 }

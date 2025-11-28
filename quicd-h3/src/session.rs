@@ -17,7 +17,7 @@ pub struct H3Request {
 /// Handle for sending HTTP/3 responses on a specific stream.
 pub struct H3ResponseSender {
     pub(crate) send_stream: quicd_x::SendStream,
-    pub(crate) qpack: std::sync::Arc<tokio::sync::Mutex<crate::qpack::QpackCodec>>,
+    pub(crate) qpack: std::sync::Arc<tokio::sync::RwLock<crate::qpack::QpackCodec>>,
     pub(crate) push_manager: Option<std::sync::Arc<tokio::sync::Mutex<PushManager>>>,
     pub(crate) connection_handle: Option<quicd_x::ConnectionHandle>,
     pub(crate) stream_id: u64, // The request stream ID for push promises
@@ -34,7 +34,7 @@ impl H3ResponseSender {
         all_headers.extend(headers);
 
         let (encoded_headers, encoder_instructions, _referenced_entries) = {
-            let mut qpack = self.qpack.lock().await;
+            let mut qpack = self.qpack.write().await;
             let result = qpack.encode_headers(&all_headers)
                 .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
             // RFC 9204 Section 2.1.2: Add references (will be released when stream completes)
@@ -79,6 +79,67 @@ impl H3ResponseSender {
         Ok(())
     }
 
+    /// Send an interim (1xx) response.
+    /// 
+    /// RFC 9114 Section 4.1: An HTTP request/response exchange can include multiple
+    /// informational (1xx) responses before the final response. These interim responses
+    /// convey status without ending the request.
+    /// 
+    /// Interim responses MUST NOT contain:
+    /// - content-length, content-type, content-encoding headers
+    /// - A message body (no DATA frames)
+    pub async fn send_interim_response(&mut self, status: u16, headers: Vec<(String, String)>) -> Result<(), H3Error> {
+        // Validate that status is 1xx
+        if status < 100 || status >= 200 {
+            return Err(H3Error::Http(format!("status {} is not an interim response (1xx)", status)));
+        }
+        
+        // Build headers with :status pseudo-header
+        let mut all_headers = vec![
+            (":status".to_string(), status.to_string()),
+        ];
+        all_headers.extend(headers);
+        
+        // RFC 9114 Section 4.1: Validate interim response headers
+        crate::validation::validate_interim_response_headers(&all_headers)?;
+        
+        // Encode headers
+        let (encoded_headers, encoder_instructions, _referenced_entries) = {
+            let mut qpack = self.qpack.write().await;
+            let result = qpack.encode_headers(&all_headers)
+                .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
+            // RFC 9204 Section 2.1.2: Add references
+            for index in &result.2 {
+                qpack.add_reference(*index);
+            }
+            result
+        };
+
+        // Send encoder instructions to encoder stream if any
+        if !encoder_instructions.is_empty() {
+            let mut encoder_stream_guard = self.encoder_send_stream.lock().await;
+            if let Some(encoder_stream) = encoder_stream_guard.as_mut() {
+                let total_size: usize = encoder_instructions.iter().map(|b| b.len()).sum();
+                let mut combined = bytes::BytesMut::with_capacity(total_size);
+                
+                for instruction in encoder_instructions {
+                    combined.extend_from_slice(&instruction);
+                }
+                
+                encoder_stream.write(combined.freeze(), false).await
+                    .map_err(|e| H3Error::Stream(format!("failed to write encoder instructions: {:?}", e)))?;
+            }
+        }
+
+        // Send HEADERS frame (no FIN - more data may follow)
+        let headers_frame = crate::frames::H3Frame::Headers { encoded_headers };
+        let frame_data = headers_frame.encode();
+        self.send_stream.write(frame_data, false).await
+            .map_err(|e| H3Error::Stream(format!("write failed: {:?}", e)))?;
+
+        Ok(())
+    }
+
     /// Send a PUSH_PROMISE frame to initiate server push.
     ///
     /// Per RFC 9114 Section 4.6: Server push allows a server to send responses
@@ -106,7 +167,7 @@ impl H3ResponseSender {
         
         // Encode headers for PUSH_PROMISE frame
         let (encoded_headers, encoder_instructions, _referenced_entries) = {
-            let mut qpack = self.qpack.lock().await;
+            let mut qpack = self.qpack.write().await;
             let result = qpack.encode_headers(&headers)
                 .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
             // RFC 9204 Section 2.1.2: Add references

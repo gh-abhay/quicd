@@ -37,6 +37,12 @@ pub struct StreamFrameParser {
     trailers_received: bool,
     /// Stream ID for error reporting
     stream_id: u64,
+    /// RFC 9114 Section 4.1.2: Content-Length tracking for validation
+    /// Stores the declared Content-Length from headers if present
+    content_length_declared: Option<u64>,
+    /// RFC 9114 Section 4.1.2: Actual bytes received in DATA frames
+    /// Must match content_length_declared if it was present
+    content_length_received: u64,
 }
 
 /// Maximum buffer size per stream to prevent memory exhaustion
@@ -56,6 +62,8 @@ impl StreamFrameParser {
             data_received: false,
             trailers_received: false,
             stream_id,
+            content_length_declared: None,
+            content_length_received: 0,
         }
     }
 
@@ -226,8 +234,10 @@ impl StreamFrameParser {
                     ));
                 }
             }
-            H3Frame::Data { .. } => {
+            H3Frame::Data { data } => {
                 self.data_received = true;
+                // RFC 9114 Section 4.1.2: Track DATA payload for Content-Length validation
+                self.record_data_bytes(data.len() as u64);
             }
             _ => {}
         }
@@ -238,6 +248,33 @@ impl StreamFrameParser {
     /// Check if there's any buffered data remaining.
     pub fn has_buffered_data(&self) -> bool {
         !self.buffer.is_empty()
+    }
+
+    /// RFC 9114 Section 4.1.2: Set the declared Content-Length from headers.
+    /// Should be called when processing request/response headers.
+    pub fn set_content_length(&mut self, length: u64) {
+        self.content_length_declared = Some(length);
+    }
+
+    /// RFC 9114 Section 4.1.2: Record DATA frame payload bytes received.
+    /// Call this for each DATA frame to accumulate the total.
+    pub fn record_data_bytes(&mut self, bytes: u64) {
+        self.content_length_received += bytes;
+    }
+
+    /// RFC 9114 Section 4.1.2: Validate Content-Length matches actual DATA payload.
+    /// Call this when stream completes (receives FIN or trailers).
+    /// Returns H3_MESSAGE_ERROR if mismatch detected.
+    pub fn validate_content_length(&self) -> Result<(), H3Error> {
+        if let Some(declared) = self.content_length_declared {
+            if declared != self.content_length_received {
+                return Err(H3Error::Http(format!(
+                    "Content-Length mismatch on stream {}: declared {} but received {} bytes",
+                    self.stream_id, declared, self.content_length_received
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Get the number of buffered bytes.

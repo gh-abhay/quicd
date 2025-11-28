@@ -42,11 +42,27 @@ fn test_decode_headers_with_prefix() {
 
 #[test]
 fn test_required_insert_count_encoding() {
-    let codec = QpackCodec::new();
+    let mut codec = QpackCodec::new();
     
-    // With no dynamic table, required insert count should be 0
-    let ric = codec.encode_required_insert_count();
+    // With no dynamic table capacity, encoding returns 0
+    let ric = codec.encode_required_insert_count(0);
     assert_eq!(ric, 0);
+    
+    // Set table capacity and test with actual insert count
+    codec.set_max_table_capacity(4096); // 4KB = ~128 entries
+    
+    // Test encoding 0 (special case)
+    let ric = codec.encode_required_insert_count(0);
+    assert_eq!(ric, 0);
+    
+    // Test encoding non-zero value
+    // With max_entries = 128, encoding formula: (req % 256) + 1
+    let ric = codec.encode_required_insert_count(5);
+    assert_eq!(ric, 6); // (5 % 256) + 1 = 6
+    
+    // Test wraparound
+    let ric = codec.encode_required_insert_count(256);
+    assert_eq!(ric, 1); // (256 % 256) + 1 = 1 (wrapped)
 }
 
 #[test]

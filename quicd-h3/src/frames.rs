@@ -14,6 +14,7 @@ pub enum H3Frame {
     GoAway { stream_id: u64 },
     MaxPushId { push_id: u64 },
     DuplicatePush { push_id: u64 },
+    PriorityUpdate { element_id: u64, priority_field_value: String },
     Reserved { frame_type: u64, payload: Bytes },
 }
 
@@ -107,6 +108,13 @@ impl H3Frame {
                     .map_err(|_| H3Error::FrameParse("DUPLICATE_PUSH push_id parse error".into()))?;
                 H3Frame::DuplicatePush { push_id }
             }
+            0xF => {
+                let (element_id, consumed) = Self::decode_varint(payload)
+                    .map_err(|_| H3Error::FrameParse("PRIORITY_UPDATE element_id parse error".into()))?;
+                let priority_field_value = String::from_utf8(payload[consumed..].to_vec())
+                    .map_err(|_| H3Error::FrameParse("PRIORITY_UPDATE priority_field_value invalid UTF-8".into()))?;
+                H3Frame::PriorityUpdate { element_id, priority_field_value }
+            }
             _ => H3Frame::Reserved { frame_type, payload: Bytes::copy_from_slice(payload) },
         };
 
@@ -190,6 +198,13 @@ impl H3Frame {
                     .map_err(|_| H3Error::FrameParse("DUPLICATE_PUSH push_id parse error".into()))?;
                 H3Frame::DuplicatePush { push_id }
             }
+            0xF => {
+                let (element_id, priority_start) = Self::decode_varint(&buf[payload_start..payload_end])
+                    .map_err(|_| H3Error::FrameParse("PRIORITY_UPDATE element_id parse error".into()))?;
+                let priority_field_value = String::from_utf8(buf[payload_start + priority_start..payload_end].to_vec())
+                    .map_err(|_| H3Error::FrameParse("PRIORITY_UPDATE priority_field_value invalid UTF-8".into()))?;
+                H3Frame::PriorityUpdate { element_id, priority_field_value }
+            }
             _ => H3Frame::Reserved { 
                 frame_type, 
                 payload: buf.slice(payload_start..payload_end) 
@@ -197,6 +212,30 @@ impl H3Frame {
         };
 
         Ok((frame, consumed))
+    }
+    
+    /// PERF #2: Parse multiple frames from a buffer in one pass.
+    /// Returns Vec of frames and the total bytes consumed.
+    /// This reduces per-frame overhead when multiple frames arrive in one read.
+    pub fn parse_multiple(buf: &Bytes) -> Result<(Vec<H3Frame>, usize), H3Error> {
+        let mut frames = Vec::with_capacity(4); // Typical: 2-4 frames per read
+        let mut total_consumed = 0;
+        
+        while total_consumed < buf.len() {
+            match Self::parse_bytes(&buf.slice(total_consumed..)) {
+                Ok((frame, consumed)) => {
+                    frames.push(frame);
+                    total_consumed += consumed;
+                }
+                Err(H3Error::FrameParse(ref msg)) if msg.contains("buffer too small") => {
+                    // Partial frame - stop parsing and return what we have
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        
+        Ok((frames, total_consumed))
     }
 
     /// Encodes the frame into bytes.
@@ -269,6 +308,14 @@ impl H3Frame {
                 Self::encode_varint(&mut buf, payload.len() as u64);
                 buf.extend_from_slice(&payload);
             }
+            H3Frame::PriorityUpdate { element_id, priority_field_value } => {
+                Self::encode_varint(&mut buf, 0xF);
+                let mut payload = BytesMut::new();
+                Self::encode_varint(&mut payload, *element_id);
+                payload.extend_from_slice(priority_field_value.as_bytes());
+                Self::encode_varint(&mut buf, payload.len() as u64);
+                buf.extend_from_slice(&payload);
+            }
             H3Frame::Reserved { frame_type, payload } => {
                 Self::encode_varint(&mut buf, *frame_type);
                 Self::encode_varint(&mut buf, payload.len() as u64);
@@ -299,6 +346,10 @@ impl H3Frame {
             | H3Frame::MaxPushId { .. } | H3Frame::DuplicatePush { .. } => {
                 // type + length + varint push_id/stream_id
                 32
+            }
+            H3Frame::PriorityUpdate { priority_field_value, .. } => {
+                // type + length + element_id + priority_field_value
+                32 + priority_field_value.len()
             }
             H3Frame::Settings { settings } => {
                 // type + length + (id + value) per setting

@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use quicd_x::{AppEvent, ConnectionHandle, QuicAppFactory, ShutdownFuture, TransportControls};
 
@@ -15,8 +16,11 @@ use crate::session::{H3Handler, H3Request, H3ResponseSender};
 use crate::stream_state::StreamFrameParser;
 use crate::qpack_streams::QpackStreamManager;
 use crate::settings::SettingsValidator;
+use crate::settings_storage::{InMemorySettingsStorage, Origin, SettingsStorage};
 use crate::connect::validate_connect_request;
 use crate::push::PushManager;
+use crate::metrics::H3Metrics;
+use crate::priority::PriorityTree;
 
 /// Core HTTP/3 session implementation.
 ///
@@ -24,7 +28,7 @@ use crate::push::PushManager;
 /// request/response handling, and integration with the underlying QUIC transport.
 pub struct H3Session<H: H3Handler> {
     handle: ConnectionHandle,
-    qpack: Arc<AsyncMutex<QpackCodec>>,
+    qpack: Arc<AsyncRwLock<QpackCodec>>,
     server_control_send: Option<quicd_x::SendStream>,
     streams: HashMap<u64, StreamState>,
     max_stream_id: u64,
@@ -60,6 +64,8 @@ pub struct H3Session<H: H3Handler> {
     request_queue: std::collections::BinaryHeap<QueuedRequest>,
     // Track stream priorities
     stream_priorities: HashMap<u64, u64>, // stream_id -> priority_id
+    // RFC 9218: Priority tree for extensible prioritization
+    priority_tree: PriorityTree,
     // RFC 9204 Section 4.4.3: Track processed insert count for INSERT_COUNT_INCREMENT
     insert_count_processed: u64,
     // PERF #29: Batch QPACK decoder instructions to reduce lock contention
@@ -73,6 +79,15 @@ pub struct H3Session<H: H3Handler> {
     stream_types: HashMap<u64, StreamType>,
     // Phase 1: GOAWAY ID tracking for validation
     last_goaway_id: Option<u64>,
+    // HTTP/3 operational metrics
+    pub metrics: Arc<H3Metrics>,
+    // 0-RTT settings storage (RFC 9114 Section 7.2.4.2)
+    settings_storage: Arc<dyn SettingsStorage>,
+    // Connection origin for settings storage
+    origin: Option<Origin>,
+    // RFC 9114 Section 5.1: Idle connection timeout tracking
+    last_activity_time: std::time::Instant,
+    idle_timeout: std::time::Duration,
 }
 
 /// Stream type context for validating frame associations
@@ -154,13 +169,28 @@ enum PushStreamState {
 }
 
 impl<H: H3Handler> H3Session<H> {
-    pub fn new(handle: ConnectionHandle, handler: H) -> Self {
+    pub fn new(handle: ConnectionHandle, handler: H, settings_storage: Arc<dyn SettingsStorage>) -> Self {
+        Self::with_origin(handle, handler, settings_storage, None)
+    }
+
+    pub fn with_origin(handle: ConnectionHandle, handler: H, settings_storage: Arc<dyn SettingsStorage>, origin: Option<Origin>) -> Self {
         // Create push manager for server push support
         let push_manager = Arc::new(AsyncMutex::new(PushManager::new()));
         
+        // If we have an origin and remembered settings, create validator with them
+        let settings_validator = if let Some(ref orig) = origin {
+            if let Some(remembered) = settings_storage.retrieve(orig) {
+                SettingsValidator::with_remembered_settings(remembered)
+            } else {
+                SettingsValidator::new()
+            }
+        } else {
+            SettingsValidator::new()
+        };
+        
         Self {
             handle,
-            qpack: Arc::new(AsyncMutex::new(QpackCodec::new())),
+            qpack: Arc::new(AsyncRwLock::new(QpackCodec::new())),
             server_control_send: None,
             streams: HashMap::new(),
             max_stream_id: 0,
@@ -169,7 +199,7 @@ impl<H: H3Handler> H3Session<H> {
             pending_control_stream_request: None,
             pending_push_streams: HashMap::new(),
             // New RFC-compliant components
-            settings_validator: SettingsValidator::new(),
+            settings_validator,
             qpack_manager: QpackStreamManager::new(),
             stream_parsers: HashMap::new(),
             // Server push state
@@ -205,6 +235,16 @@ impl<H: H3Handler> H3Session<H> {
             request_queue: std::collections::BinaryHeap::new(),
             // Track stream priorities
             stream_priorities: HashMap::new(),
+            // RFC 9218: Priority tree
+            priority_tree: PriorityTree::new(),
+            // HTTP/3 operational metrics
+            metrics: H3Metrics::new(),
+            // 0-RTT settings storage
+            settings_storage,
+            origin,
+            // RFC 9114 Section 5.1: Idle timeout tracking (default 30 seconds)
+            last_activity_time: std::time::Instant::now(),
+            idle_timeout: std::time::Duration::from_secs(30),
         }
     }
 
@@ -233,6 +273,16 @@ impl<H: H3Handler> H3Session<H> {
                     if let Err(e) = self.check_blocked_stream_timeouts().await {
                         eprintln!("Error checking blocked stream timeouts: {:?}", e);
                     }
+                    
+                    // RFC 9114 Section 5.1: Check for idle connection timeout
+                    if self.last_activity_time.elapsed() > self.idle_timeout {
+                        eprintln!("Connection idle for {:?}, sending GOAWAY", self.last_activity_time.elapsed());
+                        if !self.goaway_sent {
+                            if let Err(e) = self.send_goaway().await {
+                                eprintln!("Error sending GOAWAY on idle timeout: {:?}", e);
+                            }
+                        }
+                    }
                 }
                 _ = &mut shutdown => {
                     // Graceful shutdown
@@ -249,6 +299,9 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     async fn handle_event(&mut self, event: AppEvent) -> Result<(), H3Error> {
+        // RFC 9114 Section 5.1: Update activity timestamp on any event
+        self.last_activity_time = std::time::Instant::now();
+        
         match event {
             AppEvent::HandshakeCompleted { alpn, .. } => {
                 if alpn.starts_with("h3") {
@@ -508,8 +561,17 @@ impl<H: H3Handler> H3Session<H> {
             }
             0x01 => {
                 // Push stream (RFC 9114 Section 6.2.2)
-                // Read push ID and process push stream
-                self.process_push_stream(stream_id, recv_stream).await?;
+                // RFC 9114 Section 6.2.2: Push streams are unidirectional streams opened by servers
+                // A server MUST NOT open a push stream. If a client receives a push stream, it is
+                // acceptable. However, if a SERVER receives a push stream from a client, this is
+                // a protocol violation.
+                //
+                // Note: This implementation is a server, so receiving push streams from clients
+                // is a protocol error per RFC 9114.
+                return Err(H3Error::Connection(
+                    "H3_STREAM_CREATION_ERROR: push stream received by server (only servers can push)".into()
+                ));
+                // Client implementation would call: self.process_push_stream(stream_id, recv_stream).await?;
             }
             0x02 => {
                 // QPACK encoder stream (RFC 9204 Section 4.2)
@@ -612,6 +674,11 @@ impl<H: H3Handler> H3Session<H> {
                 Setting { identifier: 0x6, value: 0 }, // SETTINGS_MAX_FIELD_SECTION_SIZE (unlimited)
                 Setting { identifier: 0x7, value: 100 }, // SETTINGS_QPACK_BLOCKED_STREAMS (100 default)
             ];
+            
+            // RFC 9114 Section 4.4: SETTINGS_ENABLE_CONNECT_PROTOCOL for extended CONNECT
+            if self.settings_validator.enable_connect_protocol() {
+                settings.push(Setting { identifier: 0x8, value: 1 }); // SETTINGS_ENABLE_CONNECT_PROTOCOL
+            }
             
             // RFC 9114 Section 7.2.4.1: Grease with reserved settings
             // Format: 0x1f * N + 0x21, where N >= 0
@@ -727,12 +794,13 @@ impl<H: H3Handler> H3Session<H> {
                 H3Frame::Headers { encoded_headers } => {
                     if !*headers_received {
                         // Initial HEADERS frame
-                        let (headers, ref_entries) = match self.qpack.lock().await.decode_headers(&encoded_headers) {
+                        let encoded_size = encoded_headers.len();
+                        let (headers, ref_entries) = match self.qpack.read().await.decode_headers(&encoded_headers) {
                             Ok(result) => result,
                             Err(H3Error::QpackBlocked(required_insert_count)) => {
                                 // RFC 9204 Section 2.1.4: Stream is blocked waiting for dynamic table updates
                                 // Check if we would exceed MAX_BLOCKED_STREAMS
-                                if self.blocked_streams.len() >= self.qpack.lock().await.table_capacity() {
+                                if self.blocked_streams.len() >= self.qpack.read().await.table_capacity() {
                                     return Err(H3Error::Qpack(
                                         "would exceed SETTINGS_QPACK_BLOCKED_STREAMS limit".into()
                                     ));
@@ -759,11 +827,26 @@ impl<H: H3Handler> H3Session<H> {
                         // Phase 3: Extract Content-Length for validation (RFC 9114 Section 4.1.2)
                         *content_length = Self::extract_content_length_static(&headers)?;
                         
-                        // RFC 9204 Section 2.1.2: Store references for eventual release
+                        // Record QPACK decode metrics
+                        let uncompressed_size: usize = headers.iter().map(|(n, v)| n.len() + v.len()).sum();
+                        self.metrics.record_qpack_decode(uncompressed_size, encoded_size);
+                        self.metrics.header_bytes_received.fetch_add(encoded_size as u64, Ordering::Relaxed);
+                        
+                        // RFC 9204 Section 2.1.2: Add references to dynamic table entries and track for release
+                        {
+                            let mut qpack = self.qpack.write().await;
+                            for index in &ref_entries {
+                                qpack.add_reference(*index);
+                            }
+                        }
                         referenced_dynamic_entries.extend(ref_entries);
                         
                         // Mark that we need to send Section Acknowledgment
                         send_ack = true;
+                        
+                        // Record metrics
+                        self.metrics.record_request_received();
+                        self.metrics.frames_headers_received.fetch_add(1, Ordering::Relaxed);
                         
                         *headers_received = true;
                         // Queue request for priority-based processing instead of handling immediately
@@ -780,9 +863,18 @@ impl<H: H3Handler> H3Session<H> {
                         self.process_next_request().await?;
                     } else if !*trailers_received {
                         // RFC 9114 Section 4.1: Trailing HEADERS frame (trailers)
-                        let (trailer_headers, trailer_refs) = self.qpack.lock().await.decode_headers(&encoded_headers)?;
+                        let (trailer_headers, trailer_refs) = self.qpack.read().await.decode_headers(&encoded_headers)?;
                         
-                        // RFC 9204 Section 2.1.2: Track trailer references
+                        // RFC 9114 Section 4.1: Validate trailer headers
+                        crate::validation::validate_trailer_headers(&trailer_headers)?;
+                        
+                        // RFC 9204 Section 2.1.2: Add references and track for release
+                        {
+                            let mut qpack = self.qpack.write().await;
+                            for index in &trailer_refs {
+                                qpack.add_reference(*index);
+                            }
+                        }
                         referenced_dynamic_entries.extend(trailer_refs);
                         
                         // Phase 3: Validate Content-Length matches received bytes (RFC 9114 Section 4.1.2)
@@ -825,6 +917,10 @@ impl<H: H3Handler> H3Session<H> {
                         }
                     }
                     
+                    // Record metrics
+                    self.metrics.frames_data_received.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.request_bytes_received.fetch_add(frame_bytes, Ordering::Relaxed);
+                    
                     // Only store non-empty DATA frames
                     if !body_data.is_empty() {
                         body.push(body_data);
@@ -833,6 +929,11 @@ impl<H: H3Handler> H3Session<H> {
                 H3Frame::Priority { priority } => {
                     // Handle priority update (can appear any time)
                     self.handle_priority_frame(stream_id, priority).await?;
+                }
+                H3Frame::PriorityUpdate { element_id, priority_field_value } => {
+                    // RFC 9218: Handle priority update (can appear on any stream)
+                    self.metrics.frames_priority_update_received.fetch_add(1, Ordering::Relaxed);
+                    self.handle_priority_update_frame(stream_id, element_id, priority_field_value.clone()).await?;
                 }
                 // RFC 9114: These frames MUST NOT appear on request streams
                 H3Frame::PushPromise { .. } => {
@@ -857,7 +958,38 @@ impl<H: H3Handler> H3Session<H> {
 
     /// Process the next highest priority request from the queue
     async fn process_next_request(&mut self) -> Result<(), H3Error> {
-        if let Some(queued_request) = self.request_queue.pop() {
+        // Try to use the priority tree for RFC 9218 compliant scheduling
+        // If no priority information exists, fall back to BinaryHeap order
+        let selected_stream_id = self.priority_tree.get_next_priority().map(|(stream_id, _urgency)| stream_id);
+        
+        let queued_request = if let Some(priority_stream_id) = selected_stream_id {
+            // Find the request with this stream_id in the queue
+            // Since BinaryHeap doesn't support efficient removal by predicate,
+            // we need to temporarily drain and rebuild
+            let mut temp_queue = Vec::new();
+            let mut selected = None;
+            
+            while let Some(req) = self.request_queue.pop() {
+                if req.stream_id == priority_stream_id && selected.is_none() {
+                    selected = Some(req);
+                } else {
+                    temp_queue.push(req);
+                }
+            }
+            
+            // Rebuild queue
+            for req in temp_queue {
+                self.request_queue.push(req);
+            }
+            
+            // If we found the prioritized request, use it; otherwise fall back to queue order
+            selected.or_else(|| self.request_queue.pop())
+        } else {
+            // No priority information, use normal queue order
+            self.request_queue.pop()
+        };
+        
+        if let Some(queued_request) = queued_request {
             let request = self.parse_request(queued_request.headers)?;
             
             // Call handler
@@ -921,6 +1053,9 @@ impl<H: H3Handler> H3Session<H> {
             // PRIORITY can appear on request streams (RFC 9114 Section 7.2.3)
             (H3Frame::Priority { .. }, StreamType::Request) => Ok(()),
             
+            // PRIORITY_UPDATE can appear on any stream (RFC 9218 Section 7.1)
+            (H3Frame::PriorityUpdate { .. }, _) => Ok(()),
+            
             // Reserved and unknown frames can appear anywhere (RFC 9114 Section 7.2.8)
             (H3Frame::Reserved { .. }, _) => Ok(()),
             (H3Frame::DuplicatePush { .. }, _) => Ok(()), // Treated as reserved
@@ -981,8 +1116,14 @@ impl<H: H3Handler> H3Session<H> {
                     // connection where resumption information was provided"
                     self.settings_validator.remember_settings();
                     
+                    // RFC 9114 Section 7.2.4.2: Store settings persistently if we have an origin
+                    // This enables proper 0-RTT validation on future connections
+                    if let Some(ref origin) = self.origin {
+                        self.settings_storage.store(origin.clone(), settings_map.clone());
+                    }
+                    
                     // Update QPACK codec with settings
-                    let mut qpack = self.qpack.lock().await;
+                    let mut qpack = self.qpack.write().await;
                     if let Some(&capacity) = settings_map.get(&0x1) {
                         qpack.set_max_table_capacity(capacity as usize);
                     }
@@ -1048,27 +1189,32 @@ impl<H: H3Handler> H3Session<H> {
     async fn handle_priority_frame(&mut self, _stream_id: u64, priority: crate::frames::Priority) -> Result<(), H3Error> {
         // RFC 9218 Section 5: Handle extensible priority updates
         
+        use crate::priority::PriorityNode;
+        
         match priority.prioritized_element_type {
-            0x00 => {
-                // Request stream prioritization
+            0x00 | 0x01 => {
+                // Request or push stream prioritization
                 // Store priority information for request scheduling
                 self.stream_priorities.insert(priority.element_id, priority.urgency as u64);
                 
                 // RFC 9218 Section 5.3: Build priority tree
-                // For now, we use urgency as priority (lower urgency = higher priority)
-                // TODO: Implement full priority tree with parent dependencies
+                let node = PriorityNode {
+                    element_id: priority.element_id,
+                    element_type: priority.prioritized_element_type,
+                    urgency: priority.urgency,
+                    incremental: priority.incremental,
+                    parent_id: priority.parent_element_id,
+                    children: vec![],
+                };
                 
-                // If this stream is already in the request queue, update its priority
-                // For now, we just store the priority - it will be used when processing requests
-                eprintln!("Request stream {} priority: urgency={}, incremental={}, parent_type={}, parent_id={:?}",
+                self.priority_tree.insert(node);
+                
+                // If this stream is already in the request queue, we can't easily re-prioritize it
+                // The BinaryHeap doesn't support efficient priority updates
+                // In a production system, this would require a more sophisticated data structure
+                eprintln!("{} stream {} priority: urgency={}, incremental={}, parent_type={}, parent_id={:?}",
+                    if priority.prioritized_element_type == 0 { "Request" } else { "Push" },
                     priority.element_id, priority.urgency, priority.incremental, 
-                    priority.parent_element_type, priority.parent_element_id);
-            }
-            0x01 => {
-                // Push stream prioritization  
-                // TODO: Implement push stream prioritization when push is fully implemented
-                eprintln!("Push stream {} priority: urgency={}, incremental={}, parent_type={}, parent_id={:?}",
-                    priority.element_id, priority.urgency, priority.incremental,
                     priority.parent_element_type, priority.parent_element_id);
             }
             _ => {
@@ -1080,8 +1226,82 @@ impl<H: H3Handler> H3Session<H> {
         Ok(())
     }
 
+    /// RFC 9218 Section 7.1: Handle PRIORITY_UPDATE frame
+    async fn handle_priority_update_frame(&mut self, _stream_id: u64, element_id: u64, priority_field_value: String) -> Result<(), H3Error> {
+        // RFC 9218 Section 7.1: Parse priority field value
+        // Format: "u=<urgency>[,i][,a=<element_id>]"
+        
+        let mut urgency = None;
+        let mut incremental = false;
+        let mut parent_element_id = None;
+        
+        for param in priority_field_value.split(',') {
+            let param = param.trim();
+            if param.starts_with("u=") {
+                if let Ok(u) = param[2..].parse::<u8>() {
+                    if u <= 7 {
+                        urgency = Some(u);
+                    } else {
+                        return Err(H3Error::Http(format!("Invalid urgency value: {}", u)));
+                    }
+                } else {
+                    return Err(H3Error::Http(format!("Invalid urgency parameter: {}", param)));
+                }
+            } else if param == "i" {
+                incremental = true;
+            } else if param.starts_with("a=") {
+                if let Ok(id) = param[2..].parse::<u64>() {
+                    parent_element_id = Some(id);
+                } else {
+                    return Err(H3Error::Http(format!("Invalid element ID parameter: {}", param)));
+                }
+            } else {
+                return Err(H3Error::Http(format!("Unknown priority parameter: {}", param)));
+            }
+        }
+        
+        let urgency = urgency.ok_or_else(|| H3Error::Http("Missing urgency parameter in PRIORITY_UPDATE".into()))?;
+        
+        // Update stream priority
+        self.stream_priorities.insert(element_id, urgency as u64);
+        
+        // RFC 9218 Section 5.3: Update priority tree
+        use crate::priority::PriorityNode;
+        
+        let node = PriorityNode {
+            element_id,
+            element_type: 0, // Assume request stream (0x00)
+            urgency,
+            incremental,
+            parent_id: parent_element_id,
+            children: vec![],
+        };
+        
+        self.priority_tree.insert(node);
+        
+        eprintln!("PRIORITY_UPDATE for stream {}: urgency={}, incremental={}, parent_id={:?}",
+            element_id, urgency, incremental, parent_element_id);
+        
+        Ok(())
+    }
+
     /// RFC 9114 Section 4.1.1: Handle stream closure/reset
     async fn handle_stream_closed(&mut self, stream_id: u64, app_initiated: bool, error_code: u64) -> Result<(), H3Error> {
+        // RFC 9114 Section 4.1.2: Validate Content-Length against received bytes on stream close
+        if app_initiated && error_code == 0 {
+            // Normal close (not reset) - validate Content-Length
+            if let Some(StreamState::Request { content_length, bytes_received, .. }) = self.streams.get(&stream_id) {
+                if let Some(expected) = content_length {
+                    if *bytes_received != *expected {
+                        // RFC 9114 Section 4.1.2: Content-Length mismatch is a H3_MESSAGE_ERROR
+                        // Close the stream with error
+                        let _ = self.handle.reset_stream(stream_id, crate::error::H3ErrorCode::MessageError.to_u64());
+                        return Err(H3Error::MessageError);
+                    }
+                }
+            }
+        }
+        
         // RFC 9204 Section 4.4.2: If stream is cancelled, send Stream Cancellation instruction
         // BEFORE cleaning up state to ensure the instruction is sent
         // GAP #1 FIX: Moved cancellation before cleanup
@@ -1092,7 +1312,7 @@ impl<H: H3Handler> H3Session<H> {
         
         // RFC 9204 Section 2.1.2: Release all dynamic table references held by this stream
         if let Some(StreamState::Request { referenced_dynamic_entries, .. }) = self.streams.get(&stream_id) {
-            let mut qpack = self.qpack.lock().await;
+            let mut qpack = self.qpack.write().await;
             for index in referenced_dynamic_entries {
                 qpack.release_reference(*index);
             }
@@ -1139,15 +1359,14 @@ impl<H: H3Handler> H3Session<H> {
         }
         
         while cursor < instructions.len() {
-            let qpack = self.qpack.lock().await;
-            match qpack.decode_instruction(&instructions[cursor..]) {
+            let qpack = self.qpack.read().await;
+            // RFC 9204 GAP FIX: Use context-aware decoding for proper Duplicate/InsertCountIncrement disambiguation
+            match qpack.decode_instruction_with_context(&instructions[cursor..], is_encoder_stream) {
                 Ok((mut instruction, consumed)) => {
                     drop(qpack); // Release lock before handling
                     cursor += consumed;
                     
-                    // GAP FIX: Context-aware validation and disambiguation
-                    // RFC 9204: Duplicate (encoder) and InsertCountIncrement (decoder) 
-                    // both start with 0x00, requiring stream context to disambiguate
+                    // Validate instruction is on correct stream type
                     instruction = self.disambiguate_qpack_instruction(
                         instruction, 
                         stream_id, 
@@ -1217,7 +1436,7 @@ impl<H: H3Handler> H3Session<H> {
             | crate::qpack::QpackInstruction::Duplicate { .. }
         );
         
-        let mut qpack = self.qpack.lock().await;
+        let mut qpack = self.qpack.write().await;
         
         match instruction {
             crate::qpack::QpackInstruction::SetDynamicTableCapacity { capacity } => {
@@ -1276,9 +1495,22 @@ impl<H: H3Handler> H3Session<H> {
                 }
             }
             crate::qpack::QpackInstruction::InsertCountIncrement { increment } => {
+                // GAP #6 FIX: Validate increment per RFC 9204 §4.4.3
+                // "The new Known Received Count MUST NOT exceed the current value of 
+                // the insert count at the decoder"
+                let current_known = qpack.known_received_count();
+                let current_insert = qpack.insert_count();
+                let new_known = current_known + increment as usize;
+                
+                if new_known > current_insert {
+                    return Err(H3Error::Qpack(format!(
+                        "INSERT_COUNT_INCREMENT {} would exceed insert count (known={}, insert={})",
+                        increment, current_known, current_insert
+                    )));
+                }
+                
                 // Update known received count
-                let count = qpack.known_received_count();
-                qpack.update_known_received_count(count + increment as usize);
+                qpack.update_known_received_count(new_known);
             }
         }
         
@@ -1299,7 +1531,7 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     /// Parse headers into HTTP request (public for testing)
-    pub fn parse_request(&self, headers: Vec<(String, String)>) -> Result<H3Request, H3Error> {
+    pub fn parse_request(&mut self, headers: Vec<(String, String)>) -> Result<H3Request, H3Error> {
         // Parse headers into HTTP request
         let mut method = None;
         let mut path = None;
@@ -1344,6 +1576,14 @@ impl<H: H3Handler> H3Session<H> {
         let scheme = scheme.ok_or_else(|| H3Error::Http("missing :scheme".into()))?;
         let authority = authority.ok_or_else(|| H3Error::Http("missing :authority".into()))?;
         let path = path.unwrap_or_else(|| "/".to_string());
+        
+        // RFC 9114 Section 7.2.4.2: Extract origin for settings storage
+        // Do this on first request to enable 0-RTT settings validation
+        if self.origin.is_none() {
+            if let Ok(origin) = Origin::from_authority(scheme.clone(), &authority) {
+                self.origin = Some(origin);
+            }
+        }
         
         // Construct URI from components
         let uri_string = format!("{}://{}{}", scheme, authority, path);
@@ -1426,6 +1666,8 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     /// Process a push stream (RFC 9114 Section 6.2.2)
+    /// Note: This would be used in a client implementation. Servers don't receive push streams.
+    #[allow(dead_code)]
     async fn process_push_stream(&mut self, _stream_id: u64, mut recv_stream: quicd_x::RecvStream) -> Result<(), H3Error> {
         // Read push ID (varint)
         let data = match recv_stream.read().await {
@@ -1468,7 +1710,7 @@ impl<H: H3Handler> H3Session<H> {
     async fn send_section_acknowledgment(&mut self, stream_id: u64) -> Result<(), H3Error> {
         // Create Section Acknowledgment instruction
         let instruction = crate::qpack::QpackInstruction::SectionAcknowledgment { stream_id };
-        let instruction_bytes = self.qpack.lock().await.encode_instruction(&instruction)?;
+        let instruction_bytes = self.qpack.read().await.encode_instruction(&instruction)?;
         
         // Add to pending buffer instead of sending immediately
         self.pending_decoder_instructions.push(instruction_bytes);
@@ -1485,7 +1727,7 @@ impl<H: H3Handler> H3Session<H> {
     async fn send_stream_cancellation(&mut self, stream_id: u64) -> Result<(), H3Error> {
         // Create Stream Cancellation instruction
         let instruction = crate::qpack::QpackInstruction::StreamCancellation { stream_id };
-        let instruction_bytes = self.qpack.lock().await.encode_instruction(&instruction)?;
+        let instruction_bytes = self.qpack.read().await.encode_instruction(&instruction)?;
         
         // Add to pending buffer
         self.pending_decoder_instructions.push(instruction_bytes);
@@ -1500,7 +1742,7 @@ impl<H: H3Handler> H3Session<H> {
     async fn send_insert_count_increment(&mut self, increment: u64) -> Result<(), H3Error> {
         // Create Insert Count Increment instruction
         let instruction = crate::qpack::QpackInstruction::InsertCountIncrement { increment };
-        let instruction_bytes = self.qpack.lock().await.encode_instruction(&instruction)?;
+        let instruction_bytes = self.qpack.read().await.encode_instruction(&instruction)?;
         
         // Add to pending buffer
         self.pending_decoder_instructions.push(instruction_bytes);
@@ -1576,7 +1818,7 @@ impl<H: H3Handler> H3Session<H> {
     /// 
     /// Should be called after processing encoder stream instructions that insert dynamic table entries.
     async fn retry_blocked_streams(&mut self) -> Result<(), H3Error> {
-        let current_insert_count = self.qpack.lock().await.insert_count();
+        let current_insert_count = self.qpack.read().await.insert_count();
         let now = std::time::Instant::now();
         let mut streams_to_retry = Vec::new();
         
@@ -1589,14 +1831,24 @@ impl<H: H3Handler> H3Session<H> {
         }
         
         // Retry each unblocked stream
+        let mut requests_to_process = Vec::new();
+        
         for stream_id in streams_to_retry {
             if let Some(blocked) = self.blocked_streams.remove(&stream_id) {
                 // Try to decode headers again
-                match self.qpack.lock().await.decode_headers(&blocked.encoded_data) {
-                    Ok(_headers) => {
-                        // Successfully decoded - stream can now proceed
-                        // The actual handling will happen when next frame arrives on this stream
-                        // For now, we've removed it from blocked_streams which is the key part
+                match self.qpack.read().await.decode_headers(&blocked.encoded_data) {
+                    Ok((headers, referenced_entries)) => {
+                        // Successfully decoded - add references for cleanup
+                        {
+                            let mut qpack = self.qpack.write().await;
+                            for index in &referenced_entries {
+                                qpack.add_reference(*index);
+                            }
+                            qpack.unblock_stream(); // Decrement blocked stream count
+                        }
+                        
+                        // Queue the request for later processing (avoid borrow checker issues)
+                        requests_to_process.push((stream_id, headers, blocked.send_stream));
                     }
                     Err(H3Error::QpackBlocked(new_required)) => {
                         // Still blocked (shouldn't happen if logic is correct)
@@ -1615,6 +1867,24 @@ impl<H: H3Handler> H3Session<H> {
                     }
                 }
             }
+        }
+        
+        // Process all unblocked requests
+        for (stream_id, headers, send_stream) in requests_to_process {
+            // Queue the request
+            let priority_id = 0;
+            self.request_queue.push(QueuedRequest {
+                priority_id,
+                stream_id,
+                headers,
+                send_stream,
+            });
+            
+            // Process it immediately
+            self.process_next_request().await?;
+            
+            // RFC 9204 Section 4.4.1: Send Section Acknowledgment
+            self.send_section_acknowledgment(stream_id).await?;
         }
         
         Ok(())
@@ -1745,7 +2015,7 @@ impl<H: H3Handler> H3Session<H> {
             all_headers.extend(response.headers);
             
             let (encoded_headers, encoder_instructions, referenced_entries) = {
-                let mut qpack = self.qpack.lock().await;
+                let mut qpack = self.qpack.write().await;
                 let result = qpack.encode_headers(&all_headers)
                     .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
                 // RFC 9204 Section 2.1.2: Add references
@@ -1789,7 +2059,7 @@ impl<H: H3Handler> H3Session<H> {
             }
             
             // Release QPACK dynamic table references when push completes
-            let mut qpack = self.qpack.lock().await;
+            let mut qpack = self.qpack.write().await;
             for index in referenced_entries {
                 qpack.release_reference(index);
             }
@@ -1805,11 +2075,19 @@ impl<H: H3Handler> H3Session<H> {
 /// Factory for creating HTTP/3 application instances.
 pub struct H3Factory<H: H3Handler> {
     handler: H,
+    settings_storage: Arc<dyn SettingsStorage>,
 }
 
 impl<H: H3Handler> H3Factory<H> {
     pub fn new(handler: H) -> Self {
-        Self { handler }
+        Self { 
+            handler,
+            settings_storage: Arc::new(InMemorySettingsStorage::new()),
+        }
+    }
+
+    pub fn with_settings_storage(handler: H, settings_storage: Arc<dyn SettingsStorage>) -> Self {
+        Self { handler, settings_storage }
     }
 }
 
@@ -1827,7 +2105,7 @@ impl<H: H3Handler + Clone> QuicAppFactory for H3Factory<H> {
         _transport: TransportControls,
         shutdown: ShutdownFuture,
     ) -> Result<(), quicd_x::ConnectionError> {
-        let session = H3Session::new(handle, self.handler.clone());
+        let session = H3Session::new(handle, self.handler.clone(), self.settings_storage.clone());
         session.run(events, shutdown).await
             .map_err(|e| quicd_x::ConnectionError::App(format!("HTTP/3 error: {:?}", e)))
     }

@@ -212,6 +212,161 @@ impl H3Config {
     }
 }
 
+/// Builder for H3Config with fluent API and validation.
+///
+/// # Example
+/// ```
+/// use quicd_h3::config::H3ConfigBuilder;
+/// use std::time::Duration;
+///
+/// let config = H3ConfigBuilder::new()
+///     .max_frame_size(32 * 1024 * 1024)  // 32 MB
+///     .qpack_max_table_capacity(8192)     // 8 KB
+///     .max_concurrent_streams(500)
+///     .enable_server_push(true)
+///     .build()
+///     .expect("valid configuration");
+/// ```
+#[derive(Debug, Default)]
+pub struct H3ConfigBuilder {
+    config: H3Config,
+}
+
+impl H3ConfigBuilder {
+    /// Create a new builder with default values.
+    pub fn new() -> Self {
+        Self {
+            config: H3Config::default(),
+        }
+    }
+    
+    /// Start from a specific preset.
+    pub fn from_preset(preset: H3ConfigPreset) -> Self {
+        Self {
+            config: match preset {
+                H3ConfigPreset::Default => H3Config::default(),
+                H3ConfigPreset::HighThroughput => H3Config::high_throughput(),
+                H3ConfigPreset::LowMemory => H3Config::low_memory(),
+                H3ConfigPreset::Cdn => H3Config::cdn(),
+            }
+        }
+    }
+    
+    /// Set maximum frame size (in bytes).
+    pub fn max_frame_size(mut self, size: u64) -> Self {
+        self.config.max_frame_size = size;
+        self
+    }
+    
+    /// Set maximum field section size (in bytes).
+    pub fn max_field_section_size(mut self, size: u64) -> Self {
+        self.config.max_field_section_size = size;
+        self
+    }
+    
+    /// Set QPACK maximum dynamic table capacity (in bytes).
+    pub fn qpack_max_table_capacity(mut self, capacity: u64) -> Self {
+        self.config.qpack_max_table_capacity = capacity;
+        self
+    }
+    
+    /// Set maximum number of QPACK blocked streams.
+    pub fn qpack_blocked_streams(mut self, count: u64) -> Self {
+        self.config.qpack_blocked_streams = count;
+        self
+    }
+    
+    /// Set QPACK blocked stream timeout.
+    pub fn qpack_blocked_stream_timeout(mut self, timeout: Duration) -> Self {
+        self.config.qpack_blocked_stream_timeout = timeout;
+        self
+    }
+    
+    /// Set maximum number of concurrent bidirectional streams.
+    pub fn max_concurrent_streams(mut self, count: u64) -> Self {
+        self.config.max_concurrent_streams = count;
+        self
+    }
+    
+    /// Set maximum push ID for server push.
+    pub fn max_push_id(mut self, id: u64) -> Self {
+        self.config.max_push_id = id;
+        self
+    }
+    
+    /// Set initial stream buffer capacity (in bytes).
+    pub fn stream_buffer_initial_capacity(mut self, size: usize) -> Self {
+        self.config.stream_buffer_initial_capacity = size;
+        self
+    }
+    
+    /// Set maximum stream buffer size (in bytes).
+    pub fn stream_buffer_max_size(mut self, size: usize) -> Self {
+        self.config.stream_buffer_max_size = size;
+        self
+    }
+    
+    /// Enable or disable extended CONNECT protocol.
+    pub fn enable_connect_protocol(mut self, enable: bool) -> Self {
+        self.config.enable_connect_protocol = enable;
+        self
+    }
+    
+    /// Enable or disable server push.
+    pub fn enable_server_push(mut self, enable: bool) -> Self {
+        self.config.enable_server_push = enable;
+        self
+    }
+    
+    /// Set greasing probability (0.0 - 1.0).
+    pub fn grease_probability(mut self, probability: f32) -> Self {
+        self.config.grease_probability = probability;
+        self
+    }
+    
+    /// Set blocked stream check interval.
+    pub fn blocked_stream_check_interval(mut self, interval: Duration) -> Self {
+        self.config.blocked_stream_check_interval = interval;
+        self
+    }
+    
+    /// Set QPACK encoder instruction batch size.
+    pub fn qpack_encoder_instruction_batch_size(mut self, size: usize) -> Self {
+        self.config.qpack_encoder_instruction_batch_size = size;
+        self
+    }
+    
+    /// Set QPACK decoder instruction batch size.
+    pub fn qpack_decoder_instruction_batch_size(mut self, size: usize) -> Self {
+        self.config.qpack_decoder_instruction_batch_size = size;
+        self
+    }
+    
+    /// Build the configuration, validating all values.
+    pub fn build(self) -> Result<H3Config, String> {
+        self.config.validate()?;
+        Ok(self.config)
+    }
+    
+    /// Build the configuration without validation (use with caution).
+    pub fn build_unchecked(self) -> H3Config {
+        self.config
+    }
+}
+
+/// Preset configurations for common scenarios.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H3ConfigPreset {
+    /// Balanced default configuration.
+    Default,
+    /// Optimized for high-throughput scenarios.
+    HighThroughput,
+    /// Optimized for memory-constrained environments.
+    LowMemory,
+    /// Optimized for CDN/edge scenarios.
+    Cdn,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +421,58 @@ mod tests {
         config.stream_buffer_initial_capacity = 2 * 1024 * 1024;
         config.stream_buffer_max_size = 1 * 1024 * 1024;
         assert!(config.validate().is_err());
+    }
+    
+    #[test]
+    fn test_config_builder_basic() {
+        let config = H3ConfigBuilder::new()
+            .max_frame_size(32 * 1024 * 1024)
+            .max_concurrent_streams(500)
+            .enable_server_push(true)
+            .build()
+            .expect("valid configuration");
+        
+        assert_eq!(config.max_frame_size, 32 * 1024 * 1024);
+        assert_eq!(config.max_concurrent_streams, 500);
+        assert!(config.enable_server_push);
+    }
+    
+    #[test]
+    fn test_config_builder_from_preset() {
+        let config = H3ConfigBuilder::from_preset(H3ConfigPreset::HighThroughput)
+            .max_concurrent_streams(2000)
+            .build()
+            .expect("valid configuration");
+        
+        // Should have high throughput defaults
+        assert_eq!(config.max_frame_size, 64 * 1024 * 1024);
+        // But overridden value
+        assert_eq!(config.max_concurrent_streams, 2000);
+    }
+    
+    #[test]
+    fn test_config_builder_validation() {
+        let result = H3ConfigBuilder::new()
+            .max_frame_size(0)
+            .build();
+        
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("max_frame_size"));
+    }
+    
+    #[test]
+    fn test_config_builder_chaining() {
+        let config = H3ConfigBuilder::new()
+            .qpack_max_table_capacity(16384)
+            .qpack_blocked_streams(200)
+            .qpack_encoder_instruction_batch_size(16)
+            .qpack_decoder_instruction_batch_size(16)
+            .build()
+            .expect("valid configuration");
+        
+        assert_eq!(config.qpack_max_table_capacity, 16384);
+        assert_eq!(config.qpack_blocked_streams, 200);
+        assert_eq!(config.qpack_encoder_instruction_batch_size, 16);
+        assert_eq!(config.qpack_decoder_instruction_batch_size, 16);
     }
 }
