@@ -15,7 +15,7 @@ use crate::error::H3Error;
 use crate::frames::{H3Frame, Setting};
 use crate::session::{H3Handler, H3Request, H3ResponseSender};
 use crate::stream_state::StreamFrameParser;
-use crate::settings::SettingsValidator;
+use crate::settings::{SettingsValidator, known};
 use crate::settings_storage::{InMemorySettingsStorage, Origin, SettingsStorage};
 use crate::connect::validate_connect_request;
 use crate::push::PushManager;
@@ -441,6 +441,20 @@ impl<H: H3Handler> H3Session<H> {
                         }
                     }
                 }
+            }
+            AppEvent::Datagram { payload } => {
+                // RFC 9114 Section 2.1.2: HTTP/3 Datagrams
+                // Datagrams are only allowed if H3_DATAGRAM setting is enabled
+                if self.settings_validator.get(known::H3_DATAGRAM).unwrap_or(0) != 1 {
+                    // Datagrams not supported - silently ignore per RFC 9114
+                    self.metrics.datagrams_received.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                
+                // TODO: Forward datagrams to application handler if supported
+                // For now, we acknowledge receipt but don't process them
+                // as the current H3Handler trait doesn't support datagrams
+                self.metrics.datagrams_received.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
