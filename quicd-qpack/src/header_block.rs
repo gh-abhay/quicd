@@ -336,20 +336,48 @@ impl FieldLine {
     }
 }
 
-/// Encode a string (7-bit length prefix).
+/// Encode a string (7-bit length prefix) with optional Huffman encoding.
+/// 
+/// RFC 9204 Section 4.1.2: Uses Huffman encoding if it reduces size.
+/// RFC 9204 Section 7.1: Applies automatically for compression efficiency.
 #[inline]
 fn encode_string(data: &[u8], buf: &mut BytesMut) {
-    let len = data.len() as u64;
-    buf.extend_from_slice(&encode_int_with_prefix(len, 7, 0x00));
-    buf.extend_from_slice(data);
+    // Calculate Huffman encoded size
+    let huffman_size = crate::huffman::encoded_size(data);
+    
+    if huffman_size < data.len() {
+        // Use Huffman encoding (H bit = 1)
+        buf.extend_from_slice(&encode_int_with_prefix(huffman_size as u64, 7, 0x80));
+        let mut encoded = Vec::with_capacity(huffman_size);
+        crate::huffman::encode(data, &mut encoded);
+        buf.extend_from_slice(&encoded);
+    } else {
+        // Use literal encoding (H bit = 0)
+        buf.extend_from_slice(&encode_int_with_prefix(data.len() as u64, 7, 0x00));
+        buf.extend_from_slice(data);
+    }
 }
 
-/// Encode a string with custom prefix bits.
+/// Encode a string with custom prefix bits and optional Huffman encoding.
+/// 
+/// RFC 9204 Section 4.1.2: Uses Huffman encoding if it reduces size.
 #[inline]
 fn encode_string_with_prefix(data: &[u8], prefix_bits: u8, prefix_mask: u8, buf: &mut BytesMut) {
-    let len = data.len() as u64;
-    buf.extend_from_slice(&encode_int_with_prefix(len, prefix_bits, prefix_mask));
-    buf.extend_from_slice(data);
+    let huffman_size = crate::huffman::encoded_size(data);
+    
+    if huffman_size < data.len() {
+        // Use Huffman encoding (H bit = 1)
+        let h_bit = 1u8 << prefix_bits;
+        let full_prefix = prefix_mask | h_bit;
+        buf.extend_from_slice(&encode_int_with_prefix(huffman_size as u64, prefix_bits, full_prefix));
+        let mut encoded = Vec::with_capacity(huffman_size);
+        crate::huffman::encode(data, &mut encoded);
+        buf.extend_from_slice(&encoded);
+    } else {
+        // Use literal encoding (H bit = 0)
+        buf.extend_from_slice(&encode_int_with_prefix(data.len() as u64, prefix_bits, prefix_mask));
+        buf.extend_from_slice(data);
+    }
 }
 
 /// Decode a string (7-bit length prefix).

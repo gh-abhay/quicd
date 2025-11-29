@@ -99,6 +99,8 @@ pub struct StreamIdGenerator {
     next_bidi: u64,
     /// Next server-initiated unidirectional stream ID
     next_uni: u64,
+    /// Highest stream ID observed on this connection (both directions)
+    max_stream_id: u64,
 }
 
 impl Default for StreamIdGenerator {
@@ -108,6 +110,8 @@ impl Default for StreamIdGenerator {
             next_bidi: 1,
             // Server-initiated unidirectional streams start at 3
             next_uni: 3,
+            // No streams observed yet
+            max_stream_id: 0,
         }
     }
 }
@@ -119,6 +123,7 @@ impl StreamIdGenerator {
     pub fn next_bidi(&mut self) -> u64 {
         let id = self.next_bidi;
         self.next_bidi += 4;
+        self.max_stream_id = self.max_stream_id.max(id);
         id
     }
 
@@ -128,7 +133,19 @@ impl StreamIdGenerator {
     pub fn next_uni(&mut self) -> u64 {
         let id = self.next_uni;
         self.next_uni += 4;
+        self.max_stream_id = self.max_stream_id.max(id);
         id
+    }
+
+    /// Update max stream ID when observing a client-initiated stream.
+    /// Should be called when processing readable/writable streams from quiche.
+    pub fn observe_stream_id(&mut self, stream_id: u64) {
+        self.max_stream_id = self.max_stream_id.max(stream_id);
+    }
+
+    /// Get the highest stream ID observed on this connection.
+    pub fn max_stream_id(&self) -> u64 {
+        self.max_stream_id
     }
 }
 

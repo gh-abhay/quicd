@@ -45,7 +45,7 @@ pub mod huffman;
 pub mod async_io;
 
 // Re-export main types
-pub use encoder::Encoder;
+pub use encoder::{Encoder, should_never_index};
 pub use decoder::{Decoder, HeaderField};
 pub use error::{QpackError, Result};
 pub use table::DynamicTable;
@@ -53,6 +53,6 @@ pub use table::DynamicTable;
 #[cfg(feature = "async")]
 pub use async_io::{AsyncEncoder, AsyncDecoder};
 
-// Re-export utilities for benchmarking
+// Re-export utilities for benchmarking and testing
 pub use prefix_int::{encode_int, decode_int};
 pub use huffman::{encode, decode as huffman_decode, encoded_size};

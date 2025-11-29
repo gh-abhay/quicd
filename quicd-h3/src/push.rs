@@ -122,6 +122,10 @@ pub struct PushManager {
     promises: HashMap<u64, PushPromise>,
     /// Pending push stream open requests (request_id -> push_id)
     pending_push_streams: HashMap<u64, u64>,
+    /// All push IDs that have ever been used (RFC 9114: push IDs MUST NOT be reused)
+    /// Using a simple Vec since push IDs are monotonically increasing
+    /// and we can do binary search for existence checks
+    used_push_ids: Vec<u64>,
 }
 
 impl PushManager {
@@ -130,8 +134,9 @@ impl PushManager {
         Self {
             next_push_id: 0,
             max_push_id: 0,
-            promises: HashMap::new(),
-            pending_push_streams: HashMap::new(),
+            promises: HashMap::with_capacity(16),
+            pending_push_streams: HashMap::with_capacity(16),
+            used_push_ids: Vec::with_capacity(16),
         }
     }
 
@@ -170,11 +175,26 @@ impl PushManager {
         push_id: u64,
         headers: Vec<(String, String)>,
     ) -> Result<(), H3Error> {
+        // RFC 9114 Section 4.6: Push IDs MUST NOT be reused
+        // Check if this push_id has ever been used before
+        if self.used_push_ids.binary_search(&push_id).is_ok() {
+            return Err(H3Error::Http(format!(
+                "push ID {} has already been used (reuse forbidden per RFC 9114)",
+                push_id
+            )));
+        }
+        
         if self.promises.contains_key(&push_id) {
             return Err(H3Error::Http(format!(
                 "push ID {} already in use",
                 push_id
             )));
+        }
+
+        // Record this push_id as used (insert in sorted order for binary search)
+        match self.used_push_ids.binary_search(&push_id) {
+            Ok(_) => {}, // Already exists (shouldn't happen due to check above)
+            Err(pos) => self.used_push_ids.insert(pos, push_id),
         }
 
         self.promises.insert(
@@ -208,9 +228,23 @@ impl PushManager {
         }
     }
 
-    /// Register a pending push stream open request.
-    pub fn register_pending_stream(&mut self, request_id: u64, push_id: u64) {
+    /// Register a push stream open request.
+    /// 
+    /// Per RFC 9114 Section 4.6: Each push ID must be used only once.
+    pub fn register_pending_stream(&mut self, request_id: u64, push_id: u64) -> Result<(), H3Error> {
+        // Check if push_id was already used for a different stream
+        if let Some(existing_promise) = self.promises.get(&push_id) {
+            if existing_promise.push_stream_id().is_some() && 
+               existing_promise.push_stream_id() != Some(request_id) {
+                return Err(H3Error::Http(format!(
+                    "push ID {} already used for different stream",
+                    push_id
+                )));
+            }
+        }
+        
         self.pending_push_streams.insert(request_id, push_id);
+        Ok(())
     }
 
     /// Handle a push stream being opened.
@@ -360,7 +394,7 @@ mod tests {
 
         // Simulate opening push stream
         let request_id = 1234;
-        manager.register_pending_stream(request_id, push_id);
+        manager.register_pending_stream(request_id, push_id).unwrap();
         manager.handle_stream_opened(request_id, 7).unwrap();
 
         let promise = manager.get_promise(push_id).unwrap();

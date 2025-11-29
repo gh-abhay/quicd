@@ -128,6 +128,12 @@ pub struct H3Metrics {
     /// Number of server push streams opened
     pub streams_push_opened: AtomicU64,
     
+    /// Number of reserved streams received (RFC 9114 Section 6.2.3 greasing)
+    pub reserved_streams_received: AtomicU64,
+    
+    /// Number of unknown stream types received
+    pub unknown_streams_received: AtomicU64,
+    
     // ========== Error Metrics ==========
     /// Frame parsing errors (malformed frames)
     pub errors_frame_parse: AtomicU64,

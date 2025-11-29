@@ -85,6 +85,7 @@ impl SettingsValidator {
     /// Per RFC 9114 Section 7.2.4:
     /// - SETTINGS MUST be first frame on control stream
     /// - Reserved settings (0x02-0x05) MUST cause H3_SETTINGS_ERROR
+    /// - Reserved greasing settings (0x1f * N + 0x21) MUST be ignored
     /// - Duplicate SETTINGS causes H3_FRAME_UNEXPECTED
     pub fn validate_settings(
         &mut self,
@@ -95,14 +96,24 @@ impl SettingsValidator {
             return Err(H3Error::FrameUnexpected);
         }
 
-        // Validate reserved settings
-        for &id in settings.keys() {
+        // Validate and filter settings
+        let mut validated_settings = HashMap::new();
+        for (&id, &value) in &settings {
+            // RFC 9114 Section 7.2.4.1: Reserved HTTP/2 settings MUST cause error
             if known::is_reserved(id) {
                 return Err(H3Error::SettingsError);
             }
+            
+            // RFC 9114 Section 7.2.4.1: Reserved greasing settings MUST be ignored
+            if crate::frames::H3Frame::is_reserved_setting(id) {
+                // Ignore reserved settings for greasing
+                continue;
+            }
+            
+            validated_settings.insert(id, value);
         }
 
-        self.settings = settings;
+        self.settings = validated_settings;
         self.state = SettingsState::Received;
         Ok(())
     }

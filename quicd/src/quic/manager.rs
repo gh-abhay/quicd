@@ -1317,13 +1317,17 @@ impl QuicManager {
         let path_stats = conn.conn.path_stats().next();
         let rtt_estimate_ms = path_stats.map(|ps| ps.rtt.as_millis() as u32);
 
-        // Count active streams (readable + writable streams)
+        // Count active streams and track max stream ID
         let mut active_streams: usize = 0;
-        for _id in conn.conn.readable() {
+        let mut max_stream_id = conn.stream_id_gen.max_stream_id();
+        
+        for stream_id in conn.conn.readable() {
             active_streams = active_streams.saturating_add(1);
+            max_stream_id = max_stream_id.max(stream_id);
         }
-        for _id in conn.conn.writable() {
+        for stream_id in conn.conn.writable() {
             active_streams = active_streams.saturating_add(1);
+            max_stream_id = max_stream_id.max(stream_id);
         }
 
         // Build and return ConnectionStats
@@ -1335,7 +1339,7 @@ impl QuicManager {
             congestion_state: None, // quiche doesn't expose congestion state in a simple way
             packets_sent: 0,        // quiche doesn't expose total packet count directly
             packets_received: 0,    // tracked separately if needed
-            max_stream_id: 0,       // TODO: track max stream ID in manager
+            max_stream_id,
         })
     }
 

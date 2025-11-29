@@ -217,7 +217,8 @@ impl H3ResponseSender {
         // Register the pending stream
         {
             let mut manager = push_manager.lock().await;
-            manager.register_pending_stream(request_id, push_id);
+            manager.register_pending_stream(request_id, push_id)
+                .map_err(|e| H3Error::Connection(format!("failed to register push stream: {:?}", e)))?;
         }
         
         // Note: The actual stream writing happens in h3_session when UniStreamOpened event is received

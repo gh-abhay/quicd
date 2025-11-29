@@ -39,7 +39,7 @@ fn test_dynamic_table_insertion() {
     let mut decoder = Decoder::new(4096, 100);
     
     let headers = vec![
-        (b"custom-key".as_slice(), b"custom-value".as_slice()),
+        (b"custom-header".as_slice(), b"custom-value".as_slice()),
     ];
     
     let encoded = encoder.encode(0, &headers).unwrap();
@@ -52,7 +52,7 @@ fn test_dynamic_table_insertion() {
     let decoded = decoder.decode(0, encoded).unwrap();
     
     assert_eq!(decoded.len(), 1);
-    assert_eq!(decoded[0].name.as_ref(), b"custom-key");
+    assert_eq!(decoded[0].name.as_ref(), b"custom-header");
     assert_eq!(decoded[0].value.as_ref(), b"custom-value");
     
     // Verify entry was inserted into dynamic table

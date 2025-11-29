@@ -363,6 +363,116 @@ fn bench_concurrent_streams(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark HashMap optimization for table lookups
+fn bench_hashmap_optimization(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hashmap_lookup");
+    
+    // Create encoder with populated dynamic table
+    let mut encoder = Encoder::new(16384, 100);
+    encoder.set_capacity(16384).unwrap();
+    
+    // Insert 100 different headers
+    for i in 0..100 {
+        let name = format!("x-header-{:03}", i);
+        let value = format!("value-{}", i);
+        let headers = vec![(name.as_bytes(), value.as_bytes())];
+        let _ = encoder.encode(i, &headers);
+        let _ = encoder.drain_encoder_stream();
+    }
+    
+    group.throughput(Throughput::Elements(1));
+    
+    // Benchmark finding existing entry (best case - should be O(1) with HashMap)
+    group.bench_function("find_exact_existing", |b| {
+        b.iter(|| {
+            let found = encoder.table().find_exact(b"x-header-050", b"value-50");
+            black_box(found);
+        });
+    });
+    
+    // Benchmark finding by name only
+    group.bench_function("find_name_existing", |b| {
+        b.iter(|| {
+            let found = encoder.table().find_name(b"x-header-050");
+            black_box(found);
+        });
+    });
+    
+    // Benchmark miss case
+    group.bench_function("find_exact_missing", |b| {
+        b.iter(|| {
+            let found = encoder.table().find_exact(b"x-nonexistent", b"value");
+            black_box(found);
+        });
+    });
+    
+    group.finish();
+}
+
+/// Benchmark encoder instruction batching
+fn bench_instruction_batching(c: &mut Criterion) {
+    let mut group = c.benchmark_group("instruction_batching");
+    
+    // Create encoder that will generate many instructions
+    let mut encoder = Encoder::new(4096, 100);
+    encoder.set_capacity(4096).unwrap();
+    
+    // Generate 50 instructions
+    for i in 0..50 {
+        let name = format!("x-batch-{}", i);
+        let value = format!("v{}", i);
+        let headers = vec![(name.as_bytes(), value.as_bytes())];
+        let _ = encoder.encode(i, &headers);
+    }
+    
+    group.throughput(Throughput::Elements(50));
+    
+    // Benchmark individual polling
+    group.bench_function("poll_individual", |b| {
+        b.iter(|| {
+            // Create fresh encoder with instructions
+            let mut enc = Encoder::new(4096, 100);
+            enc.set_capacity(4096).unwrap();
+            for i in 0..50 {
+                let name = format!("x-b-{}", i);
+                let value = format!("v{}", i);
+                let h = vec![(name.as_bytes(), value.as_bytes())];
+                let _ = enc.encode(i, &h);
+            }
+            
+            let mut count = 0;
+            while enc.poll_encoder_stream().is_some() {
+                count += 1;
+            }
+            black_box(count);
+        });
+    });
+    
+    // Benchmark batched polling
+    group.bench_function("poll_batch_8", |b| {
+        b.iter(|| {
+            // Create fresh encoder with instructions
+            let mut enc = Encoder::new(4096, 100);
+            enc.set_capacity(4096).unwrap();
+            for i in 0..50 {
+                let name = format!("x-b-{}", i);
+                let value = format!("v{}", i);
+                let h = vec![(name.as_bytes(), value.as_bytes())];
+                let _ = enc.encode(i, &h);
+            }
+            
+            let mut count = 0;
+            while let Some(batch) = enc.poll_encoder_stream_batch(8) {
+                count += 1;
+                black_box(batch);
+            }
+            black_box(count);
+        });
+    });
+    
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_static_only,
@@ -377,6 +487,8 @@ criterion_group!(
     bench_full_request_cycle,
     bench_high_throughput,
     bench_concurrent_streams,
+    bench_hashmap_optimization,
+    bench_instruction_batching,
 );
 
 criterion_main!(benches);

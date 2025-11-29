@@ -557,6 +557,33 @@ impl H3Frame {
         }
         (frame_type - 0x21) % 0x1f == 0
     }
+
+    /// Checks if a setting identifier is reserved for greasing (0x1f * N + 0x21).
+    /// RFC 9114 Section 7.2.4.1: Reserved settings MUST NOT be assigned and MUST be ignored.
+    pub fn is_reserved_setting(setting_id: u64) -> bool {
+        if setting_id < 0x21 {
+            return false;
+        }
+        (setting_id - 0x21) % 0x1f == 0
+    }
+
+    /// Checks if an error code is reserved for greasing (0x1f * N + 0x21).
+    /// RFC 9114 Section 8.1: Reserved error codes should be treated as H3_NO_ERROR.
+    pub fn is_reserved_error_code(error_code: u64) -> bool {
+        if error_code < 0x21 {
+            return false;
+        }
+        (error_code - 0x21) % 0x1f == 0
+    }
+
+    /// Checks if a stream type is reserved for greasing (0x1f * N + 0x21).
+    /// RFC 9114 Section 6.2.3: Reserved stream types have no semantics and can be used for padding.
+    pub fn is_reserved_stream_type(stream_type: u64) -> bool {
+        if stream_type < 0x21 {
+            return false;
+        }
+        (stream_type - 0x21) % 0x1f == 0
+    }
 }
 
 impl Priority {
@@ -648,7 +675,10 @@ impl Priority {
 
 impl Setting {
     fn parse_settings(payload: &[u8]) -> Result<Vec<Self>, H3Error> {
-        let mut settings = Vec::new();
+        // Pre-allocate with capacity estimate: typical SETTINGS has 3-6 entries
+        // Each entry is at least 2 bytes (1-byte ID + 1-byte value), so divide by 2
+        let estimated_count = (payload.len() / 2).min(16);
+        let mut settings = Vec::with_capacity(estimated_count);
         let mut cursor = 0;
         
         while cursor < payload.len() {
