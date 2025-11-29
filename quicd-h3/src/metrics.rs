@@ -106,6 +106,9 @@ pub struct H3Metrics {
     /// Count of reserved/unknown frames received (for greasing)
     pub frames_reserved_received: AtomicU64,
     
+    /// Count of HTTP/3 datagrams received
+    pub datagrams_received: AtomicU64,
+    
     // ========== Stream Metrics ==========
     /// Number of bidirectional request streams opened
     pub streams_request_opened: AtomicU64,
