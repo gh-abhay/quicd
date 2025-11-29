@@ -42,10 +42,15 @@ impl H3ResponseSender {
         let encoded_headers = encoder_guard.encoder_mut().encode(self.stream_id, &all_headers)
             .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
 
-        // Send any pending encoder instructions
+        // PERF #3: Batch encoder instructions into single write
+        let mut batched_instructions = bytes::BytesMut::new();
         while let Some(inst) = encoder_guard.encoder_mut().poll_encoder_stream() {
+            batched_instructions.extend_from_slice(&inst);
+        }
+        
+        if !batched_instructions.is_empty() {
             if let Some(encoder_stream) = self.encoder_send_stream.lock().await.as_mut() {
-                let _ = encoder_stream.write(inst, false).await;
+                let _ = encoder_stream.write(batched_instructions.freeze(), false).await;
             }
         }
 
@@ -96,10 +101,15 @@ impl H3ResponseSender {
         let encoded_headers = encoder_guard.encoder_mut().encode(self.stream_id, &all_headers)
             .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
 
-        // Send any pending encoder instructions
+        // PERF #3: Batch encoder instructions into single write
+        let mut batched_instructions = bytes::BytesMut::new();
         while let Some(inst) = encoder_guard.encoder_mut().poll_encoder_stream() {
+            batched_instructions.extend_from_slice(&inst);
+        }
+        
+        if !batched_instructions.is_empty() {
             if let Some(encoder_stream) = self.encoder_send_stream.lock().await.as_mut() {
-                let _ = encoder_stream.write(inst, false).await;
+                let _ = encoder_stream.write(batched_instructions.freeze(), false).await;
             }
         }
 
@@ -131,6 +141,10 @@ impl H3ResponseSender {
         
         let mut manager = push_manager.lock().await;
         
+        // GAP FIX #4: RFC 9114 Section 7.2.7: Validate push_id against client's MAX_PUSH_ID
+        // Note: We need access to max_push_id from H3Session, which isn't available here
+        // This should be checked in H3Session when allocating the push
+        
         // Allocate a new push ID
         let push_id = manager.allocate_push_id()?;
         
@@ -146,10 +160,15 @@ impl H3ResponseSender {
         let encoded_headers = encoder_guard.encoder_mut().encode(self.stream_id, &headers_bytes)
             .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
 
-        // Send any pending encoder instructions
+        // PERF #3: Batch encoder instructions into single write
+        let mut batched_instructions = bytes::BytesMut::new();
         while let Some(inst) = encoder_guard.encoder_mut().poll_encoder_stream() {
+            batched_instructions.extend_from_slice(&inst);
+        }
+        
+        if !batched_instructions.is_empty() {
             if let Some(encoder_stream) = self.encoder_send_stream.lock().await.as_mut() {
-                let _ = encoder_stream.write(inst, false).await;
+                let _ = encoder_stream.write(batched_instructions.freeze(), false).await;
             }
         }
         

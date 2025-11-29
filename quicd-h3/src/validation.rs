@@ -370,26 +370,29 @@ impl RequestPseudoHeaders {
 }
 
 /// Phase 3: Validate Content-Length header uniqueness (RFC 9110 Section 8.6)
-fn validate_content_length_uniqueness(headers: &[(String, String)]) -> Result<(), H3Error> {
-    let mut content_length_values: Vec<&str> = Vec::new();
+/// 
+/// RFC 9110 Section 8.6: "If a message is received that has multiple Content-Length
+/// header fields with field values consisting of the same decimal value, or a single
+/// Content-Length header field with a field value containing a list of identical
+/// decimal values (e.g., 'Content-Length: 42, 42'), indicating that duplicate
+/// Content-Length header fields have been generated or combined by an upstream
+/// message processor, then the recipient MUST either reject the message as invalid
+/// or replace the duplicate field-values with a single valid Content-Length field
+/// value prior to processing."
+///
+/// We choose to reject for safety.
+pub fn validate_content_length_uniqueness(headers: &[(String, String)]) -> Result<(), H3Error> {
+    let mut content_length_count = 0;
     
-    for (name, value) in headers {
-        if name == "content-length" {
-            content_length_values.push(value);
-        }
-    }
-    
-    if content_length_values.len() > 1 {
-        // Check if all values are identical
-        let first = content_length_values[0];
-        for value in &content_length_values[1..] {
-            if *value != first {
-                // Different Content-Length values - malformed
-                return Err(H3Error::MessageError);
+    for (name, _value) in headers {
+        // RFC 9110: Header names are case-insensitive
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length_count += 1;
+            // RFC 9110 Section 8.6: Reject ANY multiple Content-Length headers
+            if content_length_count > 1 {
+                return Err(H3Error::Http("Request contains multiple Content-Length headers".to_string()));
             }
         }
-        // All values same but still reject for safety
-        return Err(H3Error::MessageError);
     }
     
     Ok(())
@@ -434,12 +437,17 @@ pub fn validate_field_section_size(
 /// - Trailers MUST NOT contain pseudo-headers
 /// - Trailers follow the same field name/value rules as headers
 /// - Trailers MUST NOT contain certain headers (e.g., Content-Length, Transfer-Encoding)
+/// - Trailers MUST NOT duplicate header names
+/// - Trailers size is subject to SETTINGS_MAX_FIELD_SECTION_SIZE
 pub fn validate_trailer_headers(trailers: &[(String, String)]) -> Result<(), H3Error> {
+    use std::collections::HashSet;
+    let mut seen_names = HashSet::new();
+    
     for (name, value) in trailers {
         // RFC 9114 Section 4.3: Pseudo-header fields MUST NOT appear in trailer sections
         if name.starts_with(':') {
             return Err(H3Error::Http(format!(
-                "pseudo-header not allowed in trailers: {}",
+                "H3_MESSAGE_ERROR: pseudo-header not allowed in trailers: {}",
                 name
             )));
         }
@@ -447,7 +455,7 @@ pub fn validate_trailer_headers(trailers: &[(String, String)]) -> Result<(), H3E
         // RFC 9114 Section 4.2: Field names MUST be lowercase
         if name.chars().any(|c| c.is_uppercase()) {
             return Err(H3Error::Http(format!(
-                "field name contains uppercase characters: {}",
+                "H3_MESSAGE_ERROR: field name contains uppercase characters: {}",
                 name
             )));
         }
@@ -455,8 +463,18 @@ pub fn validate_trailer_headers(trailers: &[(String, String)]) -> Result<(), H3E
         // RFC 9114 Section 10.3: Field values MUST NOT contain invalid characters
         if value.chars().any(|c| c == '\r' || c == '\n' || c == '\0') {
             return Err(H3Error::Http(format!(
-                "field value contains invalid characters (CR/LF/NUL): {} = {}",
+                "H3_MESSAGE_ERROR: field value contains invalid characters (CR/LF/NUL): {} = {}",
                 name, value
+            )));
+        }
+        
+        // ISSUE FIX #2: RFC 9110 Section 6.5: Trailers MUST NOT duplicate header names
+        // Header names are case-insensitive
+        let name_lower = name.to_lowercase();
+        if !seen_names.insert(name_lower) {
+            return Err(H3Error::Http(format!(
+                "H3_MESSAGE_ERROR: Duplicate trailer field name: {}",
+                name
             )));
         }
 
@@ -464,9 +482,10 @@ pub fn validate_trailer_headers(trailers: &[(String, String)]) -> Result<(), H3E
         match name.as_str() {
             "content-length" | "content-encoding" | "content-type" | 
             "content-range" | "trailer" | "transfer-encoding" |
-            "authorization" | "set-cookie" | "content-disposition" => {
+            "authorization" | "set-cookie" | "content-disposition" |
+            "host" | "cache-control" | "max-forwards" | "te" | "www-authenticate" => {
                 return Err(H3Error::Http(format!(
-                    "header not allowed in trailers: {}",
+                    "H3_MESSAGE_ERROR: header not allowed in trailers: {}",
                     name
                 )));
             }
@@ -477,9 +496,32 @@ pub fn validate_trailer_headers(trailers: &[(String, String)]) -> Result<(), H3E
     Ok(())
 }
 
+/// Validate trailer field section size against limit.
+/// This should be called in addition to validate_trailer_headers.
+pub fn validate_trailer_section_size(
+    trailers: &[(String, String)],
+    max_size: u64,
+) -> Result<(), H3Error> {
+    if max_size == 0 {
+        // 0 means unlimited
+        return Ok(());
+    }
+
+    let size = calculate_field_section_size(trailers);
+    if size as u64 > max_size {
+        return Err(H3Error::Http(format!(
+            "H3_MESSAGE_ERROR: Trailer section size {} exceeds maximum {}",
+            size, max_size
+        )));
+    }
+    
+    Ok(())
+}
+
 /// Validate that interim responses (1xx) don't contain certain headers.
 ///
 /// RFC 9114 Section 4.1: Interim responses cannot contain content or trailers.
+/// RFC 9110 Section 15.2: "A 1xx response never contains content or trailers."
 pub fn validate_interim_response_headers(headers: &[(String, String)]) -> Result<(), H3Error> {
     for (name, _value) in headers {
         // RFC 9110 Section 15.2: 1xx responses MUST NOT contain:
@@ -488,9 +530,9 @@ pub fn validate_interim_response_headers(headers: &[(String, String)]) -> Result
         // - Any representation metadata
         match name.as_str() {
             "content-length" | "content-type" | "content-encoding" | 
-            "content-language" | "content-location" | "content-range" => {
+            "content-language" | "content-location" | "content-range" | "trailer" => {
                 return Err(H3Error::Http(format!(
-                    "header not allowed in interim response: {}",
+                    "H3_MESSAGE_ERROR: header '{}' not allowed in interim (1xx) response",
                     name
                 )));
             }
@@ -498,6 +540,41 @@ pub fn validate_interim_response_headers(headers: &[(String, String)]) -> Result
         }
     }
 
+    Ok(())
+}
+
+/// Validate response headers based on status code.
+///
+/// RFC 9110 imposes different requirements for different status codes:
+/// - 1xx: No content/trailers (handled by validate_interim_response_headers)
+/// - 204 No Content: MUST NOT contain Content-Length or content
+/// - 304 Not Modified: MUST NOT contain Content-Length or content
+/// - 2xx for CONNECT: MUST NOT contain Content-Length
+pub fn validate_response_headers_for_status(status: u16, headers: &[(String, String)]) -> Result<(), H3Error> {
+    match status {
+        // RFC 9110 Section 15.3.5: 204 No Content
+        204 => {
+            for (name, _) in headers {
+                if name == "content-length" {
+                    return Err(H3Error::Http(
+                        "H3_MESSAGE_ERROR: 204 No Content MUST NOT contain Content-Length".into()
+                    ));
+                }
+            }
+        }
+        // RFC 9110 Section 15.4.5: 304 Not Modified
+        304 => {
+            for (name, _) in headers {
+                if name == "content-length" {
+                    return Err(H3Error::Http(
+                        "H3_MESSAGE_ERROR: 304 Not Modified MUST NOT contain Content-Length".into()
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    
     Ok(())
 }
 

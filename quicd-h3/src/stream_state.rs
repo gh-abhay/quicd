@@ -43,20 +43,16 @@ pub struct StreamFrameParser {
     /// RFC 9114 Section 4.1.2: Actual bytes received in DATA frames
     /// Must match content_length_declared if it was present
     content_length_received: u64,
+    /// GAP #6: Configurable maximum buffer size per stream
+    max_buffer_size: usize,
 }
 
-/// Maximum buffer size per stream to prevent memory exhaustion
-/// Default: 1 MB (configurable in production)
-const MAX_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
-
 impl StreamFrameParser {
-    /// Create a new parser for a stream.
+    /// Create a new parser for a stream with configurable buffer limits.
     /// PERF #30: Pre-allocate buffer to reduce reallocations
-    pub fn new(stream_id: u64) -> Self {
-        // Pre-allocate 16KB for typical frame sizes (HEADERS ~4KB, DATA varies)
-        const INITIAL_BUFFER_CAPACITY: usize = 16 * 1024;
+    pub fn new(stream_id: u64, initial_capacity: usize, max_buffer_size: usize) -> Self {
         Self {
-            buffer: BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY),
+            buffer: BytesMut::with_capacity(initial_capacity),
             state: StreamState::Idle,
             headers_received: false,
             data_received: false,
@@ -64,6 +60,7 @@ impl StreamFrameParser {
             stream_id,
             content_length_declared: None,
             content_length_received: 0,
+            max_buffer_size,
         }
     }
 
@@ -101,12 +98,12 @@ impl StreamFrameParser {
     /// PERF #31: Minimize copies by using efficient extension
     /// PERF #32: Enforces buffer size limit
     pub fn add_data(&mut self, data: Bytes) -> Result<(), H3Error> {
-        // PERF #32: Check buffer size limit before adding data
+        // GAP #6: Check buffer size limit before adding data (configurable)
         let new_size = self.buffer.len() + data.len();
-        if new_size > MAX_STREAM_BUFFER_SIZE {
+        if new_size > self.max_buffer_size {
             return Err(H3Error::Connection(format!(
                 "Stream {} buffer size {} exceeds maximum {}",
-                self.stream_id, new_size, MAX_STREAM_BUFFER_SIZE
+                self.stream_id, new_size, self.max_buffer_size
             )));
         }
         
@@ -300,16 +297,20 @@ impl StreamFrameParser {
 mod tests {
     use super::*;
 
+    // Default test buffer limits
+    const TEST_INITIAL_CAPACITY: usize = 16 * 1024;
+    const TEST_MAX_BUFFER_SIZE: usize = 1024 * 1024;
+
     #[test]
     fn test_frame_parser_basic() {
-        let mut parser = StreamFrameParser::new(4);
+        let mut parser = StreamFrameParser::new(4, TEST_INITIAL_CAPACITY, TEST_MAX_BUFFER_SIZE);
         parser.mark_open();
         assert_eq!(parser.state(), StreamState::Open);
     }
 
     #[test]
     fn test_frame_sequence_validation() {
-        let mut parser = StreamFrameParser::new(4);
+        let mut parser = StreamFrameParser::new(4, TEST_INITIAL_CAPACITY, TEST_MAX_BUFFER_SIZE);
         parser.mark_open();
 
         // Create a HEADERS frame
@@ -346,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_data_before_headers_rejected() {
-        let mut parser = StreamFrameParser::new(4);
+        let mut parser = StreamFrameParser::new(4, TEST_INITIAL_CAPACITY, TEST_MAX_BUFFER_SIZE);
         parser.mark_open();
 
         // Try DATA before HEADERS
@@ -362,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_partial_frame_buffering() {
-        let mut parser = StreamFrameParser::new(4);
+        let mut parser = StreamFrameParser::new(4, TEST_INITIAL_CAPACITY, TEST_MAX_BUFFER_SIZE);
         parser.mark_open();
 
         let headers = H3Frame::Headers {
@@ -391,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_stream_state_transitions() {
-        let mut parser = StreamFrameParser::new(4);
+        let mut parser = StreamFrameParser::new(4, TEST_INITIAL_CAPACITY, TEST_MAX_BUFFER_SIZE);
         assert_eq!(parser.state(), StreamState::Idle);
 
         parser.mark_open();
