@@ -260,12 +260,31 @@ impl<H: H3Handler> H3Session<H> {
         let mut timeout_check_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         timeout_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
+        // GAP FIX #3: RFC 9114 Section 5.1: Check for idle timeout
+        // Check every 5 seconds to detect idle connections
+        let mut idle_check_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        idle_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
         loop {
             tokio::select! {
                 Some(event) = events.next() => {
                     if let Err(e) = self.handle_event(event).await {
                         eprintln!("Error handling event: {:?}", e);
                         // Continue processing other events
+                    }
+                }
+                _ = timeout_check_interval.tick() => {
+                    // RFC 9204 Section 2.1.4: Check for QPACK blocked stream timeouts
+                    if let Err(e) = self.check_blocked_stream_timeouts().await {
+                        eprintln!("Error checking blocked stream timeouts: {:?}", e);
+                    }
+                }
+                _ = idle_check_interval.tick() => {
+                    // GAP FIX #3: RFC 9114 Section 5.1: Check for idle timeout
+                    if let Err(e) = self.check_idle_timeout().await {
+                        eprintln!("Error checking idle timeout: {:?}", e);
+                        // Idle timeout is fatal - close connection
+                        break;
                     }
                 }
                 _ = &mut shutdown => {
@@ -428,7 +447,9 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     fn should_accept_stream(&self, stream_id: u64) -> bool {
-        // RFC 9114 Section 5.2: Don't accept new streams after GOAWAY
+        // GAP FIX #8: RFC 9114 Section 5.2: Don't accept new streams after GOAWAY
+        // This prevents the race condition where a client opens a new stream
+        // just as we're processing a GOAWAY frame
         if self.goaway_received && stream_id > self.last_accepted_stream_id {
             return false;
         }
@@ -441,7 +462,12 @@ impl<H: H3Handler> H3Session<H> {
         mut recv_stream: quicd_x::RecvStream,
         send_stream: Option<quicd_x::SendStream>,
     ) -> Result<(), H3Error> {
-        // RFC 9114 Section 7.2.8: Periodically send reserved frames for greasing
+        // GAP FIX #10: RFC 9114 Section 6.1: Validate stream initiator
+        // "HTTP/3 does not use server-initiated bidirectional streams"
+        crate::stream_validation::validate_client_bidirectional_stream(stream_id, true)?;
+        
+        // GAP FIX #5: RFC 9114 Section 7.2.8: Periodically send reserved frames for greasing
+        // This is called per request stream to ensure systematic greasing distribution
         if Self::should_grease() {
             let _ = self.send_reserved_frame().await; // Best effort, don't fail stream on error
         }
@@ -528,6 +554,9 @@ impl<H: H3Handler> H3Session<H> {
         
         let stream_type = self.read_stream_type(&mut recv_stream).await?;
         
+        // GAP FIX #10: Validate unidirectional stream initiator based on stream type
+        crate::stream_validation::validate_unidirectional_stream_initiator(stream_id, stream_type, true)?;
+        
         match stream_type {
             0x00 => {
                 // Control stream (RFC 9114 Section 6.2.1)
@@ -584,16 +613,27 @@ impl<H: H3Handler> H3Session<H> {
                 let key = self.streams.insert(StreamState::QpackDecoder);
                 self.stream_id_to_key.insert(stream_id, key);
             }
-            0x21..=0x3f if (stream_type - 0x21) % 0x1f == 0 => {
-                // Reserved stream types (RFC 9114 Section 6.2)
+            _ if crate::frames::H3Frame::is_reserved_stream_type(stream_type) => {
+                // RFC 9114 Section 6.2.3: Reserved stream types for greasing
+                // "Stream types of the format 0x1f * N + 0x21 for non-negative integer
+                // values of N are reserved to exercise the requirement that unknown
+                // types be ignored. These streams have no semantics, and they can be
+                // sent when application-layer padding is desired."
+                //
                 // MUST be ignored but stream still consumes resources
-                eprintln!("received reserved stream type: {:#x}", stream_type);
+                self.metrics.reserved_streams_received.fetch_add(1, Ordering::Relaxed);
                 self.consume_stream_silently(recv_stream).await;
             }
             _ => {
-                // Unknown stream type (RFC 9114 Section 6.2)
-                // MUST be consumed but not processed
-                eprintln!("received unknown stream type: {:#x}, consuming silently", stream_type);
+                // RFC 9114 Section 6.2: Unknown stream type
+                // "If the stream header indicates a stream type that is not supported by
+                // the recipient, the remainder of the stream cannot be consumed as the
+                // semantics are unknown. Recipients of unknown stream types MUST either
+                // abort reading of the stream or discard incoming data without further
+                // processing."
+                //
+                // We choose to discard incoming data for better interoperability
+                self.metrics.unknown_streams_received.fetch_add(1, Ordering::Relaxed);
                 self.consume_stream_silently(recv_stream).await;
             }
         }
@@ -665,9 +705,9 @@ impl<H: H3Handler> H3Session<H> {
                 settings.push(Setting { identifier: 0x8, value: 1 }); // SETTINGS_ENABLE_CONNECT_PROTOCOL
             }
             
-            // RFC 9114 Section 7.2.4.1: Grease with reserved settings
+            // GAP FIX #5: RFC 9114 Section 7.2.4.1: Grease with reserved settings
             // Format: 0x1f * N + 0x21, where N >= 0
-            // Use with ~10% probability to avoid ossification
+            // Use with ~2% probability to avoid ossification
             if Self::should_grease() {
                 let grease_id = Self::generate_reserved_setting_id();
                 settings.push(Setting { identifier: grease_id, value: 0 });
@@ -996,8 +1036,23 @@ impl<H: H3Handler> H3Session<H> {
         Ok(())
     }
 
-    async fn handle_request_complete(&mut self, _stream_id: u64) -> Result<(), H3Error> {
-        // Request finished
+    async fn handle_request_complete(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        // RFC 9114 Section 4.1.2: Validate Content-Length when stream finishes
+        // This is called when we receive FIN on the stream
+        
+        if let Some(key) = self.stream_id_to_key.get(&stream_id) {
+            if let Some(StreamState::Request { content_length, bytes_received, .. }) = self.streams.get(*key) {
+                // GAP FIX #2: Validate Content-Length against received bytes
+                if let Some(expected) = content_length {
+                    if *bytes_received != *expected {
+                        // RFC 9114 Section 4.1.2: Mismatch is H3_MESSAGE_ERROR
+                        let _ = self.handle.reset_stream(stream_id, crate::error::H3ErrorCode::MessageError.to_u64());
+                        return Err(H3Error::MessageError);
+                    }
+                }
+            }
+        }
+        
         Ok(())
     }
 
@@ -1155,10 +1210,38 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     async fn cancel_push(&mut self, push_id: u64) -> Result<(), H3Error> {
-        // Use PushManager to handle cancellation
+        // GAP FIX #4: RFC 9114 Section 7.2.3: Validate push_id <= max_push_id
+        // "A client MUST NOT send a push ID that is larger than the maximum push ID
+        // that the server has advertised."
+        if push_id > self.max_push_id {
+            // Client sent CANCEL_PUSH for a push_id beyond our limit - protocol violation
+            // RFC 9114 Section 8.1: H3_ID_ERROR for ID out of range
+            return Err(H3Error::Connection(
+                format!("H3_ID_ERROR: CANCEL_PUSH with push_id {} exceeds MAX_PUSH_ID {}", 
+                    push_id, self.max_push_id)
+            ));
+        }
+        
+        // GAP FIX #4: Abort the push stream if it's already opened
+        let stream_id_to_abort = {
+            let manager = self.push_manager.lock().await;
+            manager.get_promise(push_id).and_then(|p| p.push_stream_id())
+        };
+        
+        if let Some(stream_id) = stream_id_to_abort {
+            // RFC 9114 Section 4.6: Abort the push stream immediately
+            // Use H3_REQUEST_CANCELLED error code
+            let _ = self.cancel_stream(stream_id, 0x010C).await;
+        }
+        
+        // GAP FIX #4: Clean up _push_streams HashMap
+        self._push_streams.remove(&push_id);
+        
+        // Use PushManager to handle cancellation state
         if let Ok(mut manager) = self.push_manager.try_lock() {
             manager.cancel_push(push_id)?;
         }
+        
         Ok(())
     }
 
@@ -1251,11 +1334,21 @@ impl<H: H3Handler> H3Session<H> {
                     return Err(H3Error::Http(format!("Invalid element ID parameter: {}", param)));
                 }
             } else {
-                return Err(H3Error::Http(format!("Unknown priority parameter: {}", param)));
+                // RFC 9218 Section 7.1: Unknown parameters are ignored
+                // This allows for future extensions without breaking compatibility
+                continue;
             }
         }
         
         let urgency = urgency.ok_or_else(|| H3Error::Http("Missing urgency parameter in PRIORITY_UPDATE".into()))?;
+        
+        // GAP FIX #1: Detect element type from stream state
+        // RFC 9218: element_type 0x00 = request, 0x01 = push
+        let element_type = if self._push_streams.contains_key(&element_id) {
+            1 // Push stream
+        } else {
+            0 // Request stream (default)
+        };
         
         // Update stream priority
         self.stream_priorities.insert(element_id, urgency as u64);
@@ -1265,7 +1358,7 @@ impl<H: H3Handler> H3Session<H> {
         
         let node = PriorityNode {
             element_id,
-            element_type: 0, // Assume request stream (0x00)
+            element_type,
             urgency,
             incremental,
             parent_id: parent_element_id,
@@ -1274,10 +1367,48 @@ impl<H: H3Handler> H3Session<H> {
         
         self.priority_tree.insert(node);
         
-        eprintln!("PRIORITY_UPDATE for stream {}: urgency={}, incremental={}, parent_id={:?}",
-            element_id, urgency, incremental, parent_element_id);
+        // GAP FIX #2: Reorder request queue if this stream is already queued
+        // RFC 9218 Section 7.1: Priority updates should affect scheduling immediately
+        self.reorder_request_queue(element_id, urgency).await;
+        
+        // Record metrics
+        self.metrics.frames_priority_update_received.fetch_add(1, Ordering::Relaxed);
+        
+        eprintln!("PRIORITY_UPDATE for {} {} {}: urgency={}, incremental={}, parent_id={:?}",
+            if element_type == 0 { "request" } else { "push" },
+            "stream", element_id, urgency, incremental, parent_element_id);
         
         Ok(())
+    }
+    
+    /// Reorder request queue when priority changes for a queued request
+    async fn reorder_request_queue(&mut self, element_id: u64, new_urgency: u8) {
+        // RFC 9218: Priority changes should take effect immediately for queued requests
+        // BinaryHeap doesn't support efficient priority updates, so we need to:
+        // 1. Extract all requests from the heap
+        // 2. Update the priority of the target request
+        // 3. Rebuild the heap
+        
+        let mut temp_requests = Vec::new();
+        let mut found = false;
+        
+        while let Some(mut req) = self.request_queue.pop() {
+            if req.stream_id == element_id {
+                // Update priority
+                req.priority_id = new_urgency as u64;
+                found = true;
+            }
+            temp_requests.push(req);
+        }
+        
+        // Rebuild queue
+        for req in temp_requests {
+            self.request_queue.push(req);
+        }
+        
+        if found {
+            eprintln!("Reordered request queue: stream {} now has urgency {}", element_id, new_urgency);
+        }
     }
 
     /// RFC 9114 Section 4.1.1: Handle stream closure/reset
@@ -1309,6 +1440,9 @@ impl<H: H3Handler> H3Session<H> {
         // Remove from blocked streams if present
         self.blocked_streams.remove(&stream_id);
         
+        // RFC 9218: Remove from priority tree when stream closes
+        self.priority_tree.remove(stream_id);
+        
         Ok(())
     }
 
@@ -1320,6 +1454,9 @@ impl<H: H3Handler> H3Session<H> {
             self.streams.remove(key);
         }
         self.blocked_streams.remove(&stream_id);
+        
+        // RFC 9218: Remove from priority tree when stream is cancelled
+        self.priority_tree.remove(stream_id);
         
         // Send RESET_STREAM to peer (synchronous call, returns request_id)
         let _request_id = self.handle.reset_stream(stream_id, error_code)
@@ -1483,10 +1620,43 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     /// Process a push stream (RFC 9114 Section 6.2.2)
-    /// Note: This would be used in a client implementation. Servers don't receive push streams.
+    /// 
+    /// **Client-side feature only** - Servers never receive push streams per RFC 9114 Section 6.2.2.
+    /// 
+    /// This stub is provided for API completeness. A full client implementation would:
+    /// 
+    /// 1. **Validate push_id** against previously received PUSH_PROMISE frames
+    ///    - RFC 9114 Section 4.6: Send H3_ID_ERROR if push_id not promised
+    ///    - Track promised IDs via PushManager
+    /// 
+    /// 2. **Parse stream frames** following RFC 9114 Section 4.6:
+    ///    - First varint: push_id
+    ///    - Followed by HEADERS frame (required)
+    ///    - Zero or more DATA frames
+    ///    - Optional trailing HEADERS
+    ///    - Any other frame type is H3_FRAME_UNEXPECTED
+    /// 
+    /// 3. **Decode QPACK headers** using `qpack_decoder.decode_header_block()`
+    ///    - Pass stream_id for proper blocking semantics
+    ///    - Send Section Ack when processing completes
+    /// 
+    /// 4. **Validate response semantics**:
+    ///    - Must have :status pseudo-header
+    ///    - Cannot have request pseudo-headers (:method, :scheme, :authority, :path)
+    ///    - Content-Length must match actual payload if present
+    /// 
+    /// 5. **Deliver to application**:
+    ///    - Match with promised request headers
+    ///    - Provide via H3Handler callback or similar API
+    ///    - Update metrics (push_streams_received, push_bytes_received)
+    /// 
+    /// 6. **Update PushManager state**:
+    ///    - Mark stream as opened (Promised -> Sending)
+    ///    - Mark as completed when FIN received
+    ///    - Handle CANCEL_PUSH or stream reset appropriately
     #[allow(dead_code)]
     async fn process_push_stream(&mut self, _stream_id: u64, mut recv_stream: quicd_x::RecvStream) -> Result<(), H3Error> {
-        // Read push ID (varint)
+        // Read push ID (varint) - RFC 9114 Section 4.6
         let data = match recv_stream.read().await {
             Ok(Some(quicd_x::StreamData::Data(bytes))) => bytes,
             _ => return Err(H3Error::Connection("failed to read push ID".into())),
@@ -1495,12 +1665,12 @@ impl<H: H3Handler> H3Session<H> {
         let (push_id, _consumed) = crate::frames::H3Frame::decode_varint(&data)
             .map_err(|e| H3Error::FrameParse(format!("invalid push ID: {:?}", e)))?;
 
-        // TODO: Properly handle push promise state and stream processing
-        // Push streams are unidirectional, so we can't send responses back on them
-        // They need to be associated with a push promise sent on a bidirectional stream
-        eprintln!("Push stream with push ID {}: not fully implemented", push_id);
+        // Stub: In a real client, this would validate the push_id was promised,
+        // parse frames, decode QPACK headers, and deliver to the application.
+        // See documentation above for full implementation requirements.
+        eprintln!("Push stream with push ID {}: client support not implemented (server-side only)", push_id);
         
-        // For now, consume the stream silently
+        // Consume stream to prevent blocking
         self.consume_stream_silently(recv_stream).await;
         
         Ok(())
@@ -1528,11 +1698,11 @@ impl<H: H3Handler> H3Session<H> {
 
 
 
-    /// Check if we should grease (use reserved identifiers)
+    /// GAP FIX #5: Check if we should grease (use reserved identifiers)
     /// 
-    /// RFC 9114: Implementations should send reserved identifiers occasionally
+    /// RFC 9114 Section 7.2.8: Implementations SHOULD send reserved identifiers occasionally
     /// to prevent intermediaries from ossifying on current protocol.
-    /// Returns true ~10% of the time.
+    /// Returns true ~2% of the time (1 in 50) for systematic greasing without excessive overhead.
     fn should_grease() -> bool {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hash, Hasher};
@@ -1540,7 +1710,7 @@ impl<H: H3Handler> H3Session<H> {
         let s = RandomState::new();
         let mut hasher = s.build_hasher();
         std::time::SystemTime::now().hash(&mut hasher);
-        (hasher.finish() % 10) == 0
+        (hasher.finish() % 50) == 0
     }
     
     /// Generate a reserved setting identifier
@@ -1700,6 +1870,66 @@ impl<H: H3Handler> H3Session<H> {
             // No response data available - send CANCEL_PUSH and close stream
             let _ = self.send_cancel_push_frame(push_id).await;
             return Err(H3Error::Http(format!("no response data for push ID {}", push_id)));
+        }
+        
+        Ok(())
+    }
+    
+    /// GAP FIX #3: RFC 9114 Section 5.1: Check for idle connection timeout
+    /// This should be called periodically from the event loop
+    async fn check_idle_timeout(&mut self) -> Result<(), H3Error> {
+        let elapsed = self.last_activity_time.elapsed();
+        
+        if elapsed >= self.idle_timeout {
+            // RFC 9114 Section 5.1: Idle timeout exceeded
+            // Send GOAWAY before closing to allow graceful shutdown
+            if !self.goaway_sent {
+                eprintln!("Idle timeout exceeded ({:?} >= {:?}) - sending GOAWAY", elapsed, self.idle_timeout);
+                self.send_goaway().await?;
+                
+                // Wait a short grace period for in-flight requests to complete
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            
+            // Close connection with H3_NO_ERROR per RFC 9114 Section 8
+            let error_code = crate::error::H3ErrorCode::NoError.to_u64();
+            self.handle.close(error_code, Some(Bytes::from("idle timeout")))
+                .map_err(|e| H3Error::Connection(format!("close error: {:?}", e)))?;
+            
+            return Err(H3Error::Connection("idle timeout".into()));
+        }
+        
+        Ok(())
+    }
+    
+    /// GAP FIX #6: RFC 9204 Section 2.1.4: Check for QPACK blocked stream timeouts
+    /// Streams blocked for > configured timeout should be aborted with H3_REQUEST_CANCELLED
+    async fn check_blocked_stream_timeouts(&mut self) -> Result<(), H3Error> {
+        let blocked_timeout = std::time::Duration::from_secs(60); // Default 60s per RFC 9204
+        let now = std::time::Instant::now();
+        let mut streams_to_abort = Vec::new();
+        
+        // Find streams that have been blocked too long
+        for (stream_id, blocked_stream) in &self.blocked_streams {
+            let blocked_duration = now.duration_since(blocked_stream.blocked_at);
+            if blocked_duration > blocked_timeout {
+                streams_to_abort.push(*stream_id);
+            }
+        }
+        
+        // Abort timed-out streams
+        for stream_id in streams_to_abort {
+            eprintln!("Aborting stream {} - QPACK blocked timeout exceeded", stream_id);
+            
+            // RFC 9204 Section 2.1.4: Abort with H3_REQUEST_CANCELLED
+            let error_code = 0x010C; // H3_REQUEST_CANCELLED
+            let _ = self.handle.reset_stream(stream_id, error_code);
+            
+            // Clean up stream state
+            self.blocked_streams.remove(&stream_id);
+            if let Some(key) = self.stream_id_to_key.remove(&stream_id) {
+                self.streams.remove(key);
+            }
         }
         
         Ok(())

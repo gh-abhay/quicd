@@ -43,8 +43,8 @@ impl Encoder {
         
         Self {
             table,
-            encoder_stream_buffer: VecDeque::new(),
-            blocked_streams: HashMap::new(),
+            encoder_stream_buffer: VecDeque::with_capacity(32),
+            blocked_streams: HashMap::with_capacity(max_blocked_streams),
             max_blocked_streams,
             max_table_capacity,
         }
@@ -78,11 +78,15 @@ impl Encoder {
     /// # Returns
     /// Encoded header block bytes
     pub fn encode(&mut self, stream_id: u64, headers: &[(&[u8], &[u8])]) -> Result<Bytes> {
-        let mut field_lines = Vec::new();
+        let mut field_lines = Vec::with_capacity(headers.len());
         let mut max_absolute_index = 0u64;
         let mut references_dynamic = false;
         
         for (name, value) in headers {
+            // RFC 9204 Section 7.1.3: Check if this is a sensitive header that should never be indexed
+            // Uses comprehensive list + pattern matching for custom auth headers
+            let never_indexed = should_never_index(name);
+            
             // Try static table exact match
             if let Some(static_idx) = static_table::find_exact(name, value) {
                 field_lines.push(FieldLine::IndexedStatic {
@@ -108,27 +112,29 @@ impl Encoder {
                 field_lines.push(FieldLine::LiteralStaticName {
                     name_index: static_idx as u64,
                     value: Bytes::copy_from_slice(value),
-                    never_indexed: false,
+                    never_indexed,
                 });
                 continue;
             }
             
-            // Try dynamic table name match
-            if let Some(abs_idx) = self.table.find_name(name) {
-                if !self.table.is_draining(abs_idx) || self.can_block_stream() {
-                    field_lines.push(FieldLine::LiteralDynamicName {
-                        name_index: abs_idx,
-                        value: Bytes::copy_from_slice(value),
-                        never_indexed: false,
-                    });
-                    max_absolute_index = max_absolute_index.max(abs_idx);
-                    references_dynamic = true;
-                    continue;
+            // Try dynamic table name match (only if not sensitive)
+            if !never_indexed {
+                if let Some(abs_idx) = self.table.find_name(name) {
+                    if !self.table.is_draining(abs_idx) || self.can_block_stream() {
+                        field_lines.push(FieldLine::LiteralDynamicName {
+                            name_index: abs_idx,
+                            value: Bytes::copy_from_slice(value),
+                            never_indexed,
+                        });
+                        max_absolute_index = max_absolute_index.max(abs_idx);
+                        references_dynamic = true;
+                        continue;
+                    }
                 }
             }
             
-            // Consider inserting into dynamic table
-            if self.should_insert(name, value) {
+            // Consider inserting into dynamic table (skip if sensitive)
+            if !never_indexed && self.should_insert(name, value) {
                 let abs_idx = self.insert_entry(name, value)?;
                 field_lines.push(FieldLine::IndexedDynamic {
                     absolute_index: abs_idx,
@@ -140,7 +146,7 @@ impl Encoder {
                 field_lines.push(FieldLine::LiteralName {
                     name: Bytes::copy_from_slice(name),
                     value: Bytes::copy_from_slice(value),
-                    never_indexed: false,
+                    never_indexed,
                 });
             }
         }
@@ -224,6 +230,45 @@ impl Encoder {
         self.encoder_stream_buffer.pop_front()
     }
     
+    /// Get a batch of encoder stream instructions for more efficient transmission.
+    /// 
+    /// Returns up to `max_instructions` batched together. This reduces syscalls
+    /// and improves throughput when multiple instructions are pending.
+    /// 
+    /// # Arguments
+    /// * `max_instructions` - Maximum number of instructions to batch (default: 8)
+    /// 
+    /// # Returns
+    /// A single `Bytes` containing multiple concatenated instructions, or `None` if empty.
+    pub fn poll_encoder_stream_batch(&mut self, max_instructions: usize) -> Option<Bytes> {
+        if self.encoder_stream_buffer.is_empty() {
+            return None;
+        }
+        
+        let batch_size = std::cmp::min(max_instructions, self.encoder_stream_buffer.len());
+        if batch_size == 0 {
+            return None;
+        }
+        
+        // Calculate total size needed
+        let mut total_size = 0;
+        for inst in self.encoder_stream_buffer.iter().take(batch_size) {
+            total_size += inst.len();
+        }
+        
+        // Pre-allocate buffer
+        let mut batched = bytes::BytesMut::with_capacity(total_size);
+        
+        // Concatenate instructions
+        for _ in 0..batch_size {
+            if let Some(inst) = self.encoder_stream_buffer.pop_front() {
+                batched.extend_from_slice(&inst);
+            }
+        }
+        
+        Some(batched.freeze())
+    }
+    
     /// Drain all encoder stream instructions.
     pub fn drain_encoder_stream(&mut self) -> Vec<Bytes> {
         self.encoder_stream_buffer.drain(..).collect()
@@ -291,6 +336,148 @@ impl Encoder {
         // Insert into table
         self.table.insert(name_bytes, value_bytes)
     }
+}
+
+/// Check if a header is sensitive and should never be indexed.
+/// 
+/// Per RFC 9204 Section 7.1.3, RFC 9110 Section 12.5.3, and security best practices:
+/// 
+/// RFC 9204 Section 7.1.3: "An encoder might also choose not to index values for fields
+/// that are considered to be highly valuable or sensitive to recovery, such as the Cookie
+/// or Authorization header fields."
+///
+/// Comprehensive list includes:
+/// - Authentication/Authorization: Credentials and tokens
+/// - Session Management: Cookies and session identifiers
+/// - Security Headers: API keys, CSRF tokens, signatures
+/// - Privacy: User tracking data
+/// - Application-specific: Custom auth headers
+#[inline]
+fn is_sensitive_header(name: &[u8]) -> bool {
+    matches!(
+        name,
+        // RFC 9110 Authentication
+        b"authorization" |
+        b"proxy-authorization" |
+        b"www-authenticate" |
+        b"proxy-authenticate" |
+        
+        // RFC 6265 Cookies (Session Management)
+        b"cookie" |
+        b"set-cookie" |
+        b"cookie2" |              // Deprecated but still used
+        b"set-cookie2" |          // Deprecated but still used
+        
+        // API Keys and Tokens (Common patterns)
+        b"x-api-key" |
+        b"api-key" |
+        b"x-auth-token" |
+        b"x-access-token" |
+        b"x-refresh-token" |
+        b"x-session-token" |
+        b"x-csrf-token" |
+        b"x-xsrf-token" |
+        
+        // OAuth and JWT
+        b"x-jwt" |
+        b"x-jwt-assertion" |
+        b"x-oauth-token" |
+        b"bearer" |
+        
+        // Security Signatures
+        b"signature" |
+        b"x-signature" |
+        b"x-amz-signature" |      // AWS
+        b"x-goog-signature" |     // Google Cloud
+        b"x-hub-signature" |      // GitHub webhooks
+        
+        // Authentication Headers (Various schemes)
+        b"x-user-token" |
+        b"x-device-token" |
+        b"x-client-id" |
+        b"x-client-secret" |
+        b"x-api-secret" |
+        b"x-auth-key" |
+        b"x-auth-user" |
+        b"x-auth-password" |
+        
+        // Session IDs
+        b"x-session-id" |
+        b"session-id" |
+        b"jsessionid" |           // Java
+        b"phpsessid" |            // PHP
+        b"aspsessionid" |         // ASP
+        
+        // Privacy/Tracking
+        b"x-user-id" |
+        b"x-tracking-id" |
+        b"x-correlation-id"       // May contain user context
+        
+        // Custom Application Headers (wildcards handled by prefix)
+        // Note: Consider making this configurable for application-specific headers
+    )
+}
+
+/// Check if a header name contains sensitive patterns (case-insensitive).
+/// 
+/// This catches custom authentication headers that follow common naming patterns.
+/// To avoid false positives, we require patterns to be at word boundaries or with
+/// common prefixes like "x-".
+#[inline]
+fn contains_sensitive_pattern(name: &[u8]) -> bool {
+    // Convert to lowercase for comparison
+    let name_lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+    
+    // Patterns that indicate authentication/security headers
+    // We check for these patterns with hyphens (common in custom headers)
+    let sensitive_patterns: &[&[u8]] = &[
+        b"-token",           // x-auth-token, x-api-token, etc.
+        b"-key",             // x-api-key, api-key, etc.
+        b"-secret",          // x-secret, api-secret, etc.
+        b"-password",        // x-password, user-password, etc.
+        b"-credential",      // x-credential, auth-credential, etc.
+        b"-auth",            // x-auth, custom-auth, etc.
+        b"-session",         // x-session, user-session, etc.
+        b"-jwt",             // x-jwt, custom-jwt, etc.
+        b"-oauth",           // x-oauth, custom-oauth, etc.
+        b"-bearer",          // x-bearer, etc.
+        b"-signature",       // x-signature, etc.
+        b"-csrf",            // x-csrf, etc.
+        b"-xsrf",            // x-xsrf, etc.
+    ];
+    
+    // Check if name contains any sensitive pattern
+    for pattern in sensitive_patterns.iter() {
+        if name_lower.windows(pattern.len()).any(|window| window == *pattern) {
+            return true;
+        }
+    }
+    
+    // Also check for patterns at the start (without hyphen)
+    let start_patterns: &[&[u8]] = &[
+        b"token",
+        b"auth",
+        b"bearer",
+        b"cookie",
+        b"session",
+    ];
+    
+    for pattern in start_patterns.iter() {
+        if name_lower.starts_with(pattern) {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Determine if a header should never be indexed (comprehensive check).
+/// 
+/// This combines explicit sensitive header names with pattern matching for
+/// custom authentication headers.
+#[inline]
+pub fn should_never_index(name: &[u8]) -> bool {
+    is_sensitive_header(name) || contains_sensitive_pattern(name)
 }
 
 #[cfg(test)]

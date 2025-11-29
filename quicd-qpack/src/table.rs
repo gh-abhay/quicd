@@ -8,8 +8,9 @@
 
 use bytes::Bytes;
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::error::{QpackError, Result};
 
@@ -81,6 +82,15 @@ pub struct DynamicTable {
     
     /// Generation counter for detecting evicted entries.
     generation: AtomicU64,
+    
+    /// HashMap index for O(1) lookups by name-value pair.
+    /// Key is (name_bytes, value_bytes), Value is absolute_index.
+    /// Uses RwLock for concurrent read access, exclusive write.
+    exact_index: RwLock<HashMap<(Bytes, Bytes), u64>>,
+    
+    /// HashMap index for O(1) lookups by name only.
+    /// Key is name_bytes, Value is absolute_index of newest entry.
+    name_index: RwLock<HashMap<Bytes, u64>>,
 }
 
 impl DynamicTable {
@@ -100,6 +110,8 @@ impl DynamicTable {
             max_capacity,
             known_received_count: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            exact_index: RwLock::new(HashMap::with_capacity(256)),
+            name_index: RwLock::new(HashMap::with_capacity(256)),
         }
     }
     
@@ -171,8 +183,24 @@ impl DynamicTable {
     }
     
     /// Update known received count (from Insert Count Increment).
+    /// 
+    /// RFC 9204 Section 2.1.4: Known Received Count can wrap around.
+    /// We use wrapping arithmetic to handle overflow gracefully.
     pub fn update_known_received_count(&self, increment: u64) {
-        self.known_received_count.fetch_add(increment, Ordering::AcqRel);
+        // Use compare-and-swap loop to safely handle wrapping
+        let mut current = self.known_received_count.load(Ordering::Acquire);
+        loop {
+            let new_value = current.wrapping_add(increment);
+            match self.known_received_count.compare_exchange_weak(
+                current,
+                new_value,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
     
     /// Insert an entry into the dynamic table.
@@ -219,6 +247,17 @@ impl DynamicTable {
         self.insert_count.fetch_add(1, Ordering::AcqRel);
         self.current_size.fetch_add(entry_size, Ordering::AcqRel);
         
+        // Update HashMap indices for O(1) lookups
+        {
+            let mut exact_idx = self.exact_index.write().unwrap();
+            exact_idx.insert((entry.name.clone(), entry.value.clone()), absolute_index);
+        }
+        {
+            let mut name_idx = self.name_index.write().unwrap();
+            // Only update if this is the newest entry for this name
+            name_idx.insert(entry.name.clone(), absolute_index);
+        }
+        
         Ok(absolute_index)
     }
     
@@ -242,6 +281,50 @@ impl DynamicTable {
         if let Some(entry) = entry {
             let entry_size = entry.size();
             self.current_size.fetch_sub(entry_size, Ordering::AcqRel);
+            
+            // Remove from HashMap indices
+            {
+                let mut exact_idx = self.exact_index.write().unwrap();
+                exact_idx.remove(&(entry.name.clone(), entry.value.clone()));
+            }
+            {
+                let mut name_idx = self.name_index.write().unwrap();
+                // Only remove if this is the indexed entry for this name
+                if let Some(&indexed_abs_idx) = name_idx.get(&entry.name) {
+                    if indexed_abs_idx == entry.absolute_index {
+                        name_idx.remove(&entry.name);
+                        
+                        // Find the next newest entry with this name to re-index
+                        // This is a fallback - in practice, newer entries would already be indexed
+                        let head_after = (head + 1) % MAX_ENTRIES;
+                        let tail_current = self.tail.load(Ordering::Acquire);
+                        
+                        if head_after != tail_current {
+                            // Search remaining entries for same name
+                            let len = if tail_current >= head_after {
+                                tail_current - head_after
+                            } else {
+                                MAX_ENTRIES - head_after + tail_current
+                            };
+                            
+                            for i in (0..len).rev() {
+                                let slot = (head_after + i) % MAX_ENTRIES;
+                                let check_entry = unsafe {
+                                    let entries_ptr = self.entries.get();
+                                    (*entries_ptr)[slot].as_ref()
+                                };
+                                
+                                if let Some(check_entry) = check_entry {
+                                    if check_entry.name == entry.name {
+                                        name_idx.insert(entry.name.clone(), check_entry.absolute_index);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         
         // Advance head
@@ -296,48 +379,17 @@ impl DynamicTable {
     /// 
     /// # Thread-safe read operation
     /// # Performance
-    /// Searches from newest to oldest for best compression ratio.
-    /// Uses fast path for length check before full comparison.
+    /// O(1) HashMap lookup with read lock.
     #[inline]
     pub fn find_exact(&self, name: &[u8], value: &[u8]) -> Option<u64> {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
+        // O(1) lookup via HashMap index
+        let index = self.exact_index.read().unwrap();
         
-        let len = if tail >= head {
-            tail - head
-        } else {
-            MAX_ENTRIES - head + tail
-        };
+        // Need to create Bytes for HashMap key lookup
+        let name_key = Bytes::copy_from_slice(name);
+        let value_key = Bytes::copy_from_slice(value);
         
-        // Early exit for empty table
-        if len == 0 {
-            return None;
-        }
-        
-        let name_len = name.len();
-        let value_len = value.len();
-        
-        // Search from newest to oldest (for best compression)
-        for i in (0..len).rev() {
-            let slot = (head + i) % MAX_ENTRIES;
-            
-            // SAFETY: Read-only access to Arc-protected data
-            let entry = unsafe {
-                let entries_ptr = self.entries.get();
-                (*entries_ptr)[slot].as_ref()
-            };
-            
-            if let Some(entry) = entry {
-                // Fast length check first (avoids expensive comparison)
-                if entry.name.len() == name_len && entry.value.len() == value_len {
-                    if entry.name.as_ref() == name && entry.value.as_ref() == value {
-                        return Some(entry.absolute_index);
-                    }
-                }
-            }
-        }
-        
-        None
+        index.get(&(name_key, value_key)).copied()
     }
     
     /// Find entry by name only.
@@ -345,44 +397,16 @@ impl DynamicTable {
     /// 
     /// # Thread-safe read operation
     /// # Performance
-    /// Fast length check before full comparison.
+    /// O(1) HashMap lookup with read lock.
     #[inline]
     pub fn find_name(&self, name: &[u8]) -> Option<u64> {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
+        // O(1) lookup via HashMap index
+        let index = self.name_index.read().unwrap();
         
-        let len = if tail >= head {
-            tail - head
-        } else {
-            MAX_ENTRIES - head + tail
-        };
+        // Need to create Bytes for HashMap key lookup
+        let name_key = Bytes::copy_from_slice(name);
         
-        // Early exit for empty table
-        if len == 0 {
-            return None;
-        }
-        
-        let name_len = name.len();
-        
-        // Search from newest to oldest
-        for i in (0..len).rev() {
-            let slot = (head + i) % MAX_ENTRIES;
-            
-            // SAFETY: Read-only access to Arc-protected data
-            let entry = unsafe {
-                let entries_ptr = self.entries.get();
-                (*entries_ptr)[slot].as_ref()
-            };
-            
-            if let Some(entry) = entry {
-                // Fast length check first
-                if entry.name.len() == name_len && entry.name.as_ref() == name {
-                    return Some(entry.absolute_index);
-                }
-            }
-        }
-        
-        None
+        index.get(&name_key).copied()
     }
     
     /// Check if an entry is in the "draining" region.
