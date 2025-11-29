@@ -62,15 +62,17 @@ impl EncoderInstruction {
                 buf.extend_from_slice(&encode_int_with_prefix(*name_index, 6, prefix));
                 
                 // H | Value Length (7+) | Value
-                encode_string(value.as_ref(), false, &mut buf);
+                // RFC 9204 Section 4.1.2: Enable Huffman encoding for compression
+                encode_string(value.as_ref(), true, &mut buf);
             }
             
             EncoderInstruction::InsertLiteral { name, value } => {
                 // 01H | Name Length (5+) | Name
-                encode_string_with_prefix(name.as_ref(), false, 5, 0x40, &mut buf);
+                // RFC 9204 Section 4.1.2: Enable Huffman encoding for compression
+                encode_string_with_prefix(name.as_ref(), true, 5, 0x40, &mut buf);
                 
                 // H | Value Length (7+) | Value
-                encode_string(value.as_ref(), false, &mut buf);
+                encode_string(value.as_ref(), true, &mut buf);
             }
             
             EncoderInstruction::Duplicate { index } => {

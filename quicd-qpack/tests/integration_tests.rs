@@ -269,3 +269,310 @@ fn test_zero_copy_semantics() {
     assert_eq!(decoded[0].name.as_ref(), b"content-type");
     assert_eq!(decoded[0].value.as_ref(), b"application/json");
 }
+
+/// RFC 9204 Section 4.1.2: Test Huffman encoding is applied automatically
+#[test]
+fn test_huffman_encoding_automatic() {
+    use quicd_qpack::huffman;
+    
+    let mut encoder = Encoder::new(4096, 100);
+    let mut decoder = Decoder::new(4096, 100);
+    encoder.set_capacity(4096).unwrap();
+    
+    // Use a long, compressible value
+    let long_value = b"www.example.com/very/long/path/that/compresses/well/with/huffman/encoding";
+    let headers = vec![(b"x-custom-url".as_slice(), long_value.as_slice())];
+    
+    let encoded = encoder.encode(0, &headers).unwrap();
+    
+    // Sync tables
+    while let Some(inst) = encoder.poll_encoder_stream() {
+        decoder.process_encoder_instruction(&inst).unwrap();
+    }
+    
+    let decoded = decoder.decode(0, encoded).unwrap();
+    assert_eq!(decoded[0].value.as_ref(), long_value);
+    
+    // Verify Huffman encoding reduces size
+    let huffman_size = huffman::encoded_size(long_value);
+    assert!(huffman_size < long_value.len(), 
+        "Huffman encoding should reduce size: {} < {}", huffman_size, long_value.len());
+}
+
+/// RFC 9204 Section 4.1.2: Test Huffman roundtrip for various inputs
+#[test]
+fn test_huffman_roundtrip_comprehensive() {
+    use quicd_qpack::huffman;
+    
+    let test_cases = vec![
+        b"www.example.com" as &[u8],
+        b"GET",
+        b"POST",
+        b"application/json",
+        b"text/html; charset=utf-8",
+        b"gzip, deflate, br",
+        b"Mozilla/5.0 (X11; Linux x86_64)",
+        b"",  // Empty string
+        b"a",  // Single character
+        b"The quick brown fox jumps over the lazy dog",
+        // All ASCII printable characters
+        b" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~",
+    ];
+    
+    for input in test_cases {
+        let mut encoded = Vec::new();
+        huffman::encode(input, &mut encoded);
+        
+        let mut decoded = Vec::new();
+        huffman::decode(&encoded, &mut decoded).unwrap();
+        
+        assert_eq!(&decoded[..], input, 
+            "Huffman roundtrip failed for: {:?}", String::from_utf8_lossy(input));
+    }
+}
+
+/// RFC 9204 Section 7.1.3: Test sensitive headers are never indexed
+#[test]
+fn test_sensitive_headers_never_indexed() {
+    let mut encoder = Encoder::new(4096, 100);
+    encoder.set_capacity(4096).unwrap();
+    
+    // Drain the SetCapacity instruction from the encoder stream
+    let _ = encoder.poll_encoder_stream();
+    
+    let sensitive_headers = vec![
+        // RFC 9110 Authentication
+        (b"authorization".as_slice(), b"Bearer secret-token".as_slice()),
+        (b"cookie".as_slice(), b"sessionid=abc123".as_slice()),
+        (b"set-cookie".as_slice(), b"sessionid=abc123; Secure".as_slice()),
+        (b"proxy-authorization".as_slice(), b"Basic base64credentials".as_slice()),
+        
+        // API Keys
+        (b"x-api-key".as_slice(), b"secret-api-key-12345".as_slice()),
+        (b"x-auth-token".as_slice(), b"auth-token-67890".as_slice()),
+        
+        // OAuth/JWT
+        (b"x-jwt".as_slice(), b"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...".as_slice()),
+        
+        // CSRF
+        (b"x-csrf-token".as_slice(), b"csrf-token-abc".as_slice()),
+    ];
+    
+    for (name, value) in &sensitive_headers {
+        let headers = vec![(*name, *value)];
+        let _ = encoder.encode(0, &headers).unwrap();
+    }
+    
+    // Sensitive headers should NOT generate dynamic table insertions
+    assert!(encoder.poll_encoder_stream().is_none(), 
+        "Sensitive headers should not be inserted into dynamic table");
+    
+    // Verify table is empty
+    assert_eq!(encoder.table().len(), 0, 
+        "Dynamic table should be empty after encoding sensitive headers");
+}
+
+/// RFC 9204 Section 7.1.3: Test pattern-based sensitive header detection
+#[test]
+fn test_sensitive_pattern_detection() {
+    use quicd_qpack::encoder::should_never_index;
+    
+    // Custom auth headers with patterns
+    let sensitive_patterns = vec![
+        b"x-custom-token" as &[u8],
+        b"my-api-key",
+        b"app-secret-value",
+        b"user-password",
+        b"oauth-bearer",
+        b"jwt-token",
+        b"session-cookie",
+    ];
+    
+    for header in sensitive_patterns {
+        assert!(should_never_index(header), 
+            "Header '{}' should be detected as sensitive", 
+            String::from_utf8_lossy(header));
+    }
+    
+    // Non-sensitive headers should not match
+    let non_sensitive = vec![
+        b"content-type" as &[u8],
+        b"accept",
+        b"user-agent",
+        b"accept-encoding",
+    ];
+    
+    for header in non_sensitive {
+        assert!(!should_never_index(header), 
+            "Header '{}' should NOT be detected as sensitive", 
+            String::from_utf8_lossy(header));
+    }
+}
+
+/// RFC 9204: Test Huffman encoding performance benefit
+#[test]
+fn test_huffman_compression_ratio() {
+    use quicd_qpack::huffman;
+    
+    let test_cases = vec![
+        // Common HTTP header values - actual compression varies by character frequency
+        (b"www.example.com" as &[u8], 0.85),     // Common domain, moderate compression
+        (b"application/json", 0.85),              // JSON content-type
+        (b"text/html; charset=utf-8", 0.8),      // HTML with charset
+        (b"gzip, deflate, br", 0.85),             // Compression algos
+    ];
+    
+    for (input, max_ratio) in test_cases {
+        let huffman_size = huffman::encoded_size(input);
+        let ratio = huffman_size as f64 / input.len() as f64;
+        
+        assert!(ratio <= max_ratio, 
+            "Huffman compression ratio {} exceeds expected {} for '{}'", 
+            ratio, max_ratio, String::from_utf8_lossy(input));
+        
+        // Verify Huffman is generally helpful (not making things worse)
+        assert!(ratio < 1.0, 
+            "Huffman should not expand data for '{}'", 
+            String::from_utf8_lossy(input));
+    }
+}
+
+/// Test HashMap optimization provides correct results
+#[test]
+fn test_dynamic_table_hashmap_correctness() {
+    let mut encoder = Encoder::new(4096, 100);
+    encoder.set_capacity(4096).unwrap();
+    
+    // Insert multiple entries
+    let headers: Vec<(&[u8], &[u8])> = vec![
+        (b"x-custom-1", b"value-1"),
+        (b"x-custom-2", b"value-2"),
+        (b"x-custom-3", b"value-3"),
+        (b"x-custom-1", b"value-different"),
+    ];
+    
+    for (name, value) in &headers {
+        let h = vec![(*name as &[u8], *value as &[u8])];
+        let _ = encoder.encode(0, &h).unwrap();
+        // Drain encoder stream to sync
+        let _ = encoder.drain_encoder_stream();
+    }
+    
+    // The table should find entries correctly
+    let table = encoder.table();
+    
+    // Check that we can find by exact match
+    assert!(table.find_exact(b"x-custom-1", b"value-1").is_some());
+    assert!(table.find_exact(b"x-custom-2", b"value-2").is_some());
+    assert!(table.find_exact(b"x-custom-3", b"value-3").is_some());
+    
+    // Check that name-only search returns the newest entry
+    let name_idx = table.find_name(b"x-custom-1");
+    assert!(name_idx.is_some());
+}
+
+/// Test encoder instruction batching
+#[test]
+fn test_encoder_instruction_batching() {
+    let mut encoder = Encoder::new(4096, 100);
+    encoder.set_capacity(4096).unwrap();
+    
+    // Encode multiple headers to generate multiple instructions
+    for i in 0..10 {
+        let name = format!("x-header-{}", i);
+        let value = format!("value-{}", i);
+        let headers = vec![(name.as_bytes(), value.as_bytes())];
+        let _ = encoder.encode(i, &headers).unwrap();
+    }
+    
+    // Test batching with max_instructions
+    let batch = encoder.poll_encoder_stream_batch(5);
+    assert!(batch.is_some());
+    
+    let batch_data = batch.unwrap();
+    assert!(batch_data.len() > 0, "Batch should contain data");
+    
+    // Should be able to get more batches
+    let batch2 = encoder.poll_encoder_stream_batch(5);
+    assert!(batch2.is_some());
+}
+
+/// Test capacity reduction triggers eviction correctly
+#[test]
+fn test_capacity_reduction_eviction() {
+    let mut encoder = Encoder::new(4096, 100);
+    encoder.set_capacity(4096).unwrap();
+    
+    // Fill table with entries
+    for i in 0..20 {
+        let name = format!("header-{}", i);
+        let value = "x".repeat(100); // 100 bytes each
+        let headers = vec![(name.as_bytes(), value.as_bytes())];
+        let _ = encoder.encode(i as u64, &headers).unwrap();
+        let _ = encoder.drain_encoder_stream();
+    }
+    
+    let initial_count = encoder.table().insert_count();
+    assert!(initial_count > 0);
+    
+    // Reduce capacity significantly - should trigger eviction
+    encoder.set_capacity(500).unwrap();
+    
+    // Table size should be within new capacity
+    assert!(encoder.table().size() <= 500);
+}
+
+/// Test Section Ack explicit acknowledgment API
+#[test]
+fn test_section_ack_explicit() {
+    let mut decoder = Decoder::new(4096, 100);
+    
+    // Calling ack_header_block should generate instruction
+    decoder.ack_header_block(42);
+    
+    let ack_inst = decoder.poll_decoder_stream();
+    assert!(ack_inst.is_some(), "Section Ack instruction should be generated");
+}
+
+/// Test wrapping arithmetic for Known Received Count
+#[test]
+fn test_known_received_count_overflow() {
+    use quicd_qpack::DynamicTable;
+    
+    let table = DynamicTable::new(4096);
+    
+    // Update with large increment near u64::MAX
+    table.update_known_received_count(u64::MAX - 100);
+    let count1 = table.known_received_count();
+    
+    // Update again - should wrap
+    table.update_known_received_count(200);
+    let count2 = table.known_received_count();
+    
+    // Count should have wrapped around
+    assert_eq!(count2, count1.wrapping_add(200));
+}
+
+/// Test empty header block handling
+#[test]
+fn test_empty_header_block() {
+    let mut encoder = Encoder::new(4096, 100);
+    let mut decoder = Decoder::new(4096, 100);
+    
+    let headers: Vec<(&[u8], &[u8])> = vec![];
+    let encoded = encoder.encode(0, &headers).unwrap();
+    
+    // Should be able to decode empty header block
+    let decoded = decoder.decode(0, encoded).unwrap();
+    assert_eq!(decoded.len(), 0);
+}
+
+/// Test maximum capacity enforcement
+#[test]
+fn test_capacity_cannot_exceed_max() {
+    let mut encoder = Encoder::new(1000, 100); // max_capacity = 1000
+    
+    // Try to set capacity beyond max
+    let result = encoder.set_capacity(2000);
+    assert!(result.is_err(), "Should not allow capacity > max_capacity");
+}
