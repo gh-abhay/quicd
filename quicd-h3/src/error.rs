@@ -128,7 +128,17 @@ pub enum H3ErrorCode {
 
 impl H3ErrorCode {
     /// Convert an error code value to the corresponding enum variant.
+    ///
+    /// RFC 9114 Section 8.1: "Error codes of the format 0x1f * N + 0x21 for non-negative
+    /// integer values of N are reserved to exercise the requirement that unknown error
+    /// codes be treated as equivalent to H3_NO_ERROR."
     pub fn from_u64(value: u64) -> Option<Self> {
+        // Check if this is a reserved error code for greasing
+        if crate::frames::H3Frame::is_reserved_error_code(value) {
+            // RFC 9114 Section 8.1: Reserved error codes are treated as H3_NO_ERROR
+            return Some(H3ErrorCode::NoError);
+        }
+        
         match value {
             0x100 => Some(H3ErrorCode::NoError),
             0x101 => Some(H3ErrorCode::GeneralProtocolError),
@@ -150,6 +160,7 @@ impl H3ErrorCode {
             0x200 => Some(H3ErrorCode::QpackDecompressionFailed),
             0x201 => Some(H3ErrorCode::QpackEncoderStreamError),
             0x202 => Some(H3ErrorCode::QpackDecoderStreamError),
+            // RFC 9114 Section 8: Unknown error codes should be treated as no error in some contexts
             _ => None,
         }
     }

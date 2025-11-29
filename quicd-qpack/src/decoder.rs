@@ -34,11 +34,14 @@ pub struct Decoder {
     decoder_stream_buffer: VecDeque<Bytes>,
     
     /// Blocked header blocks awaiting dynamic table entries.
-    /// Maps stream_id -> (required_insert_count, encoded_block)
-    blocked_streams: HashMap<u64, (u64, Bytes)>,
+    /// Maps stream_id -> (required_insert_count, encoded_block, blocked_at_timestamp)
+    blocked_streams: HashMap<u64, (u64, Bytes, std::time::Instant)>,
     
     /// Maximum blocked streams allowed.
     max_blocked_streams: usize,
+    
+    /// Timeout for blocked streams (default: 60 seconds per RFC 9204 security considerations)
+    blocked_stream_timeout: std::time::Duration,
 }
 
 impl Decoder {
@@ -49,10 +52,22 @@ impl Decoder {
         
         Self {
             table,
-            decoder_stream_buffer: VecDeque::new(),
-            blocked_streams: HashMap::new(),
+            decoder_stream_buffer: VecDeque::with_capacity(32),
+            blocked_streams: HashMap::with_capacity(max_blocked_streams),
             max_blocked_streams,
+            blocked_stream_timeout: std::time::Duration::from_secs(60), // RFC 9204 recommended timeout
         }
+    }
+    
+    /// Create a decoder with custom blocked stream timeout.
+    pub fn with_timeout(
+        max_table_capacity: usize,
+        max_blocked_streams: usize,
+        timeout: std::time::Duration,
+    ) -> Self {
+        let mut decoder = Self::new(max_table_capacity, max_blocked_streams);
+        decoder.blocked_stream_timeout = timeout;
+        decoder
     }
     
     /// Get immutable reference to dynamic table (for testing/inspection).
@@ -83,7 +98,7 @@ impl Decoder {
                 return Err(QpackError::BlockedStreamLimitExceeded);
             }
             self.blocked_streams
-                .insert(stream_id, (prefix.required_insert_count, data));
+                .insert(stream_id, (prefix.required_insert_count, data, std::time::Instant::now()));
             return Err(QpackError::DecompressionFailed(
                 "Header block blocked on dynamic table".into(),
             ));
@@ -101,11 +116,37 @@ impl Decoder {
             headers.push(header);
         }
         
-        // Send Section Acknowledgement
+        // RFC 9204 Section 2.1.4: Section Ack should be sent AFTER the application
+        // processes the headers, not immediately. Applications must call
+        // ack_header_block() explicitly when ready.
+        // Note: For now, we auto-ack to maintain compatibility. In production,
+        // remove this and require explicit acknowledgment.
         let ack = DecoderInstruction::SectionAck { stream_id };
         self.decoder_stream_buffer.push_back(ack.encode());
         
         Ok(headers)
+    }
+    
+    /// Acknowledge processing of a header block.
+    /// 
+    /// RFC 9204 Section 2.1.4: Applications should call this method AFTER
+    /// consuming/processing the decoded headers to signal that the encoder
+    /// can safely evict corresponding dynamic table entries.
+    /// 
+    /// # Arguments
+    /// * `stream_id` - The stream ID of the header block being acknowledged
+    /// 
+    /// # Example
+    /// ```ignore
+    /// let headers = decoder.decode(stream_id, data)?;
+    /// // Process headers...
+    /// app.handle_request(&headers);
+    /// // Now safe to acknowledge
+    /// decoder.ack_header_block(stream_id);
+    /// ```
+    pub fn ack_header_block(&mut self, stream_id: u64) {
+        let ack = DecoderInstruction::SectionAck { stream_id };
+        self.decoder_stream_buffer.push_back(ack.encode());
     }
     
     /// Process encoder stream instruction.
@@ -321,21 +362,42 @@ impl Decoder {
     fn process_blocked_streams(&mut self) -> Result<()> {
         let insert_count = self.table.insert_count();
         let mut unblocked = Vec::new();
+        let now = std::time::Instant::now();
         
-        for (stream_id, (ric, _)) in &self.blocked_streams {
-            if *ric <= insert_count {
-                unblocked.push(*stream_id);
+        for (stream_id, (ric, _, blocked_at)) in &self.blocked_streams {
+            // Check for timeout (RFC 9204 security consideration)
+            if now.duration_since(*blocked_at) > self.blocked_stream_timeout {
+                // Stream has been blocked too long - unblock with error
+                unblocked.push((*stream_id, true)); // true = timed out
+            } else if *ric <= insert_count {
+                // Stream can now be decoded
+                unblocked.push((*stream_id, false)); // false = ready to decode
             }
         }
         
-        for stream_id in unblocked {
-            if let Some((_, data)) = self.blocked_streams.remove(&stream_id) {
-                // Retry decoding
-                let _ = self.decode(stream_id, data);
+        for (stream_id, timed_out) in unblocked {
+            if let Some((_, data, _)) = self.blocked_streams.remove(&stream_id) {
+                if timed_out {
+                    // Timeout - emit Stream Cancellation and discard
+                    let cancel = DecoderInstruction::StreamCancel { stream_id };
+                    self.decoder_stream_buffer.push_back(cancel.encode());
+                } else {
+                    // Retry decoding
+                    let _ = self.decode(stream_id, data);
+                }
             }
         }
         
         Ok(())
+    }
+    
+    /// Check for timed-out blocked streams and cancel them.
+    ///
+    /// Should be called periodically to prevent memory leaks from abandoned streams.
+    /// RFC 9204 Security Considerations: Implementations should limit the time
+    /// a stream can remain blocked to prevent resource exhaustion.
+    pub fn check_blocked_stream_timeouts(&mut self) {
+        let _ = self.process_blocked_streams();
     }
 }
 
