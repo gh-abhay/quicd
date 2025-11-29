@@ -1830,6 +1830,16 @@ name = "quicd-moq"
 version = "0.1.0"
 
 [[package]]
+name = "quicd-qpack"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "criterion",
+ "lazy_static",
+ "tokio",
+]
+
+[[package]]
 name = "quicd-x"
 version = "0.1.0"
 dependencies = [
