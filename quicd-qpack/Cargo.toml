@@ -1,0 +1,28 @@
+[package]
+name = "quicd-qpack"
+version = "0.1.0"
+edition = "2021"
+authors = ["QUICD Team"]
+license = "MIT OR Apache-2.0"
+description = "Production-grade, lock-free, zero-copy QPACK (RFC 9204) implementation for HTTP/3"
+repository = "https://github.com/gh-abhay/quicd"
+keywords = ["http3", "qpack", "compression", "quic", "rfc9204"]
+categories = ["network-programming", "encoding", "compression"]
+readme = "README.md"
+
+[dependencies]
+bytes = "1.5"
+lazy_static = "1.4"
+tokio = { version = "1.35", features = ["io-util", "sync"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.35", features = ["full", "rt-multi-thread", "macros"] }
+criterion = "0.5"
+
+[features]
+default = ["async"]
+async = ["tokio"]
+
+[[bench]]
+name = "qpack_bench"
+harness = false
