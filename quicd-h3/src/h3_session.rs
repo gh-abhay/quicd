@@ -5,16 +5,16 @@ use std::sync::atomic::Ordering;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use tokio::sync::Mutex as AsyncMutex;
+use slab::Slab;
 
 use quicd_x::{AppEvent, ConnectionHandle, QuicAppFactory, ShutdownFuture, TransportControls};
+use quicd_qpack::{AsyncEncoder, AsyncDecoder};
 
 use crate::error::H3Error;
 use crate::frames::{H3Frame, Setting};
-use crate::qpack::QpackCodec;
 use crate::session::{H3Handler, H3Request, H3ResponseSender};
 use crate::stream_state::StreamFrameParser;
-use crate::qpack_streams::QpackStreamManager;
 use crate::settings::SettingsValidator;
 use crate::settings_storage::{InMemorySettingsStorage, Origin, SettingsStorage};
 use crate::connect::validate_connect_request;
@@ -28,37 +28,50 @@ use crate::priority::PriorityTree;
 /// request/response handling, and integration with the underlying QUIC transport.
 pub struct H3Session<H: H3Handler> {
     handle: ConnectionHandle,
-    qpack: Arc<AsyncRwLock<QpackCodec>>,
+    // QPACK encoder and decoder
+    qpack_encoder: Arc<AsyncMutex<AsyncEncoder>>,
+    qpack_decoder: AsyncDecoder,
     server_control_send: Option<quicd_x::SendStream>,
-    streams: HashMap<u64, StreamState>,
-    max_stream_id: u64,
+    // Stream state tracking using slab for O(1) access
+    streams: Slab<StreamState>,
+    // Stream ID to slab key mapping
+    stream_id_to_key: HashMap<u64, usize>,
     handler: Arc<H>,
     push_manager: Arc<tokio::sync::Mutex<PushManager>>,
     pending_control_stream_request: Option<u64>,
     pending_push_streams: HashMap<u64, u64>, // request_id -> push_id
     // New RFC-compliant components
     settings_validator: SettingsValidator,
-    qpack_manager: QpackStreamManager,
-    stream_parsers: HashMap<u64, StreamFrameParser>,
     // Server push state
     max_push_id: u64,
     _next_push_id: u64,
     _push_streams: HashMap<u64, PushStreamState>,
-    // Phase 2: QPACK encoder/decoder streams
+    // QPACK streams
     encoder_stream_id: Option<u64>,
     decoder_stream_id: Option<u64>,
     pending_encoder_stream_request: Option<u64>,
     pending_decoder_stream_request: Option<u64>,
-    // Encoder stream wrapped in Arc<Mutex> for sharing with H3ResponseSender
     encoder_send_stream: Arc<AsyncMutex<Option<quicd_x::SendStream>>>,
     decoder_send_stream: Option<quicd_x::SendStream>,
-    // Phase 2: GOAWAY state
+    // Peer QPACK streams
+    peer_encoder_recv_stream: Option<quicd_x::RecvStream>,
+    peer_decoder_recv_stream: Option<quicd_x::RecvStream>,
+    // Peer stream IDs for validation
+    peer_encoder_stream_id: Option<u64>,
+    peer_decoder_stream_id: Option<u64>,
+    // Peer control stream
+    peer_control_stream_id: Option<u64>,
+    peer_control_stream_received_settings: bool,
+    // Stream types for validation
+    stream_types: HashMap<u64, StreamType>,
+    // GOAWAY tracking
+    last_goaway_id: Option<u64>,
+    // GOAWAY state
     goaway_sent: bool,
     goaway_received: bool,
     last_accepted_stream_id: u64,
-    // RFC 9114 Section 5.2: Track max stream ID in sent GOAWAY for validation
     goaway_max_stream_id: Option<u64>,
-    // Phase 2: Blocked streams tracking
+    // Blocked streams tracking
     blocked_streams: HashMap<u64, BlockedStream>,
     // Priority queue for request processing (lower priority_id = higher priority)
     request_queue: std::collections::BinaryHeap<QueuedRequest>,
@@ -66,19 +79,6 @@ pub struct H3Session<H: H3Handler> {
     stream_priorities: HashMap<u64, u64>, // stream_id -> priority_id
     // RFC 9218: Priority tree for extensible prioritization
     priority_tree: PriorityTree,
-    // RFC 9204 Section 4.4.3: Track processed insert count for INSERT_COUNT_INCREMENT
-    insert_count_processed: u64,
-    // PERF #29: Batch QPACK decoder instructions to reduce lock contention
-    pending_decoder_instructions: Vec<Bytes>,
-    // Phase 1: Control stream lifecycle tracking (RFC 9114 Section 6.2.1)
-    peer_control_stream_id: Option<u64>,
-    peer_control_stream_received_settings: bool,
-    peer_encoder_stream_id: Option<u64>,
-    peer_decoder_stream_id: Option<u64>,
-    // Phase 1: Stream type tracking for frame validation
-    stream_types: HashMap<u64, StreamType>,
-    // Phase 1: GOAWAY ID tracking for validation
-    last_goaway_id: Option<u64>,
     // HTTP/3 operational metrics
     pub metrics: Arc<H3Metrics>,
     // 0-RTT settings storage (RFC 9114 Section 7.2.4.2)
@@ -113,8 +113,7 @@ enum StreamState {
         // Phase 3: Content-Length validation (RFC 9114 Section 4.1.2)
         content_length: Option<u64>,  // From Content-Length header
         bytes_received: u64,          // Sum of DATA frame payload bytes
-        // RFC 9204 Section 2.1.2: Track dynamic table references for this stream
-        referenced_dynamic_entries: Vec<usize>,
+        // QPACK blocking is handled internally by quicd-qpack
     },
 }
 
@@ -190,47 +189,49 @@ impl<H: H3Handler> H3Session<H> {
         
         Self {
             handle,
-            qpack: Arc::new(AsyncRwLock::new(QpackCodec::new())),
+            // QPACK encoder/decoder with default table sizes
+            qpack_encoder: Arc::new(AsyncMutex::new(AsyncEncoder::new(4096, 100))),
+            qpack_decoder: AsyncDecoder::new(4096, 100),
             server_control_send: None,
-            streams: HashMap::new(),
-            max_stream_id: 0,
+            streams: Slab::new(),
+            stream_id_to_key: HashMap::new(),
             handler: Arc::new(handler),
             push_manager,
             pending_control_stream_request: None,
             pending_push_streams: HashMap::new(),
             // New RFC-compliant components
             settings_validator,
-            qpack_manager: QpackStreamManager::new(),
-            stream_parsers: HashMap::new(),
             // Server push state
             max_push_id: 0,
             _next_push_id: 0,
             _push_streams: HashMap::new(),
-            // Phase 2: QPACK encoder/decoder streams
+            // QPACK streams
             encoder_stream_id: None,
             decoder_stream_id: None,
             pending_encoder_stream_request: None,
             pending_decoder_stream_request: None,
             encoder_send_stream: Arc::new(AsyncMutex::new(None)),
             decoder_send_stream: None,
-            // Phase 2: GOAWAY state
+            // Peer QPACK streams
+            peer_encoder_recv_stream: None,
+            peer_decoder_recv_stream: None,
+            // Peer stream IDs for validation
+            peer_encoder_stream_id: None,
+            peer_decoder_stream_id: None,
+            // Peer control stream
+            peer_control_stream_id: None,
+            peer_control_stream_received_settings: false,
+            // Stream types for validation
+            stream_types: HashMap::new(),
+            // GOAWAY tracking
+            last_goaway_id: None,
+            // GOAWAY state
             goaway_sent: false,
             goaway_received: false,
             last_accepted_stream_id: u64::MAX,
             goaway_max_stream_id: None,
-            // Phase 2: Blocked streams tracking
+            // Blocked streams tracking
             blocked_streams: HashMap::new(),
-            insert_count_processed: 0,
-            pending_decoder_instructions: Vec::new(),
-            // Phase 1: Control stream lifecycle tracking
-            peer_control_stream_id: None,
-            peer_control_stream_received_settings: false,
-            peer_encoder_stream_id: None,
-            peer_decoder_stream_id: None,
-            // Phase 1: Stream type tracking
-            stream_types: HashMap::new(),
-            // Phase 1: GOAWAY tracking
-            last_goaway_id: None,
             // Priority queue for request processing
             request_queue: std::collections::BinaryHeap::new(),
             // Track stream priorities
@@ -265,23 +266,6 @@ impl<H: H3Handler> H3Session<H> {
                     if let Err(e) = self.handle_event(event).await {
                         eprintln!("Error handling event: {:?}", e);
                         // Continue processing other events
-                    }
-                }
-                _ = timeout_check_interval.tick() => {
-                    // RFC 9204 Section 2.1.4: Enforce global timeout for QPACK blocked streams
-                    // "Implementations SHOULD impose a timeout on blocked streams"
-                    if let Err(e) = self.check_blocked_stream_timeouts().await {
-                        eprintln!("Error checking blocked stream timeouts: {:?}", e);
-                    }
-                    
-                    // RFC 9114 Section 5.1: Check for idle connection timeout
-                    if self.last_activity_time.elapsed() > self.idle_timeout {
-                        eprintln!("Connection idle for {:?}, sending GOAWAY", self.last_activity_time.elapsed());
-                        if !self.goaway_sent {
-                            if let Err(e) = self.send_goaway().await {
-                                eprintln!("Error sending GOAWAY on idle timeout: {:?}", e);
-                            }
-                        }
                     }
                 }
                 _ = &mut shutdown => {
@@ -321,8 +305,6 @@ impl<H: H3Handler> H3Session<H> {
                 }
             }
             AppEvent::NewStream { stream_id, bidirectional, recv_stream, send_stream } => {
-                self.max_stream_id = self.max_stream_id.max(stream_id);
-                
                 // Check GOAWAY state before processing
                 if !self.should_accept_stream(stream_id) {
                     // Silently drop streams beyond GOAWAY
@@ -487,14 +469,13 @@ impl<H: H3Handler> H3Session<H> {
         self.last_accepted_stream_id = self.last_accepted_stream_id.max(stream_id);
         
         // Initialize stream parser for proper frame buffering per RFC 9114
-        self.stream_parsers.insert(stream_id, StreamFrameParser::new(stream_id));
-        let parser = self.stream_parsers.get_mut(&stream_id).unwrap();
-        parser.mark_open();
+        let mut frame_parser = StreamFrameParser::new(stream_id);
+        frame_parser.mark_open();
         
         // Track stream type for frame validation
         self.stream_types.insert(stream_id, StreamType::Request);
         
-        self.streams.insert(stream_id, StreamState::Request {
+        let stream_key = self.streams.insert(StreamState::Request {
             headers_received: false,
             trailers_received: false,
             body: Vec::new(),
@@ -503,9 +484,9 @@ impl<H: H3Handler> H3Session<H> {
             // Phase 3: Initialize Content-Length tracking
             content_length: None,
             bytes_received: 0,
-            // RFC 9204 Section 2.1.2: Track dynamic table references
-            referenced_dynamic_entries: Vec::new(),
+            // QPACK blocking is handled internally by quicd-qpack
         });
+        self.stream_id_to_key.insert(stream_id, stream_key);
 
         // Read frames from the stream with proper buffering
         while let Ok(Some(data)) = recv_stream.read().await {
@@ -513,28 +494,20 @@ impl<H: H3Handler> H3Session<H> {
                 quicd_x::StreamData::Data(bytes) => {
                     // Use StreamFrameParser for proper frame buffering
                     // Collect frames first to avoid borrow checker issues
-                    let frames = if let Some(parser) = self.stream_parsers.get_mut(&stream_id) {
-                        // PERF #32: add_data now returns Result for buffer size limit
-                        parser.add_data(bytes)?;
-                        
-                        let mut collected_frames = Vec::new();
-                        while let Some(frame) = parser.parse_next_frame()? {
-                            collected_frames.push(frame);
-                        }
-                        collected_frames
-                    } else {
-                        Vec::new()
-                    };
+                    frame_parser.add_data(bytes)?;
+                    
+                    let mut collected_frames = Vec::new();
+                    while let Some(frame) = frame_parser.parse_next_frame()? {
+                        collected_frames.push(frame);
+                    }
                     
                     // Process all collected frames
-                    for frame in frames {
+                    for frame in collected_frames {
                         self.process_frame_on_request_stream(stream_id, frame).await?;
                     }
                 }
                 quicd_x::StreamData::Fin => {
-                    if let Some(parser) = self.stream_parsers.get_mut(&stream_id) {
-                        parser.mark_half_closed_remote();
-                    }
+                    frame_parser.mark_half_closed_remote();
                     self.handle_request_complete(stream_id).await?;
                     break;
                 }
@@ -568,7 +541,8 @@ impl<H: H3Handler> H3Session<H> {
                 }
                 self.peer_control_stream_id = Some(stream_id);
                 self.stream_types.insert(stream_id, StreamType::Control);
-                self.streams.insert(stream_id, StreamState::Control);
+                let key = self.streams.insert(StreamState::Control);
+                self.stream_id_to_key.insert(stream_id, key);
                 self.process_client_control_stream(stream_id, recv_stream).await?;
             }
             0x01 => {
@@ -593,10 +567,10 @@ impl<H: H3Handler> H3Session<H> {
                     ));
                 }
                 self.peer_encoder_stream_id = Some(stream_id);
-                self.stream_types.insert(stream_id, StreamType::QpackEncoder);
-                self.qpack_manager.set_encoder_stream(stream_id);
-                self.streams.insert(stream_id, StreamState::QpackEncoder);
-                self.process_qpack_stream(stream_id, recv_stream).await?;
+                self.peer_encoder_recv_stream = Some(recv_stream);
+                self.streams.insert(StreamState::QpackEncoder);
+                let key = self.streams.insert(StreamState::QpackEncoder);
+                self.stream_id_to_key.insert(stream_id, key);
             }
             0x03 => {
                 // QPACK decoder stream (RFC 9204 Section 4.2)
@@ -606,10 +580,9 @@ impl<H: H3Handler> H3Session<H> {
                     ));
                 }
                 self.peer_decoder_stream_id = Some(stream_id);
-                self.stream_types.insert(stream_id, StreamType::QpackDecoder);
-                self.qpack_manager.set_decoder_stream(stream_id);
-                self.streams.insert(stream_id, StreamState::QpackDecoder);
-                self.process_qpack_stream(stream_id, recv_stream).await?;
+                self.peer_decoder_recv_stream = Some(recv_stream);
+                let key = self.streams.insert(StreamState::QpackDecoder);
+                self.stream_id_to_key.insert(stream_id, key);
             }
             0x21..=0x3f if (stream_type - 0x21) % 0x1f == 0 => {
                 // Reserved stream types (RFC 9114 Section 6.2)
@@ -796,10 +769,8 @@ impl<H: H3Handler> H3Session<H> {
         // RFC 9114 Section 7.2: Validate frame is allowed on request stream (before any borrows)
         self.validate_frame_on_stream(&frame, StreamType::Request)?;
         
-        let mut send_ack = false;
-
-        if let Some(StreamState::Request { headers_received, trailers_received, body, trailers, send_stream, content_length, bytes_received, referenced_dynamic_entries }) = 
-            self.streams.get_mut(&stream_id) 
+        if let Some(StreamState::Request { headers_received, trailers_received, body, trailers, send_stream, content_length, bytes_received }) = 
+            self.streams.get_mut(self.stream_id_to_key[&stream_id]) 
         {
             // RFC 9114 Section 4.1: Process frame on request stream
             match frame {
@@ -807,31 +778,29 @@ impl<H: H3Handler> H3Session<H> {
                     if !*headers_received {
                         // Initial HEADERS frame
                         let encoded_size = encoded_headers.len();
-                        let (headers, ref_entries) = match self.qpack.read().await.decode_headers(&encoded_headers) {
-                            Ok(result) => result,
-                            Err(H3Error::QpackBlocked(required_insert_count)) => {
-                                // RFC 9204 Section 2.1.4: Stream is blocked waiting for dynamic table updates
-                                // Check if we would exceed MAX_BLOCKED_STREAMS
-                                if self.blocked_streams.len() >= self.qpack.read().await.table_capacity() {
-                                    return Err(H3Error::Qpack(
-                                        "would exceed SETTINGS_QPACK_BLOCKED_STREAMS limit".into()
-                                    ));
-                                }
-                                
-                                // RFC 9204 Section 2.1.4: Store this stream as blocked
-                                self.blocked_streams.insert(stream_id, BlockedStream {
-                                    required_insert_count,
-                                    encoded_data: encoded_headers.clone(),
-                                    send_stream: send_stream.clone(),
-                                    stream_id,
-                                    blocked_at: std::time::Instant::now(),
-                                });
-                                
-                                // Don't process this stream further - will retry later
-                                return Ok(());
+                        let header_fields = match self.qpack_decoder.decoder_mut().decode(stream_id, encoded_headers.clone()) {
+                            Ok(fields) => fields,
+                            Err(_) => {
+                                // Blocking is handled internally by quicd-qpack
+                                return Err(H3Error::Qpack("header decoding failed".into()));
                             }
-                            Err(e) => return Err(e),
                         };
+                        
+                        // Convert HeaderField to (String, String)
+                        let headers: Vec<(String, String)> = header_fields
+                            .into_iter()
+                            .map(|field| (
+                                String::from_utf8_lossy(&field.name).to_string(),
+                                String::from_utf8_lossy(&field.value).to_string(),
+                            ))
+                            .collect();
+                        
+                        // Send any pending decoder instructions
+                        while let Some(inst) = self.qpack_decoder.decoder_mut().poll_decoder_stream() {
+                            if let Some(ref stream) = self.decoder_send_stream {
+                                let _ = stream.write(inst, false).await;
+                            }
+                        }
                         
                         // Phase 3: Validate request headers per RFC 9114 Section 4.1
                         // This validates: pseudo-header ordering, uppercase rejection, connection-specific headers,
@@ -846,17 +815,9 @@ impl<H: H3Handler> H3Session<H> {
                         self.metrics.record_qpack_decode(uncompressed_size, encoded_size);
                         self.metrics.header_bytes_received.fetch_add(encoded_size as u64, Ordering::Relaxed);
                         
-                        // RFC 9204 Section 2.1.2: Add references to dynamic table entries and track for release
-                        {
-                            let mut qpack = self.qpack.write().await;
-                            for index in &ref_entries {
-                                qpack.add_reference(*index);
-                            }
-                        }
-                        referenced_dynamic_entries.extend(ref_entries);
+                        // QPACK blocking and references are handled internally by quicd-qpack
                         
-                        // Mark that we need to send Section Acknowledgment
-                        send_ack = true;
+                        // QPACK blocking and acknowledgments are handled internally by quicd-qpack
                         
                         // Record metrics
                         self.metrics.record_request_received();
@@ -877,19 +838,32 @@ impl<H: H3Handler> H3Session<H> {
                         self.process_next_request().await?;
                     } else if !*trailers_received {
                         // RFC 9114 Section 4.1: Trailing HEADERS frame (trailers)
-                        let (trailer_headers, trailer_refs) = self.qpack.read().await.decode_headers(&encoded_headers)?;
+                        let trailer_header_fields = match self.qpack_decoder.decoder_mut().decode(stream_id, encoded_headers.clone()) {
+                            Ok(fields) => fields,
+                            Err(_) => {
+                                return Err(H3Error::Qpack("trailer decoding failed".into()));
+                            }
+                        };
+                        
+                        let trailer_headers: Vec<(String, String)> = trailer_header_fields
+                            .into_iter()
+                            .map(|field| (
+                                String::from_utf8_lossy(&field.name).to_string(),
+                                String::from_utf8_lossy(&field.value).to_string(),
+                            ))
+                            .collect();
+                        
+                        // Send any pending decoder instructions
+                        while let Some(inst) = self.qpack_decoder.decoder_mut().poll_decoder_stream() {
+                            if let Some(ref stream) = self.decoder_send_stream {
+                                let _ = stream.write(inst, false).await;
+                            }
+                        }
                         
                         // RFC 9114 Section 4.1: Validate trailer headers
                         crate::validation::validate_trailer_headers(&trailer_headers)?;
                         
-                        // RFC 9204 Section 2.1.2: Add references and track for release
-                        {
-                            let mut qpack = self.qpack.write().await;
-                            for index in &trailer_refs {
-                                qpack.add_reference(*index);
-                            }
-                        }
-                        referenced_dynamic_entries.extend(trailer_refs);
+                        // QPACK blocking and references are handled internally by quicd-qpack
                         
                         // Phase 3: Validate Content-Length matches received bytes (RFC 9114 Section 4.1.2)
                         if let Some(expected) = content_length {
@@ -898,8 +872,7 @@ impl<H: H3Handler> H3Session<H> {
                             }
                         }
                         
-                        // Mark that we need to send Section Acknowledgment
-                        send_ack = true;
+                        // QPACK blocking and acknowledgments are handled internally by quicd-qpack
                         
                         *trailers_received = true;
                         *trailers = Some(trailer_headers);
@@ -962,10 +935,7 @@ impl<H: H3Handler> H3Session<H> {
             }
         }
         
-        // RFC 9204 Section 4.4.1: Send Section Acknowledgment after successful decode
-        if send_ack {
-            self.send_section_acknowledgment(stream_id).await?;
-        }
+        // QPACK blocking and acknowledgments are handled internally by quicd-qpack
 
         Ok(())
     }
@@ -1007,25 +977,20 @@ impl<H: H3Handler> H3Session<H> {
             let request = self.parse_request(queued_request.headers)?;
             
             // RFC 9204 Section 2.1.2: Create Arc to track response header references
-            let response_references = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            // QPACK blocking and references are handled internally by quicd-qpack
             
             // Call handler
             let mut sender = H3ResponseSender {
                 send_stream: queued_request.send_stream,
-                qpack: self.qpack.clone(),
+                qpack_encoder: self.qpack_encoder.clone(),
                 push_manager: Some(self.push_manager.clone()),
                 connection_handle: Some(self.handle.clone()),
                 stream_id: queued_request.stream_id,
                 encoder_send_stream: self.encoder_send_stream.clone(),
-                response_references: response_references.clone(),
             };
             self.handler.handle_request(request, &mut sender).await?;
             
-            // RFC 9204 Section 2.1.2: Store response references in stream state for cleanup
-            if let Some(StreamState::Request { referenced_dynamic_entries, .. }) = self.streams.get_mut(&queued_request.stream_id) {
-                let response_refs = response_references.lock().await;
-                referenced_dynamic_entries.extend(response_refs.iter());
-            }
+            // QPACK blocking and references are handled internally by quicd-qpack
         }
         
         Ok(())
@@ -1146,20 +1111,7 @@ impl<H: H3Handler> H3Session<H> {
                         self.settings_storage.store(origin.clone(), settings_map.clone());
                     }
                     
-                    // Update QPACK codec with settings
-                    let mut qpack = self.qpack.write().await;
-                    if let Some(&capacity) = settings_map.get(&0x1) {
-                        qpack.set_max_table_capacity(capacity as usize);
-                    }
-                    if let Some(&blocked) = settings_map.get(&0x7) {
-                        qpack.set_max_blocked_streams(blocked as usize);
-                    }
-                    // RFC 9114 Section 7.2.4.2: Enforce MAX_FIELD_SECTION_SIZE
-                    if let Some(&max_size) = settings_map.get(&0x6) {
-                        if max_size > 0 {
-                            qpack.set_max_field_section_size(Some(max_size as usize));
-                        }
-                    }
+                    // QPACK settings are handled internally by quicd-qpack
                 }
                 _ => {
                     // Validate that SETTINGS was first frame
@@ -1333,7 +1285,7 @@ impl<H: H3Handler> H3Session<H> {
         // RFC 9114 Section 4.1.2: Validate Content-Length against received bytes on stream close
         if app_initiated && error_code == 0 {
             // Normal close (not reset) - validate Content-Length
-            if let Some(StreamState::Request { content_length, bytes_received, .. }) = self.streams.get(&stream_id) {
+            if let Some(StreamState::Request { content_length, bytes_received, .. }) = self.streams.get(self.stream_id_to_key[&stream_id]) {
                 if let Some(expected) = content_length {
                     if *bytes_received != *expected {
                         // RFC 9114 Section 4.1.2: Content-Length mismatch is a H3_MESSAGE_ERROR
@@ -1345,28 +1297,14 @@ impl<H: H3Handler> H3Session<H> {
             }
         }
         
-        // RFC 9204 Section 4.4.2: If stream is cancelled, send Stream Cancellation instruction
-        // BEFORE cleaning up state to ensure the instruction is sent
-        // GAP #1 FIX: Moved cancellation before cleanup
-        if !app_initiated && error_code != 0 {
-            // Peer reset the stream - notify via QPACK decoder stream
-            self.send_stream_cancellation(stream_id).await?;
-        }
+        // QPACK stream cancellation is handled internally by quicd-qpack
         
-        // RFC 9204 Section 2.1.2: Release all dynamic table references held by this stream
-        // This includes both request header references and response header references
-        if let Some(StreamState::Request { referenced_dynamic_entries, .. }) = self.streams.get(&stream_id) {
-            let mut qpack = self.qpack.write().await;
-            for index in referenced_dynamic_entries {
-                qpack.release_reference(*index);
-            }
-            // Note: Response references are already merged into referenced_dynamic_entries
-            // after handle_request() completes in process_request_stream()
-        }
+        // QPACK references are handled internally by quicd-qpack
         
         // Clean up stream state after cancellation sent and references released
-        self.streams.remove(&stream_id);
-        self.stream_parsers.remove(&stream_id);
+        if let Some(key) = self.stream_id_to_key.remove(&stream_id) {
+            self.streams.remove(key);
+        }
         
         // Remove from blocked streams if present
         self.blocked_streams.remove(&stream_id);
@@ -1378,7 +1316,9 @@ impl<H: H3Handler> H3Session<H> {
     /// RFC 9114 Section 4.1.1: Applications can cancel streams via RESET_STREAM
     pub async fn cancel_stream(&mut self, stream_id: u64, error_code: u64) -> Result<(), H3Error> {
         // Clean up our stream state first
-        self.streams.remove(&stream_id);
+        if let Some(key) = self.stream_id_to_key.remove(&stream_id) {
+            self.streams.remove(key);
+        }
         self.blocked_streams.remove(&stream_id);
         
         // Send RESET_STREAM to peer (synchronous call, returns request_id)
@@ -1417,191 +1357,29 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     async fn process_qpack_instructions(&mut self, stream_id: u64, data: Bytes) -> Result<(), H3Error> {
-        let instructions = data.as_ref();
-        let mut cursor = 0;
-        
-        // Determine stream type for context-aware instruction decoding
+        // Determine stream type
         let is_encoder_stream = Some(stream_id) == self.peer_encoder_stream_id;
         let is_decoder_stream = Some(stream_id) == self.peer_decoder_stream_id;
         
-        if !is_encoder_stream && !is_decoder_stream {
+        if is_encoder_stream {
+            // Encoder stream: contains decoder instructions for our encoder
+            self.qpack_encoder.lock().await.process_decoder_instruction(data.as_ref()).await
+                .map_err(|e| H3Error::Qpack(format!("encoder stream instruction error: {:?}", e)))?;
+        } else if is_decoder_stream {
+            // Decoder stream: contains encoder instructions for our decoder
+            self.qpack_decoder.process_encoder_instruction(data.as_ref()).await
+                .map_err(|e| H3Error::Qpack(format!("decoder stream instruction error: {:?}", e)))?;
+        } else {
             return Err(H3Error::Qpack(format!(
                 "QPACK instructions on non-QPACK stream {}",
                 stream_id
             )));
         }
         
-        while cursor < instructions.len() {
-            let qpack = self.qpack.read().await;
-            // RFC 9204 GAP FIX: Use context-aware decoding for proper Duplicate/InsertCountIncrement disambiguation
-            match qpack.decode_instruction_with_context(&instructions[cursor..], is_encoder_stream) {
-                Ok((mut instruction, consumed)) => {
-                    drop(qpack); // Release lock before handling
-                    cursor += consumed;
-                    
-                    // Validate instruction is on correct stream type
-                    instruction = self.disambiguate_qpack_instruction(
-                        instruction, 
-                        stream_id, 
-                        is_encoder_stream
-                    )?;
-                    
-                    self.handle_qpack_instruction(stream_id, instruction).await?;
-                }
-                Err(e) => {
-                    // If we can't decode an instruction, we might have partial data
-                    // For now, return error
-                    return Err(e);
-                }
-            }
-        }
-        
         Ok(())
     }
 
-    /// Disambiguate QPACK instruction based on stream context.
-    /// 
-    /// RFC 9204: Both Duplicate and InsertCountIncrement start with 0x00.
-    /// The stream type determines which one it actually is.
-    fn disambiguate_qpack_instruction(
-        &self,
-        instruction: crate::qpack::QpackInstruction,
-        stream_id: u64,
-        is_encoder_stream: bool,
-    ) -> Result<crate::qpack::QpackInstruction, H3Error> {
-        use crate::qpack::QpackInstruction;
-        
-        match &instruction {
-            // Encoder-only instructions
-            QpackInstruction::SetDynamicTableCapacity { .. }
-            | QpackInstruction::InsertWithNameReference { .. }
-            | QpackInstruction::InsertWithLiteralName { .. }
-            | QpackInstruction::Duplicate { .. } => {
-                if !is_encoder_stream {
-                    return Err(H3Error::Qpack(format!(
-                        "H3_QPACK_ENCODER_STREAM_ERROR: encoder instruction on stream {}",
-                        stream_id
-                    )));
-                }
-            }
-            
-            // Decoder-only instructions
-            QpackInstruction::SectionAcknowledgment { .. }
-            | QpackInstruction::StreamCancellation { .. }
-            | QpackInstruction::InsertCountIncrement { .. } => {
-                if is_encoder_stream {
-                    return Err(H3Error::Qpack(format!(
-                        "H3_QPACK_DECODER_STREAM_ERROR: decoder instruction on stream {}",
-                        stream_id
-                    )));
-                }
-            }
-        }
-        
-        Ok(instruction)
-    }
 
-    async fn handle_qpack_instruction(&mut self, _stream_id: u64, instruction: crate::qpack::QpackInstruction) -> Result<(), H3Error> {
-        let table_changed = matches!(
-            instruction,
-            crate::qpack::QpackInstruction::InsertWithNameReference { .. }
-            | crate::qpack::QpackInstruction::InsertWithLiteralName { .. }
-            | crate::qpack::QpackInstruction::Duplicate { .. }
-        );
-        
-        let mut qpack = self.qpack.write().await;
-        
-        match instruction {
-            crate::qpack::QpackInstruction::SetDynamicTableCapacity { capacity } => {
-                // Update dynamic table capacity
-                qpack.set_max_table_capacity(capacity as usize);
-            }
-            crate::qpack::QpackInstruction::InsertWithNameReference { static_table, name_index, value } => {
-                // Insert entry into dynamic table
-                let name = if static_table {
-                    if let Some((name, _)) = qpack.get_static_entry(name_index as usize) {
-                        name.clone()
-                    } else {
-                        return Err(H3Error::Qpack("invalid static table index".into()));
-                    }
-                } else {
-                    if let Some((name, _)) = qpack.get_absolute(name_index as usize) {
-                        name.clone()
-                    } else {
-                        return Err(H3Error::Qpack("invalid dynamic table index".into()));
-                    }
-                };
-                
-                qpack.insert(name, value);
-                // GAP #21: Track insertions for INSERT_COUNT_INCREMENT
-                self.insert_count_processed += 1;
-            }
-            crate::qpack::QpackInstruction::InsertWithLiteralName { name, value } => {
-                // Insert entry into dynamic table
-                qpack.insert(name, value);
-                // GAP #21: Track insertions for INSERT_COUNT_INCREMENT
-                self.insert_count_processed += 1;
-            }
-            crate::qpack::QpackInstruction::Duplicate { index } => {
-                // Duplicate entry in dynamic table
-                qpack.duplicate(index as usize);
-                // GAP #21: Track insertions for INSERT_COUNT_INCREMENT
-                self.insert_count_processed += 1;
-            }
-            crate::qpack::QpackInstruction::SectionAcknowledgment { stream_id: acked_stream_id } => {
-                // RFC 9204 Section 4.4.1: Section Acknowledgment
-                // Update known received count and unblock the stream
-                let count = qpack.known_received_count();
-                qpack.update_known_received_count(count + 1);
-                
-                // RFC 9204 Section 2.1.4: Unblock the stream
-                qpack.unblock_stream();
-                
-                // Remove from blocked streams
-                self.blocked_streams.remove(&acked_stream_id);
-            }
-            crate::qpack::QpackInstruction::StreamCancellation { stream_id: cancelled_stream_id } => {
-                // RFC 9204 Section 4.4.2: Stream Cancellation
-                // Unblock the stream if it was blocked
-                if self.blocked_streams.remove(&cancelled_stream_id).is_some() {
-                    qpack.unblock_stream();
-                }
-            }
-            crate::qpack::QpackInstruction::InsertCountIncrement { increment } => {
-                // GAP #6 FIX: Validate increment per RFC 9204 §4.4.3
-                // "The new Known Received Count MUST NOT exceed the current value of 
-                // the insert count at the decoder"
-                let current_known = qpack.known_received_count();
-                let current_insert = qpack.insert_count();
-                let new_known = current_known + increment as usize;
-                
-                if new_known > current_insert {
-                    return Err(H3Error::Qpack(format!(
-                        "INSERT_COUNT_INCREMENT {} would exceed insert count (known={}, insert={})",
-                        increment, current_known, current_insert
-                    )));
-                }
-                
-                // Update known received count
-                qpack.update_known_received_count(new_known);
-            }
-        }
-        
-        drop(qpack); // Release lock before retry
-        
-        // GAP #21 FIX: Send INSERT_COUNT_INCREMENT to acknowledge processed insertions
-        // RFC 9204 Section 4.4.3: Decoder MUST send INSERT_COUNT_INCREMENT after processing
-        if table_changed {
-            // Send acknowledgment for the insertion we just processed
-            // Each insertion instruction increments by 1
-            self.send_insert_count_increment(1).await?;
-            
-            // RFC 9204 Section 2.1.4: Retry blocked streams if dynamic table changed
-            self.retry_blocked_streams().await?;
-        }
-        
-        Ok(())
-    }
 
     /// Parse headers into HTTP request (public for testing)
     pub fn parse_request(&mut self, headers: Vec<(String, String)>) -> Result<H3Request, H3Error> {
@@ -1746,188 +1524,9 @@ impl<H: H3Handler> H3Session<H> {
 
     /// Send Section Acknowledgment on decoder stream (RFC 9204 Section 4.4.1)
     /// PERF #29: Batches instruction encoding with single lock acquisition
-    async fn send_section_acknowledgment(&mut self, stream_id: u64) -> Result<(), H3Error> {
-        // Create Section Acknowledgment instruction
-        let instruction = crate::qpack::QpackInstruction::SectionAcknowledgment { stream_id };
-        let instruction_bytes = self.qpack.read().await.encode_instruction(&instruction)?;
-        
-        // Add to pending buffer instead of sending immediately
-        self.pending_decoder_instructions.push(instruction_bytes);
-        
-        // Flush if buffer is getting large (configurable threshold)
-        if self.pending_decoder_instructions.len() >= 8 {
-            self.flush_decoder_instructions().await?;
-        }
-        Ok(())
-    }
 
-    /// Send Stream Cancellation on decoder stream (RFC 9204 Section 4.4.2)
-    /// PERF #29: Batches instruction, but flushes immediately for critical signaling
-    async fn send_stream_cancellation(&mut self, stream_id: u64) -> Result<(), H3Error> {
-        // Create Stream Cancellation instruction
-        let instruction = crate::qpack::QpackInstruction::StreamCancellation { stream_id };
-        let instruction_bytes = self.qpack.read().await.encode_instruction(&instruction)?;
-        
-        // Add to pending buffer
-        self.pending_decoder_instructions.push(instruction_bytes);
-        
-        // Flush immediately for cancellation (critical for encoder state cleanup)
-        self.flush_decoder_instructions().await?;
-        Ok(())
-    }
 
-    /// Send Insert Count Increment on decoder stream (RFC 9204 Section 4.4.3)
-    /// PERF #29: Batches instruction encoding
-    async fn send_insert_count_increment(&mut self, increment: u64) -> Result<(), H3Error> {
-        // Create Insert Count Increment instruction
-        let instruction = crate::qpack::QpackInstruction::InsertCountIncrement { increment };
-        let instruction_bytes = self.qpack.read().await.encode_instruction(&instruction)?;
-        
-        // Add to pending buffer
-        self.pending_decoder_instructions.push(instruction_bytes);
-        
-        // Flush immediately for INSERT_COUNT_INCREMENT (required for unblocking)
-        self.flush_decoder_instructions().await?;
-        Ok(())
-    }
-    
-    /// Flush all pending decoder instructions in a single write
-    /// PERF #29: Reduces system call overhead by batching writes
-    async fn flush_decoder_instructions(&mut self) -> Result<(), H3Error> {
-        if self.pending_decoder_instructions.is_empty() {
-            return Ok(());
-        }
-        
-        if let Some(decoder_send) = &mut self.decoder_send_stream {
-            // Combine all pending instructions into a single buffer
-            let total_size: usize = self.pending_decoder_instructions.iter().map(|b| b.len()).sum();
-            let mut combined = bytes::BytesMut::with_capacity(total_size);
-            
-            for instruction_bytes in self.pending_decoder_instructions.drain(..) {
-                combined.extend_from_slice(&instruction_bytes);
-            }
-            
-            // Single write for all instructions
-            decoder_send.write(combined.freeze(), false).await
-                .map_err(|e| H3Error::Stream(format!("failed to flush decoder instructions: {:?}", e)))?;
-        } else {
-            // Clear buffer even if no stream (avoid memory leak)
-            self.pending_decoder_instructions.clear();
-        }
-        
-        Ok(())
-    }
 
-    /// Retry blocked streams after dynamic table update
-    /// 
-    /// RFC 9204 Section 2.1.4: Enforce global timeout for QPACK blocked streams.
-    /// 
-    /// This is called periodically (every 10 seconds) from the main event loop to ensure
-    /// that blocked streams are timed out even if no encoder instructions arrive.
-    /// 
-    /// "Implementations SHOULD impose a timeout on blocked streams. If a stream remains
-    /// blocked for longer than this timeout, the implementation can cancel the stream with
-    /// an error code of H3_QPACK_DECOMPRESSION_FAILED."
-    async fn check_blocked_stream_timeouts(&mut self) -> Result<(), H3Error> {
-        const BLOCKED_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-        
-        let now = std::time::Instant::now();
-        let mut streams_to_timeout = Vec::new();
-        
-        // Find streams that have been blocked too long
-        for (stream_id, blocked_stream) in &self.blocked_streams {
-            if now.duration_since(blocked_stream.blocked_at) > BLOCKED_STREAM_TIMEOUT {
-                streams_to_timeout.push(*stream_id);
-            }
-        }
-        
-        // Timeout streams that have exceeded the limit
-        for stream_id in streams_to_timeout {
-            self.blocked_streams.remove(&stream_id);
-            // RFC 9204 Section 2.2.2.2: Close stream with H3_QPACK_DECOMPRESSION_FAILED
-            let _ = self.handle.reset_stream(stream_id, crate::error::H3ErrorCode::QpackDecompressionFailed.to_u64());
-            eprintln!("QPACK blocked stream {} timed out after 60 seconds", stream_id);
-        }
-        
-        Ok(())
-    }
-
-    /// RFC 9204 Section 2.1.4: When decoder instructions arrive and update the dynamic table,
-    /// check if any blocked streams can now be decoded.
-    /// 
-    /// Should be called after processing encoder stream instructions that insert dynamic table entries.
-    async fn retry_blocked_streams(&mut self) -> Result<(), H3Error> {
-        let current_insert_count = self.qpack.read().await.insert_count();
-        let now = std::time::Instant::now();
-        let mut streams_to_retry = Vec::new();
-        
-        // Find all streams that can now be unblocked
-        // Note: Timeout checking is now handled by check_blocked_stream_timeouts()
-        for (stream_id, blocked_stream) in &self.blocked_streams {
-            if blocked_stream.required_insert_count <= current_insert_count {
-                streams_to_retry.push(*stream_id);
-            }
-        }
-        
-        // Retry each unblocked stream
-        let mut requests_to_process = Vec::new();
-        
-        for stream_id in streams_to_retry {
-            if let Some(blocked) = self.blocked_streams.remove(&stream_id) {
-                // Try to decode headers again
-                match self.qpack.read().await.decode_headers(&blocked.encoded_data) {
-                    Ok((headers, referenced_entries)) => {
-                        // Successfully decoded - add references for cleanup
-                        {
-                            let mut qpack = self.qpack.write().await;
-                            for index in &referenced_entries {
-                                qpack.add_reference(*index);
-                            }
-                            qpack.unblock_stream(); // Decrement blocked stream count
-                        }
-                        
-                        // Queue the request for later processing (avoid borrow checker issues)
-                        requests_to_process.push((stream_id, headers, blocked.send_stream));
-                    }
-                    Err(H3Error::QpackBlocked(new_required)) => {
-                        // Still blocked (shouldn't happen if logic is correct)
-                        // Re-insert with updated requirement
-                        self.blocked_streams.insert(stream_id, BlockedStream {
-                            required_insert_count: new_required,
-                            encoded_data: blocked.encoded_data,
-                            send_stream: blocked.send_stream,
-                            stream_id: blocked.stream_id,
-                            blocked_at: now, // Reset the timer
-                        });
-                    }
-                    Err(e) => {
-                        // Decoding failed - send error to stream
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        
-        // Process all unblocked requests
-        for (stream_id, headers, send_stream) in requests_to_process {
-            // Queue the request
-            let priority_id = 0;
-            self.request_queue.push(QueuedRequest {
-                priority_id,
-                stream_id,
-                headers,
-                send_stream,
-            });
-            
-            // Process it immediately
-            self.process_next_request().await?;
-            
-            // RFC 9204 Section 4.4.1: Send Section Acknowledgment
-            self.send_section_acknowledgment(stream_id).await?;
-        }
-        
-        Ok(())
-    }
 
     /// Check if we should grease (use reserved identifiers)
     /// 
@@ -2059,34 +1658,22 @@ impl<H: H3Handler> H3Session<H> {
         
         if let Some(response) = response_data {
             // Encode response headers
+            let status_str = response.status.to_string();
             let mut all_headers = vec![
-                (":status".to_string(), response.status.to_string()),
+                (b":status".as_slice(), status_str.as_bytes()),
             ];
-            all_headers.extend(response.headers);
+            for (name, value) in &response.headers {
+                all_headers.push((name.as_bytes(), value.as_bytes()));
+            }
             
-            let (encoded_headers, encoder_instructions, referenced_entries) = {
-                let mut qpack = self.qpack.write().await;
-                let result = qpack.encode_headers(&all_headers)
-                    .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
-                // RFC 9204 Section 2.1.2: Add references
-                for index in &result.2 {
-                    qpack.add_reference(*index);
-                }
-                result
-            };
-            
-            // Send encoder instructions to encoder stream if any
-            if !encoder_instructions.is_empty() {
-                let mut encoder_stream_guard = self.encoder_send_stream.lock().await;
-                if let Some(encoder_stream) = encoder_stream_guard.as_mut() {
-                    // Batch all instructions into a single write
-                    let total_size: usize = encoder_instructions.iter().map(|b| b.len()).sum();
-                    let mut combined = bytes::BytesMut::with_capacity(total_size);
-                    for instruction in encoder_instructions {
-                        combined.extend_from_slice(&instruction);
-                    }
-                    encoder_stream.write(combined.freeze(), false).await
-                        .map_err(|e| H3Error::Stream(format!("failed to write encoder instructions: {:?}", e)))?;
+            let mut encoder_guard = self.qpack_encoder.lock().await;
+            let encoded_headers = encoder_guard.encoder_mut().encode(stream_id, &all_headers)
+                .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
+
+            // Send any pending encoder instructions
+            while let Some(inst) = encoder_guard.encoder_mut().poll_encoder_stream() {
+                if let Some(encoder_stream) = self.encoder_send_stream.lock().await.as_mut() {
+                    let _ = encoder_stream.write(inst, false).await;
                 }
             }
             
@@ -2108,11 +1695,7 @@ impl<H: H3Handler> H3Session<H> {
                 promise.mark_completed();
             }
             
-            // Release QPACK dynamic table references when push completes
-            let mut qpack = self.qpack.write().await;
-            for index in referenced_entries {
-                qpack.release_reference(index);
-            }
+            // QPACK references are handled internally by quicd-qpack
         } else {
             // No response data available - send CANCEL_PUSH and close stream
             let _ = self.send_cancel_push_frame(push_id).await;
