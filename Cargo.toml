@@ -1,4 +1,4 @@
 [workspace]
-members = ["quicd", "quicd-x", "quicd-h3", "quicd-moq"]
+members = ["quicd", "quicd-x", "quicd-h3", "quicd-moq", "quicd-qpack"]
 resolver = "2"
 
