@@ -1820,7 +1820,9 @@ dependencies = [
  "criterion",
  "futures",
  "http 0.2.12",
+ "quicd-qpack",
  "quicd-x",
+ "slab",
  "thiserror 1.0.69",
  "tokio",
 ]
