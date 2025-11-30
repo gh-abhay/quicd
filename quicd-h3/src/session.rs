@@ -42,11 +42,14 @@ impl H3ResponseSender {
         let encoded_headers = encoder_guard.encoder_mut().encode(self.stream_id, &all_headers)
             .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
 
-        // PERF #3: Batch encoder instructions into single write
-        let mut batched_instructions = bytes::BytesMut::new();
+        // PERF #3: Batch encoder instructions into single write with pre-allocation
+        let mut batched_instructions = bytes::BytesMut::with_capacity(256);
         while let Some(inst) = encoder_guard.encoder_mut().poll_encoder_stream() {
             batched_instructions.extend_from_slice(&inst);
         }
+        
+        // Release encoder lock before stream write (reduces lock contention)
+        drop(encoder_guard);
         
         if !batched_instructions.is_empty() {
             if let Some(encoder_stream) = self.encoder_send_stream.lock().await.as_mut() {

@@ -127,6 +127,18 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
                             ":authority must not include userinfo subcomponent".into()
                         ));
                     }
+                    // RFC 3986 Section 3.2.2: Validate IPv6 literals in authority
+                    // IPv6 addresses must be enclosed in brackets: [::1]:8080
+                    if value.contains(':') && !value.starts_with('[') {
+                        // Multiple colons without brackets - likely malformed IPv6 or invalid
+                        let colon_count = value.matches(':').count();
+                        if colon_count > 1 {
+                            return Err(H3Error::Http(
+                                ":authority contains IPv6 address not enclosed in brackets".into()
+                            ));
+                        }
+                        // Single colon is valid for host:port
+                    }
                     authority = Some(value.clone());
                 }
                 ":path" => {
