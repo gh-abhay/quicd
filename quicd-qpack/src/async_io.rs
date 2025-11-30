@@ -81,6 +81,13 @@ pub mod async_support {
                 decoder: Decoder::new(max_table_capacity, max_blocked_streams),
             }
         }
+
+        /// Create a new async decoder with custom timeout.
+        pub fn with_timeout(max_table_capacity: usize, max_blocked_streams: usize, timeout: std::time::Duration) -> Self {
+            Self {
+                decoder: Decoder::with_timeout(max_table_capacity, max_blocked_streams, timeout),
+            }
+        }
         
         /// Get mutable reference to underlying decoder.
         pub fn decoder_mut(&mut self) -> &mut Decoder {

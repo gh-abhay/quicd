@@ -32,6 +32,7 @@
 //! ```
 
 pub mod error;
+pub mod config;
 pub mod prefix_int;
 pub mod static_table;
 pub mod table;
@@ -45,6 +46,7 @@ pub mod huffman;
 pub mod async_io;
 
 // Re-export main types
+pub use config::QpackConfig;
 pub use encoder::{Encoder, should_never_index};
 pub use decoder::{Decoder, HeaderField};
 pub use error::{QpackError, Result};

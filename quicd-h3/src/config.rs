@@ -127,17 +127,26 @@ pub struct H3Config {
     #[serde(with = "humantime_serde")]
     pub settings_deadline: Duration,
     
-    /// Interval for checking blocked stream timeouts (default: 10 seconds).
+    /// Interval for checking idle connection timeout (default: 5 seconds).
     ///
-    /// Performance tuning: How often to scan for timed-out QPACK blocked streams.
-    #[serde(with = "humantime_serde")]
-    pub blocked_stream_timeout_check_interval: Duration,
-    
-    /// Interval for checking idle connections (default: 5 seconds).
-    ///
-    /// Performance tuning: How often to check if connection has been idle.
+    /// Performance tuning: How often to check for idle connections.
+    /// Lower values detect idle connections faster but use more CPU.
     #[serde(with = "humantime_serde")]
     pub idle_check_interval: Duration,
+    
+    /// Settings storage TTL (default: 24 hours).
+    ///
+    /// RFC 9114 Section 7.2.4.2: "Clients SHOULD remember settings for some time"
+    /// How long to cache SETTINGS frames from peers for 0-RTT connections.
+    #[serde(with = "humantime_serde")]
+    pub settings_ttl: Duration,
+    
+    /// Grace period after idle timeout before closing connection (default: 1 second).
+    ///
+    /// When an idle timeout occurs, this grace period allows in-flight requests
+    /// to complete before closing the connection.
+    #[serde(with = "humantime_serde")]
+    pub idle_grace_period: Duration,
 }
 
 impl Default for H3Config {
@@ -156,13 +165,14 @@ impl Default for H3Config {
             enable_server_push: false,
             enable_datagrams: false,
             grease_probability: 0.1,
-            blocked_stream_check_interval: Duration::from_secs(10),
             qpack_encoder_instruction_batch_size: 8,
             qpack_decoder_instruction_batch_size: 8,
             idle_timeout: Duration::from_secs(30),
             settings_deadline: Duration::from_secs(10),
-            blocked_stream_timeout_check_interval: Duration::from_secs(10),
+            blocked_stream_check_interval: Duration::from_secs(10),
             idle_check_interval: Duration::from_secs(5),
+            settings_ttl: Duration::from_secs(24 * 60 * 60), // 24 hours
+            idle_grace_period: Duration::from_secs(1),
         }
     }
 }
@@ -393,12 +403,6 @@ impl H3ConfigBuilder {
     /// Set settings frame deadline.
     pub fn settings_deadline(mut self, deadline: Duration) -> Self {
         self.config.settings_deadline = deadline;
-        self
-    }
-    
-    /// Set blocked stream timeout check interval.
-    pub fn blocked_stream_timeout_check_interval(mut self, interval: Duration) -> Self {
-        self.config.blocked_stream_timeout_check_interval = interval;
         self
     }
     

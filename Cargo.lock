@@ -1857,7 +1857,9 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "criterion",
+ "humantime-serde",
  "lazy_static",
+ "serde",
  "tokio",
 ]
 

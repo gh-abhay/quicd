@@ -143,6 +143,8 @@ mod server;
 pub mod config;
 
 pub use crate::config::QuicAppConfig;
+pub use crate::config::QuicTransportConfig;
+pub use crate::config::{CongestionControl, DEFAULT_MAX_IDLE_TIMEOUT_MS, DEFAULT_INITIAL_RTT_MS, DEFAULT_MAX_STREAMS_BIDI, DEFAULT_MAX_STREAMS_UNI, DEFAULT_MAX_UDP_PAYLOAD_SIZE, DEFAULT_RECV_WINDOW, DEFAULT_STREAM_RECV_WINDOW, DEFAULT_MAX_CONNECTIONS_PER_WORKER};
 pub use crate::error::ConnectionError;
 pub use crate::events::{AppEvent, TransportEvent};
 pub use crate::factory::{AppEventStream, QuicAppFactory, ShutdownFuture};
