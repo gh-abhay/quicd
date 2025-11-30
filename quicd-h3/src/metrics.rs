@@ -103,8 +103,20 @@ pub struct H3Metrics {
     /// Count of PUSH_PROMISE frames sent (server push)
     pub frames_push_promise_sent: AtomicU64,
     
+    /// Count of DUPLICATE_PUSH frames received
+    pub frames_duplicate_push_received: AtomicU64,
+    
     /// Count of reserved/unknown frames received (for greasing)
     pub frames_reserved_received: AtomicU64,
+    
+    /// Count of reserved frames received (RFC 9114 Section 7.2.8 greasing)
+    pub reserved_frames_received: AtomicU64,
+    
+    /// Count of completely unknown frame types received
+    pub unknown_frames_received: AtomicU64,
+    
+    /// Count of trailer HEADERS received (trailers section)
+    pub trailer_bytes_received: AtomicU64,
     
     /// Count of HTTP/3 datagrams received
     pub datagrams_received: AtomicU64,
