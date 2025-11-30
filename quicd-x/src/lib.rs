@@ -140,6 +140,9 @@ mod factory;
 mod handle;
 mod server;
 
+pub mod config;
+
+pub use crate::config::QuicAppConfig;
 pub use crate::error::ConnectionError;
 pub use crate::events::{AppEvent, TransportEvent};
 pub use crate::factory::{AppEventStream, QuicAppFactory, ShutdownFuture};

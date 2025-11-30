@@ -1,0 +1,21 @@
+# Minimal quicd Configuration Example
+#
+# This is a minimal, working configuration for the quicd server.
+# All unspecified fields will use their default values.
+
+[global.network]
+host = "0.0.0.0"
+port = 443
+
+[global.logging]
+level = "info"
+
+# HTTP/3 on standard ALPN
+[[applications]]
+alpn = "h3"
+type = "http3"
+
+# HTTP/3 draft-29 for backwards compatibility
+[[applications]]
+alpn = "h3-29"
+type = "http3"

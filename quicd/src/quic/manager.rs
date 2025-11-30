@@ -35,7 +35,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::net::SocketAddr;
-use std::path::Path;
+
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -359,7 +359,7 @@ impl QuicManager {
         channel_config: crate::channel_config::ChannelConfig,
     ) -> Result<Self> {
         // Validate configuration
-        config.validate()?;
+        config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
         info!(
             worker_id,

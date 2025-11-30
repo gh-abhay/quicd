@@ -1,0 +1,47 @@
+# Edge/CDN quicd Configuration
+#
+# Optimized for CDN and edge deployments with server push enabled.
+
+[global.network]
+host = "0.0.0.0"
+port = 443
+
+[global.tls]
+cert_path = "/etc/quicd/certs/fullchain.pem"
+key_path = "/etc/quicd/certs/privkey.pem"
+enable_early_data = false  # Disable for security
+
+[global.runtime]
+worker_threads = 8
+
+[global.logging]
+level = "info"
+json_format = true  # Structured logs for aggregation
+enable_colors = false
+
+[global.quic]
+max_streams_bidi = 200
+congestion_control = "bbr"
+enable_stats = true
+
+[global.telemetry]
+enabled = true
+export_interval_seconds = 30
+# otlp_endpoint = "http://collector:4317"
+
+# HTTP/3 with CDN optimizations
+[[applications]]
+alpn = "h3"
+type = "http3"
+max_frame_size = 33554432  # 32 MB
+max_field_section_size = 131072  # 128 KB
+qpack_max_table_capacity = 8192  # 8 KB
+qpack_blocked_streams = 200
+max_concurrent_streams = 200
+max_push_id = 1000
+enable_server_push = true
+stream_buffer_initial_capacity = 32768  # 32 KB
+stream_buffer_max_size = 4194304  # 4 MB
+qpack_encoder_instruction_batch_size = 16
+qpack_decoder_instruction_batch_size = 16
+idle_timeout = "60s"

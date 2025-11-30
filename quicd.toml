@@ -1,0 +1,363 @@
+# quicd Configuration Reference
+#
+# This file documents all available configuration options for the quicd QUIC server.
+# All fields are optional and have sensible defaults.
+#
+# Configuration Hierarchy:
+# 1. Default values (lowest priority)
+# 2. This configuration file
+# 3. Environment variables (QUICD_ prefix, e.g., QUICD_GLOBAL__NETWORK__HOST)
+# 4. Command-line arguments (highest priority)
+#
+# Validation:
+#   quicd --config quicd.toml --validate
+#
+# Print defaults:
+#   quicd --print-default-config
+
+# ============================================================================
+# GLOBAL CONFIGURATION
+# ============================================================================
+# Settings that apply server-wide, independent of application protocols.
+
+[global]
+
+# ----------------------------------------------------------------------------
+# Network Binding
+# ----------------------------------------------------------------------------
+[global.network]
+# Host address to bind to
+# Examples: "0.0.0.0" (all IPv4), "::" (all IPv6), "127.0.0.1" (localhost)
+host = "127.0.0.1"
+
+# UDP port to bind to
+# Standard: 443 (requires privileges), 8443 (common alternative)
+port = 8080
+
+# Enable SO_REUSEADDR socket option
+# Allows quick restarts by reusing recently-closed ports
+reuse_addr = true
+
+# ----------------------------------------------------------------------------
+# TLS / Cryptographic Settings
+# ----------------------------------------------------------------------------
+[global.tls]
+# Path to TLS certificate file (PEM format)
+# If omitted, a self-signed certificate will be generated
+# cert_path = "/etc/quicd/certs/cert.pem"
+
+# Path to TLS private key file (PEM format)
+# Required if cert_path is specified
+# key_path = "/etc/quicd/certs/key.pem"
+
+# Enable TLS 1.3 early data (0-RTT)
+# WARNING: 0-RTT data is not forward secret and can be replayed
+# Only enable for idempotent applications
+enable_early_data = false
+
+# ----------------------------------------------------------------------------
+# Runtime Configuration
+# ----------------------------------------------------------------------------
+[global.runtime]
+# Number of Tokio worker threads for async application tasks
+# Default: Number of CPU cores
+worker_threads = 8
+
+# Maximum blocking threads in the pool
+max_blocking_threads = 512
+
+# Thread name prefix (for debugging/profiling)
+thread_name = "quicd-worker"
+
+# Stack size per thread in bytes
+thread_stack_size = 2097152  # 2 MB
+
+# Enable thread-local statistics collection
+enable_thread_stats = false
+
+# ----------------------------------------------------------------------------
+# Logging Configuration
+# ----------------------------------------------------------------------------
+[global.logging]
+# Log level: "trace", "debug", "info", "warn", "error"
+level = "info"
+
+# Enable structured JSON logging (for machine parsing)
+json_format = false
+
+# Enable ANSI color codes in logs
+# Disable when logging to files or non-TTY outputs
+enable_colors = true
+
+# Include source file and line number in logs
+# Has performance overhead
+include_file_line = false
+
+# ----------------------------------------------------------------------------
+# QUIC Transport Configuration
+# ----------------------------------------------------------------------------
+[global.quic]
+# Maximum idle timeout in milliseconds
+# Connections idle longer than this are closed
+max_idle_timeout_ms = 30000  # 30 seconds
+
+# Initial RTT estimate in milliseconds
+initial_rtt_ms = 100
+
+# Maximum concurrent bidirectional streams per connection
+max_streams_bidi = 100
+
+# Maximum concurrent unidirectional streams per connection
+max_streams_uni = 100
+
+# Maximum UDP payload size in bytes
+# Should be ≤ path MTU to avoid fragmentation
+# QUIC minimum: 1200 bytes
+max_udp_payload_size = 1350
+
+# Connection-level receive window (bytes)
+recv_window = 10485760  # 10 MB
+
+# Per-stream receive window (bytes)
+stream_recv_window = 1048576  # 1 MB
+
+# Congestion control algorithm
+# Options: "cubic", "bbr", "bbr2", "reno"
+congestion_control = "cubic"
+
+# Enable early data (0-RTT) at QUIC layer
+enable_early_data = false
+
+# Disable active migration (prevents IP/port changes)
+disable_active_migration = false
+
+# Enable packet pacing
+enable_pacing = true
+
+# Maximum connections per worker thread
+max_connections_per_worker = 100000
+
+# Enable QUIC version negotiation
+enable_version_negotiation = true
+
+# Additional QUIC versions to support (v1 always enabled)
+# additional_versions = ["draft-29"]
+
+# Enable DATAGRAM extension (RFC 9221)
+enable_dgram = false
+
+# Maximum DATAGRAM frame size
+max_dgram_size = 1350
+
+# Enable connection statistics collection
+enable_stats = true
+
+# ----------------------------------------------------------------------------
+# Network I/O Configuration
+# ----------------------------------------------------------------------------
+[global.netio]
+# Number of network I/O worker threads
+# Default: Number of CPU cores
+workers = 8
+
+# Enable SO_REUSEPORT for load distribution
+reuse_port = true
+
+# Pin worker threads to specific CPU cores
+pin_to_cpu = true
+
+# io_uring submission queue entries per worker (must be power of 2)
+uring_entries = 2048
+
+# Kernel receive buffer size (SO_RCVBUF)
+# Larger buffers reduce packet loss under burst traffic
+# socket_recv_buffer_size = 2097152  # 2 MB
+
+# Kernel send buffer size (SO_SNDBUF)
+# socket_send_buffer_size = 2097152  # 2 MB
+
+# Enable UDP GRO (Generic Receive Offload)
+# Linux 5.0+ only, gracefully degrades on other platforms
+enable_gro = true
+
+# Enable UDP GSO (Generic Segmentation Offload)
+# Linux 4.18+ only, gracefully degrades on other platforms
+enable_gso = true
+
+[global.netio.buffer_pool]
+# Maximum buffers per worker (isolated pools, no sharing)
+max_buffers_per_worker = 2048
+
+# Datagram size for buffer trimming
+datagram_size = 1350
+
+# ----------------------------------------------------------------------------
+# Channel Capacity Configuration
+# ----------------------------------------------------------------------------
+[global.channels]
+# Worker egress channel capacity (app → worker)
+# All app tasks share this channel per worker
+worker_egress_capacity = 2048
+
+# Connection ingress channel capacity (worker → app)
+# Per-connection event stream buffer
+connection_ingress_capacity = 1024
+
+# Stream ingress channel capacity (worker → app)
+# Per-stream data buffer
+stream_ingress_capacity = 256
+
+# Stream egress channel capacity (app → worker)
+# Per-stream write command buffer
+stream_egress_capacity = 256
+
+# ----------------------------------------------------------------------------
+# Telemetry Configuration
+# ----------------------------------------------------------------------------
+[global.telemetry]
+# Enable telemetry system
+enabled = true
+
+# Metrics export interval in seconds
+export_interval_seconds = 60
+
+# OpenTelemetry collector endpoint
+# otlp_endpoint = "http://localhost:4317"
+
+# Enable detailed per-connection metrics
+# Warning: High cardinality, may impact performance
+enable_per_connection_metrics = false
+
+# ============================================================================
+# APPLICATION CONFIGURATIONS
+# ============================================================================
+# Define application protocols and their ALPN mappings.
+# Each application has its own configuration schema.
+
+# ----------------------------------------------------------------------------
+# HTTP/3 Application
+# ----------------------------------------------------------------------------
+[[applications]]
+# ALPN identifier (used during QUIC handshake)
+alpn = "h3"
+
+# Application type: "http3" or "custom"
+type = "http3"
+
+# Enable this application
+enabled = true
+
+# HTTP/3 Protocol Configuration
+# Maximum size of a single HTTP/3 frame payload
+max_frame_size = 16777216  # 16 MB
+
+# Maximum size of a field section (headers) in bytes
+max_field_section_size = 65536  # 64 KB
+
+# QPACK dynamic table capacity
+qpack_max_table_capacity = 4096  # 4 KB
+
+# Maximum number of QPACK blocked streams
+qpack_blocked_streams = 100
+
+# Timeout for QPACK blocked streams
+qpack_blocked_stream_timeout = "60s"
+
+# Maximum concurrent bidirectional streams
+max_concurrent_streams = 100
+
+# Maximum push ID server can send
+max_push_id = 100
+
+# Initial buffer capacity per stream
+stream_buffer_initial_capacity = 16384  # 16 KB
+
+# Maximum buffer size per stream
+stream_buffer_max_size = 1048576  # 1 MB
+
+# Enable extended CONNECT protocol (RFC 9114 Section 4.4)
+enable_connect_protocol = true
+
+# Enable server push (RFC 9114 Section 4.6)
+enable_server_push = false
+
+# Enable HTTP/3 datagrams (RFC 9297)
+enable_datagrams = false
+
+# Probability of sending reserved identifiers (0.0-1.0)
+grease_probability = 0.1
+
+# Interval for checking QPACK blocked stream timeouts
+blocked_stream_check_interval = "10s"
+
+# QPACK encoder instruction batch size
+qpack_encoder_instruction_batch_size = 8
+
+# QPACK decoder instruction batch size
+qpack_decoder_instruction_batch_size = 8
+
+# Idle connection timeout
+idle_timeout = "30s"
+
+# Settings frame deadline
+settings_deadline = "10s"
+
+# Blocked stream timeout check interval
+blocked_stream_timeout_check_interval = "10s"
+
+# Idle check interval
+idle_check_interval = "5s"
+
+# Custom request handler configuration (optional)
+# [applications.handler]
+# custom_field = "value"
+
+# ----------------------------------------------------------------------------
+# HTTP/3 (Draft 29) - For backwards compatibility
+# ----------------------------------------------------------------------------
+[[applications]]
+alpn = "h3-29"
+type = "http3"
+enabled = true
+# Inherits same defaults as h3, override as needed
+
+# ----------------------------------------------------------------------------
+# Custom Protocol Example
+# ----------------------------------------------------------------------------
+# [[applications]]
+# alpn = "my-custom-proto"
+# type = "custom"
+# 
+# # Custom protocols use arbitrary key-value configuration
+# # The server passes this directly to your QuicAppFactory
+# [applications.params]
+# my_setting = "value"
+# my_number = 42
+# my_flag = true
+
+# ============================================================================
+# CONFIGURATION PRESETS
+# ============================================================================
+#
+# Instead of manually configuring every field, you can use presets:
+#
+# High Throughput (large buffers, high concurrency):
+#   - max_concurrent_streams = 1000
+#   - stream_buffer_max_size = 8 MB
+#   - worker_egress_capacity = 8192
+#
+# Low Memory (minimal buffers, tight limits):
+#   - max_concurrent_streams = 10
+#   - stream_buffer_max_size = 64 KB
+#   - worker_egress_capacity = 512
+#
+# Low Latency (small buffers, aggressive backpressure):
+#   - stream_buffer_max_size = 256 KB
+#   - idle_check_interval = 1s
+#
+# CDN/Edge (balanced, with server push):
+#   - max_concurrent_streams = 200
+#   - enable_server_push = true
+#   - qpack_max_table_capacity = 8 KB
+#
+# Apply presets by starting with a template or manually adjusting values.

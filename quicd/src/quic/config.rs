@@ -231,29 +231,29 @@ impl QuicConfig {
     }
 
     /// Validate configuration
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.max_idle_timeout_ms == 0 {
-            anyhow::bail!("max_idle_timeout_ms must be > 0");
+            return Err("max_idle_timeout_ms must be > 0".to_string());
         }
 
         if self.max_udp_payload_size < 1200 {
-            anyhow::bail!("max_udp_payload_size must be >= 1200 (QUIC minimum)");
+            return Err("max_udp_payload_size must be >= 1200 (QUIC minimum)".to_string());
         }
 
         if self.max_udp_payload_size > 65535 {
-            anyhow::bail!("max_udp_payload_size must be <= 65535");
+            return Err("max_udp_payload_size must be <= 65535".to_string());
         }
 
         if self.recv_window == 0 {
-            anyhow::bail!("recv_window must be > 0");
+            return Err("recv_window must be > 0".to_string());
         }
 
         if self.stream_recv_window == 0 {
-            anyhow::bail!("stream_recv_window must be > 0");
+            return Err("stream_recv_window must be > 0".to_string());
         }
 
         if self.max_connections_per_worker == 0 {
-            anyhow::bail!("max_connections_per_worker must be > 0");
+            return Err("max_connections_per_worker must be > 0".to_string());
         }
 
         Ok(())
