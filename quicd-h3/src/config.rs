@@ -80,6 +80,13 @@ pub struct H3Config {
     /// Disable to reduce complexity if push not needed.
     pub enable_server_push: bool,
     
+    /// Enable HTTP/3 datagrams (default: false).
+    ///
+    /// RFC 9297: Enables unreliable datagram support for HTTP/3.
+    /// When enabled, sends SETTINGS_H3_DATAGRAM=1 to peer.
+    /// Applications can use datagrams for real-time data (gaming, video, etc.).
+    pub enable_datagrams: bool,
+    
     /// Probability of sending reserved identifiers for greasing (default: 0.1).
     ///
     /// RFC 9114 Section 7.2.8: "Implementations SHOULD send" reserved
@@ -139,6 +146,7 @@ impl Default for H3Config {
             stream_buffer_max_size: 1024 * 1024, // 1 MB
             enable_connect_protocol: true,
             enable_server_push: false,
+            enable_datagrams: false,
             grease_probability: 0.1,
             blocked_stream_check_interval: Duration::from_secs(10),
             qpack_encoder_instruction_batch_size: 8,
