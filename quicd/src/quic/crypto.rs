@@ -108,7 +108,13 @@ pub fn create_quiche_config(
     quic_config.set_initial_max_streams_uni(config.max_streams_uni);
 
     // Congestion control
-    quic_config.set_cc_algorithm(config.congestion_control.into());
+    let cc_algo = match config.congestion_control {
+        quicd_x::CongestionControl::Bbr => quiche::CongestionControlAlgorithm::BBR,
+        quicd_x::CongestionControl::Bbr2 => quiche::CongestionControlAlgorithm::BBR2,
+        quicd_x::CongestionControl::Cubic => quiche::CongestionControlAlgorithm::CUBIC,
+        quicd_x::CongestionControl::Reno => quiche::CongestionControlAlgorithm::Reno,
+    };
+    quic_config.set_cc_algorithm(cc_algo);
 
     // Enable/disable features
     quic_config.enable_early_data();

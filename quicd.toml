@@ -184,6 +184,9 @@ enable_gro = true
 # Linux 4.18+ only, gracefully degrades on other platforms
 enable_gso = true
 
+# Maximum size for coalesced UDP packets
+max_coalesced_size = 1400
+
 [global.netio.buffer_pool]
 # Maximum buffers per worker (isolated pools, no sharing)
 max_buffers_per_worker = 2048
@@ -222,7 +225,10 @@ enabled = true
 export_interval_seconds = 60
 
 # OpenTelemetry collector endpoint
-# otlp_endpoint = "http://localhost:4317"
+otlp_endpoint = "http://localhost:4317"
+
+# Service name for telemetry
+service_name = "quicd"
 
 # Enable detailed per-connection metrics
 # Warning: High cardinality, may impact performance
@@ -307,6 +313,12 @@ blocked_stream_timeout_check_interval = "10s"
 
 # Idle check interval
 idle_check_interval = "5s"
+
+# Settings storage TTL
+settings_ttl = "24h"
+
+# Grace period after idle timeout before closing connection
+idle_grace_period = "1s"
 
 # Custom request handler configuration (optional)
 # [applications.handler]

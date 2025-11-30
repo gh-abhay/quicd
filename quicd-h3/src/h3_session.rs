@@ -205,10 +205,18 @@ enum PushStreamState {
 
 impl<H: H3Handler> H3Session<H> {
     pub fn new(handle: ConnectionHandle, handler: H, settings_storage: Arc<dyn SettingsStorage>) -> Self {
-        Self::with_origin(handle, handler, settings_storage, None)
+        Self::with_config(handle, handler, settings_storage, crate::config::H3Config::default())
+    }
+
+    pub fn with_config(handle: ConnectionHandle, handler: H, settings_storage: Arc<dyn SettingsStorage>, config: crate::config::H3Config) -> Self {
+        Self::with_origin_and_config(handle, handler, settings_storage, None, config)
     }
 
     pub fn with_origin(handle: ConnectionHandle, handler: H, settings_storage: Arc<dyn SettingsStorage>, origin: Option<Origin>) -> Self {
+        Self::with_origin_and_config(handle, handler, settings_storage, origin, crate::config::H3Config::default())
+    }
+
+    pub fn with_origin_and_config(handle: ConnectionHandle, handler: H, settings_storage: Arc<dyn SettingsStorage>, origin: Option<Origin>, config: crate::config::H3Config) -> Self {
         // Create push manager for server push support
         let push_manager = Arc::new(AsyncMutex::new(PushManager::new()));
         
@@ -223,22 +231,22 @@ impl<H: H3Handler> H3Session<H> {
             SettingsValidator::new()
         };
         
-        let config = crate::config::H3Config::default();
         let idle_timeout = config.idle_timeout;
         
         // RFC 9204: Initialize QPACK with configured table sizes
         // These must match the SETTINGS we will send to the peer
         let qpack_max_table_capacity = config.qpack_max_table_capacity as usize;
         let qpack_blocked_streams = config.qpack_blocked_streams as usize;
+        let qpack_blocked_stream_timeout = config.qpack_blocked_stream_timeout;
         
         Self {
             handle,
-            // GAP #6: Use default configuration (can be overridden later)
+            // Use provided configuration
             config,
             // RFC 9204: QPACK encoder/decoder with configured table sizes
             // Must match SETTINGS_QPACK_MAX_TABLE_CAPACITY and SETTINGS_QPACK_BLOCKED_STREAMS
             qpack_encoder: Arc::new(AsyncMutex::new(AsyncEncoder::new(qpack_max_table_capacity, qpack_blocked_streams))),
-            qpack_decoder: AsyncDecoder::new(qpack_max_table_capacity, qpack_blocked_streams),
+            qpack_decoder: AsyncDecoder::with_timeout(qpack_max_table_capacity, qpack_blocked_streams, qpack_blocked_stream_timeout),
             server_control_send: None,
             streams: Slab::new(),
             stream_id_to_key: HashMap::new(),
@@ -306,7 +314,7 @@ impl<H: H3Handler> H3Session<H> {
     ) -> Result<(), H3Error> {
         // RFC 9204 Section 2.1.4: Check for blocked stream timeouts periodically
         // Use configured interval from H3Config
-        let mut timeout_check_interval = tokio::time::interval(self.config.blocked_stream_timeout_check_interval);
+        let mut timeout_check_interval = tokio::time::interval(self.config.blocked_stream_check_interval);
         timeout_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
         // GAP FIX #3: RFC 9114 Section 5.1: Check for idle timeout
@@ -2293,7 +2301,7 @@ impl<H: H3Handler> H3Session<H> {
                 self.send_goaway().await?;
                 
                 // Wait a short grace period for in-flight requests to complete
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(self.config.idle_grace_period).await;
             }
             
             // Close connection with H3_NO_ERROR per RFC 9114 Section 8
@@ -2406,18 +2414,33 @@ impl<H: H3Handler> H3Session<H> {
 pub struct H3Factory<H: H3Handler> {
     handler: H,
     settings_storage: Arc<dyn SettingsStorage>,
+    config: crate::config::H3Config,
 }
 
 impl<H: H3Handler> H3Factory<H> {
     pub fn new(handler: H) -> Self {
+        let config = crate::config::H3Config::default();
         Self { 
             handler,
-            settings_storage: Arc::new(InMemorySettingsStorage::new()),
+            settings_storage: Arc::new(InMemorySettingsStorage::with_ttl(config.settings_ttl)),
+            config,
+        }
+    }
+
+    pub fn with_config(handler: H, config: crate::config::H3Config) -> Self {
+        Self { 
+            handler,
+            settings_storage: Arc::new(InMemorySettingsStorage::with_ttl(config.settings_ttl)),
+            config,
         }
     }
 
     pub fn with_settings_storage(handler: H, settings_storage: Arc<dyn SettingsStorage>) -> Self {
-        Self { handler, settings_storage }
+        Self { 
+            handler, 
+            settings_storage,
+            config: crate::config::H3Config::default(),
+        }
     }
 }
 
@@ -2435,7 +2458,7 @@ impl<H: H3Handler + Clone> QuicAppFactory for H3Factory<H> {
         _transport: TransportControls,
         shutdown: ShutdownFuture,
     ) -> Result<(), quicd_x::ConnectionError> {
-        let session = H3Session::new(handle, self.handler.clone(), self.settings_storage.clone());
+        let session = H3Session::with_config(handle, self.handler.clone(), self.settings_storage.clone(), self.config.clone());
         session.run(events, shutdown).await
             .map_err(|e| quicd_x::ConnectionError::App(format!("HTTP/3 error: {:?}", e)))
     }

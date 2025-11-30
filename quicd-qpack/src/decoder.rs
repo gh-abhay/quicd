@@ -45,8 +45,13 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Create a new decoder.
+    /// Create a new decoder with default configuration.
     pub fn new(max_table_capacity: usize, max_blocked_streams: usize) -> Self {
+        Self::with_config(max_table_capacity, max_blocked_streams, std::time::Duration::from_secs(60))
+    }
+
+    /// Create a new decoder from configuration.
+    pub fn with_config(max_table_capacity: usize, max_blocked_streams: usize, timeout: std::time::Duration) -> Self {
         let mut table = DynamicTable::new(max_table_capacity);
         let _ = table.set_capacity(max_table_capacity);
         
@@ -55,8 +60,13 @@ impl Decoder {
             decoder_stream_buffer: VecDeque::with_capacity(32),
             blocked_streams: HashMap::with_capacity(max_blocked_streams),
             max_blocked_streams,
-            blocked_stream_timeout: std::time::Duration::from_secs(60), // RFC 9204 recommended timeout
+            blocked_stream_timeout: timeout,
         }
+    }
+
+    /// Create a new decoder from QpackConfig.
+    pub fn from_config(config: &crate::QpackConfig) -> Self {
+        Self::with_config(config.max_table_capacity, config.max_blocked_streams, config.blocked_stream_timeout)
     }
     
     /// Create a decoder with custom blocked stream timeout.
@@ -65,9 +75,7 @@ impl Decoder {
         max_blocked_streams: usize,
         timeout: std::time::Duration,
     ) -> Self {
-        let mut decoder = Self::new(max_table_capacity, max_blocked_streams);
-        decoder.blocked_stream_timeout = timeout;
-        decoder
+        Self::with_config(max_table_capacity, max_blocked_streams, timeout)
     }
     
     /// Get immutable reference to dynamic table (for testing/inspection).
