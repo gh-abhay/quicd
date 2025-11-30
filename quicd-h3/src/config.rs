@@ -151,6 +151,8 @@ pub struct H3Config {
 
 impl Default for H3Config {
     fn default() -> Self {
+        let resources = quicd_x::system_resources::SystemResources::query();
+
         Self {
             max_frame_size: 16 * 1024 * 1024, // 16 MB
             max_field_section_size: 64 * 1024, // 64 KB
@@ -167,7 +169,7 @@ impl Default for H3Config {
             grease_probability: 0.1,
             qpack_encoder_instruction_batch_size: 8,
             qpack_decoder_instruction_batch_size: 8,
-            idle_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_millis(resources.optimal_idle_timeout_ms()),
             settings_deadline: Duration::from_secs(10),
             blocked_stream_check_interval: Duration::from_secs(10),
             idle_check_interval: Duration::from_secs(5),
