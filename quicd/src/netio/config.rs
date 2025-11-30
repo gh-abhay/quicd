@@ -83,6 +83,14 @@ pub struct NetIoConfig {
     /// **Used by**: Cloudflare (QUIC servers), kernel bypass alternatives
     #[serde(default = "default_true")]
     pub enable_gso: bool,
+
+    /// Maximum size for coalesced UDP packets (default: 1400 bytes).
+    ///
+    /// When sending multiple packets to the same destination, they are coalesced
+    /// into a single datagram up to this size to reduce syscall overhead.
+    /// Should be ≤ MTU to avoid fragmentation.
+    #[serde(default = "default_max_coalesced_size")]
+    pub max_coalesced_size: usize,
 }
 
 fn default_true() -> bool {
@@ -91,6 +99,10 @@ fn default_true() -> bool {
 
 fn default_uring_entries() -> u32 {
     DEFAULT_URING_ENTRIES
+}
+
+fn default_max_coalesced_size() -> usize {
+    1400
 }
 
 impl Default for NetIoConfig {
@@ -105,6 +117,7 @@ impl Default for NetIoConfig {
             buffer_pool: BufferPoolConfig::default(),
             enable_gro: true, // Enable by default (no-op on unsupported platforms)
             enable_gso: true, // Enable by default (no-op on unsupported platforms)
+            max_coalesced_size: default_max_coalesced_size(),
         }
     }
 }

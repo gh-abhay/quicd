@@ -28,7 +28,7 @@ pub struct GlobalConfig {
     pub logging: LoggingConfig,
 
     /// QUIC transport configuration
-    pub quic: crate::quic::QuicConfig,
+    pub quic: quicd_x::QuicTransportConfig,
 
     /// Network I/O configuration
     pub netio: crate::netio::NetIoConfig,
@@ -47,7 +47,7 @@ impl Default for GlobalConfig {
             tls: TlsConfig::default(),
             runtime: RuntimeConfig::default(),
             logging: LoggingConfig::default(),
-            quic: crate::quic::QuicConfig::default(),
+            quic: quicd_x::QuicTransportConfig::default(),
             netio: crate::netio::NetIoConfig::default(),
             channels: crate::channel_config::ChannelConfig::default(),
             telemetry: crate::telemetry::TelemetryConfig::default(),
