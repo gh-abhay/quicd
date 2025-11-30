@@ -57,8 +57,8 @@ fn main() -> anyhow::Result<()> {
     // Create application registry (initially empty; apps can be registered here)
     info!("Initializing application registry");
     let app_registry = apps::AppRegistry::new()
-        .register("h3", Arc::new(quicd_h3::H3Factory::new(quicd_h3::DefaultH3Handler)))
-        .register("h3-29", Arc::new(quicd_h3::H3Factory::new(quicd_h3::DefaultH3Handler)));
+        .register("h3", Arc::new(quicd_h3::H3Factory::with_config(quicd_h3::DefaultH3Handler, quicd_h3::config::H3Config::default())))
+        .register("h3-29", Arc::new(quicd_h3::H3Factory::with_config(quicd_h3::DefaultH3Handler, quicd_h3::config::H3Config::default())));
 
     info!(
         registered_alpns = ?app_registry.alpns(),
@@ -71,6 +71,7 @@ fn main() -> anyhow::Result<()> {
         bind_addr,
         netio_cfg,
         quic_cfg,
+        config.global.tls.clone(),
         config.global.channels.clone(),
         runtime_handle.clone(),
         app_registry,
