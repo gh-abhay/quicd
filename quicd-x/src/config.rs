@@ -179,23 +179,25 @@ fn default_max_dgram_size() -> usize {
 
 impl Default for QuicTransportConfig {
     fn default() -> Self {
+        let resources = crate::system_resources::SystemResources::query();
+
         Self {
-            max_idle_timeout_ms: DEFAULT_MAX_IDLE_TIMEOUT_MS,
+            max_idle_timeout_ms: resources.optimal_idle_timeout_ms(),
             initial_rtt_ms: DEFAULT_INITIAL_RTT_MS,
             max_streams_bidi: DEFAULT_MAX_STREAMS_BIDI,
             max_streams_uni: DEFAULT_MAX_STREAMS_UNI,
-            max_udp_payload_size: DEFAULT_MAX_UDP_PAYLOAD_SIZE,
-            recv_window: DEFAULT_RECV_WINDOW,
-            stream_recv_window: DEFAULT_STREAM_RECV_WINDOW,
+            max_udp_payload_size: resources.optimal_max_udp_payload(),
+            recv_window: resources.optimal_quic_recv_window(),
+            stream_recv_window: resources.optimal_quic_stream_recv_window(),
             congestion_control: CongestionControl::default(),
             enable_early_data: false,
             disable_active_migration: false,
             enable_pacing: true,
-            max_connections_per_worker: DEFAULT_MAX_CONNECTIONS_PER_WORKER,
+            max_connections_per_worker: (resources.max_connections_from_memory() / resources.optimal_worker_threads()).max(1000),
             enable_version_negotiation: true,
             additional_versions: Vec::new(),
             enable_dgram: false,
-            max_dgram_size: DEFAULT_MAX_UDP_PAYLOAD_SIZE,
+            max_dgram_size: resources.optimal_max_udp_payload(),
             enable_stats: true,
         }
     }

@@ -1806,6 +1806,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "socket2 0.5.10",
+ "sys-info",
  "tokio",
  "tokio-stream",
  "toml",
@@ -1872,7 +1873,10 @@ dependencies = [
  "futures",
  "futures-core",
  "humantime-serde",
+ "libc",
+ "num_cpus",
  "serde",
+ "sys-info",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
@@ -2250,6 +2254,16 @@ name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
+
+[[package]]
+name = "sys-info"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b3a0d0aba8bf96a0e1ddfdc352fc53b3df7f39318c71854910c3c4b024ae52c"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "thiserror"

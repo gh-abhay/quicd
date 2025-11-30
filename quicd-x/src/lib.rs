@@ -141,6 +141,7 @@ mod handle;
 mod server;
 
 pub mod config;
+pub mod system_resources;
 
 pub use crate::config::QuicAppConfig;
 pub use crate::config::QuicTransportConfig;

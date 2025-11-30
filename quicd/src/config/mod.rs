@@ -81,8 +81,10 @@ impl ServerConfig {
     /// - Application configuration validation
     /// - Cross-configuration consistency checks
     /// - Resource limit sanity checks
+    /// - System resource pre-flight checks
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        let mut warnings = Vec::new();
 
         // Validate global config
         if let Err(e) = self.global.validate() {
@@ -109,6 +111,26 @@ impl ServerConfig {
         // Ensure at least one application is configured
         if self.apps.is_empty() {
             errors.push("No applications configured. At least one application must be defined.".to_string());
+        }
+
+        // System resource pre-flight checks
+        let resources = quicd_x::system_resources::SystemResources::query();
+        match resources.validate_system_limits() {
+            Ok(()) => {
+                // System looks good
+            }
+            Err(warns) => {
+                warnings.extend(warns);
+            }
+        }
+
+        // Convert warnings to errors if they're critical
+        for warning in warnings {
+            if warning.contains("File descriptor limit") {
+                errors.push(format!("CRITICAL: {}", warning));
+            } else {
+                eprintln!("WARNING: {}", warning);
+            }
         }
 
         if errors.is_empty() {
