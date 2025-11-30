@@ -81,11 +81,13 @@ fn default_stream_egress_capacity() -> usize {
 
 impl Default for ChannelConfig {
     fn default() -> Self {
+        let resources = quicd_x::system_resources::SystemResources::query();
+
         Self {
-            worker_egress_capacity: default_worker_egress_capacity(),
-            connection_ingress_capacity: default_connection_ingress_capacity(),
-            stream_ingress_capacity: default_stream_ingress_capacity(),
-            stream_egress_capacity: default_stream_egress_capacity(),
+            worker_egress_capacity: resources.optimal_worker_egress_capacity(),
+            connection_ingress_capacity: resources.optimal_connection_ingress_capacity(),
+            stream_ingress_capacity: resources.optimal_stream_channel_capacity(),
+            stream_egress_capacity: resources.optimal_stream_channel_capacity(),
         }
     }
 }
@@ -130,13 +132,16 @@ impl ChannelConfig {
     /// Returns rough estimate in bytes for channel overhead per connection.
     /// Does not include the actual message payloads, just channel structures.
     pub fn estimate_memory_per_connection(&self, avg_streams: usize) -> usize {
+        // Estimate ~100 bytes per channel slot (rough approximation for internal structures)
+        const BYTES_PER_SLOT: usize = 100;
+
         // Connection ingress channel
-        let conn_ingress = self.connection_ingress_capacity * std::mem::size_of::<()>(); // Approximate
+        let conn_ingress = self.connection_ingress_capacity * BYTES_PER_SLOT;
 
         // Stream channels (both directions)
         let stream_channels = avg_streams
             * (self.stream_ingress_capacity + self.stream_egress_capacity)
-            * std::mem::size_of::<()>();
+            * BYTES_PER_SLOT;
 
         conn_ingress + stream_channels
     }
