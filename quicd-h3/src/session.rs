@@ -279,6 +279,25 @@ pub trait H3Handler: Send + Sync + 'static {
     /// # Returns
     /// Result indicating success or error
     async fn handle_request(&self, request: H3Request, sender: &mut H3ResponseSender) -> Result<(), H3Error>;
+    
+    /// Handle an HTTP/3 datagram (RFC 9297).
+    ///
+    /// This method is called when an HTTP/3 datagram is received on the connection.
+    /// Datagrams are unreliable, unordered messages that can be sent over HTTP/3
+    /// for use cases like WebRTC, gaming, or real-time applications.
+    ///
+    /// Default implementation ignores datagrams. Override to handle them.
+    ///
+    /// # Arguments
+    /// * `flow_id` - Quarter stream ID identifying the datagram flow
+    /// * `payload` - Datagram payload bytes
+    ///
+    /// # Returns
+    /// Ok(()) if handled successfully, Err for connection errors
+    async fn handle_datagram(&self, _flow_id: u64, _payload: Bytes) -> Result<(), H3Error> {
+        // Default: ignore datagrams
+        Ok(())
+    }
 }
 
 /// Default HTTP/3 handler that returns a simple 404 Not Found response.
@@ -292,5 +311,9 @@ impl H3Handler for DefaultH3Handler {
     async fn handle_request(&self, _request: H3Request, sender: &mut H3ResponseSender) -> Result<(), H3Error> {
         let body = Bytes::from("404 Not Found");
         sender.send_response(404, vec![("content-type".to_string(), "text/plain".to_string())], body).await
+    }
+    
+    async fn handle_datagram(&self, _flow_id: u64, _payload: Bytes) -> Result<(), H3Error> {
+        Ok(())
     }
 }

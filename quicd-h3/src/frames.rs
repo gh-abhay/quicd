@@ -488,6 +488,7 @@ impl H3Frame {
                 => Ok(()),
             
             // HTTP/2 reserved frame types that MUST NOT be used in HTTP/3
+            // RFC 9114 Section 11.2.1 and Appendix A.2.5
             0x06 => Err(H3Error::Connection(
                 "H3_FRAME_UNEXPECTED: PING frame (HTTP/2 type 0x06) not allowed in HTTP/3".into()
             )),
@@ -496,6 +497,15 @@ impl H3Frame {
             )),
             0x09 => Err(H3Error::Connection(
                 "H3_FRAME_UNEXPECTED: CONTINUATION frame (HTTP/2 type 0x09) not allowed in HTTP/3".into()
+            )),
+            0x0A => Err(H3Error::Connection(
+                "H3_FRAME_UNEXPECTED: ALTSVC frame (HTTP/2 type 0x0A) not allowed in HTTP/3".into()
+            )),
+            0x0B => Err(H3Error::Connection(
+                "H3_FRAME_UNEXPECTED: ORIGIN frame (HTTP/2 type 0x0B) not allowed in HTTP/3".into()
+            )),
+            0x0C => Err(H3Error::Connection(
+                "H3_FRAME_UNEXPECTED: CACHE_DIGEST frame (HTTP/2 type 0x0C) not allowed in HTTP/3".into()
             )),
             
             // RFC 9114 Section 7.2.8: Reserved frame types for greasing
