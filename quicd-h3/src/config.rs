@@ -101,6 +101,28 @@ pub struct H3Config {
     ///
     /// Performance tuning: Higher values reduce syscalls but increase latency.
     pub qpack_decoder_instruction_batch_size: usize,
+    
+    /// Idle connection timeout (default: 30 seconds).
+    ///
+    /// RFC 9114 Section 5.1: Connections with no active streams for this
+    /// duration will be closed gracefully with GOAWAY.
+    pub idle_timeout: Duration,
+    
+    /// Settings frame deadline (default: 10 seconds).
+    ///
+    /// RFC 9114 Section 3.3: Peer must send SETTINGS as first frame on
+    /// control stream within this timeout. Connection closes on violation.
+    pub settings_deadline: Duration,
+    
+    /// Interval for checking blocked stream timeouts (default: 10 seconds).
+    ///
+    /// Performance tuning: How often to scan for timed-out QPACK blocked streams.
+    pub blocked_stream_timeout_check_interval: Duration,
+    
+    /// Interval for checking idle connections (default: 5 seconds).
+    ///
+    /// Performance tuning: How often to check if connection has been idle.
+    pub idle_check_interval: Duration,
 }
 
 impl Default for H3Config {
@@ -121,6 +143,10 @@ impl Default for H3Config {
             blocked_stream_check_interval: Duration::from_secs(10),
             qpack_encoder_instruction_batch_size: 8,
             qpack_decoder_instruction_batch_size: 8,
+            idle_timeout: Duration::from_secs(30),
+            settings_deadline: Duration::from_secs(10),
+            blocked_stream_timeout_check_interval: Duration::from_secs(10),
+            idle_check_interval: Duration::from_secs(5),
         }
     }
 }
@@ -339,6 +365,30 @@ impl H3ConfigBuilder {
     /// Set QPACK decoder instruction batch size.
     pub fn qpack_decoder_instruction_batch_size(mut self, size: usize) -> Self {
         self.config.qpack_decoder_instruction_batch_size = size;
+        self
+    }
+    
+    /// Set idle connection timeout.
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.config.idle_timeout = timeout;
+        self
+    }
+    
+    /// Set settings frame deadline.
+    pub fn settings_deadline(mut self, deadline: Duration) -> Self {
+        self.config.settings_deadline = deadline;
+        self
+    }
+    
+    /// Set blocked stream timeout check interval.
+    pub fn blocked_stream_timeout_check_interval(mut self, interval: Duration) -> Self {
+        self.config.blocked_stream_timeout_check_interval = interval;
+        self
+    }
+    
+    /// Set idle connection check interval.
+    pub fn idle_check_interval(mut self, interval: Duration) -> Self {
+        self.config.idle_check_interval = interval;
         self
     }
     
