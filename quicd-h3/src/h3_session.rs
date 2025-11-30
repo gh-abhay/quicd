@@ -199,13 +199,19 @@ impl<H: H3Handler> H3Session<H> {
         let config = crate::config::H3Config::default();
         let idle_timeout = config.idle_timeout;
         
+        // RFC 9204: Initialize QPACK with configured table sizes
+        // These must match the SETTINGS we will send to the peer
+        let qpack_max_table_capacity = config.qpack_max_table_capacity as usize;
+        let qpack_blocked_streams = config.qpack_blocked_streams as usize;
+        
         Self {
             handle,
             // GAP #6: Use default configuration (can be overridden later)
             config,
-            // QPACK encoder/decoder with default table sizes
-            qpack_encoder: Arc::new(AsyncMutex::new(AsyncEncoder::new(4096, 100))),
-            qpack_decoder: AsyncDecoder::new(4096, 100),
+            // RFC 9204: QPACK encoder/decoder with configured table sizes
+            // Must match SETTINGS_QPACK_MAX_TABLE_CAPACITY and SETTINGS_QPACK_BLOCKED_STREAMS
+            qpack_encoder: Arc::new(AsyncMutex::new(AsyncEncoder::new(qpack_max_table_capacity, qpack_blocked_streams))),
+            qpack_decoder: AsyncDecoder::new(qpack_max_table_capacity, qpack_blocked_streams),
             server_control_send: None,
             streams: Slab::new(),
             stream_id_to_key: HashMap::new(),
@@ -454,11 +460,32 @@ impl<H: H3Handler> H3Session<H> {
                     return Ok(());
                 }
                 
-                // RFC 9297: Forward datagram to application handler
-                // Flow ID parsing: First varint in payload is the quarter stream ID
-                let flow_id = if payload.len() > 0 { payload[0] as u64 } else { 0 };
+                // RFC 9297 Section 2: Parse flow ID (Quarter Stream ID) as varint
+                // "The payload of an HTTP/3 datagram consists of a variable-length integer
+                // field followed by the datagram payload"
+                let (flow_id, consumed) = if !payload.is_empty() {
+                    match crate::frames::H3Frame::decode_varint(&payload) {
+                        Ok((id, len)) => (id, len),
+                        Err(_) => {
+                            // Invalid datagram format - drop it
+                            eprintln!("Datagram with invalid flow ID encoding");
+                            self.metrics.datagrams_received.fetch_add(1, Ordering::Relaxed);
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    // Empty datagram - malformed per RFC 9297
+                    eprintln!("Empty datagram received");
+                    self.metrics.datagrams_received.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                };
+                
+                // Extract datagram payload (after flow ID)
+                let datagram_payload = payload.slice(consumed..);
+                
+                // Forward to application handler
                 let handler = Arc::clone(&self.handler);
-                if let Err(e) = handler.handle_datagram(flow_id, payload).await {
+                if let Err(e) = handler.handle_datagram(flow_id, datagram_payload).await {
                     eprintln!("Datagram handler error: {:?}", e);
                 }
                 self.metrics.datagrams_received.fetch_add(1, Ordering::Relaxed);
@@ -807,21 +834,36 @@ impl<H: H3Handler> H3Session<H> {
 
     async fn send_settings(&mut self) -> Result<(), H3Error> {
         if let Some(send_stream) = &mut self.server_control_send {
-            // Build settings list
+            // Build settings list from configuration
             let mut settings = vec![
-                Setting { identifier: 0x1, value: 4096 }, // SETTINGS_QPACK_MAX_TABLE_CAPACITY (4KB default)
-                Setting { identifier: 0x6, value: 0 }, // SETTINGS_MAX_FIELD_SECTION_SIZE (unlimited)
-                Setting { identifier: 0x7, value: 100 }, // SETTINGS_QPACK_BLOCKED_STREAMS (100 default)
+                Setting { 
+                    identifier: 0x1, 
+                    value: self.config.qpack_max_table_capacity 
+                }, // SETTINGS_QPACK_MAX_TABLE_CAPACITY
+                Setting { 
+                    identifier: 0x6, 
+                    value: self.config.max_field_section_size 
+                }, // SETTINGS_MAX_FIELD_SECTION_SIZE
+                Setting { 
+                    identifier: 0x7, 
+                    value: self.config.qpack_blocked_streams 
+                }, // SETTINGS_QPACK_BLOCKED_STREAMS
             ];
             
             // RFC 9114 Section 4.4: SETTINGS_ENABLE_CONNECT_PROTOCOL for extended CONNECT
-            if self.settings_validator.enable_connect_protocol() {
+            if self.config.enable_connect_protocol {
                 settings.push(Setting { identifier: 0x8, value: 1 }); // SETTINGS_ENABLE_CONNECT_PROTOCOL
+            }
+            
+            // RFC 9297: H3_DATAGRAM setting for datagram support
+            // Only send if enabled in configuration
+            if self.settings_validator.get(known::H3_DATAGRAM).is_some() {
+                settings.push(Setting { identifier: known::H3_DATAGRAM, value: 1 });
             }
             
             // GAP FIX #5: RFC 9114 Section 7.2.4.1: Grease with reserved settings
             // Format: 0x1f * N + 0x21, where N >= 0
-            // Use with ~2% probability to avoid ossification
+            // Use with configured probability to avoid ossification
             if Self::should_grease() {
                 let grease_id = Self::generate_reserved_setting_id();
                 settings.push(Setting { identifier: grease_id, value: 0 });
@@ -1126,33 +1168,47 @@ impl<H: H3Handler> H3Session<H> {
             .map(|(stream_id, _urgency, _weight)| stream_id);
         
         let queued_request = if let Some(priority_stream_id) = selected_stream_id {
-            // O(1) lookup: Find request by stream_id using temp buffer
-            // This is more efficient than draining entire heap
+            // PERF IMPROVEMENT: Instead of scanning the entire heap, use a HashMap
+            // to map stream_id -> request for O(1) lookup. However, BinaryHeap doesn't
+            // support efficient removal of arbitrary elements.
+            //
+            // Compromise: Scan heap until we find the target stream (expected early
+            // in heap for high-priority streams), restore scanned items.
+            // This is O(k) where k = position in heap, better than O(n) queue rebuild.
             let mut found = None;
             let mut temp = Vec::with_capacity(16); // Pre-allocate for typical case
             
+            // Scan up to 32 items (reasonable limit to prevent long stalls)
+            const MAX_SCAN: usize = 32;
+            let mut scanned = 0;
+            
             while let Some(req) = self.request_queue.pop() {
-                if req.stream_id == priority_stream_id && found.is_none() {
+                if req.stream_id == priority_stream_id {
                     found = Some(req);
                     break; // Early exit optimization
                 } else {
                     temp.push(req);
+                    scanned += 1;
+                    if scanned >= MAX_SCAN {
+                        // Fallback: Process top of heap instead
+                        break;
+                    }
                 }
             }
             
-            // Restore queue in O(n log n) but only for checked items
+            // Restore queue - O(k log n) where k = scanned items
             for req in temp {
                 self.request_queue.push(req);
             }
             
             // Mark stream as processed (inactive) after selection
-            if found.is_some() {
-                self.priority_tree.mark_active(priority_stream_id, false);
+            if let Some(ref req) = found {
+                self.priority_tree.mark_active(req.stream_id, false);
             }
             
             found.or_else(|| self.request_queue.pop())
         } else {
-            // No active priority streams, fall back to queue order
+            // No active priority streams, fall back to heap order
             self.request_queue.pop()
         };
         
@@ -1302,6 +1358,23 @@ impl<H: H3Handler> H3Session<H> {
                     // Validate and process SETTINGS
                     self.settings_validator.validate_settings(settings_map.clone())?;
                     
+                    // RFC 9204 Section 3.2.3: Update QPACK encoder with peer's table capacity
+                    if let Some(&peer_capacity) = settings_map.get(&known::QPACK_MAX_TABLE_CAPACITY) {
+                        // Update our encoder's dynamic table capacity to match peer's decoder capacity
+                        if let Err(e) = self.qpack_encoder.lock().await.encoder_mut().set_capacity(peer_capacity as usize) {
+                            eprintln!("Failed to update QPACK encoder capacity: {:?}", e);
+                        }
+                    }
+                    
+                    // RFC 9204 Section 2.1.4: Update maximum blocked streams limit
+                    if let Some(&peer_blocked) = settings_map.get(&known::QPACK_BLOCKED_STREAMS) {
+                        // Note: This limits how many streams WE can have blocked waiting for
+                        // acknowledgments from the peer. The peer's setting limits how many
+                        // of THEIR streams can be blocked waiting for OUR table updates.
+                        // Our encoder already tracks this internally.
+                        eprintln!("Peer allows {} blocked streams", peer_blocked);
+                    }
+                    
                     // RFC 9114 Section 7.2.4.2: Remember settings for future 0-RTT connections
                     // "Clients SHOULD store the settings the server provided in the HTTP/3
                     // connection where resumption information was provided"
@@ -1312,8 +1385,6 @@ impl<H: H3Handler> H3Session<H> {
                     if let Some(ref origin) = self.origin {
                         self.settings_storage.store(origin.clone(), settings_map.clone());
                     }
-                    
-                    // QPACK settings are handled internally by quicd-qpack
                 }
                 _ => {
                     // Validate that SETTINGS was first frame
@@ -1611,9 +1682,17 @@ impl<H: H3Handler> H3Session<H> {
             }
         }
         
-        // QPACK stream cancellation is handled internally by quicd-qpack
+        // RFC 9204 Section 4.5: Send Stream Cancellation on decoder stream
+        // This notifies the encoder that it can stop referencing this stream's
+        // dynamic table entries in future header blocks.
+        self.qpack_decoder.decoder_mut().cancel_stream(stream_id);
         
-        // QPACK references are handled internally by quicd-qpack
+        // Send any pending decoder instructions (including Stream Cancellation)
+        while let Some(inst) = self.qpack_decoder.decoder_mut().poll_decoder_stream() {
+            if let Some(ref stream) = self.decoder_send_stream {
+                let _ = stream.write(inst, false).await;
+            }
+        }
         
         // Clean up stream state after cancellation sent and references released
         if let Some(key) = self.stream_id_to_key.remove(&stream_id) {

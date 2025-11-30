@@ -51,12 +51,15 @@ impl H3Frame {
 
         // Validate frame type is not HTTP/2 reserved type (RFC 9114 Section 7.2.8)
         Self::validate_frame_type(frame_type)?;
+        
+        // RFC 9114 Section 7.1: Verify frame type encoding is minimal
+        Self::validate_varint_encoding(&buf[cursor - type_len..cursor], frame_type)?;
 
         // Parse length (variable-length integer)
         let (length, len_len) = Self::decode_varint(&buf[cursor..])?;
         cursor += len_len;
 
-        // Verify redundant length encoding is minimal (RFC 9114 Section 7.1)
+        // RFC 9114 Section 7.1: Verify length encoding is minimal
         Self::validate_varint_encoding(&buf[cursor - len_len..cursor], length)?;
 
         // GAP #5 FIX: Validate frame size to prevent DoS (RFC 9114 Section 7.1)
@@ -271,10 +274,16 @@ impl H3Frame {
             }
             H3Frame::Settings { settings } => {
                 Self::encode_varint(&mut buf, 0x4);
-                let mut payload = BytesMut::new();
+                let mut payload = BytesMut::with_capacity(settings.len() * 16);
                 for setting in settings {
                     Self::encode_varint(&mut payload, setting.identifier);
                     Self::encode_varint(&mut payload, setting.value);
+                }
+                // RFC 9114: SETTINGS frame should be reasonably sized
+                // Most implementations send 3-10 settings (< 100 bytes total)
+                // Warn if unusually large (but still allow it)
+                if payload.len() > 1024 {
+                    eprintln!("Warning: SETTINGS frame unusually large: {} bytes", payload.len());
                 }
                 Self::encode_varint(&mut buf, payload.len() as u64);
                 buf.extend_from_slice(&payload);
