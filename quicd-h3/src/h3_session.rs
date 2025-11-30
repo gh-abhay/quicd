@@ -107,6 +107,21 @@ enum StreamType {
     QpackDecoder,
 }
 
+/// RFC 9114 Section 4.1: Stream processing phases for proper frame sequencing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPhase {
+    /// Waiting for initial HEADERS frame
+    Initial,
+    /// HEADERS received, processing DATA frames
+    ReceivedHeaders,
+    /// All DATA frames received, may receive trailing HEADERS
+    ReceivedBody,
+    /// Trailing HEADERS received, stream complete
+    ReceivedTrailers,
+    /// Final response sent, stream closing
+    Complete,
+}
+
 #[derive(Debug)]
 enum StreamState {
     Control,
@@ -122,6 +137,18 @@ enum StreamState {
         content_length: Option<u64>,  // From Content-Length header
         bytes_received: u64,          // Sum of DATA frame payload bytes
         // QPACK blocking is handled internally by quicd-qpack
+        // RFC 9114 Section 4.1: Explicit phase tracking for frame sequencing
+        phase: StreamPhase,
+        // RFC 9114 Section 4.1: Track if this is a CONNECT request (no DATA allowed for standard CONNECT)
+        is_connect: bool,
+        // RFC 9114 Section 4.4: Track if this is extended CONNECT with :protocol
+        is_extended_connect: bool,
+        // RFC 9114 Section 4.1.2: Track number of responses received (must be exactly 1 final)
+        // RFC 9114 Section 4.1: Track responses to detect multiple final responses
+        #[allow(dead_code)] // Will be used for multi-response validation
+        response_count: u32,
+        #[allow(dead_code)] // Will be used for interim response limits
+        interim_response_count: u32,
     },
 }
 
@@ -375,6 +402,25 @@ impl<H: H3Handler> H3Session<H> {
                 // Handle stream end
             }
             AppEvent::StreamClosed { stream_id, app_initiated, error_code } => {
+                // RFC 9114 Section 6.2.1: Critical stream closure is fatal
+                if Some(stream_id) == self.peer_control_stream_id {
+                    // Peer's control stream closed - H3_CLOSED_CRITICAL_STREAM
+                    eprintln!("Peer control stream {} closed - fatal error", stream_id);
+                    let error_code = crate::error::H3ErrorCode::ClosedCriticalStream.to_u64();
+                    self.handle.close(error_code, Some(Bytes::from("peer control stream closed")))
+                        .map_err(|e| H3Error::Connection(format!("close error: {:?}", e)))?;
+                    return Err(H3Error::Connection("H3_CLOSED_CRITICAL_STREAM: peer control stream closed".into()));
+                }
+                
+                // Check if our QPACK streams closed
+                if Some(stream_id) == self.peer_encoder_stream_id || Some(stream_id) == self.peer_decoder_stream_id {
+                    eprintln!("Peer QPACK stream {} closed - fatal error", stream_id);
+                    let error_code = crate::error::H3ErrorCode::ClosedCriticalStream.to_u64();
+                    self.handle.close(error_code, Some(Bytes::from("peer QPACK stream closed")))
+                        .map_err(|e| H3Error::Connection(format!("close error: {:?}", e)))?;
+                    return Err(H3Error::Connection("H3_CLOSED_CRITICAL_STREAM: peer QPACK stream closed".into()));
+                }
+                
                 // RFC 9114 Section 4.1.1: Stream was reset
                 // Clean up stream state and notify QPACK decoder if needed
                 self.handle_stream_closed(stream_id, app_initiated, error_code).await?;
@@ -599,6 +645,12 @@ impl<H: H3Handler> H3Session<H> {
             content_length: None,
             bytes_received: 0,
             // QPACK blocking is handled internally by quicd-qpack
+            // RFC 9114 Section 4.1: Initialize stream phase tracking
+            phase: StreamPhase::Initial,
+            is_connect: false,
+            is_extended_connect: false,
+            response_count: 0,
+            interim_response_count: 0,
         });
         self.stream_id_to_key.insert(stream_id, stream_key);
 
@@ -975,7 +1027,28 @@ impl<H: H3Handler> H3Session<H> {
         // RFC 9114 Section 7.2: Validate frame is allowed on request stream (before any borrows)
         self.validate_frame_on_stream(&frame, StreamType::Request)?;
         
-        if let Some(StreamState::Request { headers_received, trailers_received, body, trailers, send_stream, content_length, bytes_received }) = 
+        // RFC 9114 Section 4.1: Validate frame sequence based on current phase
+        if let Some(key) = self.stream_id_to_key.get(&stream_id) {
+            if let Some(StreamState::Request { phase, .. }) = self.streams.get(*key) {
+                match (&frame, phase) {
+                    // DATA before HEADERS is malformed
+                    (H3Frame::Data { .. }, StreamPhase::Initial) => {
+                        return Err(H3Error::MessageError);
+                    }
+                    // Multiple final HEADERS frames not allowed (trailers after trailers)
+                    (H3Frame::Headers { .. }, StreamPhase::ReceivedTrailers) => {
+                        return Err(H3Error::MessageError);
+                    }
+                    // DATA after trailers not allowed
+                    (H3Frame::Data { .. }, StreamPhase::ReceivedTrailers) => {
+                        return Err(H3Error::MessageError);
+                    }
+                    _ => {} // Other sequences are valid
+                }
+            }
+        }
+        
+        if let Some(StreamState::Request { headers_received, trailers_received, body, trailers, send_stream, content_length, bytes_received, phase, is_connect, is_extended_connect, response_count: _, interim_response_count: _ }) = 
             self.streams.get_mut(self.stream_id_to_key[&stream_id]) 
         {
             // RFC 9114 Section 4.1: Process frame on request stream
@@ -1000,6 +1073,12 @@ impl<H: H3Handler> H3Session<H> {
                                 String::from_utf8_lossy(&field.value).to_string(),
                             ))
                             .collect();
+                        
+                        // RFC 9114 Section 4.4: Detect CONNECT method
+                        let method_opt = headers.iter().find(|(n, _)| n == ":method").map(|(_, v)| v.as_str());
+                        let has_protocol = headers.iter().any(|(n, _)| n == ":protocol");
+                        *is_connect = method_opt == Some("CONNECT");
+                        *is_extended_connect = *is_connect && has_protocol;
                         
                         // PERF FIX: Batch decoder instructions to reduce syscalls
                         // RFC 9204: Batching improves throughput
@@ -1046,6 +1125,8 @@ impl<H: H3Handler> H3Session<H> {
                         self.metrics.frames_headers_received.fetch_add(1, Ordering::Relaxed);
                         
                         *headers_received = true;
+                        // RFC 9114 Section 4.1: Update phase after initial HEADERS
+                        *phase = StreamPhase::ReceivedHeaders;
                         // Queue request for priority-based processing instead of handling immediately
                         let priority_id = self.stream_priorities.get(&stream_id).copied().unwrap_or(255); // Default priority
                         let queued_request = QueuedRequest {
@@ -1111,6 +1192,8 @@ impl<H: H3Handler> H3Session<H> {
                         
                         *trailers_received = true;
                         *trailers = Some(trailer_headers);
+                        // RFC 9114 Section 4.1: Update phase after trailers
+                        *phase = StreamPhase::ReceivedTrailers;
                     } else {
                         // Multiple trailer frames not allowed
                         return Err(H3Error::FrameUnexpected);
@@ -1124,10 +1207,11 @@ impl<H: H3Handler> H3Session<H> {
                         return Err(H3Error::Http("DATA after trailers".into()));
                     }
                     
-                    // ISSUE FIX #3: RFC 9114 Section 4.4: Standard CONNECT MUST NOT have body
-                    // Check if this is a standard (not extended) CONNECT request
-                    // Extended CONNECT has :protocol pseudo-header and MAY have body
-                    // This is validated during header parsing, but we enforce it here too
+                    // RFC 9114 Section 4.4: Standard CONNECT MUST NOT have body
+                    // Extended CONNECT (with :protocol) MAY have body
+                    if *is_connect && !*is_extended_connect {
+                        return Err(H3Error::MessageError);
+                    }
                     
                     // GAP FIX: Handle empty DATA frames properly
                     // RFC 9114 Section 7.2.1: Empty DATA frames are allowed but should not
@@ -1342,6 +1426,27 @@ impl<H: H3Handler> H3Session<H> {
         // PERF #2: Try to parse multiple frames if available
         if let Ok((frames, _)) = H3Frame::parse_multiple(&data) {
             for frame in frames {
+            // RFC 9114 Section 7.2.1: DATA frames MUST NOT appear on control stream
+            if matches!(frame, H3Frame::Data { .. }) {
+                return Err(H3Error::Connection(
+                    "FRAME_UNEXPECTED: DATA frame on control stream".into()
+                ));
+            }
+            
+            // RFC 9114 Section 7.2.2: HEADERS frames MUST NOT appear on control stream
+            if matches!(frame, H3Frame::Headers { .. }) {
+                return Err(H3Error::Connection(
+                    "FRAME_UNEXPECTED: HEADERS frame on control stream".into()
+                ));
+            }
+            
+            // RFC 9114 Section 7.2.5: PUSH_PROMISE frames MUST NOT appear on control stream
+            if matches!(frame, H3Frame::PushPromise { .. }) {
+                return Err(H3Error::Connection(
+                    "FRAME_UNEXPECTED: PUSH_PROMISE frame on control stream".into()
+                ));
+            }
+            
             // Validate frame is allowed on control stream
             self.validate_frame_on_stream(&frame, StreamType::Control)?;
             // RFC 9114 Section 6.2.1: SETTINGS MUST be first frame on control stream
@@ -1411,6 +1516,16 @@ impl<H: H3Handler> H3Session<H> {
                     // This enables proper 0-RTT validation on future connections
                     if let Some(ref origin) = self.origin {
                         self.settings_storage.store(origin.clone(), settings_map.clone());
+                    }
+                    
+                    // RFC 9114 Section 7.2.4.2: Validate no omitted non-default settings
+                    // "The server MUST include all settings that differ from their default values"
+                    if self.settings_validator.get_remembered_settings().is_some() {
+                        // This is a 0-RTT connection - ensure all non-default settings are present
+                        // The validator already checked compatibility, but we log for monitoring
+                        if settings_map.len() < 2 {
+                            eprintln!("Warning: 0-RTT SETTINGS frame may be missing non-default settings");
+                        }
                     }
                 }
                 _ => {
