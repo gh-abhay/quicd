@@ -339,18 +339,18 @@ impl<H: H3Handler> H3Session<H> {
         match event {
             AppEvent::HandshakeCompleted { alpn, .. } => {
                 if alpn.starts_with("h3") {
-                    // GAP FIX: RFC 9114 Section 7.2.4.2: Check if connection is using 0-RTT
-                    // If so, we need to validate that received settings are compatible
-                    // with the remembered settings from the previous session
-                    let is_0rtt = self.handle.is_in_early_data().await.unwrap_or(false);
-                    
-                    if is_0rtt {
-                        // Mark that we're in 0-RTT mode for settings validation
-                        // The actual validation happens when SETTINGS frame is received
-                        eprintln!("Connection using 0-RTT - will validate settings compatibility");
-                    }
-                    
-                    // Initialize HTTP/3 session
+            // RFC 9114 Section 7.2.4.2: Check if connection is using 0-RTT
+            // "When a 0-RTT QUIC connection is being used, the initial value of each
+            // server setting is the value used in the previous session."
+            // The settings validator already has remembered settings if available from storage.
+            // Actual 0-RTT validation occurs when peer SETTINGS frame arrives.
+            let is_0rtt = self.handle.is_in_early_data().await.unwrap_or(false);
+            
+            if is_0rtt {
+                // Mark that we're in 0-RTT mode for settings validation
+                // The actual validation happens when SETTINGS frame is received
+                eprintln!("Connection using 0-RTT - will validate settings compatibility against remembered values");
+            }                    // Initialize HTTP/3 session
                     self.initialize_session().await?;
                 }
             }
@@ -775,10 +775,18 @@ impl<H: H3Handler> H3Session<H> {
                     self.qpack_decoder.process_encoder_instruction(bytes.as_ref()).await
                         .map_err(|e| H3Error::Qpack(format!("encoder stream instruction error: {:?}", e)))?;
                     
-                    // Send any resulting decoder instructions back to peer
+                    // PERF FIX: Batch decoder instructions from encoder stream processing
+                    let mut decoder_instructions = Vec::new();
                     while let Some(inst) = self.qpack_decoder.decoder_mut().poll_decoder_stream() {
+                        decoder_instructions.push(inst);
+                    }
+                    if !decoder_instructions.is_empty() {
                         if let Some(ref stream) = self.decoder_send_stream {
-                            let _ = stream.write(inst, false).await;
+                            let mut batch = bytes::BytesMut::new();
+                            for inst in decoder_instructions {
+                                batch.extend_from_slice(&inst);
+                            }
+                            let _ = stream.write(batch.freeze(), false).await;
                         }
                     }
                     
@@ -856,8 +864,10 @@ impl<H: H3Handler> H3Session<H> {
             }
             
             // RFC 9297: H3_DATAGRAM setting for datagram support
-            // Only send if enabled in configuration
-            if self.settings_validator.get(known::H3_DATAGRAM).is_some() {
+            // Send if datagrams are enabled in configuration
+            // "An endpoint that supports HTTP Datagrams and uses HTTP/3 Datagrams MUST
+            // include SETTINGS_H3_DATAGRAM in the HTTP/3 SETTINGS frame."
+            if self.config.enable_datagrams {
                 settings.push(Setting { identifier: known::H3_DATAGRAM, value: 1 });
             }
             
@@ -991,10 +1001,19 @@ impl<H: H3Handler> H3Session<H> {
                             ))
                             .collect();
                         
-                        // Send any pending decoder instructions
+                        // PERF FIX: Batch decoder instructions to reduce syscalls
+                        // RFC 9204: Batching improves throughput
+                        let mut decoder_instructions = Vec::new();
                         while let Some(inst) = self.qpack_decoder.decoder_mut().poll_decoder_stream() {
+                            decoder_instructions.push(inst);
+                        }
+                        if !decoder_instructions.is_empty() {
                             if let Some(ref stream) = self.decoder_send_stream {
-                                let _ = stream.write(inst, false).await;
+                                let mut batch = bytes::BytesMut::new();
+                                for inst in decoder_instructions {
+                                    batch.extend_from_slice(&inst);
+                                }
+                                let _ = stream.write(batch.freeze(), false).await;
                             }
                         }
                         
@@ -1056,10 +1075,18 @@ impl<H: H3Handler> H3Session<H> {
                             ))
                             .collect();
                         
-                        // Send any pending decoder instructions
+                        // PERF FIX: Send decoder instructions in batch (trailers path)
+                        let mut decoder_instructions = Vec::new();
                         while let Some(inst) = self.qpack_decoder.decoder_mut().poll_decoder_stream() {
+                            decoder_instructions.push(inst);
+                        }
+                        if !decoder_instructions.is_empty() {
                             if let Some(ref stream) = self.decoder_send_stream {
-                                let _ = stream.write(inst, false).await;
+                                let mut batch = bytes::BytesMut::new();
+                                for inst in decoder_instructions {
+                                    batch.extend_from_slice(&inst);
+                                }
+                                let _ = stream.write(batch.freeze(), false).await;
                             }
                         }
                         
@@ -1687,10 +1714,18 @@ impl<H: H3Handler> H3Session<H> {
         // dynamic table entries in future header blocks.
         self.qpack_decoder.decoder_mut().cancel_stream(stream_id);
         
-        // Send any pending decoder instructions (including Stream Cancellation)
+        // PERF FIX: Batch decoder instructions including Stream Cancellation
+        let mut decoder_instructions = Vec::new();
         while let Some(inst) = self.qpack_decoder.decoder_mut().poll_decoder_stream() {
+            decoder_instructions.push(inst);
+        }
+        if !decoder_instructions.is_empty() {
             if let Some(ref stream) = self.decoder_send_stream {
-                let _ = stream.write(inst, false).await;
+                let mut batch = bytes::BytesMut::new();
+                for inst in decoder_instructions {
+                    batch.extend_from_slice(&inst);
+                }
+                let _ = stream.write(batch.freeze(), false).await;
             }
         }
         
@@ -2094,10 +2129,11 @@ impl<H: H3Handler> H3Session<H> {
             let encoded_headers = encoder_guard.encoder_mut().encode(stream_id, &all_headers)
                 .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
 
-            // Send any pending encoder instructions
-            while let Some(inst) = encoder_guard.encoder_mut().poll_encoder_stream() {
+            // PERF FIX: Send pending encoder instructions in batch to reduce syscalls
+            // RFC 9204: Batching encoder stream instructions improves throughput
+            if let Some(batched_instructions) = encoder_guard.encoder_mut().poll_encoder_stream_batch(16) {
                 if let Some(encoder_stream) = self.encoder_send_stream.lock().await.as_mut() {
-                    let _ = encoder_stream.write(inst, false).await;
+                    let _ = encoder_stream.write(batched_instructions, false).await;
                 }
             }
             
