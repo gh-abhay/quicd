@@ -10,7 +10,9 @@ quicd-h3 = { path = "../quicd-h3" }
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 config = "0.14"
+toml = "0.8"
 anyhow = "1.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
