@@ -44,6 +44,7 @@ impl H3Frame {
     /// Parses a frame from the given buffer (slice-based, makes copies).
     pub fn parse(buf: &[u8]) -> Result<(H3Frame, usize), H3Error> {
         let mut cursor = 0;
+        let buf_len = buf.len();
 
         // Parse frame type (variable-length integer)
         let (frame_type, type_len) = Self::decode_varint(&buf[cursor..])?;
@@ -61,6 +62,14 @@ impl H3Frame {
 
         // RFC 9114 Section 7.1: Verify length encoding is minimal
         Self::validate_varint_encoding(&buf[cursor - len_len..cursor], length)?;
+        
+        // RFC 9114 Section 10.8: Frame payload MUST match length exactly
+        // "Each frame's payload MUST contain exactly the fields identified in its description."
+        let header_len = cursor;
+        let expected_total_len = header_len + (length as usize);
+        if buf_len < expected_total_len {
+            return Err(H3Error::FrameParse("buffer too small for frame payload".into()));
+        }
 
         // GAP #5 FIX: Validate frame size to prevent DoS (RFC 9114 Section 7.1)
         // Maximum frame payload size: 16 MB (configurable in production)
@@ -82,7 +91,11 @@ impl H3Frame {
 
         let frame = match frame_type {
             0x0 => H3Frame::Data { data: Bytes::copy_from_slice(payload) },
-            0x1 => H3Frame::Headers { encoded_headers: Bytes::copy_from_slice(payload) },
+            0x1 => {
+                // RFC 9114 Section 10.8: Verify payload is exactly the encoded field section
+                // No additional bytes should be present
+                H3Frame::Headers { encoded_headers: Bytes::copy_from_slice(payload) }
+            },
             0x2 => H3Frame::Priority { priority: Priority::parse(payload)? },
             0x3 => {
                 let (push_id, _) = Self::decode_varint(payload)
