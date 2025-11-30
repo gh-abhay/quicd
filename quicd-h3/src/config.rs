@@ -3,13 +3,15 @@
 //! This module provides configuration options for the HTTP/3 session,
 //! allowing operators to tune performance, security, and resource limits.
 
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Configuration for HTTP/3 session behavior.
 ///
 /// Default values are chosen for a balance of performance, security, and
 /// RFC compliance. Adjust based on your deployment needs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct H3Config {
     /// Maximum size of a single HTTP/3 frame payload (default: 16 MB).
     ///
@@ -42,6 +44,7 @@ pub struct H3Config {
     /// RFC 9204 Section 2.1.4: "Implementations SHOULD impose a timeout"
     /// on blocked streams. Streams blocked longer are reset with
     /// H3_QPACK_DECOMPRESSION_FAILED.
+    #[serde(with = "humantime_serde")]
     pub qpack_blocked_stream_timeout: Duration,
     
     /// Maximum number of concurrent bidirectional streams (default: 100).
@@ -97,6 +100,7 @@ pub struct H3Config {
     ///
     /// Performance tuning: Lower values improve responsiveness but increase
     /// CPU overhead. Higher values reduce overhead but delay timeout detection.
+    #[serde(with = "humantime_serde")]
     pub blocked_stream_check_interval: Duration,
     
     /// Maximum number of QPACK encoder instructions to batch (default: 8).
@@ -113,22 +117,26 @@ pub struct H3Config {
     ///
     /// RFC 9114 Section 5.1: Connections with no active streams for this
     /// duration will be closed gracefully with GOAWAY.
+    #[serde(with = "humantime_serde")]
     pub idle_timeout: Duration,
     
     /// Settings frame deadline (default: 10 seconds).
     ///
     /// RFC 9114 Section 3.3: Peer must send SETTINGS as first frame on
     /// control stream within this timeout. Connection closes on violation.
+    #[serde(with = "humantime_serde")]
     pub settings_deadline: Duration,
     
     /// Interval for checking blocked stream timeouts (default: 10 seconds).
     ///
     /// Performance tuning: How often to scan for timed-out QPACK blocked streams.
+    #[serde(with = "humantime_serde")]
     pub blocked_stream_timeout_check_interval: Duration,
     
     /// Interval for checking idle connections (default: 5 seconds).
     ///
     /// Performance tuning: How often to check if connection has been idle.
+    #[serde(with = "humantime_serde")]
     pub idle_check_interval: Duration,
 }
 

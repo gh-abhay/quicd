@@ -13,6 +13,8 @@ async-trait = "0.1"
 thiserror = "1.0"
 http = "0.2"
 slab = "0.4"
+serde = { version = "1", features = ["derive"] }
+humantime-serde = "1"
 
 [dev-dependencies]
 criterion = "0.5"

@@ -20,18 +20,18 @@ fn main() -> anyhow::Result<()> {
     }
     let config = config::load_config()?;
 
-    info!(?config, "configuration loaded");
+    info!("Configuration loaded successfully");
 
-    let bind_addr: SocketAddr = format!("{}:{}", config.host, config.port)
+    let bind_addr: SocketAddr = format!("{}:{}", config.global.network.host, config.global.network.port)
         .parse()
         .with_context(|| "invalid bind address")?;
-    let netio_cfg = config.netio.clone();
-    let quic_cfg = config.quic.clone();
-    let telemetry_cfg = config.telemetry.clone();
+    let netio_cfg = config.global.netio.clone();
+    let quic_cfg = config.global.quic.clone();
+    let telemetry_cfg = config.global.telemetry.clone();
 
     // Create tokio runtime for non-critical async tasks (telemetry, future app logic)
     info!("Creating tokio runtime for async tasks");
-    let tokio_runtime = runtime::create_runtime(&config.runtime)
+    let tokio_runtime = runtime::create_runtime(&config.global.runtime)
         .with_context(|| "failed to create tokio runtime")?;
 
     // Get runtime handle for explicit task spawning
@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
         bind_addr,
         netio_cfg,
         quic_cfg,
-        config.channels.clone(),
+        config.global.channels.clone(),
         runtime_handle.clone(),
         app_registry,
     )
