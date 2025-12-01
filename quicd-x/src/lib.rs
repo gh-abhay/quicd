@@ -157,3 +157,58 @@ pub use crate::server::{
     new_connection_handle, new_recv_stream, new_send_stream, ConnectionState, EgressCommand,
     StreamWriteCmd,
 };
+
+/// Macro to export a QUIC application factory from a dynamic library.
+///
+/// This macro generates the necessary C-ABI entry point for the `quicd` server
+/// to load and instantiate the application factory.
+///
+/// # Requirements
+///
+/// - The factory type must implement `Default`
+/// - The factory type must implement `QuicAppFactory`
+/// - The library must be compiled as a `cdylib` (set in Cargo.toml)
+/// - The `quicd-x` version must match the server's version
+///
+/// # Example
+///
+/// ```rust
+/// use quicd_x::{QuicAppFactory, export_quic_app};
+/// use async_trait::async_trait;
+///
+/// #[derive(Default)]
+/// struct MyAppFactory;
+///
+/// #[async_trait]
+/// impl QuicAppFactory for MyAppFactory {
+///     fn accepts_alpn(&self, alpn: &str) -> bool {
+///         alpn == "my-proto"
+///     }
+///     // ... implement other required methods
+/// }
+///
+/// export_quic_app!(MyAppFactory);
+/// ```
+///
+/// # Cargo.toml Configuration
+///
+/// ```toml
+/// [lib]
+/// crate-type = ["cdylib"]
+///
+/// [dependencies]
+/// quicd-x = "0.1"  # Must match server version
+/// ```
+#[macro_export]
+macro_rules! export_quic_app {
+    ($factory_type:ty) => {
+        #[no_mangle]
+        pub extern "C" fn _quicd_create_factory() -> *mut std::ffi::c_void {
+            let factory: Box<dyn $crate::QuicAppFactory> = Box::new(<$factory_type>::default());
+            // Double-box to convert fat pointer (trait object) to thin pointer
+            let wrapper: Box<Box<dyn $crate::QuicAppFactory>> = Box::new(factory);
+            Box::into_raw(wrapper) as *mut std::ffi::c_void
+        }
+    };
+}
+

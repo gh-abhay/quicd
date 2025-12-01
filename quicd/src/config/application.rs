@@ -27,8 +27,8 @@ pub struct ApplicationConfig {
     /// Type-specific configuration.
     ///
     /// The structure of this field depends on `app_type`:
-    /// - `Http3` → HTTP/3 configuration
-    /// - `Custom` → Generic key-value configuration
+    /// - `Http3` → HTTP/3 configuration (built-in)
+    /// - `Plugin` → Dynamic library configuration
     #[serde(flatten)]
     pub config: ApplicationTypeConfig,
 }
@@ -69,11 +69,10 @@ pub enum ApplicationType {
     /// HTTP/3 protocol (RFC 9114)
     Http3,
 
-    /// Custom application protocol
+    /// Dynamically loaded plugin
     ///
-    /// Uses generic key-value configuration and requires a custom
-    /// `QuicAppFactory` implementation.
-    Custom,
+    /// Loads an application factory from a shared library (.so/.dylib/.dll).
+    Plugin,
 }
 
 /// Type-specific application configuration.
@@ -85,8 +84,8 @@ pub enum ApplicationTypeConfig {
     /// HTTP/3 configuration
     Http3(Http3Config),
 
-    /// Custom application configuration
-    Custom(CustomConfig),
+    /// Plugin configuration
+    Plugin(PluginConfig),
 }
 
 impl Default for ApplicationTypeConfig {
@@ -102,20 +101,20 @@ impl ApplicationTypeConfig {
             (ApplicationTypeConfig::Http3(cfg), ApplicationType::Http3) => {
                 cfg.validate().map_err(|e| vec![e])
             }
-            (ApplicationTypeConfig::Custom(_), ApplicationType::Custom) => {
-                // Custom configs are opaque to the server
-                Ok(())
+            (ApplicationTypeConfig::Plugin(cfg), ApplicationType::Plugin) => {
+                cfg.validate().map_err(|e| vec![e])
             }
-            (ApplicationTypeConfig::Http3(_), ApplicationType::Custom) => {
-                Err(vec!["Type mismatch: expected Custom config but got Http3".to_string()])
+            (ApplicationTypeConfig::Http3(_), ApplicationType::Plugin) => {
+                Err(vec!["Type mismatch: expected Plugin config but got Http3".to_string()])
             }
-            (ApplicationTypeConfig::Custom(_), ApplicationType::Http3) => {
-                Err(vec!["Type mismatch: expected Http3 config but got Custom".to_string()])
+            (ApplicationTypeConfig::Plugin(_), ApplicationType::Http3) => {
+                Err(vec!["Type mismatch: expected Http3 config but got Plugin".to_string()])
             }
         }
     }
 
     /// Try to extract HTTP/3 configuration.
+    #[allow(dead_code)]
     pub fn as_http3(&self) -> Option<&Http3Config> {
         match self {
             ApplicationTypeConfig::Http3(cfg) => Some(cfg),
@@ -123,10 +122,11 @@ impl ApplicationTypeConfig {
         }
     }
 
-    /// Try to extract custom configuration.
-    pub fn as_custom(&self) -> Option<&CustomConfig> {
+    /// Try to extract plugin configuration.
+    #[allow(dead_code)]
+    pub fn as_plugin(&self) -> Option<&PluginConfig> {
         match self {
-            ApplicationTypeConfig::Custom(cfg) => Some(cfg),
+            ApplicationTypeConfig::Plugin(cfg) => Some(cfg),
             _ => None,
         }
     }
@@ -171,16 +171,42 @@ impl Http3Config {
     }
 }
 
-/// Custom application configuration.
+/// Plugin application configuration.
 ///
-/// Opaque key-value configuration for custom application protocols.
-/// The server does not validate this; it's passed directly to the
-/// application's `QuicAppFactory`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CustomConfig {
-    /// Arbitrary configuration parameters
-    #[serde(flatten)]
-    pub params: HashMap<String, serde_json::Value>,
+/// # ABI Compatibility
+///
+/// The plugin must be compiled with:
+/// - The same Rust compiler version as the server
+/// - The same `quicd-x` dependency version
+/// - Compatible system ABI (same target triple)
+///
+/// Failure to meet these requirements will result in undefined behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginConfig {
+    /// Path to the dynamic library (.so, .dylib, .dll)
+    ///
+    /// Can be absolute or relative to the server's working directory.
+    pub library_path: String,
+}
+
+impl PluginConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.library_path.is_empty() {
+            return Err("Library path cannot be empty".to_string());
+        }
+
+        // Check if the file exists
+        let path = std::path::Path::new(&self.library_path);
+        if !path.exists() {
+            return Err(format!("Plugin library not found: {}", self.library_path));
+        }
+
+        if !path.is_file() {
+            return Err(format!("Plugin path is not a file: {}", self.library_path));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -208,8 +234,15 @@ mod tests {
     }
 
     #[test]
-    fn test_type_mismatch() {
-        let config = ApplicationTypeConfig::Http3(Http3Config::default());
-        assert!(config.validate(&ApplicationType::Custom).is_err());
+    fn test_plugin_config_validation() {
+        let plugin = PluginConfig {
+            library_path: String::new(),
+        };
+        assert!(plugin.validate().is_err());
+
+        let plugin = PluginConfig {
+            library_path: "/nonexistent/path.so".to_string(),
+        };
+        assert!(plugin.validate().is_err());
     }
 }
