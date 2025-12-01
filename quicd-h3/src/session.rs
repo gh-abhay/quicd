@@ -311,9 +311,14 @@ pub struct DefaultH3Handler;
 
 #[async_trait]
 impl H3Handler for DefaultH3Handler {
-    async fn handle_request(&self, _request: H3Request, sender: &mut H3ResponseSender) -> Result<(), H3Error> {
-        let body = Bytes::from("404 Not Found");
-        sender.send_response(404, vec![("content-type".to_string(), "text/plain".to_string())], body).await
+    async fn handle_request(&self, request: H3Request, sender: &mut H3ResponseSender) -> Result<(), H3Error> {
+        if request.method == Method::GET && request.uri.path() == "/" {
+            let body = Bytes::from("Hello World");
+            sender.send_response(200, vec![("content-type".to_string(), "text/plain".to_string())], body).await
+        } else {
+            let body = Bytes::from("404 Not Found");
+            sender.send_response(404, vec![("content-type".to_string(), "text/plain".to_string())], body).await
+        }
     }
     
     async fn handle_datagram(&self, _flow_id: u64, _payload: Bytes) -> Result<(), H3Error> {
