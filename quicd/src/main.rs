@@ -54,11 +54,37 @@ fn main() -> anyhow::Result<()> {
 
     info!("eBPF routing initialized successfully");
 
-    // Create application registry (initially empty; apps can be registered here)
+    // Create application registry
     info!("Initializing application registry");
-    let app_registry = apps::AppRegistry::new()
-        .register("h3", Arc::new(quicd_h3::H3Factory::with_config(quicd_h3::DefaultH3Handler, quicd_h3::config::H3Config::default())))
-        .register("h3-29", Arc::new(quicd_h3::H3Factory::with_config(quicd_h3::DefaultH3Handler, quicd_h3::config::H3Config::default())));
+    let mut app_registry = apps::AppRegistry::new();
+
+    for app_config in &config.apps {
+        match &app_config.config {
+            config::application::ApplicationTypeConfig::Http3(h3_cfg) => {
+                if h3_cfg.enabled {
+                    let factory = Arc::new(quicd_h3::H3Factory::with_config(
+                        quicd_h3::DefaultH3Handler,
+                        h3_cfg.h3.clone(),
+                    ));
+                    app_registry = app_registry.register(&app_config.alpn, factory);
+                }
+            }
+            config::application::ApplicationTypeConfig::Plugin(plugin_cfg) => {
+                info!("Loading plugin for ALPN {}: {}", app_config.alpn, plugin_cfg.library_path);
+                let factory = apps::load_plugin(&plugin_cfg.library_path)
+                    .with_context(|| format!("Failed to load plugin for ALPN {}", app_config.alpn))?;
+                app_registry = app_registry.register(&app_config.alpn, factory);
+            }
+        }
+    }
+
+    // Fallback to default H3 if registry is empty (for backward compatibility)
+    if app_registry.is_empty() {
+        info!("No applications configured, registering default H3 handlers");
+        app_registry = app_registry
+            .register("h3", Arc::new(quicd_h3::H3Factory::with_config(quicd_h3::DefaultH3Handler, quicd_h3::config::H3Config::default())))
+            .register("h3-29", Arc::new(quicd_h3::H3Factory::with_config(quicd_h3::DefaultH3Handler, quicd_h3::config::H3Config::default())));
+    }
 
     info!(
         registered_alpns = ?app_registry.alpns(),
