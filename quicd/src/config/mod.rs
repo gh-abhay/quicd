@@ -21,14 +21,13 @@
 //! alpn = "h3"
 //! type = "http3"
 //! [applications.config]
-//! max_concurrent_streams = 100
-//! enable_server_push = false
+//! enabled = true
 //!
 //! [[applications]]
 //! alpn = "my-proto"
-//! type = "custom"
+//! type = "plugin"
 //! [applications.config]
-//! # custom config here
+//! library_path = "/path/to/libmy_proto.so"
 //! ```
 
 pub mod application;
