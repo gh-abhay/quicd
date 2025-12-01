@@ -32,7 +32,7 @@ host = "127.0.0.1"
 
 # UDP port to bind to
 # Standard: 443 (requires privileges), 8443 (common alternative)
-port = 8080
+port = 443
 
 # Enable SO_REUSEADDR socket option
 # Allows quick restarts by reusing recently-closed ports
@@ -44,11 +44,11 @@ reuse_addr = true
 [global.tls]
 # Path to TLS certificate file (PEM format)
 # If omitted, a self-signed certificate will be generated
-# cert_path = "/etc/quicd/certs/cert.pem"
+cert_path = "certs/cert.pem"
 
 # Path to TLS private key file (PEM format)
 # Required if cert_path is specified
-# key_path = "/etc/quicd/certs/key.pem"
+key_path = "certs/key.pem"
 
 # Enable TLS 1.3 early data (0-RTT)
 # WARNING: 0-RTT data is not forward secret and can be replayed
@@ -80,7 +80,7 @@ enable_thread_stats = false
 # ----------------------------------------------------------------------------
 [global.logging]
 # Log level: "trace", "debug", "info", "warn", "error"
-level = "info"
+level = "debug"
 
 # Enable structured JSON logging (for machine parsing)
 json_format = false
