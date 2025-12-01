@@ -23,6 +23,9 @@
 use quicd_x::QuicAppFactory;
 use std::collections::HashMap;
 use std::sync::Arc;
+use anyhow::Context;
+use libloading::{Library, Symbol};
+use std::ffi::c_void;
 
 /// Registry of QUIC application factories indexed by ALPN.
 ///
@@ -44,6 +47,7 @@ impl AppRegistry {
     }
 
     /// Create a registry with initial factories
+    #[allow(dead_code)]
     pub fn with_factories(factories: HashMap<String, Arc<dyn QuicAppFactory>>) -> Self {
         Self {
             factories: Arc::new(factories),
@@ -70,6 +74,7 @@ impl AppRegistry {
     }
 
     /// Check if an ALPN is supported
+    #[allow(dead_code)]
     pub fn supports(&self, alpn: &str) -> bool {
         self.factories.contains_key(alpn)
     }
@@ -80,6 +85,7 @@ impl AppRegistry {
     }
 
     /// Get the number of registered applications
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.factories.len()
     }
@@ -101,6 +107,53 @@ impl std::fmt::Debug for AppRegistry {
         f.debug_struct("AppRegistry")
             .field("alpns", &self.alpns())
             .finish()
+    }
+}
+
+/// Load an application factory from a dynamic library.
+///
+/// # Safety Requirements
+///
+/// The plugin library must:
+/// - Be compiled with the same Rust compiler version as the server
+/// - Link against the same `quicd-x` version
+/// - Export `_quicd_create_factory` function (use `export_quic_app!` macro)
+/// - Be compiled for the same target architecture
+///
+/// Violating these requirements leads to undefined behavior.
+///
+/// # Arguments
+///
+/// * `path` - Path to the dynamic library file (.so/.dylib/.dll)
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The library file cannot be loaded
+/// - The required symbol is not found
+/// - The factory function returns null
+pub fn load_plugin(path: &str) -> anyhow::Result<Arc<dyn QuicAppFactory>> {
+    unsafe {
+        let lib = Library::new(path)
+            .with_context(|| format!("Failed to load plugin library: {}", path))?;
+        // Leak the library to keep it loaded for the lifetime of the process
+        let lib = Box::leak(Box::new(lib));
+
+        let func: Symbol<unsafe extern "C" fn() -> *mut c_void> = lib.get(b"_quicd_create_factory")
+            .with_context(|| format!("Plugin {} does not export '_quicd_create_factory' symbol. Did you use the export_quic_app! macro?", path))?;
+
+        let raw_ptr = func();
+        if raw_ptr.is_null() {
+            anyhow::bail!("Plugin {} returned null factory pointer", path);
+        }
+
+        // Reconstruct the double-boxed factory
+        // Note: This assumes the plugin was compiled with the same Rust compiler version
+        // and quicd-x version as the server.
+        let wrapper: Box<Box<dyn QuicAppFactory>> = Box::from_raw(raw_ptr as *mut Box<dyn QuicAppFactory>);
+        let factory: Box<dyn QuicAppFactory> = *wrapper;
+
+        Ok(Arc::from(factory))
     }
 }
 
