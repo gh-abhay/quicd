@@ -247,7 +247,7 @@ enable_per_connection_metrics = false
 # ALPN identifier (used during QUIC handshake)
 alpn = "h3"
 
-# Application type: "http3" or "custom"
+# Application type: "http3" or "plugin"
 type = "http3"
 
 # Enable this application
@@ -334,18 +334,32 @@ enabled = true
 # Inherits same defaults as h3, override as needed
 
 # ----------------------------------------------------------------------------
-# Custom Protocol Example
+# Plugin Protocol Example
 # ----------------------------------------------------------------------------
+# Load a custom protocol from a dynamic library (.so/.dylib/.dll)
+# The plugin must be compiled with quicd-x and export the factory using
+# the export_quic_app! macro. See PLUGIN_DEVELOPMENT.md for details.
+#
 # [[applications]]
 # alpn = "my-custom-proto"
-# type = "custom"
-# 
-# # Custom protocols use arbitrary key-value configuration
-# # The server passes this directly to your QuicAppFactory
-# [applications.params]
-# my_setting = "value"
-# my_number = 42
-# my_flag = true
+# type = "plugin"
+# [applications.config]
+# library_path = "/path/to/libmy_custom_proto.so"
+#
+# # You can load multiple plugins
+# [[applications]]
+# alpn = "echo"
+# type = "plugin"
+# [applications.config]
+# library_path = "/usr/local/lib/quicd/libecho_protocol.so"
+#
+# # Plugins coexist with built-in protocols
+# # The server routes connections based on negotiated ALPN during handshake
+#
+# ABI Compatibility Requirements:
+# - Plugin must be compiled with the same Rust compiler version as the server
+# - Plugin must use the same quicd-x dependency version
+# - Plugin must be compiled for the same target architecture
 
 # ============================================================================
 # CONFIGURATION PRESETS
