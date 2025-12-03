@@ -182,9 +182,9 @@ pub fn rotate_generation() -> u8 {
 }
 
 /// Generate a connection ID with embedded routing cookie for a worker.
-pub fn generate_connection_id(worker_idx: u8, prefix_seed: u32) -> [u8; 8] {
+pub fn generate_connection_id(worker_idx: u8, prefix_seed: u32) -> [u8; 20] {
     let generation = current_generation();
-    ConnectionId::new_with_seed(generation, worker_idx, prefix_seed)
+    ConnectionId::generate_with_seed(generation, worker_idx, prefix_seed)
 }
 
 /// Validate a connection ID and return the worker index if valid.
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn test_connection_id_generation() {
         let cid = generate_connection_id(42, 0x1234_5678);
-        assert_eq!(cid.len(), 8);
+        assert_eq!(cid.len(), 20);
         assert!(ConnectionId::validate_cookie(&cid));
         assert_eq!(ConnectionId::get_worker_idx(&cid), Some(42));
     }
