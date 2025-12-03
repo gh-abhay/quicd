@@ -44,11 +44,11 @@ reuse_addr = true
 [global.tls]
 # Path to TLS certificate file (PEM format)
 # If omitted, a self-signed certificate will be generated
-cert_path = "certs/cert.pem"
+cert_path = "/server-cert/cert.pem"
 
 # Path to TLS private key file (PEM format)
 # Required if cert_path is specified
-key_path = "certs/key.pem"
+key_path = "/server-cert/key.pem"
 
 # Enable TLS 1.3 early data (0-RTT)
 # WARNING: 0-RTT data is not forward secret and can be replayed
