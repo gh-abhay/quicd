@@ -1,5 +1,5 @@
 target/
-certs/
+/certs/
 
 # Added by cargo
 #
