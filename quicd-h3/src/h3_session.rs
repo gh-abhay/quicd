@@ -95,6 +95,16 @@ pub struct H3Session<H: H3Handler> {
     max_client_bidi_stream_id: u64,
     // Track highest client-initiated unidirectional stream ID seen
     max_client_uni_stream_id: u64,
+    // Event-driven stream reading: Store RecvStream handles for non-blocking I/O
+    // Maps stream_id -> (RecvStream, buffer for partial frames)
+    active_recv_streams: HashMap<u64, ActiveRecvStream>,
+}
+
+/// Active receive stream state for event-driven, non-blocking reading
+struct ActiveRecvStream {
+    recv_stream: quicd_x::RecvStream,
+    // Buffered data that hasn't been fully parsed yet
+    buffer: bytes::BytesMut,
 }
 
 /// Stream type context for validating frame associations
@@ -349,6 +359,8 @@ impl<H: H3Handler> H3Session<H> {
             // GAP #3: Initialize stream ID tracking (no streams seen yet)
             max_client_bidi_stream_id: 0,
             max_client_uni_stream_id: 0,
+            // Event-driven stream reading
+            active_recv_streams: HashMap::new(),
         }
     }
 
@@ -453,8 +465,13 @@ impl<H: H3Handler> H3Session<H> {
                         .await?;
                 } else {
                     // Unidirectional stream (push or control)
+                    // Register the stream - don't block on reading
                     self.handle_unidirectional_stream(stream_id, recv_stream)
                         .await?;
+                    
+                    // Now that stream is registered, read the stream type (first byte)
+                    // This is needed to identify what kind of stream it is
+                    self.process_new_unidirectional_stream(stream_id).await?;
                 }
             }
             AppEvent::StreamReadable { stream_id } => {
@@ -802,7 +819,7 @@ impl<H: H3Handler> H3Session<H> {
     async fn handle_unidirectional_stream(
         &mut self,
         stream_id: u64,
-        mut recv_stream: quicd_x::RecvStream,
+        recv_stream: quicd_x::RecvStream,
     ) -> Result<(), H3Error> {
         // GAP FIX #3: RFC 9114 Section 6.1: Validate stream ID monotonicity
         // Client-initiated unidirectional streams must have increasing IDs
@@ -817,8 +834,63 @@ impl<H: H3Handler> H3Session<H> {
         // RFC 9114 Section 6.2: Read stream type from first bytes
         // "The purpose is indicated by a stream type, which is sent as a
         // variable-length integer at the start of the stream."
+        
+        // Store the stream for event-driven reading - do NOT block on read
+        // The stream type will be read when StreamReadable event arrives
+        self.active_recv_streams.insert(
+            stream_id,
+            ActiveRecvStream {
+                recv_stream,
+                buffer: bytes::BytesMut::new(),
+            },
+        );
 
-        let stream_type = self.read_stream_type(&mut recv_stream).await?;
+        // Return immediately - data will be processed in handle_stream_readable
+        Ok(())
+    }
+
+    /// Read and process stream type for a newly registered unidirectional stream
+    async fn process_new_unidirectional_stream(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        // Get the active stream (should exist since we just registered it)
+        let active_stream = match self.active_recv_streams.get_mut(&stream_id) {
+            Some(s) => s,
+            None => return Ok(()), // Stream was already removed
+        };
+
+        // Try to read stream type byte
+        let stream_type = match active_stream.recv_stream.read().await {
+            Ok(Some(quicd_x::StreamData::Data(bytes))) => {
+                // Parse stream type varint from the first bytes
+                let (stream_type, consumed) = crate::frames::H3Frame::decode_varint(&bytes)
+                    .map_err(|e| H3Error::FrameParse(format!("invalid stream type varint: {:?}", e)))?;
+                
+                // Store any remaining bytes in the buffer
+                if consumed < bytes.len() {
+                    active_stream.buffer.extend_from_slice(&bytes[consumed..]);
+                }
+                
+                stream_type
+            }
+            Ok(Some(quicd_x::StreamData::Fin)) => {
+                // Stream ended before type byte - error
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::Connection(
+                    "stream ended before stream type".into(),
+                ));
+            }
+            Ok(None) => {
+                // Channel closed
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::Connection("no data on stream".into()));
+            }
+            Err(e) => {
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::Stream(format!(
+                    "failed to read stream type: {:?}",
+                    e
+                )));
+            }
+        };
 
         // Validate unidirectional stream initiator based on stream type
         crate::stream_validation::validate_unidirectional_stream_initiator(
@@ -834,6 +906,7 @@ impl<H: H3Handler> H3Session<H> {
                 // claiming to be a control stream MUST be treated as a connection error of
                 // type H3_STREAM_CREATION_ERROR"
                 if self.peer_control_stream_id.is_some() {
+                    self.active_recv_streams.remove(&stream_id);
                     return Err(H3Error::Connection(
                         "duplicate control stream from peer - H3_STREAM_CREATION_ERROR".into(),
                     ));
@@ -842,8 +915,7 @@ impl<H: H3Handler> H3Session<H> {
                 self.stream_types.insert(stream_id, StreamType::Control);
                 let key = self.streams.insert(StreamState::Control);
                 self.stream_id_to_key.insert(stream_id, key);
-                self.process_client_control_stream(stream_id, recv_stream)
-                    .await?;
+                // Stream is now registered and ready for StreamReadable events
             }
             0x01 => {
                 // Push stream (RFC 9114 Section 6.2.2)
@@ -854,14 +926,15 @@ impl<H: H3Handler> H3Session<H> {
                 //
                 // Note: This implementation is a server, so receiving push streams from clients
                 // is a protocol error per RFC 9114.
+                self.active_recv_streams.remove(&stream_id);
                 return Err(H3Error::Connection(
                     "H3_STREAM_CREATION_ERROR: push stream received by server (only servers can push)".into()
                 ));
-                // Client implementation would call: self.process_push_stream(stream_id, recv_stream).await?;
             }
             0x02 => {
                 // QPACK encoder stream (RFC 9204 Section 4.2)
                 if self.peer_encoder_stream_id.is_some() {
+                    self.active_recv_streams.remove(&stream_id);
                     return Err(H3Error::Connection(
                         "duplicate QPACK encoder stream from peer - H3_STREAM_CREATION_ERROR"
                             .into(),
@@ -870,13 +943,12 @@ impl<H: H3Handler> H3Session<H> {
                 self.peer_encoder_stream_id = Some(stream_id);
                 let key = self.streams.insert(StreamState::QpackEncoder);
                 self.stream_id_to_key.insert(stream_id, key);
-                // RFC 9204 Section 4.2: Process encoder stream continuously
-                self.process_qpack_encoder_stream(stream_id, recv_stream)
-                    .await?;
+                // Stream is now registered and ready for StreamReadable events
             }
             0x03 => {
                 // QPACK decoder stream (RFC 9204 Section 4.2)
                 if self.peer_decoder_stream_id.is_some() {
+                    self.active_recv_streams.remove(&stream_id);
                     return Err(H3Error::Connection(
                         "duplicate QPACK decoder stream from peer - H3_STREAM_CREATION_ERROR"
                             .into(),
@@ -885,9 +957,7 @@ impl<H: H3Handler> H3Session<H> {
                 self.peer_decoder_stream_id = Some(stream_id);
                 let key = self.streams.insert(StreamState::QpackDecoder);
                 self.stream_id_to_key.insert(stream_id, key);
-                // RFC 9204 Section 4.2: Process decoder stream continuously
-                self.process_qpack_decoder_stream(stream_id, recv_stream)
-                    .await?;
+                // Stream is now registered and ready for StreamReadable events
             }
             _ if crate::frames::H3Frame::is_reserved_stream_type(stream_type) => {
                 // RFC 9114 Section 6.2.3: Reserved stream types for greasing
@@ -900,7 +970,8 @@ impl<H: H3Handler> H3Session<H> {
                 self.metrics
                     .reserved_streams_received
                     .fetch_add(1, Ordering::Relaxed);
-                self.consume_stream_silently(recv_stream).await;
+                // Remove from active streams - we'll silently discard
+                self.active_recv_streams.remove(&stream_id);
             }
             _ => {
                 // RFC 9114 Section 6.2: Unknown stream type
@@ -914,120 +985,185 @@ impl<H: H3Handler> H3Session<H> {
                 self.metrics
                     .unknown_streams_received
                     .fetch_add(1, Ordering::Relaxed);
-                self.consume_stream_silently(recv_stream).await;
+                // Remove from active streams - we'll silently discard
+                self.active_recv_streams.remove(&stream_id);
             }
         }
 
         Ok(())
     }
 
-    async fn process_client_control_stream(
-        &mut self,
-        _stream_id: u64,
-        mut recv_stream: quicd_x::RecvStream,
-    ) -> Result<(), H3Error> {
-        // Read frames from the client control stream
-        while let Ok(Some(data)) = recv_stream.read().await {
-            match data {
-                quicd_x::StreamData::Data(bytes) => {
-                    self.process_control_frames(bytes).await?;
-                }
-                quicd_x::StreamData::Fin => {
-                    // RFC 9114 Section 6.2.1: Control stream closure MUST be treated as
-                    // a connection error of type H3_CLOSED_CRITICAL_STREAM
-                    return Err(H3Error::ClosedCriticalStream);
-                }
-            }
-        }
-        Ok(())
-    }
 
-    /// RFC 9204 Section 4.2: Process QPACK encoder stream from peer
-    async fn process_qpack_encoder_stream(
-        &mut self,
-        _stream_id: u64,
-        mut recv_stream: quicd_x::RecvStream,
-    ) -> Result<(), H3Error> {
-        // Read QPACK encoder instructions from the stream
-        while let Ok(Some(data)) = recv_stream.read().await {
-            match data {
-                quicd_x::StreamData::Data(bytes) => {
-                    // RFC 9204: Encoder stream contains instructions for our decoder
-                    self.qpack_decoder
-                        .process_encoder_instruction(bytes.as_ref())
-                        .await
-                        .map_err(|e| {
-                            H3Error::Qpack(format!("encoder stream instruction error: {:?}", e))
-                        })?;
 
-                    // PERF FIX: Batch decoder instructions from encoder stream processing
-                    let mut decoder_instructions = Vec::new();
-                    while let Some(inst) = self.qpack_decoder.decoder_mut().poll_decoder_stream() {
-                        decoder_instructions.push(inst);
-                    }
-                    if !decoder_instructions.is_empty() {
-                        if let Some(ref stream) = self.decoder_send_stream {
-                            let mut batch = bytes::BytesMut::new();
-                            for inst in decoder_instructions {
-                                batch.extend_from_slice(&inst);
-                            }
-                            let _ = stream.write(batch.freeze(), false).await;
-                        }
-                    }
-
-                    // GAP FIX #5: RFC 9204 Section 2.1.4: Retry blocked streams now that table entries arrived
-                    let _ = self.retry_blocked_streams().await;
-                }
-                quicd_x::StreamData::Fin => {
-                    // RFC 9114 Section 6.2.3 & RFC 9204 Section 4.2:
-                    // "Closure of either unidirectional stream type MUST be treated as a
-                    // connection error of type H3_CLOSED_CRITICAL_STREAM"
-                    return Err(H3Error::ClosedCriticalStream);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// RFC 9204 Section 4.2: Process QPACK decoder stream from peer
-    async fn process_qpack_decoder_stream(
-        &mut self,
-        _stream_id: u64,
-        mut recv_stream: quicd_x::RecvStream,
-    ) -> Result<(), H3Error> {
-        // Read QPACK decoder instructions from the stream
-        while let Ok(Some(data)) = recv_stream.read().await {
-            match data {
-                quicd_x::StreamData::Data(bytes) => {
-                    // RFC 9204: Decoder stream contains instructions for our encoder
-                    self.qpack_encoder
-                        .lock()
-                        .await
-                        .process_decoder_instruction(bytes.as_ref())
-                        .await
-                        .map_err(|e| {
-                            H3Error::Qpack(format!("decoder stream instruction error: {:?}", e))
-                        })?;
-
-                    // RFC 9204 Section 2.1.4: Decoder acknowledgments received
-                    // This allows encoder to evict table entries that are no longer needed
-                    // Blocked streams are managed separately in check_blocked_stream_timeouts
-                }
-                quicd_x::StreamData::Fin => {
-                    // RFC 9114 Section 6.2.3 & RFC 9204 Section 4.2:
-                    // "Closure of either unidirectional stream type MUST be treated as a
-                    // connection error of type H3_CLOSED_CRITICAL_STREAM"
-                    return Err(H3Error::ClosedCriticalStream);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_stream_readable(&mut self, _stream_id: u64) -> Result<(), H3Error> {
+    async fn handle_stream_readable(&mut self, stream_id: u64) -> Result<(), H3Error> {
         // Stream has data available - this is edge-triggered
-        // For now, we handle data in the main stream processing methods
-        // This could be used for more sophisticated backpressure handling
+        // Read available data without blocking and process it
+        
+        // Check if this is a stream we're tracking
+        if !self.active_recv_streams.contains_key(&stream_id) {
+            // Not a stream we're tracking (bidirectional streams handle their own reading)
+            return Ok(());
+        }
+
+        // Identify stream type and delegate to appropriate handler
+        let stream_type = self.stream_types.get(&stream_id).copied();
+        
+        match stream_type {
+            Some(StreamType::Control) => {
+                self.read_control_stream_data(stream_id).await?;
+            }
+            Some(StreamType::QpackEncoder) => {
+                self.read_qpack_encoder_stream_data(stream_id).await?;
+            }
+            Some(StreamType::QpackDecoder) => {
+                self.read_qpack_decoder_stream_data(stream_id).await?;
+            }
+            Some(StreamType::Request) | None => {
+                // Bidirectional request streams handle their own reading
+                // in handle_bidirectional_stream via blocking read loop
+                // (will be fixed in a future iteration)
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Read and process available data from control stream
+    async fn read_control_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        let active_stream = match self.active_recv_streams.get_mut(&stream_id) {
+            Some(s) => s,
+            None => return Ok(()), // Stream was removed
+        };
+
+        // Read available data (non-blocking since StreamReadable event fired)
+        match active_stream.recv_stream.read().await {
+            Ok(Some(quicd_x::StreamData::Data(bytes))) => {
+                // Append to buffer
+                active_stream.buffer.extend_from_slice(&bytes);
+                
+                // Process frames from buffered data
+                let buffer_bytes = active_stream.buffer.split().freeze();
+                self.process_control_frames(buffer_bytes).await?;
+            }
+            Ok(Some(quicd_x::StreamData::Fin)) => {
+                // RFC 9114 Section 6.2.1: Control stream closure MUST be treated as
+                // a connection error of type H3_CLOSED_CRITICAL_STREAM
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::ClosedCriticalStream);
+            }
+            Ok(None) => {
+                // Channel closed - treat as FIN
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::ClosedCriticalStream);
+            }
+            Err(e) => {
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::Stream(format!("control stream read error: {:?}", e)));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Read and process available data from QPACK encoder stream
+    async fn read_qpack_encoder_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        let active_stream = match self.active_recv_streams.get_mut(&stream_id) {
+            Some(s) => s,
+            None => return Ok(()), // Stream was removed
+        };
+
+        // Read available data (non-blocking since StreamReadable event fired)
+        match active_stream.recv_stream.read().await {
+            Ok(Some(quicd_x::StreamData::Data(bytes))) => {
+                // RFC 9204: Encoder stream contains instructions for our decoder
+                self.qpack_decoder
+                    .process_encoder_instruction(bytes.as_ref())
+                    .await
+                    .map_err(|e| {
+                        H3Error::Qpack(format!("encoder stream instruction error: {:?}", e))
+                    })?;
+
+                // PERF FIX: Batch decoder instructions from encoder stream processing
+                let mut decoder_instructions = Vec::new();
+                while let Some(inst) = self.qpack_decoder.decoder_mut().poll_decoder_stream() {
+                    decoder_instructions.push(inst);
+                }
+                if !decoder_instructions.is_empty() {
+                    if let Some(ref stream) = self.decoder_send_stream {
+                        let mut batch = bytes::BytesMut::new();
+                        for inst in decoder_instructions {
+                            batch.extend_from_slice(&inst);
+                        }
+                        let _ = stream.write(batch.freeze(), false).await;
+                    }
+                }
+
+                // GAP FIX #5: RFC 9204 Section 2.1.4: Retry blocked streams now that table entries arrived
+                let _ = self.retry_blocked_streams().await;
+            }
+            Ok(Some(quicd_x::StreamData::Fin)) => {
+                // RFC 9114 Section 6.2.3 & RFC 9204 Section 4.2:
+                // "Closure of either unidirectional stream type MUST be treated as a
+                // connection error of type H3_CLOSED_CRITICAL_STREAM"
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::ClosedCriticalStream);
+            }
+            Ok(None) => {
+                // Channel closed - treat as FIN
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::ClosedCriticalStream);
+            }
+            Err(e) => {
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::Stream(format!("encoder stream read error: {:?}", e)));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Read and process available data from QPACK decoder stream
+    async fn read_qpack_decoder_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        let active_stream = match self.active_recv_streams.get_mut(&stream_id) {
+            Some(s) => s,
+            None => return Ok(()), // Stream was removed
+        };
+
+        // Read available data (non-blocking since StreamReadable event fired)
+        match active_stream.recv_stream.read().await {
+            Ok(Some(quicd_x::StreamData::Data(bytes))) => {
+                // RFC 9204: Decoder stream contains instructions for our encoder
+                self.qpack_encoder
+                    .lock()
+                    .await
+                    .process_decoder_instruction(bytes.as_ref())
+                    .await
+                    .map_err(|e| {
+                        H3Error::Qpack(format!("decoder stream instruction error: {:?}", e))
+                    })?;
+
+                // RFC 9204 Section 2.1.4: Decoder acknowledgments received
+                // This allows encoder to evict table entries that are no longer needed
+                // Blocked streams are managed separately in check_blocked_stream_timeouts
+            }
+            Ok(Some(quicd_x::StreamData::Fin)) => {
+                // RFC 9114 Section 6.2.3 & RFC 9204 Section 4.2:
+                // "Closure of either unidirectional stream type MUST be treated as a
+                // connection error of type H3_CLOSED_CRITICAL_STREAM"
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::ClosedCriticalStream);
+            }
+            Ok(None) => {
+                // Channel closed - treat as FIN
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::ClosedCriticalStream);
+            }
+            Err(e) => {
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::Stream(format!("decoder stream read error: {:?}", e)));
+            }
+        }
+
         Ok(())
     }
 
@@ -2334,35 +2470,7 @@ impl<H: H3Handler> H3Session<H> {
         Ok(None)
     }
 
-    /// Read stream type from the first bytes of a unidirectional stream (RFC 9114 Section 6.2)
-    async fn read_stream_type(
-        &self,
-        recv_stream: &mut quicd_x::RecvStream,
-    ) -> Result<u64, H3Error> {
-        // Read first bytes for stream type varint
-        let data = match recv_stream.read().await {
-            Ok(Some(quicd_x::StreamData::Data(bytes))) => bytes,
-            Ok(Some(quicd_x::StreamData::Fin)) => {
-                return Err(H3Error::Connection(
-                    "stream ended before stream type".into(),
-                ));
-            }
-            Ok(None) => {
-                return Err(H3Error::Connection("no data on stream".into()));
-            }
-            Err(e) => {
-                return Err(H3Error::Stream(format!(
-                    "failed to read stream type: {:?}",
-                    e
-                )));
-            }
-        };
 
-        let (stream_type, _consumed) = crate::frames::H3Frame::decode_varint(&data)
-            .map_err(|e| H3Error::FrameParse(format!("invalid stream type varint: {:?}", e)))?;
-
-        Ok(stream_type)
-    }
 
     /// Process a push stream (RFC 9114 Section 6.2.2)
     ///
