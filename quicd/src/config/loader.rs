@@ -55,8 +55,8 @@ pub struct CliArgs {
 /// - Required values are missing
 pub fn load_config() -> Result<ServerConfig> {
     let matches = CliArgs::command().get_matches();
-    let cli = CliArgs::from_arg_matches(&matches)
-        .context("Failed to parse command-line arguments")?;
+    let cli =
+        CliArgs::from_arg_matches(&matches).context("Failed to parse command-line arguments")?;
 
     // Handle special flags
     if cli.print_default_config {
@@ -74,14 +74,9 @@ pub fn load_config() -> Result<ServerConfig> {
     apply_cli_overrides(&mut config, &cli);
 
     // Validate
-    config
-        .validate()
-        .map_err(|errors| {
-            anyhow::anyhow!(
-                "Configuration validation failed:\n{}",
-                errors.join("\n")
-            )
-        })?;
+    config.validate().map_err(|errors| {
+        anyhow::anyhow!("Configuration validation failed:\n{}", errors.join("\n"))
+    })?;
 
     if cli.validate {
         println!("✓ Configuration is valid");
@@ -97,15 +92,17 @@ fn load_config_file(path: &str) -> Result<ServerConfig> {
 
     // If file doesn't exist, use default config
     if !path_obj.exists() {
-        eprintln!("Warning: Configuration file '{}' not found, using defaults", path);
+        eprintln!(
+            "Warning: Configuration file '{}' not found, using defaults",
+            path
+        );
         return Ok(ServerConfig::default());
     }
 
     let config_str = std::fs::read_to_string(path_obj)
         .with_context(|| format!("Failed to read config file: {}", path))?;
 
-    toml::from_str(&config_str)
-        .with_context(|| format!("Failed to parse TOML config: {}", path))
+    toml::from_str(&config_str).with_context(|| format!("Failed to parse TOML config: {}", path))
 }
 
 /// Apply environment variable overrides.
@@ -160,8 +157,8 @@ fn apply_cli_overrides(config: &mut ServerConfig, cli: &CliArgs) {
 /// Print the default configuration in TOML format.
 fn print_default_config() -> Result<()> {
     let default_config = ServerConfig::default();
-    let toml_str = toml::to_string_pretty(&default_config)
-        .context("Failed to serialize default config")?;
+    let toml_str =
+        toml::to_string_pretty(&default_config).context("Failed to serialize default config")?;
     println!("{}", toml_str);
     Ok(())
 }

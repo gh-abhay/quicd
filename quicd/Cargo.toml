@@ -18,7 +18,7 @@ sys-info = "0.9"
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 num_cpus = "1.0"
-quiche = "0.24"
+quiche = "0.24.6"
 datagram-socket = "0.5"
 io-uring = "0.6"
 socket2 = "0.5"
