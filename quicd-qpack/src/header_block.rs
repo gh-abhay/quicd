@@ -1,5 +1,5 @@
 //! Header block encoding and decoding per RFC 9204 Section 4.5.
-//! 
+//!
 //! Header block structure:
 //! - Encoded Field Section Prefix (Required Insert Count, Delta Base, Base)
 //! - Encoded Field Lines (Indexed, Literal with/without name reference)
@@ -15,15 +15,15 @@ pub enum FieldLine {
     /// Indexed Field Line - Static Table.
     /// Pattern: 1T | Index (6+), T=1 for static
     IndexedStatic { index: u64 },
-    
+
     /// Indexed Field Line - Dynamic Table with Post-Base Index.
     /// Pattern: 1T | Index (6+), T=0 for dynamic (post-base)
     IndexedDynamicPost { index: u64 },
-    
+
     /// Indexed Field Line - Dynamic Table (Base-relative).
     /// Pattern: 1xxx xxxx followed by 0xxx xxxx (dynamic with base)
     IndexedDynamic { absolute_index: u64 },
-    
+
     /// Literal Field Line With Name Reference - Static Table.
     /// Pattern: 01NT | Index (4+), N=never-indexed, T=1 for static
     LiteralStaticName {
@@ -31,7 +31,7 @@ pub enum FieldLine {
         value: Bytes,
         never_indexed: bool,
     },
-    
+
     /// Literal Field Line With Name Reference - Dynamic Table.
     /// Pattern: 01NT | Index (4+), N=never-indexed, T=0 for dynamic
     LiteralDynamicName {
@@ -39,7 +39,7 @@ pub enum FieldLine {
         value: Bytes,
         never_indexed: bool,
     },
-    
+
     /// Literal Field Line Without Name Reference.
     /// Pattern: 001N H | Name Length (3+) | Name | H | Value Length (7+) | Value
     LiteralName {
@@ -47,7 +47,7 @@ pub enum FieldLine {
         value: Bytes,
         never_indexed: bool,
     },
-    
+
     /// Literal Field Line With Post-Base Name Reference.
     /// Pattern: 0000 N | Index (3+)
     LiteralPostBaseName {
@@ -72,37 +72,38 @@ impl EncodedPrefix {
     /// Encode the prefix.
     pub fn encode(&self, max_entries: u64) -> Bytes {
         let mut buf = BytesMut::new();
-        
+
         // Encode Required Insert Count with wraparound
         let enc_ric = encode_required_insert_count(self.required_insert_count, max_entries);
         buf.extend_from_slice(&encode_int_with_prefix(enc_ric, 8, 0));
-        
+
         // Encode Delta Base: S | Delta Base (7+)
         let sign_bit = if self.sign { 0x80 } else { 0x00 };
         buf.extend_from_slice(&encode_int_with_prefix(self.delta_base, 7, sign_bit));
-        
+
         buf.freeze()
     }
-    
+
     /// Decode the prefix.
     pub fn decode(data: &[u8], max_entries: u64, total_inserted: u64) -> Result<(Self, usize)> {
         let mut offset = 0;
-        
+
         // Decode Required Insert Count
         let (enc_ric, consumed) = decode_int(&data[offset..], 8)?;
         offset += consumed;
-        
-        let required_insert_count = decode_required_insert_count(enc_ric, max_entries, total_inserted)?;
-        
+
+        let required_insert_count =
+            decode_required_insert_count(enc_ric, max_entries, total_inserted)?;
+
         // Decode Delta Base
         if offset >= data.len() {
             return Err(QpackError::UnexpectedEof);
         }
-        
+
         let sign = (data[offset] & 0x80) != 0;
         let (delta_base, consumed) = decode_int(&data[offset..], 7)?;
         offset += consumed;
-        
+
         Ok((
             EncodedPrefix {
                 required_insert_count,
@@ -112,12 +113,13 @@ impl EncodedPrefix {
             offset,
         ))
     }
-    
+
     /// Calculate Base from Required Insert Count and Delta Base.
     pub fn base(&self) -> u64 {
         if self.sign {
             // Negative delta: Base = Required Insert Count - Delta Base - 1
-            self.required_insert_count.saturating_sub(self.delta_base + 1)
+            self.required_insert_count
+                .saturating_sub(self.delta_base + 1)
         } else {
             // Positive delta: Base = Required Insert Count + Delta Base
             self.required_insert_count + self.delta_base
@@ -130,7 +132,7 @@ fn encode_required_insert_count(ric: u64, max_entries: u64) -> u64 {
     if ric == 0 {
         return 0;
     }
-    
+
     // EncodedInsertCount = (InsertCount mod (2 * MaxEntries)) + 1
     (ric % (2 * max_entries)) + 1
 }
@@ -144,25 +146,25 @@ fn decode_required_insert_count(
     if encoded == 0 {
         return Ok(0);
     }
-    
+
     // FullRange = 2 * MaxEntries
     let full_range = 2 * max_entries;
-    
+
     if encoded > full_range {
         return Err(QpackError::DecompressionFailed(
             "Encoded Insert Count too large".into(),
         ));
     }
-    
+
     // MaxValue = TotalNumberOfInserts + MaxEntries
     let max_value = total_inserted + max_entries;
-    
+
     // MaxWrapped = (MaxValue / FullRange) * FullRange
     let max_wrapped = (max_value / full_range) * full_range;
-    
+
     // ReqInsertCount = MaxWrapped + EncodedInsertCount - 1
     let mut ric = max_wrapped + encoded - 1;
-    
+
     // If ReqInsertCount > MaxValue, subtract FullRange
     if ric > max_value {
         if ric <= full_range {
@@ -172,7 +174,7 @@ fn decode_required_insert_count(
         }
         ric -= full_range;
     }
-    
+
     Ok(ric)
 }
 
@@ -180,25 +182,25 @@ impl FieldLine {
     /// Encode a field line to bytes.
     pub fn encode(&self, base: u64) -> Bytes {
         let mut buf = BytesMut::new();
-        
+
         match self {
             FieldLine::IndexedStatic { index } => {
                 // 1T | Index (6+), T=1
                 buf.extend_from_slice(&encode_int_with_prefix(*index, 6, 0xC0));
             }
-            
+
             FieldLine::IndexedDynamicPost { index } => {
                 // 0001 | Index (4+)
                 buf.extend_from_slice(&encode_int_with_prefix(*index, 4, 0x10));
             }
-            
+
             FieldLine::IndexedDynamic { absolute_index } => {
                 // 1T | Index (6+), T=0 for dynamic
                 // Calculate relative index from base
                 let relative_index = base.saturating_sub(*absolute_index + 1);
                 buf.extend_from_slice(&encode_int_with_prefix(relative_index, 6, 0x80));
             }
-            
+
             FieldLine::LiteralStaticName {
                 name_index,
                 value,
@@ -209,7 +211,7 @@ impl FieldLine {
                 buf.extend_from_slice(&encode_int_with_prefix(*name_index, 4, prefix));
                 encode_string(value.as_ref(), &mut buf);
             }
-            
+
             FieldLine::LiteralDynamicName {
                 name_index,
                 value,
@@ -221,7 +223,7 @@ impl FieldLine {
                 buf.extend_from_slice(&encode_int_with_prefix(relative_index, 4, prefix));
                 encode_string(value.as_ref(), &mut buf);
             }
-            
+
             FieldLine::LiteralName {
                 name,
                 value,
@@ -232,7 +234,7 @@ impl FieldLine {
                 encode_string_with_prefix(name.as_ref(), 3, prefix, &mut buf);
                 encode_string(value.as_ref(), &mut buf);
             }
-            
+
             FieldLine::LiteralPostBaseName {
                 name_index,
                 value,
@@ -244,25 +246,25 @@ impl FieldLine {
                 encode_string(value.as_ref(), &mut buf);
             }
         }
-        
+
         buf.freeze()
     }
-    
+
     /// Decode a field line from bytes.
     pub fn decode(data: &[u8], base: u64) -> Result<(Self, usize)> {
         if data.is_empty() {
             return Err(QpackError::UnexpectedEof);
         }
-        
+
         let first = data[0];
         let mut offset;
-        
+
         let field_line = if first & 0x80 != 0 {
             // Indexed Field Line: 1T | Index (6+)
             let is_static = (first & 0x40) != 0;
             let (index, consumed) = decode_int(data, 6)?;
             offset = consumed;
-            
+
             if is_static {
                 FieldLine::IndexedStatic { index }
             } else {
@@ -281,10 +283,10 @@ impl FieldLine {
             let is_static = (first & 0x10) != 0;
             let (name_index, consumed) = decode_int(data, 4)?;
             offset = consumed;
-            
+
             let (value, consumed) = decode_string(&data[offset..])?;
             offset += consumed;
-            
+
             if is_static {
                 FieldLine::LiteralStaticName {
                     name_index,
@@ -303,10 +305,10 @@ impl FieldLine {
             let never_indexed = (first & 0x08) != 0;
             let (name_index, consumed) = decode_int(data, 3)?;
             offset = consumed;
-            
+
             let (value, consumed) = decode_string(&data[offset..])?;
             offset += consumed;
-            
+
             FieldLine::LiteralPostBaseName {
                 name_index,
                 value,
@@ -317,10 +319,10 @@ impl FieldLine {
             let never_indexed = (first & 0x10) != 0;
             let (name, consumed) = decode_string_with_prefix(data, 3)?;
             offset = consumed;
-            
+
             let (value, consumed) = decode_string(&data[offset..])?;
             offset += consumed;
-            
+
             FieldLine::LiteralName {
                 name,
                 value,
@@ -331,20 +333,20 @@ impl FieldLine {
                 "Invalid field line pattern".into(),
             ));
         };
-        
+
         Ok((field_line, offset))
     }
 }
 
 /// Encode a string (7-bit length prefix) with optional Huffman encoding.
-/// 
+///
 /// RFC 9204 Section 4.1.2: Uses Huffman encoding if it reduces size.
 /// RFC 9204 Section 7.1: Applies automatically for compression efficiency.
 #[inline]
 fn encode_string(data: &[u8], buf: &mut BytesMut) {
     // Calculate Huffman encoded size
     let huffman_size = crate::huffman::encoded_size(data);
-    
+
     if huffman_size < data.len() {
         // Use Huffman encoding (H bit = 1)
         buf.extend_from_slice(&encode_int_with_prefix(huffman_size as u64, 7, 0x80));
@@ -359,23 +361,31 @@ fn encode_string(data: &[u8], buf: &mut BytesMut) {
 }
 
 /// Encode a string with custom prefix bits and optional Huffman encoding.
-/// 
+///
 /// RFC 9204 Section 4.1.2: Uses Huffman encoding if it reduces size.
 #[inline]
 fn encode_string_with_prefix(data: &[u8], prefix_bits: u8, prefix_mask: u8, buf: &mut BytesMut) {
     let huffman_size = crate::huffman::encoded_size(data);
-    
+
     if huffman_size < data.len() {
         // Use Huffman encoding (H bit = 1)
         let h_bit = 1u8 << prefix_bits;
         let full_prefix = prefix_mask | h_bit;
-        buf.extend_from_slice(&encode_int_with_prefix(huffman_size as u64, prefix_bits, full_prefix));
+        buf.extend_from_slice(&encode_int_with_prefix(
+            huffman_size as u64,
+            prefix_bits,
+            full_prefix,
+        ));
         let mut encoded = Vec::with_capacity(huffman_size);
         crate::huffman::encode(data, &mut encoded);
         buf.extend_from_slice(&encoded);
     } else {
         // Use literal encoding (H bit = 0)
-        buf.extend_from_slice(&encode_int_with_prefix(data.len() as u64, prefix_bits, prefix_mask));
+        buf.extend_from_slice(&encode_int_with_prefix(
+            data.len() as u64,
+            prefix_bits,
+            prefix_mask,
+        ));
         buf.extend_from_slice(data);
     }
 }
@@ -386,17 +396,17 @@ fn decode_string(data: &[u8]) -> Result<(Bytes, usize)> {
     if data.is_empty() {
         return Err(QpackError::UnexpectedEof);
     }
-    
+
     let huffman = (data[0] & 0x80) != 0;
     let (len, mut offset) = decode_int(data, 7)?;
-    
+
     if offset + len as usize > data.len() {
         return Err(QpackError::UnexpectedEof);
     }
-    
+
     let string_data = &data[offset..offset + len as usize];
     offset += len as usize;
-    
+
     let decoded_data = if huffman {
         let mut decoded = Vec::new();
         crate::huffman::decode(string_data, &mut decoded)
@@ -405,7 +415,7 @@ fn decode_string(data: &[u8]) -> Result<(Bytes, usize)> {
     } else {
         Bytes::copy_from_slice(string_data)
     };
-    
+
     Ok((decoded_data, offset))
 }
 
@@ -415,17 +425,17 @@ fn decode_string_with_prefix(data: &[u8], prefix_bits: u8) -> Result<(Bytes, usi
     if data.is_empty() {
         return Err(QpackError::UnexpectedEof);
     }
-    
+
     let huffman = (data[0] & (1u8 << prefix_bits)) != 0;
     let (len, mut offset) = decode_int(data, prefix_bits)?;
-    
+
     if offset + len as usize > data.len() {
         return Err(QpackError::UnexpectedEof);
     }
-    
+
     let string_data = &data[offset..offset + len as usize];
     offset += len as usize;
-    
+
     let decoded_data = if huffman {
         let mut decoded = Vec::new();
         crate::huffman::decode(string_data, &mut decoded)
@@ -434,14 +444,14 @@ fn decode_string_with_prefix(data: &[u8], prefix_bits: u8) -> Result<(Bytes, usi
     } else {
         Bytes::copy_from_slice(string_data)
     };
-    
+
     Ok((decoded_data, offset))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_encode_decode_prefix() {
         let prefix = EncodedPrefix {
@@ -449,24 +459,24 @@ mod tests {
             sign: false,
             delta_base: 5,
         };
-        
+
         let encoded = prefix.encode(100);
         let (decoded, _) = EncodedPrefix::decode(&encoded, 100, 50).unwrap();
-        
+
         assert_eq!(decoded.required_insert_count, 10);
         assert_eq!(decoded.sign, false);
         assert_eq!(decoded.delta_base, 5);
     }
-    
+
     #[test]
     fn test_indexed_static() {
         let field = FieldLine::IndexedStatic { index: 17 };
         let encoded = field.encode(0);
         let (decoded, _) = FieldLine::decode(&encoded, 0).unwrap();
-        
+
         assert_eq!(decoded, field);
     }
-    
+
     #[test]
     fn test_literal_static_name() {
         let field = FieldLine::LiteralStaticName {
@@ -474,10 +484,10 @@ mod tests {
             value: Bytes::from_static(b"custom"),
             never_indexed: false,
         };
-        
+
         let encoded = field.encode(0);
         let (decoded, _) = FieldLine::decode(&encoded, 0).unwrap();
-        
+
         assert_eq!(decoded, field);
     }
 }

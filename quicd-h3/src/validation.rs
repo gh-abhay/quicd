@@ -8,15 +8,31 @@ use http::Method;
 
 /// RFC 9110 Section 9.1: HTTP method token validation
 /// token = 1*tchar
-/// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." / 
+/// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
 ///         "0"-"9" / "A"-"Z" / "^" / "_" / "`" / "a"-"z" / "|" / "~"
 fn is_valid_method(method: &str) -> bool {
     if method.is_empty() {
         return false;
     }
     method.chars().all(|c| {
-        c.is_ascii_alphanumeric() 
-        || matches!(c, '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~')
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '!' | '#'
+                    | '$'
+                    | '%'
+                    | '&'
+                    | '\''
+                    | '*'
+                    | '+'
+                    | '-'
+                    | '.'
+                    | '^'
+                    | '_'
+                    | '`'
+                    | '|'
+                    | '~'
+            )
     })
 }
 
@@ -25,7 +41,7 @@ fn is_valid_method(method: &str) -> bool {
 fn is_valid_scheme(scheme: &str) -> bool {
     let mut chars = scheme.chars();
     match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() => {},
+        Some(c) if c.is_ascii_alphabetic() => {}
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
@@ -39,7 +55,9 @@ fn is_valid_scheme(scheme: &str) -> bool {
 /// - No uppercase characters in field names
 /// - No prohibited headers (Connection, etc.)
 /// - Pseudo-header values are valid
-pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestPseudoHeaders, H3Error> {
+pub fn validate_request_headers(
+    headers: &[(String, String)],
+) -> Result<RequestPseudoHeaders, H3Error> {
     let mut method = None;
     let mut scheme = None;
     let mut authority = None;
@@ -92,7 +110,7 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
             // Pseudo-header field
             if seen_regular_header {
                 return Err(H3Error::Http(
-                    "pseudo-header field after regular header field".into()
+                    "pseudo-header field after regular header field".into(),
                 ));
             }
 
@@ -124,7 +142,7 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
                     // RFC 9114 Section 4.3.1: Authority MUST NOT include deprecated userinfo
                     if value.contains('@') {
                         return Err(H3Error::Http(
-                            ":authority must not include userinfo subcomponent".into()
+                            ":authority must not include userinfo subcomponent".into(),
                         ));
                     }
                     // RFC 3986 Section 3.2.2: Validate IPv6 literals in authority
@@ -134,7 +152,7 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
                         let colon_count = value.matches(':').count();
                         if colon_count > 1 {
                             return Err(H3Error::Http(
-                                ":authority contains IPv6 address not enclosed in brackets".into()
+                                ":authority contains IPv6 address not enclosed in brackets".into(),
                             ));
                         }
                         // Single colon is valid for host:port
@@ -167,8 +185,11 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
             seen_regular_header = true;
 
             // RFC 9114 Section 4.2: Connection-specific fields MUST NOT be present
-            if name == "connection" || name == "keep-alive" || name == "proxy-connection"
-                || name == "transfer-encoding" {
+            if name == "connection"
+                || name == "keep-alive"
+                || name == "proxy-connection"
+                || name == "transfer-encoding"
+            {
                 return Err(H3Error::Http(format!(
                     "connection-specific header field not allowed: {}",
                     name
@@ -178,26 +199,26 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
             // RFC 9114 Section 4.5: HTTP/3 does not support Upgrade
             if name == "upgrade" {
                 return Err(H3Error::Http(
-                    "Upgrade header field not allowed in HTTP/3".into()
+                    "Upgrade header field not allowed in HTTP/3".into(),
                 ));
             }
 
             // TE header field is allowed but MUST NOT contain anything other than "trailers"
             if name == "te" && value != "trailers" {
                 return Err(H3Error::Http(
-                    "TE header field MUST only contain 'trailers'".into()
+                    "TE header field MUST only contain 'trailers'".into(),
                 ));
             }
         }
     }
-    
+
     // RFC 9114 Section 4.2: Validate TE header if present
     if has_te_header && te_value != "trailers" {
         return Err(H3Error::Http(
-            "TE header field MUST only contain 'trailers'".into()
+            "TE header field MUST only contain 'trailers'".into(),
         ));
     }
-    
+
     // Phase 3: Validate Content-Length is not duplicated (RFC 9110 Section 8.6)
     validate_content_length_uniqueness(headers)?;
 
@@ -215,7 +236,9 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
             return Err(H3Error::Http("CONNECT request MUST have :authority".into()));
         }
         if scheme.is_some() {
-            return Err(H3Error::Http("CONNECT request MUST NOT have :scheme".into()));
+            return Err(H3Error::Http(
+                "CONNECT request MUST NOT have :scheme".into(),
+            ));
         }
         if path.is_some() {
             return Err(H3Error::Http("CONNECT request MUST NOT have :path".into()));
@@ -237,23 +260,24 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
         if scheme_val == "http" || scheme_val == "https" {
             let has_authority = authority.is_some();
             let has_host = headers.iter().any(|(n, _)| n == "host");
-            
+
             if !has_authority && !has_host {
                 return Err(H3Error::Http(
-                    "missing :authority or Host header for http/https scheme".into()
+                    "missing :authority or Host header for http/https scheme".into(),
                 ));
             }
 
             // If both present, they MUST match
             if has_authority && has_host {
-                let host_value = headers.iter()
+                let host_value = headers
+                    .iter()
                     .find(|(n, _)| n == "host")
                     .map(|(_, v)| v)
                     .unwrap();
-                
+
                 if authority.as_ref().unwrap() != host_value {
                     return Err(H3Error::Http(
-                        ":authority and Host header values do not match".into()
+                        ":authority and Host header values do not match".into(),
                     ));
                 }
             }
@@ -268,8 +292,12 @@ pub fn validate_request_headers(headers: &[(String, String)]) -> Result<RequestP
 
         // :path MUST NOT be empty for http/https
         if let Some(p) = &path {
-            if p.is_empty() && (scheme.as_ref().unwrap() == "http" || scheme.as_ref().unwrap() == "https") {
-                return Err(H3Error::Http(":path MUST NOT be empty for http/https".into()));
+            if p.is_empty()
+                && (scheme.as_ref().unwrap() == "http" || scheme.as_ref().unwrap() == "https")
+            {
+                return Err(H3Error::Http(
+                    ":path MUST NOT be empty for http/https".into(),
+                ));
             }
         }
     }
@@ -300,7 +328,7 @@ pub fn validate_response_headers(headers: &[(String, String)]) -> Result<u16, H3
         if name.starts_with(':') {
             if seen_regular_header {
                 return Err(H3Error::Http(
-                    "pseudo-header field after regular header field".into()
+                    "pseudo-header field after regular header field".into(),
                 ));
             }
 
@@ -308,9 +336,11 @@ pub fn validate_response_headers(headers: &[(String, String)]) -> Result<u16, H3
                 if status.is_some() {
                     return Err(H3Error::Http("duplicate :status pseudo-header".into()));
                 }
-                status = Some(value.parse::<u16>().map_err(|_| {
-                    H3Error::Http(format!("invalid :status value: {}", value))
-                })?);
+                status = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| H3Error::Http(format!("invalid :status value: {}", value)))?,
+                );
             } else {
                 return Err(H3Error::Http(format!(
                     "unknown response pseudo-header: {}",
@@ -321,8 +351,12 @@ pub fn validate_response_headers(headers: &[(String, String)]) -> Result<u16, H3
             seen_regular_header = true;
 
             // Same connection-specific field checks
-            if name == "connection" || name == "keep-alive" || name == "proxy-connection"
-                || name == "transfer-encoding" || name == "upgrade" {
+            if name == "connection"
+                || name == "keep-alive"
+                || name == "proxy-connection"
+                || name == "transfer-encoding"
+                || name == "upgrade"
+            {
                 return Err(H3Error::Http(format!(
                     "connection-specific header field not allowed: {}",
                     name
@@ -357,7 +391,8 @@ impl RequestPseudoHeaders {
 
     /// Parse into http::Method.
     pub fn parse_method(&self) -> Result<Method, H3Error> {
-        self.method.parse()
+        self.method
+            .parse()
             .map_err(|_| H3Error::Http(format!("invalid method: {}", self.method)))
     }
 
@@ -368,21 +403,28 @@ impl RequestPseudoHeaders {
             return Err(H3Error::Http("CONNECT request has no URI".into()));
         }
 
-        let scheme = self.scheme.as_ref()
+        let scheme = self
+            .scheme
+            .as_ref()
             .ok_or_else(|| H3Error::Http("missing scheme for URI".into()))?;
-        let authority = self.authority.as_ref()
+        let authority = self
+            .authority
+            .as_ref()
             .ok_or_else(|| H3Error::Http("missing authority for URI".into()))?;
-        let path = self.path.as_ref()
+        let path = self
+            .path
+            .as_ref()
             .ok_or_else(|| H3Error::Http("missing path for URI".into()))?;
 
         let uri_string = format!("{}://{}{}", scheme, authority, path);
-        uri_string.parse()
+        uri_string
+            .parse()
             .map_err(|_| H3Error::Http(format!("invalid URI construction: {}", uri_string)))
     }
 }
 
 /// Phase 3: Validate Content-Length header uniqueness (RFC 9110 Section 8.6)
-/// 
+///
 /// RFC 9110 Section 8.6: "If a message is received that has multiple Content-Length
 /// header fields with field values consisting of the same decimal value, or a single
 /// Content-Length header field with a field value containing a list of identical
@@ -395,18 +437,20 @@ impl RequestPseudoHeaders {
 /// We choose to reject for safety.
 pub fn validate_content_length_uniqueness(headers: &[(String, String)]) -> Result<(), H3Error> {
     let mut content_length_count = 0;
-    
+
     for (name, _value) in headers {
         // RFC 9110: Header names are case-insensitive
         if name.eq_ignore_ascii_case("content-length") {
             content_length_count += 1;
             // RFC 9110 Section 8.6: Reject ANY multiple Content-Length headers
             if content_length_count > 1 {
-                return Err(H3Error::Http("Request contains multiple Content-Length headers".to_string()));
+                return Err(H3Error::Http(
+                    "Request contains multiple Content-Length headers".to_string(),
+                ));
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -417,7 +461,8 @@ pub fn validate_content_length_uniqueness(headers: &[(String, String)]) -> Resul
 /// - Length of uncompressed value in bytes  
 /// - 32 bytes of overhead per field
 pub fn calculate_field_section_size(headers: &[(String, String)]) -> usize {
-    headers.iter()
+    headers
+        .iter()
         .map(|(name, value)| name.len() + value.len() + 32)
         .sum()
 }
@@ -454,7 +499,7 @@ pub fn validate_field_section_size(
 pub fn validate_trailer_headers(trailers: &[(String, String)]) -> Result<(), H3Error> {
     use std::collections::HashSet;
     let mut seen_names = HashSet::new();
-    
+
     for (name, value) in trailers {
         // RFC 9114 Section 4.3: Pseudo-header fields MUST NOT appear in trailer sections
         if name.starts_with(':') {
@@ -479,7 +524,7 @@ pub fn validate_trailer_headers(trailers: &[(String, String)]) -> Result<(), H3E
                 name, value
             )));
         }
-        
+
         // ISSUE FIX #2: RFC 9110 Section 6.5: Trailers MUST NOT duplicate header names
         // Header names are case-insensitive
         let name_lower = name.to_lowercase();
@@ -492,10 +537,20 @@ pub fn validate_trailer_headers(trailers: &[(String, String)]) -> Result<(), H3E
 
         // RFC 9110 Section 6.5: Certain headers MUST NOT appear in trailers
         match name.as_str() {
-            "content-length" | "content-encoding" | "content-type" | 
-            "content-range" | "trailer" | "transfer-encoding" |
-            "authorization" | "set-cookie" | "content-disposition" |
-            "host" | "cache-control" | "max-forwards" | "te" | "www-authenticate" => {
+            "content-length"
+            | "content-encoding"
+            | "content-type"
+            | "content-range"
+            | "trailer"
+            | "transfer-encoding"
+            | "authorization"
+            | "set-cookie"
+            | "content-disposition"
+            | "host"
+            | "cache-control"
+            | "max-forwards"
+            | "te"
+            | "www-authenticate" => {
                 return Err(H3Error::Http(format!(
                     "H3_MESSAGE_ERROR: header not allowed in trailers: {}",
                     name
@@ -526,7 +581,7 @@ pub fn validate_trailer_section_size(
             size, max_size
         )));
     }
-    
+
     Ok(())
 }
 
@@ -541,8 +596,8 @@ pub fn validate_interim_response_headers(headers: &[(String, String)]) -> Result
         // - Transfer-Encoding (already banned in HTTP/3)
         // - Any representation metadata
         match name.as_str() {
-            "content-length" | "content-type" | "content-encoding" | 
-            "content-language" | "content-location" | "content-range" | "trailer" => {
+            "content-length" | "content-type" | "content-encoding" | "content-language"
+            | "content-location" | "content-range" | "trailer" => {
                 return Err(H3Error::Http(format!(
                     "H3_MESSAGE_ERROR: header '{}' not allowed in interim (1xx) response",
                     name
@@ -562,14 +617,17 @@ pub fn validate_interim_response_headers(headers: &[(String, String)]) -> Result
 /// - 204 No Content: MUST NOT contain Content-Length or content
 /// - 304 Not Modified: MUST NOT contain Content-Length or content
 /// - 2xx for CONNECT: MUST NOT contain Content-Length
-pub fn validate_response_headers_for_status(status: u16, headers: &[(String, String)]) -> Result<(), H3Error> {
+pub fn validate_response_headers_for_status(
+    status: u16,
+    headers: &[(String, String)],
+) -> Result<(), H3Error> {
     match status {
         // RFC 9110 Section 15.3.5: 204 No Content
         204 => {
             for (name, _) in headers {
                 if name == "content-length" {
                     return Err(H3Error::Http(
-                        "H3_MESSAGE_ERROR: 204 No Content MUST NOT contain Content-Length".into()
+                        "H3_MESSAGE_ERROR: 204 No Content MUST NOT contain Content-Length".into(),
                     ));
                 }
             }
@@ -579,14 +637,14 @@ pub fn validate_response_headers_for_status(status: u16, headers: &[(String, Str
             for (name, _) in headers {
                 if name == "content-length" {
                     return Err(H3Error::Http(
-                        "H3_MESSAGE_ERROR: 304 Not Modified MUST NOT contain Content-Length".into()
+                        "H3_MESSAGE_ERROR: 304 Not Modified MUST NOT contain Content-Length".into(),
                     ));
                 }
             }
         }
         _ => {}
     }
-    
+
     Ok(())
 }
 
@@ -705,10 +763,10 @@ mod tests {
 
         // Should pass with higher limit
         assert!(validate_field_section_size(&headers, 100).is_ok());
-        
+
         // Should fail with lower limit
         assert!(validate_field_section_size(&headers, 50).is_err());
-        
+
         // Should pass with unlimited (0)
         assert!(validate_field_section_size(&headers, 0).is_ok());
     }

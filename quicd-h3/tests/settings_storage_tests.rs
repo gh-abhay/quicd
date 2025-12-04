@@ -3,8 +3,8 @@
 //! Tests the complete flow of storing settings after receiving them from a peer,
 //! retrieving them on a subsequent connection, and validating compatibility.
 
+use quicd_h3::settings::{known, SettingsValidator};
 use quicd_h3::settings_storage::{InMemorySettingsStorage, Origin, SettingsStorage};
-use quicd_h3::settings::{SettingsValidator, known};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +29,10 @@ fn test_settings_storage_basic_flow() {
     // Next connection - retrieve remembered settings
     let remembered = storage.retrieve(&origin).unwrap();
     assert_eq!(remembered.get(&known::MAX_FIELD_SECTION_SIZE), Some(&8192));
-    assert_eq!(remembered.get(&known::QPACK_MAX_TABLE_CAPACITY), Some(&4096));
+    assert_eq!(
+        remembered.get(&known::QPACK_MAX_TABLE_CAPACITY),
+        Some(&4096)
+    );
     assert_eq!(remembered.get(&known::ENABLE_CONNECT_PROTOCOL), Some(&1));
 }
 
@@ -56,7 +59,9 @@ fn test_settings_validation_with_storage() {
     second_settings.insert(known::QPACK_MAX_TABLE_CAPACITY, 4096); // Same - OK
     second_settings.insert(known::QPACK_BLOCKED_STREAMS, 200); // Increased - OK
 
-    assert!(validator.validate_0rtt_compatibility(&second_settings).is_ok());
+    assert!(validator
+        .validate_0rtt_compatibility(&second_settings)
+        .is_ok());
 }
 
 #[test]
@@ -77,7 +82,9 @@ fn test_settings_validation_rejects_reduced_limits() {
     let mut second_settings = HashMap::new();
     second_settings.insert(known::MAX_FIELD_SECTION_SIZE, 8192); // Reduced!
 
-    assert!(validator.validate_0rtt_compatibility(&second_settings).is_err());
+    assert!(validator
+        .validate_0rtt_compatibility(&second_settings)
+        .is_err());
 }
 
 #[test]
@@ -102,7 +109,7 @@ fn test_settings_expiration() {
 #[test]
 fn test_multiple_origins_isolated() {
     let storage = InMemorySettingsStorage::new();
-    
+
     let origin1 = Origin::new("https".to_string(), "example.com".to_string(), 443);
     let origin2 = Origin::new("https".to_string(), "other.com".to_string(), 443);
 
@@ -117,11 +124,17 @@ fn test_multiple_origins_isolated() {
 
     // Each origin should have its own settings
     assert_eq!(
-        storage.retrieve(&origin1).unwrap().get(&known::MAX_FIELD_SECTION_SIZE),
+        storage
+            .retrieve(&origin1)
+            .unwrap()
+            .get(&known::MAX_FIELD_SECTION_SIZE),
         Some(&8192)
     );
     assert_eq!(
-        storage.retrieve(&origin2).unwrap().get(&known::MAX_FIELD_SECTION_SIZE),
+        storage
+            .retrieve(&origin2)
+            .unwrap()
+            .get(&known::MAX_FIELD_SECTION_SIZE),
         Some(&16384)
     );
 }
@@ -139,7 +152,7 @@ fn test_0rtt_settings_validation_complete_flow() {
 
     // === FIRST CONNECTION ===
     let mut first_validator = SettingsValidator::new();
-    
+
     // Receive SETTINGS frame
     let mut received_settings = HashMap::new();
     received_settings.insert(known::MAX_FIELD_SECTION_SIZE, 65536);
@@ -148,17 +161,21 @@ fn test_0rtt_settings_validation_complete_flow() {
     received_settings.insert(known::ENABLE_CONNECT_PROTOCOL, 1);
 
     // Validate and remember
-    assert!(first_validator.validate_settings(received_settings.clone()).is_ok());
+    assert!(first_validator
+        .validate_settings(received_settings.clone())
+        .is_ok());
     first_validator.remember_settings();
 
     // Store persistently
     storage.store(origin.clone(), received_settings);
 
     // === SECOND CONNECTION (0-RTT) ===
-    
+
     // Retrieve remembered settings
-    let remembered = storage.retrieve(&origin).expect("should have remembered settings");
-    
+    let remembered = storage
+        .retrieve(&origin)
+        .expect("should have remembered settings");
+
     // Create validator with remembered settings for 0-RTT validation
     let mut second_validator = SettingsValidator::with_remembered_settings(remembered);
 
@@ -170,10 +187,14 @@ fn test_0rtt_settings_validation_complete_flow() {
     new_settings.insert(known::ENABLE_CONNECT_PROTOCOL, 1); // Still enabled - OK
 
     // Validate 0-RTT compatibility BEFORE processing settings
-    assert!(second_validator.validate_0rtt_compatibility(&new_settings).is_ok());
+    assert!(second_validator
+        .validate_0rtt_compatibility(&new_settings)
+        .is_ok());
 
     // Then validate and process the settings normally
-    assert!(second_validator.validate_settings(new_settings.clone()).is_ok());
+    assert!(second_validator
+        .validate_settings(new_settings.clone())
+        .is_ok());
 
     // Remember for next time
     second_validator.remember_settings();
@@ -198,7 +219,9 @@ fn test_0rtt_validation_rejects_disabled_feature() {
     let mut second_settings = HashMap::new();
     second_settings.insert(known::ENABLE_CONNECT_PROTOCOL, 0); // Disabled!
 
-    assert!(validator.validate_0rtt_compatibility(&second_settings).is_err());
+    assert!(validator
+        .validate_0rtt_compatibility(&second_settings)
+        .is_err());
 }
 
 #[test]
@@ -218,13 +241,15 @@ fn test_0rtt_validation_rejects_omitted_non_default() {
     // Server omits the setting entirely - MUST be rejected
     let second_settings = HashMap::new(); // Empty!
 
-    assert!(validator.validate_0rtt_compatibility(&second_settings).is_err());
+    assert!(validator
+        .validate_0rtt_compatibility(&second_settings)
+        .is_err());
 }
 
 #[test]
 fn test_clear_expired_maintains_fresh_entries() {
     let storage = InMemorySettingsStorage::with_ttl(Duration::from_millis(100));
-    
+
     let origin1 = Origin::new("https".to_string(), "old.example.com".to_string(), 443);
     let origin2 = Origin::new("https".to_string(), "new.example.com".to_string(), 443);
 
@@ -233,10 +258,10 @@ fn test_clear_expired_maintains_fresh_entries() {
 
     // Store first entry
     storage.store(origin1.clone(), settings.clone());
-    
+
     // Wait for it to become stale
     std::thread::sleep(Duration::from_millis(150));
-    
+
     // Store second entry (fresh)
     storage.store(origin2.clone(), settings.clone());
 

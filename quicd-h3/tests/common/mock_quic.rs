@@ -45,10 +45,22 @@ struct StreamData {
 
 #[derive(Debug, Clone)]
 pub enum MockEvent {
-    StreamOpened { stream_id: u64, is_bidirectional: bool },
-    StreamData { stream_id: u64, data: Bytes, fin: bool },
-    StreamClosed { stream_id: u64 },
-    ConnectionClosed { error_code: u64, reason: String },
+    StreamOpened {
+        stream_id: u64,
+        is_bidirectional: bool,
+    },
+    StreamData {
+        stream_id: u64,
+        data: Bytes,
+        fin: bool,
+    },
+    StreamClosed {
+        stream_id: u64,
+    },
+    ConnectionClosed {
+        error_code: u64,
+        reason: String,
+    },
 }
 
 impl MockConnectionHandle {
@@ -71,17 +83,23 @@ impl MockConnectionHandle {
     /// Open a new stream (simulates peer opening a stream)
     pub fn open_stream(&self, stream_id: u64, is_bidirectional: bool) {
         let mut streams = self.streams.lock().unwrap();
-        streams.insert(stream_id, StreamData {
+        streams.insert(
             stream_id,
-            is_bidirectional,
-            read_buffer: VecDeque::new(),
-            write_buffer: Vec::new(),
-            fin_received: false,
-            fin_sent: false,
-        });
+            StreamData {
+                stream_id,
+                is_bidirectional,
+                read_buffer: VecDeque::new(),
+                write_buffer: Vec::new(),
+                fin_received: false,
+                fin_sent: false,
+            },
+        );
 
         let mut events = self.events.lock().unwrap();
-        events.push_back(MockEvent::StreamOpened { stream_id, is_bidirectional });
+        events.push_back(MockEvent::StreamOpened {
+            stream_id,
+            is_bidirectional,
+        });
     }
 
     /// Send data on a stream (simulates receiving data from peer)
@@ -94,7 +112,11 @@ impl MockConnectionHandle {
             }
 
             let mut events = self.events.lock().unwrap();
-            events.push_back(MockEvent::StreamData { stream_id, data, fin });
+            events.push_back(MockEvent::StreamData {
+                stream_id,
+                data,
+                fin,
+            });
         }
     }
 
@@ -211,7 +233,10 @@ mod tests {
 
         let event = handle.next_event().unwrap();
         match event {
-            MockEvent::StreamOpened { stream_id, is_bidirectional } => {
+            MockEvent::StreamOpened {
+                stream_id,
+                is_bidirectional,
+            } => {
                 assert_eq!(stream_id, 4);
                 assert!(is_bidirectional);
             }
@@ -231,7 +256,11 @@ mod tests {
         let event = handle.next_event(); // Skip StreamOpened
         let event = handle.next_event().unwrap();
         match event {
-            MockEvent::StreamData { stream_id, data, fin } => {
+            MockEvent::StreamData {
+                stream_id,
+                data,
+                fin,
+            } => {
                 assert_eq!(stream_id, 4);
                 assert_eq!(data, Bytes::from("hello"));
                 assert!(!fin);

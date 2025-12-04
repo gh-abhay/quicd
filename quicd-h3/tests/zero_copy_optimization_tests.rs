@@ -1,6 +1,6 @@
+use bytes::Bytes;
 /// Zero-copy optimizations and performance tests
 use quicd_h3::frames::H3Frame;
-use bytes::Bytes;
 
 #[test]
 fn test_zero_copy_frame_parsing() {
@@ -8,10 +8,10 @@ fn test_zero_copy_frame_parsing() {
     let data = Bytes::from(vec![1, 2, 3, 4, 5]);
     let frame = H3Frame::Data { data: data.clone() };
     let encoded = frame.encode();
-    
+
     // Parse using zero-copy method - parse_bytes uses Bytes::slice internally
     let (parsed, consumed) = H3Frame::parse_bytes(&encoded).unwrap();
-    
+
     assert_eq!(consumed, encoded.len());
     match parsed {
         H3Frame::Data { data: parsed_data } => {
@@ -28,10 +28,10 @@ fn test_optimized_cancel_push_encoding() {
     let push_id = 12345u64;
     let frame = H3Frame::CancelPush { push_id };
     let encoded = frame.encode();
-    
+
     // Parse it back
     let (parsed, consumed) = H3Frame::parse(&encoded).unwrap();
-    
+
     assert_eq!(consumed, encoded.len());
     match parsed {
         H3Frame::CancelPush { push_id: parsed_id } => {
@@ -47,11 +47,13 @@ fn test_optimized_goaway_encoding() {
     let stream_id = 98765u64;
     let frame = H3Frame::GoAway { stream_id };
     let encoded = frame.encode();
-    
+
     let (parsed, _) = H3Frame::parse(&encoded).unwrap();
-    
+
     match parsed {
-        H3Frame::GoAway { stream_id: parsed_id } => {
+        H3Frame::GoAway {
+            stream_id: parsed_id,
+        } => {
             assert_eq!(parsed_id, stream_id);
         }
         _ => panic!("Expected GOAWAY frame"),
@@ -64,9 +66,9 @@ fn test_optimized_max_push_id_encoding() {
     let push_id = 54321u64;
     let frame = H3Frame::MaxPushId { push_id };
     let encoded = frame.encode();
-    
+
     let (parsed, _) = H3Frame::parse(&encoded).unwrap();
-    
+
     match parsed {
         H3Frame::MaxPushId { push_id: parsed_id } => {
             assert_eq!(parsed_id, push_id);
@@ -78,19 +80,19 @@ fn test_optimized_max_push_id_encoding() {
 #[test]
 fn test_frame_encoding_sizes() {
     // Test that frame encoding produces minimal sizes
-    
+
     // Small push_id (< 64) should use 1 byte
     let frame1 = H3Frame::CancelPush { push_id: 42 };
     let encoded1 = frame1.encode();
     // Frame type (1) + length (1) + push_id (1) = 3 bytes
     assert_eq!(encoded1.len(), 3);
-    
+
     // Medium push_id (< 16384) should use 2 bytes
     let frame2 = H3Frame::CancelPush { push_id: 1000 };
     let encoded2 = frame2.encode();
     // Frame type (1) + length (1) + push_id (2) = 4 bytes
     assert_eq!(encoded2.len(), 4);
-    
+
     // Large push_id (< 1073741824) should use 4 bytes
     let frame3 = H3Frame::CancelPush { push_id: 100000 };
     let encoded3 = frame3.encode();
@@ -104,26 +106,25 @@ fn test_parse_bytes_multiple_frames() {
     let frame1 = H3Frame::CancelPush { push_id: 1 };
     let frame2 = H3Frame::MaxPushId { push_id: 100 };
     let frame3 = H3Frame::GoAway { stream_id: 200 };
-    
+
     let encoded1 = frame1.encode();
     let encoded2 = frame2.encode();
     let encoded3 = frame3.encode();
-    
+
     // Concatenate frames
-    let mut combined = bytes::BytesMut::with_capacity(
-        encoded1.len() + encoded2.len() + encoded3.len()
-    );
+    let mut combined =
+        bytes::BytesMut::with_capacity(encoded1.len() + encoded2.len() + encoded3.len());
     combined.extend_from_slice(&encoded1);
     combined.extend_from_slice(&encoded2);
     combined.extend_from_slice(&encoded3);
     let combined = combined.freeze();
-    
+
     // Parse all frames using zero-copy method
     let (frames, total_consumed) = H3Frame::parse_multiple(&combined).unwrap();
-    
+
     assert_eq!(frames.len(), 3);
     assert_eq!(total_consumed, combined.len());
-    
+
     // Verify frames
     match &frames[0] {
         H3Frame::CancelPush { push_id } => assert_eq!(*push_id, 1),
@@ -143,16 +144,18 @@ fn test_parse_bytes_multiple_frames() {
 fn test_headers_frame_zero_copy() {
     // Test that HEADERS frame uses Bytes::slice for efficient parsing
     let encoded_headers = Bytes::from(vec![0x01, 0x02, 0x03, 0x04]);
-    let frame = H3Frame::Headers { 
-        encoded_headers: encoded_headers.clone() 
+    let frame = H3Frame::Headers {
+        encoded_headers: encoded_headers.clone(),
     };
     let encoded_frame = frame.encode();
-    
+
     // Parse back using zero-copy method
     let (parsed, _) = H3Frame::parse_bytes(&encoded_frame).unwrap();
-    
+
     match parsed {
-        H3Frame::Headers { encoded_headers: parsed_headers } => {
+        H3Frame::Headers {
+            encoded_headers: parsed_headers,
+        } => {
             assert_eq!(parsed_headers, encoded_headers);
             // parse_bytes uses Bytes::slice internally for zero-copy
         }
@@ -166,10 +169,10 @@ fn test_data_frame_zero_copy() {
     let data = Bytes::from(b"Hello, HTTP/3!".to_vec());
     let frame = H3Frame::Data { data: data.clone() };
     let encoded_frame = frame.encode();
-    
+
     // Parse back using zero-copy method
     let (parsed, _) = H3Frame::parse_bytes(&encoded_frame).unwrap();
-    
+
     match parsed {
         H3Frame::Data { data: parsed_data } => {
             assert_eq!(parsed_data, data);
@@ -183,17 +186,19 @@ fn test_data_frame_zero_copy() {
 fn test_large_frame_encoding() {
     // Test encoding of a large DATA frame (should still be efficient)
     let large_data = Bytes::from(vec![0xAB; 65536]); // 64 KB
-    let frame = H3Frame::Data { data: large_data.clone() };
-    
+    let frame = H3Frame::Data {
+        data: large_data.clone(),
+    };
+
     let encoded = frame.encode();
-    
+
     // Frame type (1) + length varint (4 bytes for 65536 since it's >= 16384) + data (65536) = 65541
     assert_eq!(encoded.len(), 1 + 4 + 65536);
-    
+
     // Parse back
     let (parsed, consumed) = H3Frame::parse(&encoded).unwrap();
     assert_eq!(consumed, encoded.len());
-    
+
     match parsed {
         H3Frame::Data { data } => {
             assert_eq!(data.len(), 65536);

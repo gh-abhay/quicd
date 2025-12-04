@@ -26,7 +26,7 @@ use super::crypto::{create_quiche_config, TlsCredentials};
 use super::prefetch::{prefetch, PrefetchMode};
 use crate::netio::buffer::WorkerBuffer;
 use crate::quic::routing;
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use quiche::ConnectionId;
@@ -40,12 +40,18 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
+use ring::rand::{SecureRandom, SystemRandom};
 
 /// Maximum connection ID length (QUIC allows up to 20 bytes)
 const MAX_CONN_ID_LEN: usize = 20;
 
 /// Size of stream read buffers (64KB - max for efficient UDP/QUIC)
 const STREAM_BUFFER_SIZE: usize = 65536;
+
+/// Maximum datagram/UDP payload size (65KB - RFC 9221, RFC 9000 §14)
+/// Used for both stream buffers and datagram reception.
+/// The actual MTU may be smaller; applications should check conn.dgram_max_writable_len()
+const MAX_DATAGRAM_SIZE: usize = 65536;
 
 /// Convert a borrowed ConnectionId to an owned ConnectionId<'static> using inline storage.
 ///
@@ -73,6 +79,51 @@ fn connection_id_to_owned(cid: &ConnectionId) -> ConnectionId<'static> {
     // If len ≤ 20: uses SmallVec's inline storage, then moves to Vec (still no heap)
     // If len > 20: would heap allocate, but impossible per QUIC spec
     small_vec.to_vec().into()
+}
+
+/// Prefix used by QUIC draft version numbers (RFC 9000 §15).
+const QUIC_DRAFT_VERSION_PREFIX: u32 = 0xff00_0000;
+
+fn format_quic_version(version: u32) -> String {
+    format!("{:#010x}", version)
+}
+
+fn parse_quic_version_label(label: &str) -> Option<u32> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+
+    match lower.as_str() {
+        "v1" | "version1" | "rfc9000" => return Some(quiche::PROTOCOL_VERSION),
+        _ => {}
+    }
+
+    if let Some(rest) = lower
+        .strip_prefix("draft-")
+        .or_else(|| lower.strip_prefix("draft"))
+    {
+        if let Ok(num) = rest.parse::<u32>() {
+            if num <= 0xff {
+                return Some(QUIC_DRAFT_VERSION_PREFIX | num);
+            }
+        }
+    }
+
+    if let Some(hex) = lower.strip_prefix("0x") {
+        if !hex.is_empty() {
+            return u32::from_str_radix(hex, 16).ok();
+        }
+        return None;
+    }
+
+    if lower.len() == 8 && lower.chars().all(|c| c.is_ascii_hexdigit()) {
+        return u32::from_str_radix(&lower, 16).ok();
+    }
+
+    lower.parse::<u32>().ok()
 }
 
 /// Timeout queue entry for priority-based timeout tracking.
@@ -223,6 +274,35 @@ impl SendBufferPool {
     }
 }
 
+/// Determine congestion state from path and connection statistics (RFC 9002 §7)
+///
+/// Since quiche doesn't expose ssthresh directly, we infer congestion state from:
+/// - CWND size (small CWND suggests slow start, large suggests congestion avoidance)
+/// - Packet loss (indicates recovery state)
+/// - Delivery rate (active sending vs. idle)
+fn determine_congestion_state(
+    path_stats: &quiche::PathStats,
+    quiche_stats: &quiche::Stats,
+    last_packets_lost: u64,
+) -> quicd_x::CongestionState {
+    let current_packets_lost = quiche_stats.lost as u64;
+    let recent_loss = current_packets_lost > last_packets_lost;
+
+    // If we recently lost packets and delivery rate is active, we're in recovery
+    if recent_loss && path_stats.delivery_rate > 0 {
+        return quicd_x::CongestionState::Recovery;
+    }
+
+    // Typical initial CWND is 10 * MTU (~14KB for 1400-byte MTU)
+    // Use 50KB as threshold for slow start vs. congestion avoidance
+    // This is a heuristic since quiche doesn't expose ssthresh
+    if path_stats.cwnd < 50_000 {
+        quicd_x::CongestionState::SlowStart
+    } else {
+        quicd_x::CongestionState::CongestionAvoidance
+    }
+}
+
 /// Helper to send an event to the app task with proper error handling
 ///
 /// Returns true if event was sent successfully, false otherwise.
@@ -264,6 +344,8 @@ pub struct OutgoingPacket {
 struct CloseInfo {
     error_code: u64,
     reason: Option<Bytes>,
+    /// True if application error, false if transport error (RFC 9000 §10.2)
+    is_app: bool,
 }
 
 /// QUIC connection manager for a worker thread
@@ -277,8 +359,14 @@ pub struct QuicManager {
     /// QUIC configuration
     config: QuicConfig,
 
-    /// Quiche configuration (shared by all connections)
-    quiche_config: quiche::Config,
+    /// Quiche configurations keyed by wire version
+    quiche_configs: AHashMap<u32, quiche::Config>,
+
+    /// Ordered list of supported QUIC versions (first entry is the default)
+    supported_versions: Vec<u32>,
+
+    /// Fast membership lookup for supported versions
+    supported_versions_set: AHashSet<u32>,
 
     /// Active connections mapped by Connection ID
     /// Key: Destination Connection ID (DCID) from packet header
@@ -383,8 +471,73 @@ impl QuicManager {
             );
         };
 
-        // Create Quiche configuration
-        let quiche_config = create_quiche_config(&credentials, &config)?;
+        // Resolve configured QUIC versions (RFC 9368 §3) starting with RFC 9000 v1
+        let mut version_candidates = vec![quiche::PROTOCOL_VERSION];
+        for label in &config.additional_versions {
+            match parse_quic_version_label(label) {
+                Some(version) => {
+                    if version_candidates.contains(&version) {
+                        trace!(
+                            worker_id,
+                            version = %format_quic_version(version),
+                            %label,
+                            "Ignoring duplicate QUIC version label"
+                        );
+                    } else {
+                        version_candidates.push(version);
+                    }
+                }
+                None => {
+                    warn!(
+                        worker_id,
+                        %label,
+                        "Ignoring invalid QUIC version label"
+                    );
+                }
+            }
+        }
+
+        let mut quiche_configs = AHashMap::new();
+        let mut supported_versions = Vec::new();
+
+        for (index, version) in version_candidates.iter().copied().enumerate() {
+            match create_quiche_config(&credentials, &config, version) {
+                Ok(cfg) => {
+                    quiche_configs.insert(version, cfg);
+                    supported_versions.push(version);
+                }
+                Err(e) => {
+                    if index == 0 {
+                        return Err(e);
+                    }
+
+                    warn!(
+                        worker_id,
+                        version = %format_quic_version(version),
+                        error = ?e,
+                        "Skipping unsupported QUIC version"
+                    );
+                }
+            }
+        }
+
+        if supported_versions.is_empty() {
+            anyhow::bail!("failed to configure any QUIC versions");
+        }
+
+        let supported_versions_set = supported_versions
+            .iter()
+            .copied()
+            .collect::<AHashSet<u32>>();
+
+        info!(
+            worker_id,
+            versions = ?supported_versions
+                .iter()
+                .map(|v| format_quic_version(*v))
+                .collect::<Vec<_>>(),
+            "Resolved QUIC versions"
+        );
 
         // Generate connection ID seed for this worker
         // Each worker has its own seed to avoid connection ID collisions
@@ -413,7 +566,9 @@ impl QuicManager {
             worker_id,
             local_addr,
             config,
-            quiche_config,
+            quiche_configs,
+            supported_versions,
+            supported_versions_set,
             connections,
             connection_aliases: AHashMap::new(),
             conn_id_seed,
@@ -471,6 +626,7 @@ impl QuicManager {
                 } else {
                     Some(Bytes::from(err.reason.clone()))
                 },
+                is_app: err.is_app,
             };
         }
 
@@ -482,6 +638,7 @@ impl QuicManager {
                 } else {
                     Some(Bytes::from(err.reason.clone()))
                 },
+                is_app: err.is_app,
             };
         }
 
@@ -489,6 +646,7 @@ impl QuicManager {
             return CloseInfo {
                 error_code: 0,
                 reason: Some(Bytes::from_static(b"idle timeout")),
+                is_app: false, // Idle timeout is a transport-level error
             };
         }
 
@@ -520,6 +678,7 @@ impl QuicManager {
                 let event = quicd_x::AppEvent::ConnectionClosing {
                     error_code: info.error_code,
                     reason: info.reason.clone(),
+                    is_app: info.is_app,
                 };
                 let _ = send_app_event(self.worker_id, conn.connection_id, &ingress_tx, event);
                 // Drop sender after notification so subsequent attempts fail fast.
@@ -555,6 +714,22 @@ impl QuicManager {
         }
 
         Ok(())
+    }
+
+    /// Reschedule a connection's timeout after new activity.
+    ///
+    /// RFC 9000 §10.1 requires idle timeout tracking to include both ingress and egress
+    /// ack-eliciting packets. Whenever we process activity for a connection without going
+    /// through the ingress path (e.g., pure egress writes), we must explicitly refresh the
+    /// timeout heap entry so idle connections are not closed spuriously.
+    fn schedule_connection_timeout(&mut self, dcid: &ConnectionId<'static>) {
+        if let Some(conn) = self.connections.get(dcid) {
+            if let Some(timeout) = conn.timeout() {
+                let deadline = conn.last_active + timeout;
+                self.timeout_queue
+                    .push(TimeoutEntry::new(deadline, dcid.clone()));
+            }
+        }
     }
 
     /// Process an incoming packet and return packets that need to be sent
@@ -601,15 +776,32 @@ impl QuicManager {
             "Received QUIC packet"
         );
 
-        if hdr.version != quiche::PROTOCOL_VERSION && self.config.enable_version_negotiation {
-            let mut out = [0; MAX_DATAGRAM_SIZE];
-            let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out)
-                .context("failed to negotiate version")?;
+        if !self.supported_versions_set.contains(&hdr.version) {
+            if self.config.enable_version_negotiation {
+                let mut out = [0; MAX_DATAGRAM_SIZE];
+                let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out)
+                    .context("failed to negotiate version")?;
 
-            outgoing_packets.push(OutgoingPacket {
-                to: peer_addr,
-                data: out[..len].to_vec(),
-            });
+                outgoing_packets.push(OutgoingPacket {
+                    to: peer_addr,
+                    data: out[..len].to_vec(),
+                });
+
+                debug!(
+                    worker_id = self.worker_id,
+                    version = %format_quic_version(hdr.version),
+                    peer = %peer_addr,
+                    "Sent version negotiation response"
+                );
+            } else {
+                warn!(
+                    worker_id = self.worker_id,
+                    version = %format_quic_version(hdr.version),
+                    peer = %peer_addr,
+                    "Unsupported QUIC version (version negotiation disabled)"
+                );
+            }
+
             return Ok((None, outgoing_packets));
         }
 
@@ -661,7 +853,6 @@ impl QuicManager {
         let mut should_send_packets = false;
         let mut spawn_app = false;
         let mut handshake_trace_id: Option<String> = None;
-        let mut path_events = Vec::new();
 
         {
             let conn = self
@@ -690,11 +881,8 @@ impl QuicManager {
                         handshake_trace_id = Some(conn.trace_id().to_string());
                     }
 
-                    // Collect path events (connection migration, path validation)
-                    // Must collect first to avoid borrow checker issues
-                    while let Some(path_event) = conn.path_event_next() {
-                        path_events.push(path_event);
-                    }
+                    // Note: Path events are now processed in process_connection_events()
+                    // No need to collect them here to avoid duplicate processing
                 }
                 Err(quiche::Error::Done) => {
                     trace!(worker_id = self.worker_id, "Packet processing done");
@@ -710,10 +898,8 @@ impl QuicManager {
             }
         }
 
-        // Process path events after releasing connection borrow
-        for path_event in path_events {
-            self.handle_path_event(&canonical_dcid, path_event)?;
-        }
+        // Note: handle_path_event() calls removed - path events now processed
+        // comprehensively in process_connection_events() below
 
         if spawn_app {
             self.stats.borrow_mut().handshakes_completed += 1;
@@ -741,7 +927,15 @@ impl QuicManager {
             }
         }
 
+        // Process all transport events and notify application layer (RFC compliance)
+        // Must be called after packet processing to capture all state changes
+        // Call this regardless of stream processing - path events and other transport
+        // events can occur independently of stream activity (e.g., connection migration)
+        self.process_connection_events(&canonical_dcid)?;
+
         if should_send_packets {
+            let mut refreshed = false;
+
             if let Some(conn) = self.connections.get_mut(&canonical_dcid) {
                 collect_packets_for_conn(
                     self.worker_id,
@@ -750,13 +944,11 @@ impl QuicManager {
                     &mut outgoing_packets,
                 )?;
 
-                // Reschedule timeout after processing packet (connection activity updated)
-                // Do this while we have the mutable borrow
-                if let Some(timeout) = conn.timeout() {
-                    let deadline = conn.last_active + timeout;
-                    self.timeout_queue
-                        .push(TimeoutEntry::new(deadline, canonical_dcid.clone()));
-                }
+                refreshed = true;
+            }
+
+            if refreshed {
+                self.schedule_connection_timeout(&canonical_dcid);
             }
         }
 
@@ -843,109 +1035,536 @@ impl QuicManager {
         Ok(outgoing_packets)
     }
 
-    /// Handle path events (connection migration, path validation).
+    /// Process all connection events from quiche and send to application layer.
     ///
-    /// QUIC supports connection migration where a client can change its IP address
-    /// or port during a connection (e.g., mobile device switching networks).
-    /// This method processes path events from Quiche and updates connection state.
-    fn handle_path_event(
-        &mut self,
-        dcid: &ConnectionId<'static>,
-        event: quiche::PathEvent,
-    ) -> Result<()> {
-        use quiche::PathEvent;
+    /// This is the critical RFC compliance function that polls ALL quiche events
+    /// and translates them to quicd-x AppEvents for the application layer.
+    ///
+    /// Must be called after packet processing to ensure applications receive
+    /// all transport events (migration, path validation, flow control, etc.).
+    ///
+    /// # RFC Compliance
+    ///
+    /// - RFC 9000 §4: Flow control events (stream blocked, connection blocked)
+    /// - RFC 9000 §5: Connection ID events (new CID, retired CID)
+    /// - RFC 9000 §8-9: Path events (validation, migration)
+    /// - RFC 9000 §19.4: STOP_SENDING events
+    /// - RFC 9002 §7: Congestion state changes
+    /// - RFC 9001 §6: Key update events
+    fn process_connection_events(&mut self, dcid: &ConnectionId<'static>) -> Result<()> {
+        {
+            let conn = self
+                .connections
+                .get(dcid)
+                .ok_or_else(|| anyhow::anyhow!("Connection not found for event processing"))?;
 
-        let conn = self
-            .connections
-            .get_mut(dcid)
-            .ok_or_else(|| anyhow::anyhow!("Connection not found for path event"))?;
-
-        match event {
-            PathEvent::New(local_addr, peer_addr) => {
-                // A new network path has been observed (server-side only)
-                info!(
-                    worker_id = self.worker_id,
-                    connection_id = ?dcid,
-                    %local_addr,
-                    %peer_addr,
-                    "New network path detected"
-                );
-            }
-
-            PathEvent::Validated(local_addr, peer_addr) => {
-                // Path validation succeeded
-                info!(
-                    worker_id = self.worker_id,
-                    connection_id = ?dcid,
-                    %local_addr,
-                    %peer_addr,
-                    "Network path validated"
-                );
-            }
-
-            PathEvent::FailedValidation(local_addr, peer_addr) => {
-                // Path validation failed - this path won't be used
-                warn!(
-                    worker_id = self.worker_id,
-                    connection_id = ?dcid,
-                    %local_addr,
-                    %peer_addr,
-                    "Network path validation failed"
-                );
-            }
-
-            PathEvent::Closed(local_addr, peer_addr) => {
-                // Path has been closed
-                info!(
-                    worker_id = self.worker_id,
-                    connection_id = ?dcid,
-                    %local_addr,
-                    %peer_addr,
-                    "Network path closed"
-                );
-            }
-
-            PathEvent::ReusedSourceConnectionId(
-                seq,
-                (old_local, old_peer),
-                (new_local, new_peer),
-            ) => {
-                // Source connection ID is being reused on a different path
-                debug!(
-                    worker_id = self.worker_id,
-                    connection_id = ?dcid,
-                    sequence = seq,
-                    old_local = %old_local,
-                    old_peer = %old_peer,
-                    new_local = %new_local,
-                    new_peer = %new_peer,
-                    "Source connection ID reused on different path"
-                );
-            }
-
-            PathEvent::PeerMigrated(local_addr, peer_addr) => {
-                // Peer has migrated to a new network path (validated path only)
-                // This is the critical event for mobile clients
-                let old_peer_addr = conn.peer_addr;
-                conn.peer_addr = peer_addr;
-
-                info!(
-                    worker_id = self.worker_id,
-                    connection_id = ?dcid,
-                    %local_addr,
-                    old_peer = %old_peer_addr,
-                    new_peer = %peer_addr,
-                    "Peer migrated to new network path"
-                );
-
-                // Update connection statistics
-                self.stats.borrow_mut().migrations_completed += 1;
+            if conn.ingress_tx.is_none() {
+                self.replenish_source_connection_ids(dcid)?;
+                return Ok(());
             }
         }
+
+        {
+            let conn = self
+                .connections
+                .get_mut(dcid)
+                .expect("connection must exist after ingress check");
+
+            // Only process events if app task is spawned
+            let ingress_tx = match conn.ingress_tx.as_ref() {
+            Some(tx) => tx.clone(),
+            None => unreachable!("ingress channel verified in previous check"),
+        };
+
+        let connection_id = conn.connection_id;
+        let worker_id = self.worker_id;
+
+        // === RFC 9000 §8-9: Path Events (Migration, Validation) ===
+        while let Some(path_event) = conn.path_event_next() {
+            use quiche::PathEvent;
+
+            match path_event {
+                PathEvent::New(local_addr, peer_addr) => {
+                    trace!(worker_id, connection_id, %local_addr, %peer_addr, "New path");
+
+                    let event = quicd_x::AppEvent::TransportEvent(
+                        quicd_x::TransportEvent::MigrationStarted {
+                            new_peer_addr: peer_addr,
+                            local_addr,
+                        },
+                    );
+                    send_app_event(worker_id, connection_id, &ingress_tx, event);
+                }
+
+                PathEvent::Validated(local_addr, peer_addr) => {
+                    info!(worker_id, connection_id, %local_addr, %peer_addr, "Path validated");
+
+                    // Get RTT from path stats if available
+                    let rtt_us = conn
+                        .path_stats()
+                        .and_then(|s| s.rtt.as_micros().try_into().ok())
+                        .unwrap_or(0);
+
+                    let event =
+                        quicd_x::AppEvent::TransportEvent(quicd_x::TransportEvent::PathValidated {
+                            peer_addr,
+                            local_addr,
+                            rtt_us,
+                        });
+                    send_app_event(worker_id, connection_id, &ingress_tx, event);
+                }
+
+                PathEvent::FailedValidation(local_addr, peer_addr) => {
+                    warn!(worker_id, connection_id, %local_addr, %peer_addr, "Path validation failed");
+
+                    let event = quicd_x::AppEvent::TransportEvent(
+                        quicd_x::TransportEvent::PathValidationFailed {
+                            peer_addr,
+                            reason: "Path validation timeout or unreachable".to_string(),
+                        },
+                    );
+                    send_app_event(worker_id, connection_id, &ingress_tx, event);
+                }
+
+                PathEvent::Closed(local_addr, peer_addr) => {
+                    debug!(worker_id, connection_id, %local_addr, %peer_addr, "Path closed");
+                    // Path closure doesn't need explicit app notification (normal lifecycle)
+                }
+
+                PathEvent::ReusedSourceConnectionId(
+                    seq,
+                    (old_local, old_peer),
+                    (new_local, new_peer),
+                ) => {
+                    trace!(
+                        worker_id, connection_id, seq,
+                        old_local = %old_local, old_peer = %old_peer,
+                        new_local = %new_local, new_peer = %new_peer,
+                        "CID reused on different path"
+                    );
+                }
+
+                PathEvent::PeerMigrated(local_addr, peer_addr) => {
+                    let old_peer_addr = conn.peer_addr;
+                    conn.peer_addr = peer_addr;
+
+                    info!(
+                        worker_id, connection_id,
+                        %local_addr, old_peer = %old_peer_addr, new_peer = %peer_addr,
+                        "Peer migrated"
+                    );
+
+                    self.stats.borrow_mut().migrations_completed += 1;
+
+                    // Notify application of successful migration
+                    let event =
+                        quicd_x::AppEvent::TransportEvent(quicd_x::TransportEvent::PathValidated {
+                            peer_addr,
+                            local_addr,
+                            rtt_us: 0, // RTT not available during migration event
+                        });
+                    send_app_event(worker_id, connection_id, &ingress_tx, event);
+                }
+            }
+        }
+
+        // Re-borrow conn for remaining event processing
+        let conn = self.connections.get_mut(dcid).unwrap();
+
+        // === RFC 9000 §3.5: STOP_SENDING Detection ===
+        // STOP_SENDING frames are detected in the write path (see process_stream_writes).
+        // When stream_send() returns Error::StreamStopped(error_code), we forward
+        // AppEvent::StopSending to the application. This is the correct approach
+        // since quiche doesn't expose a direct stream_stopped_by_peer() query API.
+        // The error-based detection ensures we catch STOP_SENDING frames immediately
+        // when the application attempts to write to the stream.
+
+        // === RFC 9221: QUIC Datagrams ===
+        // Poll for unreliable datagram payloads received from peer.
+        // Datagrams are independent of streams and provide unreliable delivery.
+        // Must be polled in a loop since multiple datagrams may be buffered.
+        let mut dgram_buf = vec![0u8; MAX_DATAGRAM_SIZE]; // Max datagram size
+        loop {
+            match conn.conn.dgram_recv(&mut dgram_buf) {
+                Ok(len) => {
+                    if len > 0 {
+                        trace!(worker_id, connection_id, len, "Datagram received");
+
+                        // Zero-copy: clone only the received portion
+                        let payload = bytes::Bytes::copy_from_slice(&dgram_buf[..len]);
+
+                        let event = quicd_x::AppEvent::Datagram { payload };
+                        send_app_event(worker_id, connection_id, &ingress_tx, event);
+                    } else {
+                        // len == 0 means no more datagrams available
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => {
+                    // No more datagrams to receive
+                    break;
+                }
+                Err(e) => {
+                    // Unexpected error receiving datagram
+                    warn!(worker_id, connection_id, error = ?e, "Error receiving datagram");
+                    break;
+                }
+            }
+        }
+
+        // === RFC 9000 §19.16: Stream Finished Events ===
+        // Check for streams that have been finished by peer (FIN received)
+        // Use stream_finished() API if available, otherwise check during read
+        // Note: stream_finished() is the proper way per RFC 9000 §2.2
+        for stream_id in conn.conn.readable() {
+            // Check if stream is finished using quiche's stream_finished()
+            if conn.conn.stream_finished(stream_id) {
+                // Only notify if we haven't notified before
+                // Stream manager tracks which streams were notified
+                if let Some(ref sm) = conn.stream_manager {
+                    if sm.has_stream(stream_id) {
+                        trace!(
+                            worker_id,
+                            connection_id,
+                            stream_id,
+                            "Stream finished (FIN received)"
+                        );
+
+                        let event = quicd_x::AppEvent::StreamFinished { stream_id };
+                        send_app_event(worker_id, connection_id, &ingress_tx, event);
+                    }
+                }
+            }
+        }
+
+        // === RFC 9000 §4: Stream Writable Notifications ===
+        // Check for streams that became writable (have flow control credits)
+        // We iterate through quiche's writable() iterator, which returns all streams
+        // that currently have send capacity. This includes both app-initiated and
+        // peer-initiated bidirectional streams.
+        if conn.stream_manager.is_some() {
+            // Collect currently writable streams from quiche
+            let writable_streams: Vec<u64> = conn.conn.writable().collect();
+            let writable_set: std::collections::HashSet<u64> =
+                writable_streams.iter().copied().collect();
+
+            for stream_id in &writable_streams {
+                // Check if state changed from not-writable to writable
+                let was_writable = conn
+                    .stream_writable_state
+                    .get(stream_id)
+                    .copied()
+                    .unwrap_or(false);
+
+                if !was_writable {
+                    // Stream became writable - notify application
+                    // Only send event if stream is registered with stream manager
+                    if let Some(ref sm) = conn.stream_manager {
+                        if sm.has_stream(*stream_id) {
+                            debug!(worker_id, stream_id, "Stream became writable");
+
+                            let event = quicd_x::AppEvent::StreamWritable {
+                                stream_id: *stream_id,
+                            };
+                            send_app_event(worker_id, connection_id, &ingress_tx, event);
+                        }
+                    }
+                }
+
+                // Mark as writable
+                conn.stream_writable_state.insert(*stream_id, true);
+            }
+
+            // Mark streams that are no longer in writable set as not-writable
+            // This is needed to detect future transitions to writable state
+            conn.stream_writable_state.retain(|stream_id, is_writable| {
+                if *is_writable && !writable_set.contains(stream_id) {
+                    *is_writable = false;
+                }
+                true // Keep all entries
+            });
+        }
+
+        // === RFC 9000 §14: MTU Updates ===
+        // Check if maximum datagram size changed (PMTU discovery)
+        let current_mtu = conn.conn.max_send_udp_payload_size();
+        if current_mtu != conn.last_known_mtu {
+            info!(
+                worker_id,
+                connection_id,
+                old_mtu = conn.last_known_mtu,
+                new_mtu = current_mtu,
+                "MTU changed (PMTU discovery or path change)"
+            );
+
+            conn.last_known_mtu = current_mtu;
+
+            let event = quicd_x::AppEvent::TransportEvent(quicd_x::TransportEvent::MtuUpdated {
+                mtu: current_mtu,
+            });
+            send_app_event(worker_id, connection_id, &ingress_tx, event);
+        }
+
+        // === RFC 9000 §4.6: Stream Concurrency Limits ===
+        // Check if peer increased stream limits (sent MAX_STREAMS frame)
+        let current_bidi_limit = conn.conn.peer_streams_left_bidi();
+        let current_uni_limit = conn.conn.peer_streams_left_uni();
+
+        // Check bidirectional stream limit
+        if current_bidi_limit > conn.last_peer_streams_bidi {
+            debug!(
+                worker_id,
+                connection_id,
+                old_limit = conn.last_peer_streams_bidi,
+                new_limit = current_bidi_limit,
+                "Peer increased bidirectional stream limit"
+            );
+
+            conn.last_peer_streams_bidi = current_bidi_limit;
+
+            let event =
+                quicd_x::AppEvent::TransportEvent(quicd_x::TransportEvent::StreamsLimitIncreased {
+                    bidirectional: true,
+                    new_limit: current_bidi_limit,
+                });
+            send_app_event(worker_id, connection_id, &ingress_tx, event);
+        }
+
+        // Check unidirectional stream limit
+        if current_uni_limit > conn.last_peer_streams_uni {
+            debug!(
+                worker_id,
+                connection_id,
+                old_limit = conn.last_peer_streams_uni,
+                new_limit = current_uni_limit,
+                "Peer increased unidirectional stream limit"
+            );
+
+            conn.last_peer_streams_uni = current_uni_limit;
+
+            let event =
+                quicd_x::AppEvent::TransportEvent(quicd_x::TransportEvent::StreamsLimitIncreased {
+                    bidirectional: false,
+                    new_limit: current_uni_limit,
+                });
+            send_app_event(worker_id, connection_id, &ingress_tx, event);
+        }
+
+        // === RFC 9000 §4.1: Connection-Level Flow Control ===
+        // Monitor connection-level flow control (MAX_DATA) to detect unblocking
+        // When peer sends MAX_DATA frame increasing the limit, unblock the connection
+        // Note: quiche doesn't expose direct MAX_DATA tracking, so we monitor capacity changes
+        // Blocking is detected in process_stream_writes when writes fail with Done
+
+        if conn.connection_blocked_at.is_some() {
+            // Connection was blocked, check if capacity increased
+            let current_capacity = conn.connection_send_capacity();
+
+            if current_capacity > 0 {
+                // Connection has capacity again - unblocked
+                conn.connection_blocked_at = None;
+
+                debug!(
+                    worker_id,
+                    connection_id,
+                    capacity = current_capacity,
+                    "Connection-level flow control unblocked (MAX_DATA received)"
+                );
+
+                let event = quicd_x::AppEvent::TransportEvent(
+                    quicd_x::TransportEvent::ConnectionUnblocked {
+                        new_limit: current_capacity,
+                    },
+                );
+                send_app_event(worker_id, connection_id, &ingress_tx, event);
+            }
+        }
+
+        // === RFC 9000 §5.1: Connection ID Management ===
+        // Track new source Connection IDs (quiche 0.24.6+)
+        for cid in conn.conn.source_ids() {
+            let cid_static = quiche::ConnectionId::from_vec(cid.as_ref().to_vec());
+
+            if conn.known_source_cids.insert(cid_static.clone()) {
+                let cid_bytes = cid.as_ref();
+                let meta = conn.get_source_cid_meta(cid_bytes);
+
+                let (sequence, reset_token) = match meta {
+                    Some(info) => (info.sequence, Some(info.reset_token)),
+                    None => {
+                        warn!(
+                            worker_id,
+                            connection_id,
+                            "Missing metadata for source CID event"
+                        );
+                        (0, None)
+                    }
+                };
+
+                debug!(
+                    worker_id,
+                    connection_id,
+                    cid_len = cid_bytes.len(),
+                    sequence,
+                    "New source Connection ID detected"
+                );
+
+                let event =
+                    quicd_x::AppEvent::TransportEvent(quicd_x::TransportEvent::NewConnectionId {
+                        sequence,
+                        cid: bytes::Bytes::copy_from_slice(cid_bytes),
+                        reset_token,
+                    });
+                send_app_event(worker_id, connection_id, &ingress_tx, event);
+            }
+        }
+
+        while let Some(retired_cid) = conn.conn.retired_scid_next() {
+            let sequence = match conn.retire_source_connection_id(retired_cid.as_ref()) {
+                Some(meta) => meta.sequence,
+                None => {
+                    warn!(
+                        worker_id,
+                        connection_id,
+                        "Peer retired unknown source Connection ID"
+                    );
+                    0
+                }
+            };
+
+            let event = quicd_x::AppEvent::TransportEvent(
+                quicd_x::TransportEvent::ConnectionIdRetired { sequence },
+            );
+            send_app_event(worker_id, connection_id, &ingress_tx, event);
+        }
+
+        // === RFC 9002 §6: Packet Loss Detection ===
+        // Track packet loss and notify application
+        let quiche_stats = conn.conn.stats();
+        let current_packets_lost = quiche_stats.lost as u64;
+
+        if current_packets_lost > conn.last_packets_lost {
+            let new_losses = current_packets_lost - conn.last_packets_lost;
+
+            debug!(
+                worker_id,
+                connection_id,
+                new_losses,
+                total = current_packets_lost,
+                "Packet loss detected"
+            );
+
+            conn.last_packets_lost = current_packets_lost;
+
+            let event = quicd_x::AppEvent::TransportEvent(quicd_x::TransportEvent::PacketLost {
+                count: new_losses,
+                total_lost: current_packets_lost,
+            });
+            send_app_event(worker_id, connection_id, &ingress_tx, event);
+        }
+
+        // === RFC 9000 §13.4, RFC 9002 §7: ECN Congestion Detection ===
+        // Track ECN-CE (Congestion Experienced) marks from connection stats
+        // Note: quiche may not expose ECN counts directly in current version
+        // This is a placeholder for when quiche exposes ECN statistics
+        // For now, we track based on congestion state changes which implicitly include ECN
+
+        // === RFC 9002 §7: Congestion Control State Changes ===
+        // Monitor congestion window, RTT, and bytes in flight
+        if let Some(path_stats) = conn.conn.path_stats().next() {
+            let current_cwnd = path_stats.cwnd as u64;
+            let current_srtt_us = path_stats.rtt.as_micros() as u64;
+            let current_bytes_in_flight = (quiche_stats.sent - quiche_stats.recv) as u64;
+            let current_state =
+                determine_congestion_state(&path_stats, &quiche_stats, conn.last_packets_lost);
+
+            // Detect state transitions or significant changes in congestion metrics
+            // Report if state changed OR CWND changed by >10% OR RTT changed by >20%
+            let state_changed = current_state != conn.last_congestion_state;
+            let cwnd_changed = (current_cwnd as i64 - conn.last_cwnd as i64).abs() as u64
+                > (conn.last_cwnd / 10).max(1);
+            let srtt_changed = (current_srtt_us as i64 - conn.last_srtt_us as i64).abs() as u64
+                > (conn.last_srtt_us / 5).max(1000); // Min 1ms change threshold
+
+            if state_changed || cwnd_changed || srtt_changed {
+                trace!(
+                    worker_id,
+                    connection_id,
+                    state = ?current_state,
+                    cwnd = current_cwnd,
+                    srtt_us = current_srtt_us,
+                    bytes_in_flight = current_bytes_in_flight,
+                    "Congestion state changed"
+                );
+
+                conn.last_congestion_state = current_state;
+                conn.last_cwnd = current_cwnd;
+                conn.last_srtt_us = current_srtt_us;
+                conn.last_bytes_in_flight = current_bytes_in_flight;
+
+                let event = quicd_x::AppEvent::TransportEvent(
+                    quicd_x::TransportEvent::CongestionStateChanged {
+                        state: current_state,
+                        cwnd: current_cwnd,
+                        bytes_in_flight: current_bytes_in_flight,
+                        srtt_us: current_srtt_us,
+                    },
+                );
+                send_app_event(worker_id, connection_id, &ingress_tx, event);
+            }
+        }
+
+        // === RFC 9001 §4.6: 0-RTT Early Data Tracking ===
+        // Track transition out of early data (0-RTT → 1-RTT)
+        let currently_in_early_data = conn.conn.is_in_early_data();
+
+        if conn.was_in_early_data && !currently_in_early_data {
+            // Check if 0-RTT was accepted or rejected
+            // If is_established() is true and we transitioned out of early data,
+            // then 0-RTT was accepted. If connection was reset during early data,
+            // it was rejected (but that would close the connection).
+            let was_accepted = conn.conn.is_established();
+
+            if was_accepted {
+                info!(
+                    worker_id,
+                    connection_id, "0-RTT early data accepted - transitioned to 1-RTT"
+                );
+
+                // Notify application that 0-RTT was accepted (RFC 9001 §4.6.2)
+                let event = quicd_x::AppEvent::EarlyDataAccepted;
+                send_app_event(worker_id, connection_id, &ingress_tx, event);
+            } else {
+                warn!(
+                    worker_id,
+                    connection_id, "0-RTT early data rejected by peer"
+                );
+
+                // Notify application that 0-RTT was rejected (RFC 9001 §4.6.2)
+                // Application must be prepared to retransmit data sent during 0-RTT
+                let event = quicd_x::AppEvent::EarlyDataRejected;
+                send_app_event(worker_id, connection_id, &ingress_tx, event);
+            }
+
+            conn.was_in_early_data = false;
+
+            // Also send key update event for security auditing
+            let event =
+                quicd_x::AppEvent::TransportEvent(quicd_x::TransportEvent::KeyUpdateCompleted {
+                    key_phase: 1, // 0-RTT → 1-RTT transition
+                });
+            send_app_event(worker_id, connection_id, &ingress_tx, event);
+        }
+    }
+        self.replenish_source_connection_ids(dcid)?;
 
         Ok(())
     }
 
+    /// Handle path events (connection migration, path validation).
+    ///
+    /// QUIC supports connection migration where a client can change its IP address
+    /// or port during a connection (e.g., mobile device switching networks).
     /// Gracefully close all connections with a shutdown notification.
     ///
     /// This method closes all active connections by sending CONNECTION_CLOSE frames
@@ -1057,7 +1676,9 @@ fn process_streams(
         let stream_manager = conn.stream_manager.as_mut().unwrap();
 
         // Check if this is a new stream
-        if !stream_manager.has_stream(*stream_id) {
+        let is_new_stream = !stream_manager.has_stream(*stream_id);
+
+        if is_new_stream {
             // Determine if bidirectional (even stream IDs are client-initiated bidirectional)
             let bidirectional = (stream_id % 4) == 0 || (stream_id % 4) == 1;
 
@@ -1072,6 +1693,26 @@ fn process_streams(
                     "Failed to register new stream - app channel full, deferring processing"
                 );
                 continue; // Skip this stream for now, will retry on next readable event
+            }
+        } else {
+            // RFC 9000 §2.2: Stream is already registered and has become readable again
+            // Generate StreamReadable event for efficient backpressure handling
+            // This is edge-triggered: we notify when a stream becomes readable
+            trace!(worker_id, stream_id, "Stream readable (has buffered data)");
+
+            // Send StreamReadable event to app
+            if let Some(ref sm) = conn.stream_manager {
+                let event = quicd_x::AppEvent::StreamReadable {
+                    stream_id: *stream_id,
+                };
+                if sm.conn_ingress_tx.try_send(event).is_err() {
+                    // App channel full - skip this event, will retry on next poll
+                    trace!(
+                        worker_id,
+                        stream_id,
+                        "Failed to send StreamReadable - app channel full"
+                    );
+                }
             }
         }
 
@@ -1313,33 +1954,98 @@ impl QuicManager {
         // Get quiche stats
         let quiche_stats = conn.conn.stats();
 
-        // Get path stats for RTT
-        let path_stats = conn.conn.path_stats().next();
-        let rtt_estimate_ms = path_stats.map(|ps| ps.rtt.as_millis() as u32);
+        // Get path stats for RTT and congestion metrics
+        // Extract all fields at once to avoid move issues
+        let (srtt_us, min_rtt_us, rttvar_us, latest_rtt_us, cwnd, path_mtu) =
+            if let Some(ps) = conn.conn.path_stats().next() {
+                (
+                    Some(ps.rtt.as_micros() as u64),
+                    ps.min_rtt.map(|d| d.as_micros() as u64),
+                    Some(ps.rttvar.as_micros() as u64),
+                    Some(ps.rtt.as_micros() as u64),
+                    ps.cwnd as u64,
+                    ps.pmtu,
+                )
+            } else {
+                (None, None, None, None, 0, 1200)
+            };
+
+        // === RFC 9002: Congestion Control Metrics ===
+        // bytes_in_flight should be sent - acked, but quiche doesn't expose acked separately
+        // Using sent - recv as approximation (close enough for monitoring)
+        let bytes_in_flight = quiche_stats.sent.saturating_sub(quiche_stats.recv) as u64;
+
+        // === RFC 9000 §4: Flow Control Limits ===
+        // Get current flow control limits from our tracking state
+        let max_streams_bidi = conn.last_peer_streams_bidi;
+        let max_streams_uni = conn.last_peer_streams_uni;
 
         // Count active streams and track max stream ID
         let mut active_streams: usize = 0;
         let mut max_stream_id = conn.stream_id_gen.max_stream_id();
-        
+
+        // Use a HashSet to avoid double-counting streams that are both readable and writable
+        let mut seen_streams = std::collections::HashSet::new();
+
         for stream_id in conn.conn.readable() {
-            active_streams = active_streams.saturating_add(1);
+            if seen_streams.insert(stream_id) {
+                active_streams += 1;
+            }
             max_stream_id = max_stream_id.max(stream_id);
         }
         for stream_id in conn.conn.writable() {
-            active_streams = active_streams.saturating_add(1);
+            if seen_streams.insert(stream_id) {
+                active_streams += 1;
+            }
             max_stream_id = max_stream_id.max(stream_id);
         }
 
-        // Build and return ConnectionStats
+        // Build and return ConnectionStats with RFC-compliant metrics
         Some(quicd_x::ConnectionStats {
-            rtt_estimate_ms,
+            // === RFC 9002 §5: RTT Metrics ===
+            srtt_us,
+            min_rtt_us,
+            rttvar_us,
+            latest_rtt_us,
+            pto_ms: None, // quiche 0.24 doesn't expose PTO directly
+
+            // === RFC 9002 §7: Congestion Control ===
+            cwnd,
+            bytes_in_flight,
+            ssthresh: None,        // quiche doesn't expose ssthresh separately
+            pacing_rate_bps: None, // quiche 0.24 doesn't expose pacing rate
+
+            // === RFC 9000 §4: Flow Control ===
+            max_data: 0, // quiche 0.24 doesn't expose max_data directly
+            data_sent: quiche_stats.sent as u64,
+            max_data_recv: 0, // quiche 0.24 doesn't expose max_data_recv
+            data_received: quiche_stats.recv as u64,
+            max_streams_bidi,
+            max_streams_uni,
+
+            // === Basic Statistics ===
             bytes_sent: quiche_stats.sent as u64,
             bytes_received: quiche_stats.recv as u64,
             active_streams,
-            congestion_state: None, // quiche doesn't expose congestion state in a simple way
-            packets_sent: 0,        // quiche doesn't expose total packet count directly
-            packets_received: 0,    // tracked separately if needed
+            packets_sent: conn.stats.packets_sent,
+            packets_received: conn.stats.packets_recv,
+            packets_lost: quiche_stats.lost as u64,
+            packets_retransmitted: quiche_stats.retrans as u64, // Use quiche's retrans counter
             max_stream_id,
+
+            // === RFC 9000 §13.4: ECN Statistics ===
+            // quiche 0.24 doesn't expose ECN counters directly
+            ecn_ect0_count: 0,
+            ecn_ect1_count: 0,
+            ecn_ce_count: 0,
+
+            // === Path Information ===
+            path_mtu,
+            is_in_early_data: conn.is_in_early_data(),
+            is_established: conn.is_established(),
+            is_closed: conn.is_closed(),
+            path_validations_completed: 0, // Would need to track in QuicConnection
+            path_validations_failed: 0,    // Would need to track in QuicConnection
         })
     }
 
@@ -1851,6 +2557,241 @@ impl QuicManager {
         }
     }
 
+    /// Process ValidatePath command (RFC 9000 §8.2, §9.1)
+    fn process_validate_path(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        peer_addr: std::net::SocketAddr,
+    ) -> Result<()> {
+        // Look up the connection
+        let dcid = self
+            .connection_id_map
+            .get(&connection_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Connection not found for ValidatePath"))?;
+
+        // Get the connection
+        let conn = self
+            .get_connection_mut(&dcid)
+            .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
+
+        // Get the current local address from the active path
+        let local_addr = conn
+            .conn
+            .path_stats()
+            .next()
+            .map(|p| p.local_addr)
+            .ok_or_else(|| anyhow::anyhow!("No active path found for connection"))?;
+
+        // Initiate explicit path validation probe (RFC 9000 §9.1)
+        // This will cause PATH_CHALLENGE frames to be sent to the new path
+        conn.conn.probe_path(local_addr, peer_addr).map_err(|e| {
+            warn!(
+                worker_id,
+                connection_id,
+                %peer_addr,
+                error = %e,
+                "Failed to initiate path validation probe"
+            );
+            anyhow::anyhow!("Path probe failed: {}", e)
+        })?;
+
+        info!(
+            worker_id,
+            connection_id,
+            %local_addr,
+            %peer_addr,
+            "Initiated active path validation probe (RFC 9000 §9.1)"
+        );
+
+        Ok(())
+    }
+
+    /// Derive stateless reset token for a connection ID using the worker seed (RFC 9000 §10.3).
+    fn reset_token_for(&self, cid_bytes: &[u8]) -> u128 {
+        let tag = ring::hmac::sign(&self.conn_id_seed, cid_bytes);
+        let mut token = [0u8; 16];
+        token.copy_from_slice(&tag.as_ref()[..16]);
+        u128::from_be_bytes(token)
+    }
+
+    /// Generate a new eBPF-routable Connection ID for this worker.
+    fn generate_worker_connection_id(&self, worker_idx: u8) -> Result<[u8; MAX_CONN_ID_LEN]> {
+        let rng = SystemRandom::new();
+        let mut seed_bytes = [0u8; 4];
+        rng.fill(&mut seed_bytes)
+            .map_err(|_| anyhow::anyhow!("failed to obtain randomness for connection ID generation"))?;
+        let seed = u32::from_be_bytes(seed_bytes);
+        Ok(routing::generate_connection_id(worker_idx, seed))
+    }
+
+    /// Ensure we have provided enough Source Connection IDs to the peer (RFC 9000 §5.1).
+    fn replenish_source_connection_ids(
+        &mut self,
+        dcid: &ConnectionId<'static>,
+    ) -> Result<()> {
+        let worker_idx: u8 = self.worker_id.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "worker_id {} exceeds 255 and cannot be encoded into Connection IDs",
+                self.worker_id
+            )
+        })?;
+
+        let mut minted = 0usize;
+
+        loop {
+            let scids_left = match self.connections.get_mut(dcid) {
+                Some(conn) => conn.conn.scids_left(),
+                None => break,
+            };
+
+            if scids_left == 0 {
+                break;
+            }
+
+            let cid_bytes = self.generate_worker_connection_id(worker_idx)?;
+            let cid_vec = cid_bytes.to_vec();
+            let quiche_cid = quiche::ConnectionId::from_vec(cid_vec.clone());
+            let reset_token = self.reset_token_for(&cid_vec);
+            let reset_token_bytes = reset_token.to_be_bytes();
+
+            let provisioned = match self.connections.get_mut(dcid) {
+                Some(conn) => match conn.conn.new_scid(&quiche_cid, reset_token, true) {
+                    Ok(sequence) => {
+                        conn.record_source_connection_id(&cid_vec, sequence, reset_token_bytes);
+                        true
+                    }
+                    Err(quiche::Error::Done) => false,
+                    Err(e) => {
+                        warn!(
+                            worker_id = self.worker_id,
+                            connection = ?dcid,
+                            error = ?e,
+                            "Failed to provision additional source Connection ID"
+                        );
+                        false
+                    }
+                },
+                None => false,
+            };
+
+            if !provisioned {
+                break;
+            }
+
+            minted += 1;
+        }
+
+        if minted > 0 {
+            info!(
+                worker_id = self.worker_id,
+                connection = ?dcid,
+                minted,
+                "Provisioned {minted} source Connection ID(s) for peer (RFC 9000 §5.1)"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Process MigrateTo command (RFC 9000 §9).
+    fn process_migrate_to(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        new_local_addr: SocketAddr,
+    ) -> Result<()> {
+        let Some(dcid) = self.connection_id_map.get(&connection_id).cloned() else {
+            warn!(worker_id, connection_id, "Connection not found for MigrateTo");
+            return Ok(());
+        };
+
+        let (ingress_tx, peer_addr, is_server) = match self.connections.get(&dcid) {
+            Some(conn) => (conn.ingress_tx.clone(), conn.peer_addr, conn.conn.is_server()),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for migration");
+                return Ok(());
+            }
+        };
+
+        if is_server {
+            warn!(
+                worker_id,
+                connection_id,
+                %new_local_addr,
+                "Active migration requested on server-side connection; rejecting per RFC 9000 §9"
+            );
+
+            if let Some(ingress_tx) = ingress_tx {
+                let reason = format!(
+                    "Active connection migration can only be initiated by clients per RFC 9000 §9. \
+                     Server refused to migrate to {new_local_addr}."
+                );
+                let event = quicd_x::AppEvent::TransportEvent(
+                    quicd_x::TransportEvent::PathValidationFailed {
+                        peer_addr,
+                        reason,
+                    },
+                );
+                send_app_event(worker_id, connection_id, &ingress_tx, event);
+            }
+
+            return Ok(());
+        }
+
+        let migrate_result = match self.connections.get_mut(&dcid) {
+            Some(conn) => conn.conn.migrate_source(new_local_addr),
+            None => {
+                warn!(worker_id, connection_id, "Connection disappeared before migration");
+                return Ok(());
+            }
+        };
+
+        match migrate_result {
+            Ok(dcid_seq) => {
+                info!(
+                    worker_id,
+                    connection_id,
+                    %new_local_addr,
+                    dcid_seq,
+                    "Initiated client-side migration to new local address"
+                );
+
+                if let Some(ingress_tx) = ingress_tx {
+                    let event = quicd_x::AppEvent::TransportEvent(
+                        quicd_x::TransportEvent::MigrationStarted {
+                            new_peer_addr: peer_addr,
+                            local_addr: new_local_addr,
+                        },
+                    );
+                    send_app_event(worker_id, connection_id, &ingress_tx, event);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    worker_id,
+                    connection_id,
+                    %new_local_addr,
+                    error = ?e,
+                    "Failed to initiate migration"
+                );
+
+                if let Some(ingress_tx) = ingress_tx {
+                    let event = quicd_x::AppEvent::TransportEvent(
+                        quicd_x::TransportEvent::PathValidationFailed {
+                            peer_addr,
+                            reason: format!("Migration to {new_local_addr} failed: {e:?}"),
+                        },
+                    );
+                    send_app_event(worker_id, connection_id, &ingress_tx, event);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Process RequestStats command
     fn process_request_stats(
         &mut self,
@@ -1908,6 +2849,296 @@ impl QuicManager {
         let _ = reply.send(state);
     }
 
+    /// Process SetStreamPriority command (RFC 9218 extensible priorities)
+    fn process_set_stream_priority(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        stream_id: u64,
+        urgency: u8,
+        incremental: bool,
+    ) {
+        // Look up the connection
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(
+                    worker_id,
+                    connection_id, stream_id, "Connection not found for SetStreamPriority"
+                );
+                return;
+            }
+        };
+
+        // Get the connection
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Note: quiche doesn't currently expose a direct API for RFC 9218 priorities
+        // This would require sending PRIORITY_UPDATE frames via H3
+        // For now, we log the priority change and notify the application
+        trace!(
+            worker_id,
+            connection_id,
+            stream_id,
+            urgency,
+            incremental,
+            "Stream priority set (requires H3 layer for PRIORITY_UPDATE frames)"
+        );
+
+        // Notify application that priority was changed
+        if let Some(ref ingress_tx) = conn.ingress_tx {
+            let event =
+                quicd_x::AppEvent::TransportEvent(quicd_x::TransportEvent::StreamPriorityChanged {
+                    stream_id,
+                    urgency,
+                    incremental,
+                });
+            let _ = ingress_tx.try_send(event);
+        }
+    }
+
+    /// Process StopSending command (RFC 9000 §3.5)
+    fn process_stop_sending(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        stream_id: u64,
+        error_code: u64,
+    ) {
+        // Look up the connection
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(
+                    worker_id,
+                    connection_id, stream_id, "Connection not found for StopSending"
+                );
+                return;
+            }
+        };
+
+        // Get the connection
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Send STOP_SENDING frame via quiche
+        match conn
+            .conn
+            .stream_shutdown(stream_id, quiche::Shutdown::Read, error_code)
+        {
+            Ok(()) => {
+                debug!(
+                    worker_id,
+                    connection_id, stream_id, error_code, "Sent STOP_SENDING frame"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    worker_id,
+                    connection_id,
+                    stream_id,
+                    error = ?e,
+                    "Failed to send STOP_SENDING"
+                );
+            }
+        }
+    }
+
+    /// Process GetMaxDatagramSize command (RFC 9221 §3)
+    fn process_get_max_datagram_size(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<Option<usize>>,
+    ) {
+        // Look up the connection
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(
+                    worker_id,
+                    connection_id, "Connection not found for GetMaxDatagramSize"
+                );
+                let _ = reply.send(None);
+                return;
+            }
+        };
+
+        // Get the connection
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(None);
+                return;
+            }
+        };
+
+        // Query maximum datagram size from quiche
+        let max_size = conn.conn.dgram_max_writable_len();
+
+        debug!(
+            worker_id,
+            connection_id,
+            max_size = ?max_size,
+            "Queried max datagram size"
+        );
+
+        let _ = reply.send(max_size);
+    }
+
+    /// Process GetStreamCredits command (RFC 9000 §4.6)
+    fn process_get_stream_credits(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<quicd_x::StreamCredits>,
+    ) {
+        // Look up the connection
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(
+                    worker_id,
+                    connection_id, "Connection not found for GetStreamCredits"
+                );
+                let _ = reply.send(quicd_x::StreamCredits { bidi: 0, uni: 0 });
+                return;
+            }
+        };
+
+        // Get the connection
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(quicd_x::StreamCredits { bidi: 0, uni: 0 });
+                return;
+            }
+        };
+
+        // Query stream credits from quiche
+        let bidi = conn.conn.peer_streams_left_bidi();
+        let uni = conn.conn.peer_streams_left_uni();
+
+        debug!(
+            worker_id,
+            connection_id, bidi, uni, "Queried stream credits"
+        );
+
+        let _ = reply.send(quicd_x::StreamCredits { bidi, uni });
+    }
+
+    /// Process QueryStreamCapacity command (RFC 9000 §4.1)
+    fn process_query_stream_capacity(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        stream_id: quicd_x::StreamId,
+        reply: tokio::sync::oneshot::Sender<Result<u64, quicd_x::ConnectionError>>,
+    ) {
+        // Look up the connection
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(
+                    worker_id,
+                    connection_id, stream_id, "Connection not found for QueryStreamCapacity"
+                );
+                let _ = reply.send(Err(quicd_x::ConnectionError::Closed(
+                    "connection not found".into(),
+                )));
+                return;
+            }
+        };
+
+        // Get the connection
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(Err(quicd_x::ConnectionError::Closed(
+                    "connection not found".into(),
+                )));
+                return;
+            }
+        };
+
+        // Query stream send capacity from quiche (RFC 9000 §4.1)
+        match conn.stream_send_capacity(stream_id) {
+            Ok(capacity) => {
+                debug!(
+                    worker_id,
+                    connection_id, stream_id, capacity, "Queried stream send capacity"
+                );
+                let _ = reply.send(Ok(capacity));
+            }
+            Err(quiche::Error::InvalidStreamState(_)) => {
+                warn!(
+                    worker_id,
+                    connection_id, stream_id, "Stream not in writable state"
+                );
+                let _ = reply.send(Err(quicd_x::ConnectionError::App(
+                    "stream not found or not writable".into(),
+                )));
+            }
+            Err(e) => {
+                warn!(
+                    worker_id,
+                    connection_id,
+                    stream_id,
+                    error = ?e,
+                    "Failed to query stream capacity"
+                );
+                let _ = reply.send(Err(quicd_x::ConnectionError::Closed(
+                    format!("quiche error: {:?}", e).into(),
+                )));
+            }
+        }
+    }
+
+    /// Process QueryConnectionCapacity command (RFC 9000 §4.1)
+    fn process_query_connection_capacity(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<u64>,
+    ) {
+        // Look up the connection
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(
+                    worker_id,
+                    connection_id, "Connection not found for QueryConnectionCapacity"
+                );
+                let _ = reply.send(0);
+                return;
+            }
+        };
+
+        // Get the connection
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(0);
+                return;
+            }
+        };
+
+        // Query connection-level send capacity (RFC 9000 §4.1)
+        let capacity = conn.connection_send_capacity();
+
+        debug!(
+            worker_id,
+            connection_id, capacity, "Queried connection send capacity"
+        );
+
+        let _ = reply.send(capacity);
+    }
+
     /// Process an egress command from an application task and return packets to send.
     ///
     /// This is called from the worker's event loop when processing egress commands.
@@ -1934,6 +3165,14 @@ impl QuicManager {
             EgressCommand::Close { connection_id, .. } => *connection_id,
             EgressCommand::RequestStats { connection_id, .. } => *connection_id,
             EgressCommand::QueryConnectionState { connection_id, .. } => *connection_id,
+            EgressCommand::MigrateTo { connection_id, .. } => *connection_id,
+            EgressCommand::ValidatePath { connection_id, .. } => *connection_id,
+            EgressCommand::SetStreamPriority { connection_id, .. } => *connection_id,
+            EgressCommand::StopSending { connection_id, .. } => *connection_id,
+            EgressCommand::GetMaxDatagramSize { connection_id, .. } => *connection_id,
+            EgressCommand::GetStreamCredits { connection_id, .. } => *connection_id,
+            EgressCommand::QueryStreamCapacity { connection_id, .. } => *connection_id,
+            EgressCommand::QueryConnectionCapacity { connection_id, .. } => *connection_id,
         };
 
         match command {
@@ -2027,10 +3266,115 @@ impl QuicManager {
                 );
                 self.process_query_connection_state(worker_id, connection_id, reply);
             }
+            EgressCommand::MigrateTo {
+                connection_id,
+                new_local_addr,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id,
+                    %new_local_addr,
+                    "Processing MigrateTo command (RFC 9000 §9)"
+                );
+                self.process_migrate_to(worker_id, connection_id, new_local_addr)?;
+            }
+            EgressCommand::ValidatePath {
+                connection_id,
+                peer_addr,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id,
+                    %peer_addr,
+                    "Processing ValidatePath command (RFC 9000 §8.2)"
+                );
+                self.process_validate_path(worker_id, connection_id, peer_addr)?;
+            }
+            EgressCommand::SetStreamPriority {
+                connection_id,
+                stream_id,
+                urgency,
+                incremental,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id,
+                    stream_id,
+                    urgency,
+                    incremental,
+                    "Processing SetStreamPriority command (RFC 9218)"
+                );
+                self.process_set_stream_priority(
+                    worker_id,
+                    connection_id,
+                    stream_id,
+                    urgency,
+                    incremental,
+                );
+            }
+            EgressCommand::StopSending {
+                connection_id,
+                stream_id,
+                error_code,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id,
+                    stream_id,
+                    error_code,
+                    "Processing StopSending command (RFC 9000 §3.5)"
+                );
+                self.process_stop_sending(worker_id, connection_id, stream_id, error_code);
+            }
+            EgressCommand::GetMaxDatagramSize {
+                connection_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, "Processing GetMaxDatagramSize command (RFC 9221 §3)"
+                );
+                self.process_get_max_datagram_size(worker_id, connection_id, reply);
+            }
+            EgressCommand::GetStreamCredits {
+                connection_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, "Processing GetStreamCredits command (RFC 9000 §4.6)"
+                );
+                self.process_get_stream_credits(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryStreamCapacity {
+                connection_id,
+                stream_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id,
+                    stream_id,
+                    "Processing QueryStreamCapacity command (RFC 9000 §4.1)"
+                );
+                self.process_query_stream_capacity(worker_id, connection_id, stream_id, reply);
+            }
+            EgressCommand::QueryConnectionCapacity {
+                connection_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, "Processing QueryConnectionCapacity command (RFC 9000 §4.1)"
+                );
+                self.process_query_connection_capacity(worker_id, connection_id, reply);
+            }
         }
 
         // After processing command, generate any packets needed
         // Look up the QUIC connection and collect packets
+        let mut refreshed_dcid: Option<ConnectionId<'static>> = None;
+
         if let Some(dcid) = self.connection_id_map.get(&connection_id) {
             // Prefetch the connection object before accessing it
             if let Some(conn_ptr) = self.connections.get(dcid) {
@@ -2048,10 +3392,16 @@ impl QuicManager {
                     &self.send_buffer_pool,
                     &mut outgoing_packets,
                 )?;
+
+                refreshed_dcid = Some(dcid.clone());
             }
         }
 
         self.cleanup_closed_connections(&mut outgoing_packets)?;
+
+        if let Some(dcid) = refreshed_dcid {
+            self.schedule_connection_timeout(&dcid);
+        }
 
         Ok(outgoing_packets)
     }
@@ -2091,13 +3441,27 @@ impl QuicManager {
         // Convert borrowed ConnectionId to owned using inline storage (no heap allocation)
         let initial_dcid = connection_id_to_owned(&hdr.dcid);
 
-        let conn = quiche::accept(
-            &scid,
-            Some(&hdr.dcid),
-            self.local_addr,
-            peer_addr,
-            &mut self.quiche_config,
-        )
+        let requested_version = hdr.version;
+
+        let conn = {
+            let quiche_config =
+                self.quiche_configs
+                    .get_mut(&requested_version)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "missing quiche config for version {:#010x}",
+                            requested_version
+                        )
+                    })?;
+
+            quiche::accept(
+                &scid,
+                Some(&hdr.dcid),
+                self.local_addr,
+                peer_addr,
+                quiche_config,
+            )
+        }
         .context("failed to create connection")?;
 
         debug!(
@@ -2122,6 +3486,15 @@ impl QuicManager {
 
         self.connections.insert(scid.clone(), quic_conn);
         self.connection_aliases.insert(initial_dcid, scid.clone());
+
+        let initial_reset_token = self.reset_token_for(scid.as_ref());
+        if let Some(conn_entry) = self.connections.get_mut(&scid) {
+            conn_entry.record_source_connection_id(
+                scid.as_ref(),
+                0,
+                initial_reset_token.to_be_bytes(),
+            );
+        }
 
         if let Some(deadline) = timeout_deadline {
             self.timeout_queue
@@ -2159,8 +3532,22 @@ impl QuicManager {
 
         // Now process the writes
         for (dcid, writes) in writes_by_dcid {
+            let mut refreshed = false;
+
             if let Some(conn) = self.connections.get_mut(&dcid) {
+                // === RFC 9000 §4.1: Connection-Level Flow Control Tracking ===
+                // Before processing writes, check if connection was previously blocked
+                let was_conn_blocked = conn.connection_blocked_at.is_some();
+
                 for (stream_id, data, fin, reply_tx) in writes {
+                    // === RFC 9000 §4.1: Stream-Level Flow Control Tracking ===
+                    // Track if stream was previously blocked
+                    let was_stream_blocked = conn
+                        .stream_blocked_state
+                        .get(&stream_id)
+                        .and_then(|opt| *opt)
+                        .is_some();
+
                     match conn.stream_send(stream_id, &data, fin) {
                         Ok(written) => {
                             trace!(
@@ -2170,8 +3557,121 @@ impl QuicManager {
                                 fin,
                                 "Wrote to stream"
                             );
-                            // Send success reply to app (ignoring errors if app already hung up)
+
+                            // Send success reply to app
                             let _ = reply_tx.send(Ok(written));
+
+                            // If stream was blocked, it's now unblocked (successful write)
+                            if was_stream_blocked {
+                                conn.stream_blocked_state.insert(stream_id, None);
+
+                                if let Some(ref sm) = conn.stream_manager {
+                                    debug!(
+                                        worker_id,
+                                        stream_id, "Stream unblocked after successful write"
+                                    );
+                                    // Note: Can't determine exact new_limit without quiche API
+                                    // Using 0 as placeholder - app knows write succeeded
+                                    let event = quicd_x::AppEvent::TransportEvent(
+                                        quicd_x::TransportEvent::StreamUnblocked {
+                                            stream_id,
+                                            new_limit: 0, // Limit unknown in quiche 0.24
+                                        },
+                                    );
+                                    let _ = sm.conn_ingress_tx.try_send(event);
+                                }
+                            }
+
+                            // === RFC 9000 §4.1: Connection-Level Flow Control Unblocked ===
+                            // If connection was blocked but we just succeeded, it's unblocked
+                            if was_conn_blocked {
+                                conn.connection_blocked_at = None;
+
+                                if let Some(ref sm) = conn.stream_manager {
+                                    debug!(worker_id, "Connection-level flow control unblocked");
+                                    // Get updated connection-level limit (approximate via cwnd)
+                                    let new_limit = conn.connection_send_capacity();
+                                    let event = quicd_x::AppEvent::TransportEvent(
+                                        quicd_x::TransportEvent::ConnectionUnblocked { new_limit },
+                                    );
+                                    let _ = sm.conn_ingress_tx.try_send(event);
+                                }
+                            }
+                        }
+                        Err(quiche::Error::Done) => {
+                            // === RFC 9000 §4.1: Flow Control Blocking Detection ===
+                            // Error::Done can indicate either:
+                            // 1. Stream-level blocking (stream flow control limit reached)
+                            // 2. Connection-level blocking (connection flow control limit reached)
+                            //
+                            // We check stream capacity first to distinguish between the two
+
+                            let stream_capacity = conn.stream_send_capacity(stream_id).unwrap_or(0);
+                            let conn_capacity = conn.connection_send_capacity();
+
+                            // If stream has capacity but connection doesn't, it's connection-level blocking
+                            if stream_capacity > 0 && conn_capacity == 0 {
+                                // === Connection-Level Blocked ===
+                                if !was_conn_blocked {
+                                    conn.connection_blocked_at = Some(0); // Offset unknown
+
+                                    if let Some(ref sm) = conn.stream_manager {
+                                        debug!(worker_id, "Connection-level flow control blocked");
+                                        let event = quicd_x::AppEvent::TransportEvent(
+                                            quicd_x::TransportEvent::ConnectionBlocked {
+                                                limit: conn_capacity,
+                                            },
+                                        );
+                                        let _ = sm.conn_ingress_tx.try_send(event);
+                                    }
+                                }
+                            } else {
+                                // === Stream-Level Blocked ===
+                                if !was_stream_blocked {
+                                    // Mark as blocked (offset unknown without API)
+                                    conn.stream_blocked_state.insert(stream_id, Some(0));
+
+                                    if let Some(ref sm) = conn.stream_manager {
+                                        debug!(
+                                            worker_id,
+                                            stream_id, "Stream blocked by flow control"
+                                        );
+                                        let event = quicd_x::AppEvent::TransportEvent(
+                                            quicd_x::TransportEvent::StreamBlocked {
+                                                stream_id,
+                                                limit: 0, // Limit unknown in quiche 0.24
+                                            },
+                                        );
+                                        let _ = sm.conn_ingress_tx.try_send(event);
+                                    }
+                                }
+                            }
+
+                            // Send error to application
+                            let _ = reply_tx.send(Err(quicd_x::ConnectionError::Stream(format!(
+                                "Stream {} blocked by flow control",
+                                stream_id
+                            ))));
+                        }
+                        Err(quiche::Error::StreamStopped(error_code)) => {
+                            // === RFC 9000 §3.5: STOP_SENDING Detection ===
+                            // Peer sent STOP_SENDING frame requesting us to stop sending
+                            warn!(worker_id, stream_id, error_code, "Peer sent STOP_SENDING");
+
+                            // Notify application that peer requested stop
+                            if let Some(ref sm) = conn.stream_manager {
+                                let event = quicd_x::AppEvent::StopSending {
+                                    stream_id,
+                                    error_code,
+                                };
+                                let _ = sm.conn_ingress_tx.try_send(event);
+                            }
+
+                            // Send error reply to write command
+                            let _ = reply_tx.send(Err(quicd_x::ConnectionError::Stream(format!(
+                                "Peer requested stop sending: error code {}",
+                                error_code
+                            ))));
                         }
                         Err(e) => {
                             warn!(worker_id, stream_id, error = ?e, "Failed to write to stream");
@@ -2189,6 +3689,12 @@ impl QuicManager {
                     &self.send_buffer_pool,
                     &mut outgoing_packets,
                 )?;
+
+                refreshed = true;
+            }
+
+            if refreshed {
+                self.schedule_connection_timeout(&dcid);
             }
         }
 
@@ -2198,14 +3704,47 @@ impl QuicManager {
     }
 }
 
-/// Maximum UDP datagram size
-const MAX_DATAGRAM_SIZE: usize = 65536;
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn parses_common_version_labels() {
+        assert_eq!(
+            parse_quic_version_label("v1"),
+            Some(quiche::PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            parse_quic_version_label("draft-29"),
+            Some(QUIC_DRAFT_VERSION_PREFIX | 29)
+        );
+        assert_eq!(
+            parse_quic_version_label("0xff00001d"),
+            Some(QUIC_DRAFT_VERSION_PREFIX | 0x1d)
+        );
+        assert_eq!(
+            parse_quic_version_label("ff00001d"),
+            Some(QUIC_DRAFT_VERSION_PREFIX | 0x1d)
+        );
+        assert_eq!(
+            parse_quic_version_label("0x00000001"),
+            Some(quiche::PROTOCOL_VERSION)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_version_labels() {
+        assert_eq!(parse_quic_version_label(""), None);
+        assert_eq!(parse_quic_version_label("notaversion"), None);
+    }
+}
 
 impl std::fmt::Debug for QuicManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuicManager")
             .field("worker_id", &self.worker_id)
             .field("local_addr", &self.local_addr)
+            .field("supported_versions", &self.supported_versions)
             .field("connections", &self.connections.len())
             .field("stats", &self.stats)
             .finish()

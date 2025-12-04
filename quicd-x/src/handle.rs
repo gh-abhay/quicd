@@ -67,6 +67,70 @@ impl ConnectionHandle {
         self.peer_addr
     }
 
+    /// Query available send capacity for a stream (RFC 9000 §4.1).
+    ///
+    /// Returns the number of bytes that can be sent on this stream without
+    /// blocking due to flow control. Applications can use this to implement
+    /// adaptive sending strategies.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(capacity)`: Number of bytes available to send
+    /// - `Err(ConnectionError::StreamNotFound)`: Stream doesn't exist
+    /// - `Err(ConnectionError::Closed)`: Connection closed
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(handle: quicd_x::ConnectionHandle, stream_id: u64) {
+    /// let capacity = handle.stream_send_capacity(stream_id).await.unwrap();
+    /// if capacity > 0 {
+    ///     // Safe to send up to 'capacity' bytes
+    /// }
+    /// # }
+    /// ```
+    pub async fn stream_send_capacity(&self, stream_id: StreamId) -> Result<u64, ConnectionError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        self.egress_tx
+            .send(EgressCommand::QueryStreamCapacity {
+                connection_id: self.connection_id,
+                stream_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+
+        reply_rx
+            .await
+            .map_err(|_| ConnectionError::Closed("worker dropped response".into()))?
+    }
+
+    /// Query connection-level send capacity (RFC 9000 §4.1).
+    ///
+    /// Returns the total number of bytes that can be sent on the connection
+    /// across all streams, limited by the peer's MAX_DATA flow control.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(capacity)`: Connection-wide bytes available to send
+    /// - `Err(ConnectionError::Closed)`: Connection closed
+    pub async fn connection_send_capacity(&self) -> Result<u64, ConnectionError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        self.egress_tx
+            .send(EgressCommand::QueryConnectionCapacity {
+                connection_id: self.connection_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+
+        reply_rx
+            .await
+            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))
+    }
+
     /// Opens a new bi-directional stream.
     ///
     /// The result will be delivered as an AppEvent::StreamOpened.
@@ -204,12 +268,157 @@ impl ConnectionHandle {
             })
             .await
             .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
-        
+
         let state = reply_rx
             .await
             .map_err(|_| ConnectionError::Closed("worker unavailable".into()))?;
-        
+
         Ok(state.is_in_early_data)
+    }
+
+    /// Initiate connection migration to a new local address (RFC 9000 §9).
+    ///
+    /// This is used when the client wants to migrate to a different network interface
+    /// or IP address. The worker will initiate path validation automatically.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_local_addr` - The new local socket address to migrate to
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub fn migrate_to(&self, new_local_addr: SocketAddr) -> Result<(), ConnectionError> {
+        self.egress_tx
+            .try_send(EgressCommand::MigrateTo {
+                connection_id: self.connection_id,
+                new_local_addr,
+            })
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+        Ok(())
+    }
+
+    /// Request path validation for a specific address (RFC 9000 §8.2).
+    ///
+    /// This sends PATH_CHALLENGE frames to validate that a path is working.
+    /// The result will be delivered via TransportEvent::PathValidated or PathValidationFailed.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer_addr` - The peer address to validate
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub fn validate_path(&self, peer_addr: SocketAddr) -> Result<(), ConnectionError> {
+        self.egress_tx
+            .try_send(EgressCommand::ValidatePath {
+                connection_id: self.connection_id,
+                peer_addr,
+            })
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+        Ok(())
+    }
+
+    /// Set stream priority using RFC 9218 extensible priority scheme.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_id` - The stream to set priority for
+    /// * `urgency` - Priority urgency (0-7, where 0 is highest priority)
+    /// * `incremental` - Whether this stream should be sent incrementally
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub fn set_stream_priority(
+        &self,
+        stream_id: StreamId,
+        urgency: u8,
+        incremental: bool,
+    ) -> Result<(), ConnectionError> {
+        self.egress_tx
+            .try_send(EgressCommand::SetStreamPriority {
+                connection_id: self.connection_id,
+                stream_id,
+                urgency,
+                incremental,
+            })
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+        Ok(())
+    }
+
+    /// Send STOP_SENDING to peer for a stream (RFC 9000 §3.5).
+    ///
+    /// This requests that the peer stop sending data on the specified stream.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_id` - The stream to stop
+    /// * `error_code` - Application error code
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub fn stop_sending(
+        &self,
+        stream_id: StreamId,
+        error_code: u64,
+    ) -> Result<(), ConnectionError> {
+        self.egress_tx
+            .try_send(EgressCommand::StopSending {
+                connection_id: self.connection_id,
+                stream_id,
+                error_code,
+            })
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+        Ok(())
+    }
+
+    /// Get maximum datagram size that can be sent (RFC 9221 §3).
+    ///
+    /// Returns None if datagrams are not supported by the peer.
+    /// The size includes QUIC and UDP overhead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub async fn max_datagram_size(&self) -> Result<Option<usize>, ConnectionError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.egress_tx
+            .send(EgressCommand::GetMaxDatagramSize {
+                connection_id: self.connection_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+
+        reply_rx
+            .await
+            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))
+    }
+
+    /// Query remaining stream credits (RFC 9000 §4.6).
+    ///
+    /// Returns the number of bidirectional and unidirectional streams
+    /// that can still be opened before hitting the peer's limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectionError::Closed` if the worker thread is unavailable.
+    pub async fn stream_credits(&self) -> Result<crate::server::StreamCredits, ConnectionError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.egress_tx
+            .send(EgressCommand::GetStreamCredits {
+                connection_id: self.connection_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ConnectionError::Closed("worker unavailable or overloaded".into()))?;
+
+        reply_rx
+            .await
+            .map_err(|_| ConnectionError::Closed("worker unavailable".into()))
     }
 }
 
@@ -387,24 +596,108 @@ pub struct TransportControls {
 /// These are informational metrics that applications can use to adapt their
 /// behavior (e.g., adaptive bitrate based on RTT, backpressure handling, etc.).
 ///
-/// # Fields
-///
-/// - `rtt_estimate_ms`: Estimated round-trip time in milliseconds
-/// - `bytes_sent`: Total application data bytes sent on this connection
-/// - `bytes_received`: Total application data bytes received on this connection
-/// - `active_streams`: Number of currently open streams
-/// - `congestion_state`: Current congestion control state (e.g., "slow_start", "congestion_avoidance")
-/// - `packets_sent`: Total QUIC packets transmitted
-/// - `packets_received`: Total QUIC packets received
-/// - `max_stream_id`: The highest stream ID processed on this connection
+/// All metrics are sourced from the underlying quiche connection state and
+/// represent the current snapshot at query time.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionStats {
-    pub rtt_estimate_ms: Option<u32>,
+    // === RFC 9002 Loss Detection and Congestion Control ===
+    /// Smoothed round-trip time in microseconds (RFC 9002 §5.3).
+    pub srtt_us: Option<u64>,
+
+    /// Minimum RTT observed in microseconds (RFC 9002 §5.2).
+    pub min_rtt_us: Option<u64>,
+
+    /// RTT variance in microseconds (RFC 9002 §5.3).
+    pub rttvar_us: Option<u64>,
+
+    /// Latest RTT sample in microseconds.
+    pub latest_rtt_us: Option<u64>,
+
+    /// Probe timeout value in milliseconds (RFC 9002 §6.2).
+    pub pto_ms: Option<u64>,
+
+    /// Congestion window in bytes (RFC 9002 §7).
+    pub cwnd: u64,
+
+    /// Bytes currently in flight (unacknowledged).
+    pub bytes_in_flight: u64,
+
+    /// Slow start threshold in bytes (RFC 9002 §7.3.2).
+    pub ssthresh: Option<u64>,
+
+    /// Pacing rate in bytes per second (if available).
+    pub pacing_rate_bps: Option<u64>,
+
+    // === RFC 9000 Flow Control ===
+    /// Maximum data that can be sent (connection-level flow control).
+    pub max_data: u64,
+
+    /// Data sent so far on this connection.
+    pub data_sent: u64,
+
+    /// Maximum data that can be received.
+    pub max_data_recv: u64,
+
+    /// Data received so far on this connection.
+    pub data_received: u64,
+
+    /// Maximum bidirectional streams that can be opened.
+    pub max_streams_bidi: u64,
+
+    /// Maximum unidirectional streams that can be opened.
+    pub max_streams_uni: u64,
+
+    // === Connection Statistics ===
+    /// Total application data bytes sent.
     pub bytes_sent: u64,
+
+    /// Total application data bytes received.
     pub bytes_received: u64,
+
+    /// Number of currently open streams.
     pub active_streams: usize,
-    pub congestion_state: Option<String>,
+
+    /// Total QUIC packets transmitted.
     pub packets_sent: u64,
+
+    /// Total QUIC packets received.
     pub packets_received: u64,
+
+    /// Total packets declared lost (RFC 9002 §6).
+    pub packets_lost: u64,
+
+    /// Total packets retransmitted.
+    pub packets_retransmitted: u64,
+
+    /// Highest stream ID processed.
     pub max_stream_id: u64,
+
+    // === ECN Statistics (RFC 9000 §13.4) ===
+    /// ECT(0) marked packets received.
+    pub ecn_ect0_count: u64,
+
+    /// ECT(1) marked packets received.
+    pub ecn_ect1_count: u64,
+
+    /// ECN-CE (congestion experienced) marked packets received.
+    pub ecn_ce_count: u64,
+
+    // === Path Information ===
+    /// Current path MTU in bytes.
+    pub path_mtu: usize,
+
+    /// Whether the connection is in early data (0-RTT) state.
+    pub is_in_early_data: bool,
+
+    /// Whether the connection handshake is complete.
+    pub is_established: bool,
+
+    /// Whether the connection is closing or closed.
+    pub is_closed: bool,
+
+    /// Number of successful path validations.
+    pub path_validations_completed: u64,
+
+    /// Number of failed path validations.
+    pub path_validations_failed: u64,
 }

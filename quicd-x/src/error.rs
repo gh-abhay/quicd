@@ -100,4 +100,134 @@ pub enum ConnectionError {
     /// - Invalid TLS configuration
     #[error("tls handshake failed: {0}")]
     TlsFail(String),
+
+    /// Operation would block due to flow control or stream limits.
+    ///
+    /// The application should wait for an unblocked event before retrying.
+    /// This is not a fatal error; the connection remains valid.
+    #[error("operation blocked: {0}")]
+    Blocked(String),
+
+    /// Stream is in an invalid state for the requested operation.
+    ///
+    /// Examples:
+    /// - Trying to write to a receive-only stream
+    /// - Trying to read from a send-only stream
+    /// - Operating on a closed stream
+    #[error("stream state error: {0}")]
+    StreamState(String),
+}
+
+/// RFC 9000 compliant QUIC transport error codes.
+///
+/// These error codes are defined in RFC 9000 Section 20.
+/// Applications should use these when closing connections or resetting streams
+/// to ensure interoperability with other QUIC implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum QuicErrorCode {
+    /// No error (graceful close).
+    NoError = 0x00,
+
+    /// Internal implementation error.
+    InternalError = 0x01,
+
+    /// Connection refused or not accepted by server.
+    ConnectionRefused = 0x02,
+
+    /// Flow control error (data exceeded limits).
+    FlowControlError = 0x03,
+
+    /// Stream limit error (too many streams).
+    StreamLimitError = 0x04,
+
+    /// Stream state error (invalid operation for current state).
+    StreamStateError = 0x05,
+
+    /// Final size error (stream size changed).
+    FinalSizeError = 0x06,
+
+    /// Frame encoding error.
+    FrameEncodingError = 0x07,
+
+    /// Transport parameter error.
+    TransportParameterError = 0x08,
+
+    /// Connection ID limit error.
+    ConnectionIdLimitError = 0x09,
+
+    /// Protocol violation detected.
+    ProtocolViolation = 0x0A,
+
+    /// Invalid token received.
+    InvalidToken = 0x0B,
+
+    /// Application error (application-specific closure).
+    ApplicationError = 0x0C,
+
+    /// Crypto buffer limit exceeded.
+    CryptoBufferExceeded = 0x0D,
+
+    /// Key update error.
+    KeyUpdateError = 0x0E,
+
+    /// AEAD limit reached.
+    AeadLimitReached = 0x0F,
+
+    /// No available path after migration.
+    NoAvailablePath = 0x10,
+}
+
+impl QuicErrorCode {
+    /// Convert to u64 for use in QUIC frames.
+    pub fn as_u64(self) -> u64 {
+        self as u64
+    }
+
+    /// Create from u64, returning None for unknown codes.
+    pub fn from_u64(code: u64) -> Option<Self> {
+        match code {
+            0x00 => Some(Self::NoError),
+            0x01 => Some(Self::InternalError),
+            0x02 => Some(Self::ConnectionRefused),
+            0x03 => Some(Self::FlowControlError),
+            0x04 => Some(Self::StreamLimitError),
+            0x05 => Some(Self::StreamStateError),
+            0x06 => Some(Self::FinalSizeError),
+            0x07 => Some(Self::FrameEncodingError),
+            0x08 => Some(Self::TransportParameterError),
+            0x09 => Some(Self::ConnectionIdLimitError),
+            0x0A => Some(Self::ProtocolViolation),
+            0x0B => Some(Self::InvalidToken),
+            0x0C => Some(Self::ApplicationError),
+            0x0D => Some(Self::CryptoBufferExceeded),
+            0x0E => Some(Self::KeyUpdateError),
+            0x0F => Some(Self::AeadLimitReached),
+            0x10 => Some(Self::NoAvailablePath),
+            _ => None,
+        }
+    }
+
+    /// Get human-readable description.
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::NoError => "no error",
+            Self::InternalError => "internal error",
+            Self::ConnectionRefused => "connection refused",
+            Self::FlowControlError => "flow control error",
+            Self::StreamLimitError => "stream limit error",
+            Self::StreamStateError => "stream state error",
+            Self::FinalSizeError => "final size error",
+            Self::FrameEncodingError => "frame encoding error",
+            Self::TransportParameterError => "transport parameter error",
+            Self::ConnectionIdLimitError => "connection ID limit error",
+            Self::ProtocolViolation => "protocol violation",
+            Self::InvalidToken => "invalid token",
+            Self::ApplicationError => "application error",
+            Self::CryptoBufferExceeded => "crypto buffer exceeded",
+            Self::KeyUpdateError => "key update error",
+            Self::AeadLimitReached => "AEAD limit reached",
+            Self::NoAvailablePath => "no available path",
+        }
+    }
 }

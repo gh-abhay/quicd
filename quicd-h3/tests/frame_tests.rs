@@ -9,8 +9,8 @@ mod tests {
     fn test_priority_frame_encoding_decoding() {
         // Test PRIORITY frame with RFC 9218 extensible priority
         let priority = Priority {
-            urgency: 3, // medium priority
-            incremental: false, // initial priority setting
+            urgency: 3,             // medium priority
+            incremental: false,     // initial priority setting
             parent_element_type: 3, // root (no parent)
             parent_element_id: None,
             prioritized_element_type: 0x00, // request stream
@@ -25,7 +25,9 @@ mod tests {
         assert_eq!(consumed, encoded.len());
 
         match decoded_frame {
-            H3Frame::Priority { priority: decoded_priority } => {
+            H3Frame::Priority {
+                priority: decoded_priority,
+            } => {
                 assert_eq!(decoded_priority.urgency, 3);
                 assert_eq!(decoded_priority.incremental, false);
                 assert_eq!(decoded_priority.parent_element_type, 3);
@@ -53,7 +55,10 @@ mod tests {
         assert_eq!(consumed, encoded.len());
 
         match decoded_frame {
-            H3Frame::PushPromise { push_id: decoded_push_id, encoded_headers } => {
+            H3Frame::PushPromise {
+                push_id: decoded_push_id,
+                encoded_headers,
+            } => {
                 assert_eq!(decoded_push_id, push_id);
                 assert_eq!(encoded_headers.as_ref(), headers_data);
             }
@@ -73,7 +78,9 @@ mod tests {
         assert_eq!(consumed, encoded.len());
 
         match decoded_frame {
-            H3Frame::MaxPushId { push_id: decoded_push_id } => {
+            H3Frame::MaxPushId {
+                push_id: decoded_push_id,
+            } => {
                 assert_eq!(decoded_push_id, push_id);
             }
             _ => panic!("Expected MAX_PUSH_ID frame"),
@@ -92,7 +99,9 @@ mod tests {
         assert_eq!(consumed, encoded.len());
 
         match decoded_frame {
-            H3Frame::CancelPush { push_id: decoded_push_id } => {
+            H3Frame::CancelPush {
+                push_id: decoded_push_id,
+            } => {
                 assert_eq!(decoded_push_id, push_id);
             }
             _ => panic!("Expected CANCEL_PUSH frame"),
@@ -102,9 +111,18 @@ mod tests {
     #[test]
     fn test_settings_frame_encoding_decoding() {
         let settings = vec![
-            Setting { identifier: 0x1, value: 4096 }, // QPACK max table capacity
-            Setting { identifier: 0x6, value: 0 },    // Max field section size
-            Setting { identifier: 0x7, value: 100 },  // QPACK blocked streams
+            Setting {
+                identifier: 0x1,
+                value: 4096,
+            }, // QPACK max table capacity
+            Setting {
+                identifier: 0x6,
+                value: 0,
+            }, // Max field section size
+            Setting {
+                identifier: 0x7,
+                value: 100,
+            }, // QPACK blocked streams
         ];
 
         let frame = H3Frame::Settings { settings };
@@ -115,7 +133,9 @@ mod tests {
         assert_eq!(consumed, encoded.len());
 
         match decoded_frame {
-            H3Frame::Settings { settings: decoded_settings } => {
+            H3Frame::Settings {
+                settings: decoded_settings,
+            } => {
                 assert_eq!(decoded_settings.len(), 3);
                 assert_eq!(decoded_settings[0].identifier, 0x1);
                 assert_eq!(decoded_settings[0].value, 4096);
@@ -182,7 +202,9 @@ mod tests {
         assert_eq!(consumed, encoded.len());
 
         match decoded_frame {
-            H3Frame::GoAway { stream_id: decoded_stream_id } => {
+            H3Frame::GoAway {
+                stream_id: decoded_stream_id,
+            } => {
                 assert_eq!(decoded_stream_id, stream_id);
             }
             _ => panic!("Expected GOAWAY frame"),
@@ -201,7 +223,9 @@ mod tests {
         assert_eq!(consumed, encoded.len());
 
         match decoded_frame {
-            H3Frame::DuplicatePush { push_id: decoded_push_id } => {
+            H3Frame::DuplicatePush {
+                push_id: decoded_push_id,
+            } => {
                 assert_eq!(decoded_push_id, push_id);
             }
             _ => panic!("Expected DUPLICATE_PUSH frame"),
@@ -213,8 +237,12 @@ mod tests {
         let mut combined_data = Vec::new();
 
         // Create multiple frames
-        let frame1 = H3Frame::Data { data: Bytes::from("frame1") };
-        let frame2 = H3Frame::Headers { encoded_headers: Bytes::from("headers") };
+        let frame1 = H3Frame::Data {
+            data: Bytes::from("frame1"),
+        };
+        let frame2 = H3Frame::Headers {
+            encoded_headers: Bytes::from("headers"),
+        };
         let frame3 = H3Frame::MaxPushId { push_id: 123 };
 
         combined_data.extend_from_slice(&frame1.encode());

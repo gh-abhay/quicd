@@ -3,7 +3,7 @@
 mod common;
 
 use bytes::Bytes;
-use common::mock_quic::{MockConnectionHandle, MockConfig};
+use common::mock_quic::{MockConfig, MockConnectionHandle};
 
 #[test]
 fn test_stream_id_must_increase() {
@@ -137,12 +137,12 @@ fn test_concurrent_stream_id_tracking() {
     let handle = MockConnectionHandle::new();
 
     // Open bidirectional streams
-    handle.open_stream(0, true);  // Client bidi
+    handle.open_stream(0, true); // Client bidi
     handle.open_stream(4, true);
     handle.open_stream(8, true);
 
     // Open unidirectional streams
-    handle.open_stream(2, false);  // Client uni
+    handle.open_stream(2, false); // Client uni
     handle.open_stream(6, false);
     handle.open_stream(10, false);
 

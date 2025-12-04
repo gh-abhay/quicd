@@ -1,5 +1,5 @@
 //! Production Example: HTTP/3 Request/Response Cycle
-//! 
+//!
 //! Demonstrates realistic usage of QPACK encoder/decoder in an HTTP/3 context.
 
 use quicd_qpack::{Decoder, Encoder, HeaderField};

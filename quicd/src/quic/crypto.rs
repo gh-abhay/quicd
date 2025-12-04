@@ -51,9 +51,14 @@ impl TlsCredentials {
 pub fn create_quiche_config(
     credentials: &TlsCredentials,
     config: &super::config::QuicConfig,
+    version: u32,
 ) -> Result<quiche::Config> {
-    let mut quic_config =
-        quiche::Config::new(quiche::PROTOCOL_VERSION).context("failed to create quiche config")?;
+    let mut quic_config = quiche::Config::new(version).with_context(|| {
+        format!(
+            "failed to create quiche config for version {:#010x}",
+            version
+        )
+    })?;
 
     // Write credentials to temp files (Quiche expects file paths)
     // Use thread ID + timestamp for uniqueness to avoid races
@@ -161,7 +166,7 @@ mod tests {
     fn test_create_quiche_config() {
         let creds = TlsCredentials::self_signed().expect("failed to generate cert");
         let quic_config = super::super::config::QuicConfig::default();
-        let config = create_quiche_config(&creds, &quic_config);
+        let config = create_quiche_config(&creds, &quic_config, quiche::PROTOCOL_VERSION);
         assert!(config.is_ok());
     }
 }

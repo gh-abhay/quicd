@@ -1,3 +1,28 @@
+//! # QUIC Application Events - RFC Compliance
+//!
+//! This module defines the complete event interface between the QUIC transport layer
+//! and application protocols (HTTP/3, MOQ, DOQ, etc.). All events are designed for
+//! 100% RFC compliance across the QUIC protocol suite.
+//!
+//! ## RFC Coverage
+//!
+//! - **RFC 9000 (QUIC Transport)**: Stream lifecycle, flow control, connection migration, CID management
+//! - **RFC 9001 (QUIC TLS)**: Handshake completion, key updates, early data (0-RTT)
+//! - **RFC 9002 (Loss & Congestion)**: RTT tracking, packet loss, congestion state changes
+//! - **RFC 9221 (QUIC Datagrams)**: Unreliable datagram delivery
+//! - **RFC 9218 (Extensible Priorities)**: Stream priority management
+//!
+//! ## Event-Driven Architecture
+//!
+//! All events are delivered asynchronously from worker threads to application tasks via
+//! bounded mpsc channels. The worker never blocks on event delivery - if the application
+//! is slow, events may be dropped (with warnings logged).
+//!
+//! ## Zero-Copy Data Flow
+//!
+//! Stream data and datagrams use `bytes::Bytes` for zero-copy delivery. Ownership of
+//! data transfers from worker to application without any memcpy operations.
+
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -5,6 +30,17 @@ use bytes::Bytes;
 
 use crate::error::ConnectionError;
 use crate::handle::{ConnectionStats, RecvStream, SendStream, StreamId};
+
+/// Congestion control state per RFC 9002 §7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionState {
+    /// Slow start phase - exponential growth
+    SlowStart,
+    /// Congestion avoidance phase - linear growth
+    CongestionAvoidance,
+    /// Recovery phase after packet loss
+    Recovery,
+}
 
 /// Events raised by the worker runtime toward an application task.
 ///
@@ -87,6 +123,21 @@ pub enum AppEvent {
     /// The app may want to check `ConnectionHandle::stats()` to learn new limits.
     ConnectionCapacityChanged,
 
+    /// Peer sent STOP_SENDING for a stream (RFC 9000 §3.5).
+    ///
+    /// The peer no longer wants to receive data on this stream.
+    /// The application should stop sending and may reset the stream.
+    StopSending {
+        stream_id: StreamId,
+        /// Application error code from peer
+        error_code: u64,
+    },
+
+    /// Stream became writable after being blocked.
+    ///
+    /// Flow control credits are now available; the application can resume sending.
+    StreamWritable { stream_id: StreamId },
+
     /// Transport-level signal delivered to the application.
     ///
     /// These are informational events about the underlying QUIC transport.
@@ -96,11 +147,19 @@ pub enum AppEvent {
     ///
     /// After this event, no more data can be sent or received. The application
     /// task will end shortly after. Use this event to clean up resources gracefully.
+    ///
+    /// # RFC 9000 §10.2 Compliance
+    ///
+    /// Distinguishes between transport-level and application-level closures.
+    /// Transport errors (is_app=false) indicate QUIC protocol violations.
+    /// Application errors (is_app=true) indicate application-initiated closes.
     ConnectionClosing {
         /// QUIC error code from the peer (or generated locally)
         error_code: u64,
         /// Optional reason string from the peer
         reason: Option<Bytes>,
+        /// True if this is an application error, false for transport error (RFC 9000 §10.2)
+        is_app: bool,
     },
 
     /// Response to `ConnectionHandle::open_bi()` command.
@@ -142,34 +201,238 @@ pub enum AppEvent {
         request_id: u64,
         result: Result<ConnectionStats, ConnectionError>,
     },
+
+    /// 0-RTT early data was accepted by peer (RFC 9001 §4.6.2).
+    ///
+    /// The application can now be confident that data sent during 0-RTT
+    /// will not be rejected. This event fires when transitioning from
+    /// early data state to 1-RTT established state.
+    EarlyDataAccepted,
+
+    /// 0-RTT early data was rejected by peer (RFC 9001 §4.6.2).
+    ///
+    /// Any data sent during 0-RTT must be retransmitted. The application
+    /// should be prepared to handle this by resending requests or aborting
+    /// non-idempotent operations sent during 0-RTT.
+    EarlyDataRejected,
 }
 
 /// Transport-level events from the QUIC layer.
 ///
 /// These events are informational and do not require action from the application,
 /// but the app may want to adjust behavior based on them (e.g., react to congestion).
+///
+/// All events are sent from the worker thread and are edge-triggered.
 #[derive(Debug)]
 pub enum TransportEvent {
-    /// Peer has migrated to a new network path.
+    /// Connection migration initiated by peer (RFC 9000 §9).
     ///
-    /// Indicates that packets are now being received from a different address.
-    /// The connection remains valid; the QUIC protocol handles this transparently.
-    PathMigrated { new_peer_addr: SocketAddr },
+    /// The peer has started sending from a new network path. The worker validates
+    /// this path automatically. Applications typically don't need to act on this,
+    /// but may want to log or monitor migration events.
+    MigrationStarted {
+        /// New peer address detected
+        new_peer_addr: SocketAddr,
+        /// Local address for this path
+        local_addr: SocketAddr,
+    },
 
-    /// Effective Maximum Transmission Unit (MTU) changed for the connection.
+    /// Path validation completed successfully (RFC 9000 §8.2).
     ///
-    /// The underlying network path has changed, affecting packet size limits.
-    /// Applications sending datagrams may want to adjust payload sizes.
-    MtuUpdated { mtu: usize },
+    /// The QUIC layer has confirmed that the path is working bidirectionally.
+    /// This follows a PATH_CHALLENGE/PATH_RESPONSE exchange.
+    PathValidated {
+        /// Validated peer address
+        peer_addr: SocketAddr,
+        /// Local address for this path
+        local_addr: SocketAddr,
+        /// Round-trip time measured during validation (microseconds)
+        rtt_us: u64,
+    },
 
-    /// Congestion control state changed.
+    /// Path validation failed (RFC 9000 §8.2).
     ///
-    /// Can indicate transitions between normal, slow-start, or recovery states.
-    /// Applications may use this to adjust sending behavior (e.g., adaptive bitrate).
-    CongestionStateChanged { state: String, bytes_in_flight: u64 },
+    /// The peer did not respond to PATH_CHALLENGE frames, or the path is unreachable.
+    /// The connection may fall back to a previous working path.
+    PathValidationFailed {
+        /// Peer address that failed validation
+        peer_addr: SocketAddr,
+        /// Reason for failure
+        reason: String,
+    },
 
-    /// Catch-all for transport events not covered by dedicated variants yet.
+    /// New connection ID available from peer (RFC 9000 §5.1).
     ///
-    /// Future QUIC events will be added as dedicated variants.
-    Other { kind: String },
+    /// The peer has provided a new connection ID that can be used for this connection.
+    /// The worker manages CID rotation automatically.
+    NewConnectionId {
+        /// Sequence number for this CID
+        sequence: u64,
+        /// Connection ID bytes (up to 20 bytes)
+        cid: Bytes,
+        /// Stateless reset token for this CID
+        reset_token: Option<[u8; 16]>,
+    },
+
+    /// Connection ID retired (RFC 9000 §5.1).
+    ///
+    /// A previously issued connection ID is no longer in use and has been retired.
+    ConnectionIdRetired {
+        /// Sequence number of retired CID
+        sequence: u64,
+    },
+
+    /// Stream is blocked by flow control (RFC 9000 §4).
+    ///
+    /// The application tried to send data but the stream's flow control limit
+    /// has been reached. The application should wait for a StreamUnblocked event
+    /// or reduce sending rate.
+    StreamBlocked {
+        /// Stream that is blocked
+        stream_id: StreamId,
+        /// Current send offset limit
+        limit: u64,
+    },
+
+    /// Stream unblocked by peer credit update (RFC 9000 §4).
+    ///
+    /// The peer sent a MAX_STREAM_DATA frame increasing the flow control limit.
+    /// The application can resume sending on this stream.
+    StreamUnblocked {
+        /// Stream that is now unblocked
+        stream_id: StreamId,
+        /// New send offset limit
+        new_limit: u64,
+    },
+
+    /// Connection-level flow control blocked (RFC 9000 §4).
+    ///
+    /// The total bytes sent across all streams has reached the connection-level
+    /// flow control limit. Applications should reduce overall sending rate.
+    ConnectionBlocked {
+        /// Current connection send limit
+        limit: u64,
+    },
+
+    /// Connection-level flow control unblocked (RFC 9000 §4).
+    ///
+    /// The peer sent a MAX_DATA frame increasing the connection-level limit.
+    ConnectionUnblocked {
+        /// New connection send limit
+        new_limit: u64,
+    },
+
+    /// Maximum streams limit reached (RFC 9000 §4.6).
+    ///
+    /// Cannot open more streams of this type until the peer increases the limit
+    /// or existing streams are closed.
+    StreamsLimitReached {
+        /// True for bidirectional, false for unidirectional
+        bidirectional: bool,
+        /// Current limit
+        limit: u64,
+    },
+
+    /// Maximum streams limit increased (RFC 9000 §4.6).
+    ///
+    /// The peer has allowed opening more streams of this type.
+    StreamsLimitIncreased {
+        /// True for bidirectional, false for unidirectional
+        bidirectional: bool,
+        /// New limit
+        new_limit: u64,
+    },
+
+    /// Effective Maximum Transmission Unit (MTU) changed (RFC 9000 §14).
+    ///
+    /// Path MTU discovery completed or the network path changed.
+    /// Applications sending datagrams should respect this size.
+    MtuUpdated {
+        /// New MTU in bytes
+        mtu: usize,
+    },
+
+    /// Congestion control state changed (RFC 9002 §7).
+    ///
+    /// Transitions between slow start, congestion avoidance, and recovery.
+    /// Applications may use this for adaptive bitrate or backpressure.
+    CongestionStateChanged {
+        /// New congestion state
+        state: CongestionState,
+        /// Current congestion window (bytes)
+        cwnd: u64,
+        /// Bytes currently in flight (unacknowledged)
+        bytes_in_flight: u64,
+        /// Smoothed RTT estimate (microseconds)
+        srtt_us: u64,
+    },
+
+    /// Packet loss detected (RFC 9002 §6).
+    ///
+    /// The loss detection algorithm has determined that packets were lost.
+    /// This is informational; the QUIC layer handles retransmission automatically.
+    PacketLost {
+        /// Number of packets declared lost in this event
+        count: u64,
+        /// Total packets lost on this connection
+        total_lost: u64,
+    },
+
+    /// ECN-CE mark received (RFC 9000 §13.4, RFC 9002 §7).
+    ///
+    /// Explicit Congestion Notification: the network has marked packets
+    /// indicating congestion. The congestion controller reacts to this.
+    EcnCongestionEncountered {
+        /// Number of ECN-CE marked packets
+        ce_count: u64,
+    },
+
+    /// Key update initiated (RFC 9001 §6).
+    ///
+    /// The connection is updating its encryption keys. This happens automatically
+    /// but applications may want to log it for security auditing.
+    KeyUpdateInitiated {
+        /// Key phase number
+        key_phase: u64,
+    },
+
+    /// Key update completed (RFC 9001 §6).
+    ///
+    /// The key update process finished successfully. All subsequent packets
+    /// will use the new keys.
+    KeyUpdateCompleted {
+        /// New key phase number
+        key_phase: u64,
+    },
+
+    /// Stream priority changed (RFC 9218 - extensible priority scheme).
+    ///
+    /// The priority of a stream was updated, either by the application or peer.
+    StreamPriorityChanged {
+        /// Stream with updated priority
+        stream_id: StreamId,
+        /// Urgency level (0-7, where 0 is highest priority)
+        urgency: u8,
+        /// Whether this stream is incremental
+        incremental: bool,
+    },
+
+    /// Peer violated QUIC protocol (RFC 9000).
+    ///
+    /// A protocol error was detected. The connection will close shortly.
+    ProtocolViolation {
+        /// QUIC error code
+        error_code: u64,
+        /// Human-readable description
+        description: String,
+    },
+
+    /// Stateless reset received (RFC 9000 §10.3).
+    ///
+    /// A stateless reset packet was received, indicating the peer has lost
+    /// connection state. The connection is immediately closed.
+    StatelessResetReceived {
+        /// Reset token that matched
+        reset_token: [u8; 16],
+    },
 }

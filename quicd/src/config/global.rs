@@ -7,7 +7,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-
 /// Global server configuration.
 ///
 /// Contains all settings that apply to the entire server instance,

@@ -193,7 +193,9 @@ impl Default for QuicTransportConfig {
             enable_early_data: false,
             disable_active_migration: false,
             enable_pacing: true,
-            max_connections_per_worker: (resources.max_connections_from_memory() / resources.optimal_worker_threads()).max(1000),
+            max_connections_per_worker: (resources.max_connections_from_memory()
+                / resources.optimal_worker_threads())
+            .max(1000),
             enable_version_negotiation: true,
             additional_versions: Vec::new(),
             enable_dgram: false,
@@ -407,7 +409,9 @@ impl QuicAppConfig {
             return Err("connection_cleanup_timeout must be > 0".to_string());
         }
         if self.connection_cleanup_timeout.as_secs() > 300 {
-            return Err("connection_cleanup_timeout is unreasonably high (> 5 minutes)".to_string());
+            return Err(
+                "connection_cleanup_timeout is unreasonably high (> 5 minutes)".to_string(),
+            );
         }
 
         // Validate channel capacities (must be at least 1)
@@ -443,13 +447,12 @@ impl QuicAppConfig {
         }
 
         // Check for excessive memory usage scenarios
-        let estimated_stream_memory_mb = 
+        let estimated_stream_memory_mb =
             (self.stream_ingress_channel_capacity * 64 * 1024) / (1024 * 1024);
         if estimated_stream_memory_mb > 16 {
             eprintln!(
                 "Warning: stream_ingress_channel_capacity ({}) may use ~{}MB per stream",
-                self.stream_ingress_channel_capacity,
-                estimated_stream_memory_mb
+                self.stream_ingress_channel_capacity, estimated_stream_memory_mb
             );
         }
 

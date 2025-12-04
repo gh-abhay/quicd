@@ -183,24 +183,19 @@ impl PushManager {
                 push_id
             )));
         }
-        
+
         if self.promises.contains_key(&push_id) {
-            return Err(H3Error::Http(format!(
-                "push ID {} already in use",
-                push_id
-            )));
+            return Err(H3Error::Http(format!("push ID {} already in use", push_id)));
         }
 
         // Record this push_id as used (insert in sorted order for binary search)
         match self.used_push_ids.binary_search(&push_id) {
-            Ok(_) => {}, // Already exists (shouldn't happen due to check above)
+            Ok(_) => {} // Already exists (shouldn't happen due to check above)
             Err(pos) => self.used_push_ids.insert(pos, push_id),
         }
 
-        self.promises.insert(
-            push_id,
-            PushPromise::new(push_id, headers),
-        );
+        self.promises
+            .insert(push_id, PushPromise::new(push_id, headers));
         Ok(())
     }
 
@@ -229,20 +224,25 @@ impl PushManager {
     }
 
     /// Register a push stream open request.
-    /// 
+    ///
     /// Per RFC 9114 Section 4.6: Each push ID must be used only once.
-    pub fn register_pending_stream(&mut self, request_id: u64, push_id: u64) -> Result<(), H3Error> {
+    pub fn register_pending_stream(
+        &mut self,
+        request_id: u64,
+        push_id: u64,
+    ) -> Result<(), H3Error> {
         // Check if push_id was already used for a different stream
         if let Some(existing_promise) = self.promises.get(&push_id) {
-            if existing_promise.push_stream_id().is_some() && 
-               existing_promise.push_stream_id() != Some(request_id) {
+            if existing_promise.push_stream_id().is_some()
+                && existing_promise.push_stream_id() != Some(request_id)
+            {
                 return Err(H3Error::Http(format!(
                     "push ID {} already used for different stream",
                     push_id
                 )));
             }
         }
-        
+
         self.pending_push_streams.insert(request_id, push_id);
         Ok(())
     }
@@ -394,7 +394,9 @@ mod tests {
 
         // Simulate opening push stream
         let request_id = 1234;
-        manager.register_pending_stream(request_id, push_id).unwrap();
+        manager
+            .register_pending_stream(request_id, push_id)
+            .unwrap();
         manager.handle_stream_opened(request_id, 7).unwrap();
 
         let promise = manager.get_promise(push_id).unwrap();

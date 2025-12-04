@@ -47,7 +47,7 @@ impl PriorityTree {
             round_robin_index: HashMap::new(),
         }
     }
-    
+
     /// Calculate weight from urgency per RFC 9218 Section 4
     /// Weight = 2^(7 - urgency)
     fn calculate_weight(urgency: u8) -> u32 {
@@ -59,10 +59,10 @@ impl PriorityTree {
     pub fn insert(&mut self, mut node: PriorityNode) {
         let id = node.element_id;
         let parent_id = node.parent_id;
-        
+
         // Calculate weight from urgency
         node.weight = Self::calculate_weight(node.urgency);
-        
+
         // Remove from old parent if it exists
         if let Some(old_node) = self.nodes.get(&id) {
             if let Some(old_parent_id) = old_node.parent_id {
@@ -71,7 +71,7 @@ impl PriorityTree {
                 }
             }
         }
-        
+
         // Add to new parent
         if let Some(parent_id) = parent_id {
             if let Some(parent) = self.nodes.get_mut(&parent_id) {
@@ -82,7 +82,7 @@ impl PriorityTree {
         } else {
             self.root_id = Some(id);
         }
-        
+
         self.nodes.insert(id, node);
     }
 
@@ -91,54 +91,56 @@ impl PriorityTree {
     pub fn get_next_priority(&mut self) -> Option<(u64, u8, u32)> {
         // Get all active streams grouped by urgency
         let mut urgency_groups: HashMap<u8, Vec<u64>> = HashMap::new();
-        
+
         for (element_id, node) in &self.nodes {
             if node.active {
-                urgency_groups.entry(node.urgency)
+                urgency_groups
+                    .entry(node.urgency)
                     .or_insert_with(Vec::new)
                     .push(*element_id);
             }
         }
-        
+
         if urgency_groups.is_empty() {
             return None;
         }
-        
+
         // RFC 9218 Section 4: Process lowest urgency (highest priority) first
         let min_urgency = *urgency_groups.keys().min()?;
         let candidates = urgency_groups.get(&min_urgency)?;
-        
+
         if candidates.is_empty() {
             return None;
         }
-        
+
         // RFC 9218 Section 4: Within same urgency, use weighted round-robin
         // Fair scheduling: rotate among streams at same urgency level
         let rr_index = self.round_robin_index.entry(min_urgency).or_insert(0);
         let selected_id = candidates[*rr_index % candidates.len()];
         *rr_index = (*rr_index + 1) % candidates.len();
-        
+
         let node = self.nodes.get(&selected_id)?;
         Some((node.element_id, node.urgency, node.weight))
     }
-    
+
     /// Mark a stream as active (has data to send)
     pub fn mark_active(&mut self, element_id: u64, active: bool) {
         if let Some(node) = self.nodes.get_mut(&element_id) {
             node.active = active;
         }
     }
-    
+
     /// Record bytes sent for a stream (for bandwidth accounting)
     pub fn record_bytes_sent(&mut self, element_id: u64, bytes: u64) {
         if let Some(node) = self.nodes.get_mut(&element_id) {
             node.bytes_sent = node.bytes_sent.saturating_add(bytes);
         }
     }
-    
+
     /// Get all active streams at a given urgency level
     pub fn get_active_at_urgency(&self, urgency: u8) -> Vec<u64> {
-        self.nodes.iter()
+        self.nodes
+            .iter()
             .filter(|(_, node)| node.active && node.urgency == urgency)
             .map(|(id, _)| *id)
             .collect()
@@ -153,7 +155,7 @@ impl PriorityTree {
                     parent.children.retain(|child| *child != element_id);
                 }
             }
-            
+
             // Orphan children (move to root or remove)
             for child_id in node.children {
                 if let Some(child) = self.nodes.get_mut(&child_id) {
@@ -182,7 +184,7 @@ mod tests {
     #[test]
     fn test_priority_tree_basic() {
         let mut tree = PriorityTree::new();
-        
+
         // Add root node
         tree.insert(PriorityNode {
             element_id: 1,
@@ -191,11 +193,11 @@ mod tests {
             incremental: false,
             parent_id: None,
             children: vec![],
-            weight: 0,  // Will be calculated
+            weight: 0, // Will be calculated
             bytes_sent: 0,
             active: true,
         });
-        
+
         // Add child with higher priority (lower urgency)
         tree.insert(PriorityNode {
             element_id: 2,
@@ -204,20 +206,23 @@ mod tests {
             incremental: false,
             parent_id: Some(1),
             children: vec![],
-            weight: 0,  // Will be calculated
+            weight: 0, // Will be calculated
             bytes_sent: 0,
             active: true,
         });
-        
+
         // Higher priority (urgency 1) should be returned first
         let next = tree.get_next_priority();
-        assert_eq!(next.map(|(id, urgency, _weight)| (id, urgency)), Some((2, 1)));
+        assert_eq!(
+            next.map(|(id, urgency, _weight)| (id, urgency)),
+            Some((2, 1))
+        );
     }
 
     #[test]
     fn test_priority_tree_remove() {
         let mut tree = PriorityTree::new();
-        
+
         tree.insert(PriorityNode {
             element_id: 1,
             element_type: 0,
@@ -229,15 +234,15 @@ mod tests {
             bytes_sent: 0,
             active: false,
         });
-        
+
         tree.remove(1);
         assert!(tree.get(1).is_none());
     }
-    
+
     #[test]
     fn test_priority_weight_calculation() {
         let mut tree = PriorityTree::new();
-        
+
         // Urgency 0 (highest) should get weight 128 (2^7)
         tree.insert(PriorityNode {
             element_id: 1,
@@ -250,9 +255,9 @@ mod tests {
             bytes_sent: 0,
             active: false,
         });
-        
+
         assert_eq!(tree.get(1).unwrap().weight, 128);
-        
+
         // Urgency 7 (lowest) should get weight 1 (2^0)
         tree.insert(PriorityNode {
             element_id: 2,
@@ -265,14 +270,14 @@ mod tests {
             bytes_sent: 0,
             active: false,
         });
-        
+
         assert_eq!(tree.get(2).unwrap().weight, 1);
     }
-    
+
     #[test]
     fn test_priority_round_robin() {
         let mut tree = PriorityTree::new();
-        
+
         // Add three streams with same urgency
         for i in 1..=3 {
             tree.insert(PriorityNode {
@@ -287,17 +292,17 @@ mod tests {
                 active: true,
             });
         }
-        
+
         // Should round-robin among them
         let first = tree.get_next_priority().map(|(id, _, _)| id);
         let second = tree.get_next_priority().map(|(id, _, _)| id);
         let third = tree.get_next_priority().map(|(id, _, _)| id);
-        
+
         // All three should be returned
         assert!(first.is_some());
         assert!(second.is_some());
         assert!(third.is_some());
-        
+
         // They should be different
         assert_ne!(first, second);
     }
