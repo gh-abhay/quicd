@@ -43,7 +43,7 @@ pub struct QuicConnection {
     /// alias map when the connection is dropped.
     pub dcid_aliases: Vec<ConnectionId<'static>>,
 
-    /// Last time we received a packet from this connection
+    /// Last time we observed ack-eliciting activity (ingress or egress)
     pub last_active: Instant,
 
     /// Connection statistics (updated periodically)
@@ -66,6 +66,59 @@ pub struct QuicConnection {
 
     /// Stream ID generator for this connection
     pub stream_id_gen: StreamIdGenerator,
+
+    // === RFC 9000 Compliance: Event Tracking ===
+    /// Track writable state per stream to detect changes (RFC 9000 §4)
+    /// Maps stream_id -> is_currently_writable
+    pub stream_writable_state: ahash::AHashMap<u64, bool>,
+
+    /// Last known MTU for detecting changes (RFC 9000 §14)
+    pub last_known_mtu: usize,
+
+    /// Track per-stream blocked state (RFC 9000 §4.1)
+    /// Maps stream_id -> Some(blocked_at_offset) or None if not blocked
+    pub stream_blocked_state: ahash::AHashMap<u64, Option<u64>>,
+
+    /// Track connection-level blocked state (RFC 9000 §4.1)
+    /// Some(offset) if blocked, None if not blocked
+    pub connection_blocked_at: Option<u64>,
+
+    /// Last known stream limits from peer (RFC 9000 §4.6)
+    pub last_peer_streams_bidi: u64,
+    pub last_peer_streams_uni: u64,
+
+    /// Track known connection IDs to detect new ones (RFC 9000 §5.1)
+    pub known_source_cids: ahash::AHashSet<quiche::ConnectionId<'static>>,
+
+    // === RFC 9000 §3.5: STOP_SENDING Tracking ===
+    /// Track which streams we've already notified the app about STOP_SENDING
+    /// to avoid duplicate events
+    pub stream_stop_sending_notified: ahash::AHashSet<u64>,
+
+    // === RFC 9002: Loss Detection & Congestion Control Tracking ===
+    /// Last known packet loss count for detecting changes (RFC 9002 §6)
+    pub last_packets_lost: u64,
+
+    /// Last known congestion window for detecting changes (RFC 9002 §7)
+    pub last_cwnd: u64,
+
+    /// Last known smoothed RTT for detecting significant changes (RFC 9002 §5)
+    pub last_srtt_us: u64,
+
+    /// Last known bytes in flight for congestion tracking (RFC 9002 §7)
+    pub last_bytes_in_flight: u64,
+
+    // === RFC 9000 §13.4: ECN Tracking ===
+    /// Last known ECN-CE count for detecting congestion (RFC 9000 §13.4)
+    pub last_ecn_ce_count: u64,
+
+    // === RFC 9001: TLS Key Updates ===
+    /// Last observed key phase for detecting updates (RFC 9001 §6)
+    /// quiche doesn't expose this directly, so we track based on is_in_early_data changes
+    pub was_in_early_data: bool,
+
+    /// Last known congestion state for detecting transitions (RFC 9002 §7)
+    pub last_congestion_state: quicd_x::CongestionState,
 }
 
 /// Connection statistics
@@ -159,6 +212,16 @@ impl QuicConnection {
         // Generate a stable connection ID for quicd-x from the scid
         let connection_id = scid_to_connection_id(&scid);
 
+        // Initialize MTU from quiche
+        let initial_mtu = conn.max_send_udp_payload_size();
+
+        // Initialize stream limits from quiche
+        let initial_bidi_limit = conn.peer_streams_left_bidi();
+        let initial_uni_limit = conn.peer_streams_left_uni();
+
+        // Initialize 0-RTT state before moving conn
+        let initial_early_data = conn.is_in_early_data();
+
         Self {
             conn,
             peer_addr,
@@ -172,6 +235,29 @@ impl QuicConnection {
             stream_manager: None,
             shutdown_tx: None,
             stream_id_gen: StreamIdGenerator::default(),
+
+            // RFC 9000 Compliance: Event tracking state
+            stream_writable_state: ahash::AHashMap::new(),
+            last_known_mtu: initial_mtu,
+            stream_blocked_state: ahash::AHashMap::new(),
+            connection_blocked_at: None,
+            last_peer_streams_bidi: initial_bidi_limit,
+            last_peer_streams_uni: initial_uni_limit,
+            known_source_cids: ahash::AHashSet::new(),
+            stream_stop_sending_notified: ahash::AHashSet::new(),
+
+            // RFC 9002: Loss Detection & Congestion Control tracking
+            last_packets_lost: 0,
+            last_cwnd: 0,
+            last_srtt_us: 0,
+            last_bytes_in_flight: 0,
+            last_congestion_state: quicd_x::CongestionState::SlowStart,
+
+            // RFC 9000 §13.4: ECN tracking
+            last_ecn_ce_count: 0,
+
+            // RFC 9001: TLS Key Updates
+            was_in_early_data: initial_early_data,
         }
     }
 
@@ -193,6 +279,8 @@ impl QuicConnection {
         match self.conn.send(out) {
             Ok((written, send_info)) => {
                 self.stats.packets_sent += 1;
+                // RFC 9000 §10.1: Refresh idle timeout when we transmit
+                self.last_active = Instant::now();
                 Ok((written, send_info))
             }
             Err(e) => Err(e),
@@ -330,6 +418,47 @@ impl QuicConnection {
     /// Get connection trace ID for logging
     pub fn trace_id(&self) -> &str {
         self.conn.trace_id()
+    }
+
+    /// Query stream send capacity (RFC 9000 §4.1)
+    ///
+    /// Returns the number of bytes that can be written to the stream
+    /// without being blocked by flow control.
+    pub fn stream_send_capacity(&self, stream_id: u64) -> Result<u64, quiche::Error> {
+        // Check if stream is writable and get capacity
+        // quiche's stream_capacity() returns the send capacity
+        match self.conn.stream_capacity(stream_id) {
+            Ok(capacity) => Ok(capacity as u64),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Query connection-level send capacity (RFC 9000 §4.1)
+    ///
+    /// Returns the total bytes available for sending across all streams,
+    /// limited by the peer's MAX_DATA frame.
+    pub fn connection_send_capacity(&self) -> u64 {
+        // quiche doesn't expose direct connection-level send capacity
+        // We approximate using max_send_udp_payload_size and congestion window
+        // A better implementation would track sent vs MAX_DATA directly
+        let stats = self.conn.stats();
+
+        // Estimate: if we've sent less than what peer allows, we have capacity
+        // This is approximate - ideally quiche would expose send_capacity()
+        // For now, return a conservative estimate based on CWND
+        if let Some(path_stats) = self.conn.path_stats().next() {
+            path_stats.cwnd as u64
+        } else {
+            0
+        }
+    }
+
+    /// Get maximum datagram payload size (RFC 9221 §5)
+    ///
+    /// Returns the maximum size for unreliable datagram payloads.
+    /// Returns None if datagrams are not negotiated.
+    pub fn dgram_max_writable_len(&self) -> Option<usize> {
+        self.conn.dgram_max_writable_len()
     }
 }
 

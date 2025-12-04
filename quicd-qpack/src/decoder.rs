@@ -1,5 +1,5 @@
 //! QPACK Decoder implementation per RFC 9204.
-//! 
+//!
 //! Lock-free, zero-copy decoder with:
 //! - Header block parsing
 //! - Encoder stream instruction processing
@@ -29,17 +29,17 @@ pub struct HeaderField {
 pub struct Decoder {
     /// Dynamic table (owned by decoder for write access).
     table: DynamicTable,
-    
+
     /// Decoder stream instruction queue.
     decoder_stream_buffer: VecDeque<Bytes>,
-    
+
     /// Blocked header blocks awaiting dynamic table entries.
     /// Maps stream_id -> (required_insert_count, encoded_block, blocked_at_timestamp)
     blocked_streams: HashMap<u64, (u64, Bytes, std::time::Instant)>,
-    
+
     /// Maximum blocked streams allowed.
     max_blocked_streams: usize,
-    
+
     /// Timeout for blocked streams (default: 60 seconds per RFC 9204 security considerations)
     blocked_stream_timeout: std::time::Duration,
 }
@@ -47,14 +47,22 @@ pub struct Decoder {
 impl Decoder {
     /// Create a new decoder with default configuration.
     pub fn new(max_table_capacity: usize, max_blocked_streams: usize) -> Self {
-        Self::with_config(max_table_capacity, max_blocked_streams, std::time::Duration::from_secs(60))
+        Self::with_config(
+            max_table_capacity,
+            max_blocked_streams,
+            std::time::Duration::from_secs(60),
+        )
     }
 
     /// Create a new decoder from configuration.
-    pub fn with_config(max_table_capacity: usize, max_blocked_streams: usize, timeout: std::time::Duration) -> Self {
+    pub fn with_config(
+        max_table_capacity: usize,
+        max_blocked_streams: usize,
+        timeout: std::time::Duration,
+    ) -> Self {
         let mut table = DynamicTable::new(max_table_capacity);
         let _ = table.set_capacity(max_table_capacity);
-        
+
         Self {
             table,
             decoder_stream_buffer: VecDeque::with_capacity(32),
@@ -66,9 +74,13 @@ impl Decoder {
 
     /// Create a new decoder from QpackConfig.
     pub fn from_config(config: &crate::QpackConfig) -> Self {
-        Self::with_config(config.max_table_capacity, config.max_blocked_streams, config.blocked_stream_timeout)
+        Self::with_config(
+            config.max_table_capacity,
+            config.max_blocked_streams,
+            config.blocked_stream_timeout,
+        )
     }
-    
+
     /// Create a decoder with custom blocked stream timeout.
     pub fn with_timeout(
         max_table_capacity: usize,
@@ -77,27 +89,27 @@ impl Decoder {
     ) -> Self {
         Self::with_config(max_table_capacity, max_blocked_streams, timeout)
     }
-    
+
     /// Get immutable reference to dynamic table (for testing/inspection).
     pub fn table(&self) -> &DynamicTable {
         &self.table
     }
-    
+
     /// Decode a header block.
-    /// 
+    ///
     /// # Arguments
     /// * `stream_id` - HTTP/3 stream ID
     /// * `data` - Encoded header block bytes
-    /// 
+    ///
     /// # Returns
     /// Vector of decoded header fields, or blocks if entries not available
     pub fn decode(&mut self, stream_id: u64, data: Bytes) -> Result<Vec<HeaderField>> {
         // Decode prefix
         let max_entries = self.table.capacity() as u64 / 32;
         let total_inserted = self.table.insert_count();
-        
+
         let (prefix, mut offset) = EncodedPrefix::decode(&data, max_entries, total_inserted)?;
-        
+
         // Check if we need to block
         let insert_count = self.table.insert_count();
         if prefix.required_insert_count > insert_count {
@@ -105,25 +117,31 @@ impl Decoder {
             if self.blocked_streams.len() >= self.max_blocked_streams {
                 return Err(QpackError::BlockedStreamLimitExceeded);
             }
-            self.blocked_streams
-                .insert(stream_id, (prefix.required_insert_count, data, std::time::Instant::now()));
+            self.blocked_streams.insert(
+                stream_id,
+                (
+                    prefix.required_insert_count,
+                    data,
+                    std::time::Instant::now(),
+                ),
+            );
             return Err(QpackError::DecompressionFailed(
                 "Header block blocked on dynamic table".into(),
             ));
         }
-        
+
         let base = prefix.base();
         let mut headers = Vec::new();
-        
+
         // Decode field lines
         while offset < data.len() {
             let (field_line, consumed) = FieldLine::decode(&data[offset..], base)?;
             offset += consumed;
-            
+
             let header = self.resolve_field_line(field_line)?;
             headers.push(header);
         }
-        
+
         // RFC 9204 Section 2.1.4: Section Ack should be sent AFTER the application
         // processes the headers, not immediately. Applications must call
         // ack_header_block() explicitly when ready.
@@ -131,19 +149,19 @@ impl Decoder {
         // remove this and require explicit acknowledgment.
         let ack = DecoderInstruction::SectionAck { stream_id };
         self.decoder_stream_buffer.push_back(ack.encode());
-        
+
         Ok(headers)
     }
-    
+
     /// Acknowledge processing of a header block.
-    /// 
+    ///
     /// RFC 9204 Section 2.1.4: Applications should call this method AFTER
     /// consuming/processing the decoded headers to signal that the encoder
     /// can safely evict corresponding dynamic table entries.
-    /// 
+    ///
     /// # Arguments
     /// * `stream_id` - The stream ID of the header block being acknowledged
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let headers = decoder.decode(stream_id, data)?;
@@ -156,20 +174,20 @@ impl Decoder {
         let ack = DecoderInstruction::SectionAck { stream_id };
         self.decoder_stream_buffer.push_back(ack.encode());
     }
-    
+
     /// Process encoder stream instruction.
     pub fn process_encoder_instruction(&mut self, data: &[u8]) -> Result<()> {
         let mut offset = 0;
-        
+
         while offset < data.len() {
             let (inst, consumed) = EncoderInstruction::decode(&data[offset..])?;
             offset += consumed;
-            
+
             match inst {
                 EncoderInstruction::SetCapacity { capacity } => {
                     self.handle_set_capacity(capacity as usize)?;
                 }
-                
+
                 EncoderInstruction::InsertWithNameRef {
                     is_static,
                     name_index,
@@ -177,33 +195,33 @@ impl Decoder {
                 } => {
                     self.handle_insert_with_name_ref(is_static, name_index, value)?;
                 }
-                
+
                 EncoderInstruction::InsertLiteral { name, value } => {
                     self.handle_insert_literal(name, value)?;
                 }
-                
+
                 EncoderInstruction::Duplicate { index } => {
                     self.handle_duplicate(index)?;
                 }
             }
-            
+
             // Check if any blocked streams can now be decoded
             self.process_blocked_streams()?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Get next decoder stream instruction (if any).
     pub fn poll_decoder_stream(&mut self) -> Option<Bytes> {
         self.decoder_stream_buffer.pop_front()
     }
-    
+
     /// Drain all decoder stream instructions.
     pub fn drain_decoder_stream(&mut self) -> Vec<Bytes> {
         self.decoder_stream_buffer.drain(..).collect()
     }
-    
+
     /// Cancel a stream (e.g., on stream reset).
     pub fn cancel_stream(&mut self, stream_id: u64) {
         if self.blocked_streams.remove(&stream_id).is_some() {
@@ -211,7 +229,7 @@ impl Decoder {
             self.decoder_stream_buffer.push_back(cancel.encode());
         }
     }
-    
+
     /// Resolve a field line to a header field.
     fn resolve_field_line(&self, field_line: FieldLine) -> Result<HeaderField> {
         match field_line {
@@ -223,7 +241,7 @@ impl Decoder {
                     value: Bytes::copy_from_slice(entry.value),
                 })
             }
-            
+
             FieldLine::IndexedDynamic { absolute_index } => {
                 let entry = self
                     .table
@@ -234,7 +252,7 @@ impl Decoder {
                     value: entry.value.clone(),
                 })
             }
-            
+
             FieldLine::IndexedDynamicPost { index } => {
                 // Post-base index: base + index
                 let base = self.table.insert_count();
@@ -248,7 +266,7 @@ impl Decoder {
                     value: entry.value.clone(),
                 })
             }
-            
+
             FieldLine::LiteralStaticName {
                 name_index,
                 value,
@@ -261,7 +279,7 @@ impl Decoder {
                     value,
                 })
             }
-            
+
             FieldLine::LiteralDynamicName {
                 name_index,
                 value,
@@ -276,13 +294,13 @@ impl Decoder {
                     value,
                 })
             }
-            
+
             FieldLine::LiteralName {
                 name,
                 value,
                 never_indexed: _,
             } => Ok(HeaderField { name, value }),
-            
+
             FieldLine::LiteralPostBaseName {
                 name_index,
                 value,
@@ -301,13 +319,13 @@ impl Decoder {
             }
         }
     }
-    
+
     /// Handle Set Capacity instruction.
     fn handle_set_capacity(&mut self, capacity: usize) -> Result<()> {
         self.table.set_capacity(capacity)?;
         Ok(())
     }
-    
+
     /// Handle Insert With Name Reference instruction.
     fn handle_insert_with_name_ref(
         &mut self,
@@ -326,52 +344,52 @@ impl Decoder {
                 .ok_or(QpackError::InvalidDynamicIndex(name_index))?;
             entry.name.clone()
         };
-        
+
         self.table.insert(name, value)?;
-        
+
         // Emit Insert Count Increment
         let inc = DecoderInstruction::InsertCountIncrement { increment: 1 };
         self.decoder_stream_buffer.push_back(inc.encode());
-        
+
         Ok(())
     }
-    
+
     /// Handle Insert Literal instruction.
     fn handle_insert_literal(&mut self, name: Bytes, value: Bytes) -> Result<()> {
         self.table.insert(name, value)?;
-        
+
         // Emit Insert Count Increment
         let inc = DecoderInstruction::InsertCountIncrement { increment: 1 };
         self.decoder_stream_buffer.push_back(inc.encode());
-        
+
         Ok(())
     }
-    
+
     /// Handle Duplicate instruction.
     fn handle_duplicate(&mut self, index: u64) -> Result<()> {
         let entry = self
             .table
             .get(index)
             .ok_or(QpackError::InvalidDynamicIndex(index))?;
-        
+
         let name = entry.name.clone();
         let value = entry.value.clone();
-        
+
         self.table.insert(name, value)?;
-        
+
         // Emit Insert Count Increment
         let inc = DecoderInstruction::InsertCountIncrement { increment: 1 };
         self.decoder_stream_buffer.push_back(inc.encode());
-        
+
         Ok(())
     }
-    
+
     /// Try to decode blocked streams after dynamic table update.
     fn process_blocked_streams(&mut self) -> Result<()> {
         let insert_count = self.table.insert_count();
         let mut unblocked = Vec::new();
         let now = std::time::Instant::now();
-        
+
         for (stream_id, (ric, _, blocked_at)) in &self.blocked_streams {
             // Check for timeout (RFC 9204 security consideration)
             if now.duration_since(*blocked_at) > self.blocked_stream_timeout {
@@ -382,7 +400,7 @@ impl Decoder {
                 unblocked.push((*stream_id, false)); // false = ready to decode
             }
         }
-        
+
         for (stream_id, timed_out) in unblocked {
             if let Some((_, data, _)) = self.blocked_streams.remove(&stream_id) {
                 if timed_out {
@@ -395,10 +413,10 @@ impl Decoder {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Check for timed-out blocked streams and cancel them.
     ///
     /// Should be called periodically to prevent memory leaks from abandoned streams.
@@ -412,34 +430,34 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_decode_static_only() {
         let mut decoder = Decoder::new(4096, 100);
-        
+
         // Manually construct simple header block with static entries
         let mut data = BytesMut::new();
-        
+
         // Prefix: RIC=0, Delta=0
         data.extend_from_slice(&[0x00, 0x00]);
-        
+
         // Indexed static :method=GET (index 17)
         data.extend_from_slice(&[0xC0 | 17]); // 11xxxxxx with index 17
-        
+
         let headers = decoder.decode(0, data.freeze()).unwrap();
-        
+
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].name.as_ref(), b":method");
         assert_eq!(headers[0].value.as_ref(), b"GET");
     }
-    
+
     #[test]
     fn test_process_set_capacity() {
         let mut decoder = Decoder::new(4096, 100);
-        
+
         let inst = EncoderInstruction::SetCapacity { capacity: 2048 };
         decoder.process_encoder_instruction(&inst.encode()).unwrap();
-        
+
         assert_eq!(decoder.table.capacity(), 2048);
     }
 }

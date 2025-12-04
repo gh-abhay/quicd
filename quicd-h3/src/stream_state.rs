@@ -3,9 +3,9 @@
 //! This module implements per-stream state tracking according to RFC 9114,
 //! including frame buffering for handling frames that span multiple reads.
 
-use bytes::{Bytes, BytesMut};
 use crate::error::H3Error;
 use crate::frames::H3Frame;
+use bytes::{Bytes, BytesMut};
 
 /// State of an HTTP/3 stream per RFC 9114.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +106,7 @@ impl StreamFrameParser {
                 self.stream_id, new_size, self.max_buffer_size
             )));
         }
-        
+
         // Reserve space if needed to avoid multiple reallocations
         let remaining_cap = self.buffer.capacity() - self.buffer.len();
         if remaining_cap < data.len() {
@@ -182,22 +182,16 @@ impl StreamFrameParser {
         match frame {
             Headers { .. } => {
                 if self.trailers_received {
-                    return Err(H3Error::Http(
-                        "HEADERS after trailers is invalid".into()
-                    ));
+                    return Err(H3Error::Http("HEADERS after trailers is invalid".into()));
                 }
                 // HEADERS can be initial headers or trailers
             }
             Data { .. } => {
                 if !self.headers_received {
-                    return Err(H3Error::Http(
-                        "DATA before HEADERS is invalid".into()
-                    ));
+                    return Err(H3Error::Http("DATA before HEADERS is invalid".into()));
                 }
                 if self.trailers_received {
-                    return Err(H3Error::Http(
-                        "DATA after trailers is invalid".into()
-                    ));
+                    return Err(H3Error::Http("DATA after trailers is invalid".into()));
                 }
             }
             PushPromise { .. } => {
@@ -226,9 +220,7 @@ impl StreamFrameParser {
                     self.trailers_received = true;
                 } else {
                     // Multiple HEADERS before DATA is invalid
-                    return Err(H3Error::Http(
-                        "multiple HEADERS frames before DATA".into()
-                    ));
+                    return Err(H3Error::Http("multiple HEADERS frames before DATA".into()));
                 }
             }
             H3Frame::Data { data } => {
@@ -278,7 +270,7 @@ impl StreamFrameParser {
     pub fn buffered_bytes(&self) -> usize {
         self.buffer.len()
     }
-    
+
     /// Get the remaining capacity before reallocation.
     /// PERF #30: Useful for monitoring buffer efficiency
     pub fn remaining_capacity(&self) -> usize {

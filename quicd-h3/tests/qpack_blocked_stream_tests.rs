@@ -14,9 +14,7 @@ fn test_blocked_stream_retry_on_table_update() {
     let mut decoder = Decoder::new(4096, 100);
 
     // First, encode a header that will create a dynamic table entry
-    let headers_to_insert = vec![
-        (b"x-custom-header".as_slice(), b"value1".as_slice()),
-    ];
+    let headers_to_insert = vec![(b"x-custom-header".as_slice(), b"value1".as_slice())];
     let _ = encoder.encode(1, &headers_to_insert).unwrap();
 
     // Now encode headers that reference the dynamic entry (index 0 in dynamic table)
@@ -100,9 +98,7 @@ fn test_multiple_streams_blocked_same_entry() {
 
     // Create header blocks that all reference the same future dynamic entry
     // First, encode headers that will create the dynamic entry
-    let headers_to_insert = vec![
-        (b"x-shared-header".as_slice(), b"shared-value".as_slice()),
-    ];
+    let headers_to_insert = vec![(b"x-shared-header".as_slice(), b"shared-value".as_slice())];
     let _ = encoder.encode(1, &headers_to_insert).unwrap();
 
     // Create three streams that reference this dynamic entry
@@ -115,9 +111,18 @@ fn test_multiple_streams_blocked_same_entry() {
     let encoded_c = encoder.encode(7, &headers_with_ref).unwrap();
 
     // All should block initially
-    assert!(matches!(decoder.decode(3, encoded_a.clone()), Err(QpackError::DecompressionFailed(_))));
-    assert!(matches!(decoder.decode(5, encoded_b.clone()), Err(QpackError::DecompressionFailed(_))));
-    assert!(matches!(decoder.decode(7, encoded_c.clone()), Err(QpackError::DecompressionFailed(_))));
+    assert!(matches!(
+        decoder.decode(3, encoded_a.clone()),
+        Err(QpackError::DecompressionFailed(_))
+    ));
+    assert!(matches!(
+        decoder.decode(5, encoded_b.clone()),
+        Err(QpackError::DecompressionFailed(_))
+    ));
+    assert!(matches!(
+        decoder.decode(7, encoded_c.clone()),
+        Err(QpackError::DecompressionFailed(_))
+    ));
 
     // Process encoder instructions - all should unblock
     while let Some(inst) = encoder.poll_encoder_stream() {
@@ -151,12 +156,21 @@ fn test_blocked_streams_limit() {
     let encoded = data.freeze();
 
     // Block two streams - should succeed
-    assert!(matches!(decoder.decode(1, encoded.clone()), Err(QpackError::DecompressionFailed(_))));
-    assert!(matches!(decoder.decode(3, encoded.clone()), Err(QpackError::DecompressionFailed(_))));
+    assert!(matches!(
+        decoder.decode(1, encoded.clone()),
+        Err(QpackError::DecompressionFailed(_))
+    ));
+    assert!(matches!(
+        decoder.decode(3, encoded.clone()),
+        Err(QpackError::DecompressionFailed(_))
+    ));
 
     // Third stream should fail with BlockedStreamLimitExceeded
     let result = decoder.decode(5, encoded);
-    assert!(matches!(result, Err(QpackError::BlockedStreamLimitExceeded)));
+    assert!(matches!(
+        result,
+        Err(QpackError::BlockedStreamLimitExceeded)
+    ));
 }
 
 #[test]
@@ -173,7 +187,10 @@ fn test_blocked_stream_check_interval() {
     let encoded = data.freeze();
 
     // Block a stream
-    assert!(matches!(decoder.decode(9, encoded), Err(QpackError::DecompressionFailed(_))));
+    assert!(matches!(
+        decoder.decode(9, encoded),
+        Err(QpackError::DecompressionFailed(_))
+    ));
 
     // Wait less than timeout
     std::thread::sleep(Duration::from_millis(20));

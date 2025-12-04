@@ -5,10 +5,10 @@
 //! connection origin (scheme + host + port) to ensure settings are only reused for
 //! connections to the same server.
 
+use crate::settings::SettingId;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
-use crate::settings::SettingId;
 
 /// Maximum age of remembered settings before expiration (24 hours).
 ///
@@ -42,7 +42,8 @@ impl Origin {
     /// Parse from authority string (host:port).
     pub fn from_authority(scheme: String, authority: &str) -> Result<Self, String> {
         if let Some((host, port_str)) = authority.rsplit_once(':') {
-            let port = port_str.parse::<u16>()
+            let port = port_str
+                .parse::<u16>()
                 .map_err(|_| format!("invalid port: {}", port_str))?;
             Ok(Self::new(scheme, host.to_string(), port))
         } else {
@@ -176,7 +177,8 @@ impl InMemorySettingsStorage {
 
     /// Get the number of stored origins.
     pub fn len(&self) -> usize {
-        self.storage.read()
+        self.storage
+            .read()
             .map(|storage| storage.len())
             .unwrap_or(0)
     }
@@ -258,7 +260,7 @@ mod tests {
         settings.insert(0x06, 8192);
 
         storage.store(origin.clone(), settings.clone());
-        
+
         let retrieved = storage.retrieve(&origin).unwrap();
         assert_eq!(retrieved.get(&0x01), Some(&4096));
         assert_eq!(retrieved.get(&0x06), Some(&8192));
@@ -308,7 +310,7 @@ mod tests {
     #[test]
     fn test_clear_expired() {
         let storage = InMemorySettingsStorage::with_ttl(Duration::from_millis(100));
-        
+
         let origin1 = Origin::new("https".to_string(), "example.com".to_string(), 443);
         let origin2 = Origin::new("https".to_string(), "other.com".to_string(), 443);
 
@@ -316,10 +318,10 @@ mod tests {
         settings.insert(0x01, 4096);
 
         storage.store(origin1.clone(), settings.clone());
-        
+
         // Wait a bit
         std::thread::sleep(Duration::from_millis(150));
-        
+
         // Store a fresh entry
         storage.store(origin2.clone(), settings.clone());
 
@@ -335,7 +337,7 @@ mod tests {
     #[test]
     fn test_multiple_origins() {
         let storage = InMemorySettingsStorage::new();
-        
+
         let origin1 = Origin::new("https".to_string(), "example.com".to_string(), 443);
         let origin2 = Origin::new("https".to_string(), "other.com".to_string(), 443);
         let origin3 = Origin::new("https".to_string(), "example.com".to_string(), 8443);

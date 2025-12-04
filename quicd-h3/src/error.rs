@@ -52,12 +52,12 @@ impl H3Error {
                 } else {
                     H3ErrorCode::GeneralProtocolError
                 }
-            },
+            }
             H3Error::QpackBlocked(_) => {
                 // Blocked streams are not errors - this should not reach the error code mapping
                 // But if it does, treat as internal issue
                 H3ErrorCode::InternalError
-            },
+            }
             H3Error::Http(msg) => {
                 if msg.contains("malformed") || msg.contains("invalid") {
                     H3ErrorCode::MessageError
@@ -100,26 +100,26 @@ pub enum H3ErrorCode {
     GeneralProtocolError = 0x101,
     InternalError = 0x102,
     StreamCreationError = 0x103,
-    
+
     // 0x104-0x107: Frame parsing errors
     ClosedCriticalStream = 0x104,
     FrameUnexpected = 0x105,
     FrameError = 0x106,
     ExcessiveLoad = 0x107,
-    
+
     // 0x108-0x10B: QPACK errors
     IdError = 0x108,
     SettingsError = 0x109,
     MissingSettings = 0x10A,
     RequestRejected = 0x10B,
-    
+
     // 0x10C-0x110: Request/response errors
     RequestCancelled = 0x10C,
     RequestIncomplete = 0x10D,
     MessageError = 0x10E,
     ConnectError = 0x10F,
     VersionFallback = 0x110,
-    
+
     // QPACK-specific error codes (RFC 9204 Section 6)
     QpackDecompressionFailed = 0x200,
     QpackEncoderStreamError = 0x201,
@@ -138,7 +138,7 @@ impl H3ErrorCode {
             // RFC 9114 Section 8.1: Reserved error codes are treated as H3_NO_ERROR
             return Some(H3ErrorCode::NoError);
         }
-        
+
         match value {
             0x100 => Some(H3ErrorCode::NoError),
             0x101 => Some(H3ErrorCode::GeneralProtocolError),
@@ -164,12 +164,12 @@ impl H3ErrorCode {
             _ => None,
         }
     }
-    
+
     /// Convert the enum variant to its u64 value.
     pub fn to_u64(self) -> u64 {
         self as u64
     }
-    
+
     /// Get a human-readable description of the error.
     pub fn description(&self) -> &'static str {
         match self {

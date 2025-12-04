@@ -153,6 +153,22 @@ impl StreamManager {
         self.stream_ingress_txs.contains_key(&stream_id)
     }
 
+    /// Get all active stream IDs (both ingress and egress).
+    ///
+    /// Returns a Vec containing all stream IDs that are currently being tracked
+    /// by this manager. Used for checking stream writable state and other per-stream
+    /// operations in the QUIC manager.
+    pub fn active_stream_ids(&self) -> Vec<StreamId> {
+        let mut ids: Vec<StreamId> = self.stream_ingress_txs.keys().copied().collect();
+        // Also include streams that only have egress (uni streams from app)
+        for egress_stream_id in self.stream_egress_rxs.keys() {
+            if !ids.contains(egress_stream_id) {
+                ids.push(*egress_stream_id);
+            }
+        }
+        ids
+    }
+
     /// Add a bidirectional stream opened by the app via `open_bi()`.
     ///
     /// This stream has both read and write directions.

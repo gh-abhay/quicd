@@ -3,9 +3,9 @@
 //! Implements both standard CONNECT (for TCP tunneling) and extended CONNECT
 //! (with :protocol pseudo-header for protocols like WebSocket).
 
-use bytes::Bytes;
 use crate::error::H3Error;
 use crate::validation::RequestPseudoHeaders;
+use bytes::Bytes;
 use tokio::net::TcpStream;
 
 /// State of a CONNECT tunnel.
@@ -37,16 +37,15 @@ pub struct ConnectTunnel {
 
 impl ConnectTunnel {
     /// Create a new CONNECT tunnel.
-    pub fn new(
-        stream_id: u64,
-        pseudo_headers: &RequestPseudoHeaders,
-    ) -> Result<Self, H3Error> {
+    pub fn new(stream_id: u64, pseudo_headers: &RequestPseudoHeaders) -> Result<Self, H3Error> {
         // Validate this is a CONNECT request
         if !pseudo_headers.is_connect() {
             return Err(H3Error::Http("not a CONNECT request".into()));
         }
 
-        let authority = pseudo_headers.authority.clone()
+        let authority = pseudo_headers
+            .authority
+            .clone()
             .ok_or_else(|| H3Error::Http("CONNECT requires :authority".into()))?;
 
         Ok(Self {
@@ -109,9 +108,9 @@ impl ConnectTunnel {
 
         if let Some(tcp) = &mut self.tcp_stream {
             use tokio::io::AsyncWriteExt;
-            tcp.write_all(data).await.map_err(|e| {
-                H3Error::ConnectError(format!("TCP write failed: {}", e))
-            })?;
+            tcp.write_all(data)
+                .await
+                .map_err(|e| H3Error::ConnectError(format!("TCP write failed: {}", e)))?;
             Ok(())
         } else {
             Err(H3Error::Http("no TCP connection".into()))
@@ -229,12 +228,12 @@ pub async fn forward_connect_tunnel(
     mut h3_recv_stream: quicd_x::RecvStream,
     h3_send_stream: quicd_x::SendStream,
 ) -> Result<(), H3Error> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use crate::frames::H3Frame;
-    
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     // Split TCP stream for simultaneous read/write
     let (mut tcp_read, mut tcp_write) = tcp_stream.split();
-    
+
     // Task 1: Forward QUIC -> TCP (client to server)
     let quic_to_tcp = async move {
         loop {
@@ -248,9 +247,10 @@ pub async fn forward_connect_tunnel(
                                 cursor += consumed;
                                 // Write payload to TCP
                                 if let Err(e) = tcp_write.write_all(&payload).await {
-                                    return Err(H3Error::ConnectError(
-                                        format!("TCP write failed: {}", e)
-                                    ));
+                                    return Err(H3Error::ConnectError(format!(
+                                        "TCP write failed: {}",
+                                        e
+                                    )));
                                 }
                             }
                             Ok((_, consumed)) => {
@@ -279,11 +279,11 @@ pub async fn forward_connect_tunnel(
         }
         Ok(())
     };
-    
+
     // Task 2: Forward TCP -> QUIC (server to client)
     let tcp_to_quic = async move {
         let mut buffer = vec![0u8; 16384]; // 16KB buffer for TCP reads
-        
+
         loop {
             match tcp_read.read(&mut buffer).await {
                 Ok(0) => {
@@ -299,7 +299,7 @@ pub async fn forward_connect_tunnel(
                         data: Bytes::copy_from_slice(&buffer[..n]),
                     };
                     let frame_data = data_frame.encode();
-                    
+
                     if let Err(e) = h3_send_stream.write(frame_data, false).await {
                         return Err(H3Error::Stream(format!("QUIC write failed: {:?}", e)));
                     }
@@ -312,7 +312,7 @@ pub async fn forward_connect_tunnel(
         }
         Ok(())
     };
-    
+
     // Run both forwarding tasks concurrently
     tokio::select! {
         result = quic_to_tcp => result,
@@ -341,7 +341,7 @@ pub fn validate_connect_request(
         if !enable_connect_protocol {
             return Err(H3Error::MessageError);
         }
-        
+
         // Extended CONNECT: needs all pseudo-headers
         if pseudo_headers.scheme.is_none() {
             return Err(H3Error::Http("extended CONNECT requires :scheme".into()));
@@ -355,7 +355,9 @@ pub fn validate_connect_request(
     } else {
         // Standard CONNECT: no :scheme or :path
         if pseudo_headers.scheme.is_some() {
-            return Err(H3Error::Http("standard CONNECT MUST NOT have :scheme".into()));
+            return Err(H3Error::Http(
+                "standard CONNECT MUST NOT have :scheme".into(),
+            ));
         }
         if pseudo_headers.path.is_some() {
             return Err(H3Error::Http("standard CONNECT MUST NOT have :path".into()));
@@ -383,7 +385,7 @@ mod tests {
         };
 
         assert!(validate_connect_request(&pseudo, false).is_ok());
-        
+
         let tunnel = ConnectTunnel::new(4, &pseudo);
         assert!(tunnel.is_ok());
         let tunnel = tunnel.unwrap();
@@ -403,13 +405,13 @@ mod tests {
 
         // Should succeed when extended CONNECT is enabled
         assert!(validate_connect_request(&pseudo, true).is_ok());
-        
+
         // Should fail when extended CONNECT is disabled
         assert!(matches!(
             validate_connect_request(&pseudo, false),
             Err(H3Error::MessageError)
         ));
-        
+
         let tunnel = ConnectTunnel::new(4, &pseudo);
         assert!(tunnel.is_ok());
         let tunnel = tunnel.unwrap();

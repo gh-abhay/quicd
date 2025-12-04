@@ -23,7 +23,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stream_id = 0;
     let encoded1 = encoder.encode(stream_id, &headers1)?;
-    println!("Encoded {} headers into {} bytes", headers1.len(), encoded1.len());
+    println!(
+        "Encoded {} headers into {} bytes",
+        headers1.len(),
+        encoded1.len()
+    );
 
     // Check for encoder stream instructions (none expected for static-only)
     let encoder_insts = encoder.drain_encoder_stream();
@@ -60,7 +64,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stream_id2 = 4;
     let encoded2 = encoder.encode(stream_id2, &headers2)?;
-    println!("Encoded {} headers into {} bytes", headers2.len(), encoded2.len());
+    println!(
+        "Encoded {} headers into {} bytes",
+        headers2.len(),
+        encoded2.len()
+    );
 
     // Process encoder instructions (dynamic table insertions)
     let encoder_insts2 = encoder.drain_encoder_stream();
@@ -127,7 +135,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Display dynamic table stats
     println!("=== Dynamic Table Statistics ===");
     println!("Encoder table size: {} bytes", encoder.table().size());
-    println!("Encoder table capacity: {} bytes", encoder.table().capacity());
+    println!(
+        "Encoder table capacity: {} bytes",
+        encoder.table().capacity()
+    );
     println!("Encoder table entries: {}", encoder.table().len());
     println!("Encoder insert count: {}", encoder.table().insert_count());
 

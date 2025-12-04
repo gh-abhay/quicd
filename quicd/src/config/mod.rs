@@ -94,7 +94,10 @@ impl ServerConfig {
         for (idx, app) in self.apps.iter().enumerate() {
             if let Err(e) = app.validate() {
                 for err in e {
-                    errors.push(format!("Application[{}] (ALPN: {}): {}", idx, app.alpn, err));
+                    errors.push(format!(
+                        "Application[{}] (ALPN: {}): {}",
+                        idx, app.alpn, err
+                    ));
                 }
             }
         }
@@ -109,7 +112,9 @@ impl ServerConfig {
 
         // Ensure at least one application is configured
         if self.apps.is_empty() {
-            errors.push("No applications configured. At least one application must be defined.".to_string());
+            errors.push(
+                "No applications configured. At least one application must be defined.".to_string(),
+            );
         }
 
         // System resource pre-flight checks
@@ -177,7 +182,7 @@ mod tests {
                 config: ApplicationTypeConfig::Http3(Http3Config::default()),
             },
         ];
-        
+
         let result = config.validate();
         assert!(result.is_err());
         let errors = result.unwrap_err();

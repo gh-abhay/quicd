@@ -22,9 +22,12 @@ fn main() -> anyhow::Result<()> {
 
     info!("Configuration loaded successfully");
 
-    let bind_addr: SocketAddr = format!("{}:{}", config.global.network.host, config.global.network.port)
-        .parse()
-        .with_context(|| "invalid bind address")?;
+    let bind_addr: SocketAddr = format!(
+        "{}:{}",
+        config.global.network.host, config.global.network.port
+    )
+    .parse()
+    .with_context(|| "invalid bind address")?;
     let netio_cfg = config.global.netio.clone();
     let quic_cfg = config.global.quic.clone();
     let telemetry_cfg = config.global.telemetry.clone();
@@ -70,9 +73,13 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             config::application::ApplicationTypeConfig::Plugin(plugin_cfg) => {
-                info!("Loading plugin for ALPN {}: {}", app_config.alpn, plugin_cfg.library_path);
-                let factory = apps::load_plugin(&plugin_cfg.library_path)
-                    .with_context(|| format!("Failed to load plugin for ALPN {}", app_config.alpn))?;
+                info!(
+                    "Loading plugin for ALPN {}: {}",
+                    app_config.alpn, plugin_cfg.library_path
+                );
+                let factory = apps::load_plugin(&plugin_cfg.library_path).with_context(|| {
+                    format!("Failed to load plugin for ALPN {}", app_config.alpn)
+                })?;
                 app_registry = app_registry.register(&app_config.alpn, factory);
             }
         }
@@ -82,8 +89,20 @@ fn main() -> anyhow::Result<()> {
     if app_registry.is_empty() {
         info!("No applications configured, registering default H3 handlers");
         app_registry = app_registry
-            .register("h3", Arc::new(quicd_h3::H3Factory::with_config(quicd_h3::DefaultH3Handler, quicd_h3::config::H3Config::default())))
-            .register("h3-29", Arc::new(quicd_h3::H3Factory::with_config(quicd_h3::DefaultH3Handler, quicd_h3::config::H3Config::default())));
+            .register(
+                "h3",
+                Arc::new(quicd_h3::H3Factory::with_config(
+                    quicd_h3::DefaultH3Handler,
+                    quicd_h3::config::H3Config::default(),
+                )),
+            )
+            .register(
+                "h3-29",
+                Arc::new(quicd_h3::H3Factory::with_config(
+                    quicd_h3::DefaultH3Handler,
+                    quicd_h3::config::H3Config::default(),
+                )),
+            );
     }
 
     info!(

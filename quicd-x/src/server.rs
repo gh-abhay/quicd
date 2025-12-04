@@ -73,6 +73,90 @@ pub enum EgressCommand {
         connection_id: ConnectionId,
         reply: tokio::sync::oneshot::Sender<ConnectionState>,
     },
+
+    /// Request connection migration to new local address (RFC 9000 §9).
+    ///
+    /// The worker will initiate path validation automatically.
+    MigrateTo {
+        connection_id: ConnectionId,
+        new_local_addr: SocketAddr,
+    },
+
+    /// Request path validation for specific address (RFC 9000 §8.2).
+    ///
+    /// Response: TransportEvent::PathValidated or PathValidationFailed
+    ValidatePath {
+        connection_id: ConnectionId,
+        peer_addr: SocketAddr,
+    },
+
+    /// Set stream priority using RFC 9218 extensible priority scheme.
+    ///
+    /// No explicit response; priority changes reflected in stream behavior.
+    SetStreamPriority {
+        connection_id: ConnectionId,
+        stream_id: StreamId,
+        urgency: u8,
+        incremental: bool,
+    },
+
+    /// Send STOP_SENDING frame to peer (RFC 9000 §3.5).
+    ///
+    /// Requests peer to stop sending on this stream.
+    StopSending {
+        connection_id: ConnectionId,
+        stream_id: StreamId,
+        error_code: u64,
+    },
+
+    /// Query maximum datagram size (RFC 9221 §3).
+    ///
+    /// Returns the maximum size of datagram that can be sent.
+    /// Response delivered via oneshot channel.
+    GetMaxDatagramSize {
+        connection_id: ConnectionId,
+        reply: tokio::sync::oneshot::Sender<Option<usize>>,
+    },
+
+    /// Query remaining stream credits (RFC 9000 §4.6).
+    ///
+    /// Returns how many more streams can be opened.
+    /// Response delivered via oneshot channel.
+    GetStreamCredits {
+        connection_id: ConnectionId,
+        reply: tokio::sync::oneshot::Sender<StreamCredits>,
+    },
+
+    /// Query stream send capacity (RFC 9000 §4.1).
+    ///
+    /// Returns how many bytes can be sent on this stream without being
+    /// blocked by flow control. Applications can use this to implement
+    /// adaptive sending strategies.
+    /// Response delivered via oneshot channel.
+    QueryStreamCapacity {
+        connection_id: ConnectionId,
+        stream_id: StreamId,
+        reply: tokio::sync::oneshot::Sender<Result<u64, ConnectionError>>,
+    },
+
+    /// Query connection-level send capacity (RFC 9000 §4.1).
+    ///
+    /// Returns total bytes available for sending across all streams,
+    /// limited by the peer's MAX_DATA frame.
+    /// Response delivered via oneshot channel.
+    QueryConnectionCapacity {
+        connection_id: ConnectionId,
+        reply: tokio::sync::oneshot::Sender<u64>,
+    },
+}
+
+/// Stream credit information (RFC 9000 §4.6).
+#[derive(Debug, Clone, Copy)]
+pub struct StreamCredits {
+    /// Remaining bidirectional streams that can be opened
+    pub bidi: u64,
+    /// Remaining unidirectional streams that can be opened
+    pub uni: u64,
 }
 
 /// Connection state information for queries.

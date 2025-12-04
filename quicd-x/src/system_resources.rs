@@ -205,14 +205,16 @@ impl SystemResources {
         }
 
         // Check UDP buffer sizes
-        if self.max_udp_recv_buf < 1_048_576 { // 1MB
+        if self.max_udp_recv_buf < 1_048_576 {
+            // 1MB
             warnings.push(format!(
                 "UDP receive buffer limit ({}) may limit throughput",
                 self.max_udp_recv_buf
             ));
         }
 
-        if self.max_udp_send_buf < 1_048_576 { // 1MB
+        if self.max_udp_send_buf < 1_048_576 {
+            // 1MB
             warnings.push(format!(
                 "UDP send buffer limit ({}) may limit throughput",
                 self.max_udp_send_buf
@@ -220,13 +222,17 @@ impl SystemResources {
         }
 
         // Check memory
-        if self.total_memory_bytes < 1_073_741_824 { // 1GB
+        if self.total_memory_bytes < 1_073_741_824 {
+            // 1GB
             warnings.push("System has less than 1GB RAM, performance may be limited".to_string());
         }
 
         // Check cores
         if self.physical_cores < 2 {
-            warnings.push("Single-core system detected, consider upgrading for better performance".to_string());
+            warnings.push(
+                "Single-core system detected, consider upgrading for better performance"
+                    .to_string(),
+            );
         }
 
         if warnings.is_empty() {
@@ -309,8 +315,8 @@ fn get_max_fds() -> u64 {
     // Try getrlimit (Unix)
     #[cfg(unix)]
     {
-        use std::mem;
         use libc::{getrlimit, rlimit, RLIMIT_NOFILE};
+        use std::mem;
 
         let mut rlim = unsafe { mem::zeroed::<rlimit>() };
         if unsafe { getrlimit(RLIMIT_NOFILE, &mut rlim) } == 0 {
@@ -327,12 +333,16 @@ fn get_max_udp_buffer_size(is_recv: bool) -> usize {
     #[cfg(unix)]
     {
         use std::mem;
-        use std::os::unix::io::AsRawFd;
         use std::net::UdpSocket;
+        use std::os::unix::io::AsRawFd;
 
         // Create a test socket to query limits
         if let Ok(socket) = UdpSocket::bind("127.0.0.1:0") {
-            let opt = if is_recv { libc::SO_RCVBUF } else { libc::SO_SNDBUF };
+            let opt = if is_recv {
+                libc::SO_RCVBUF
+            } else {
+                libc::SO_SNDBUF
+            };
             let mut buf_size: libc::socklen_t = mem::size_of::<usize>() as libc::socklen_t;
             let mut value: usize = 0;
 
@@ -344,7 +354,8 @@ fn get_max_udp_buffer_size(is_recv: bool) -> usize {
                     &mut value as *mut usize as *mut libc::c_void,
                     &mut buf_size,
                 )
-            } == 0 {
+            } == 0
+            {
                 // Try to set maximum possible
                 let max_sizes = [4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024, 512 * 1024];
                 for &size in &max_sizes {
@@ -356,7 +367,8 @@ fn get_max_udp_buffer_size(is_recv: bool) -> usize {
                             &size as *const usize as *const libc::c_void,
                             mem::size_of::<usize>() as libc::socklen_t,
                         )
-                    } == 0 {
+                    } == 0
+                    {
                         return size;
                     }
                 }
@@ -403,7 +415,7 @@ mod tests {
         assert!(resources.max_connections_from_memory() >= 100);
         assert!(resources.optimal_udp_recv_buf() >= 2 * 1024 * 1024);
         assert!(resources.optimal_io_uring_entries() >= 1024);
-        
+
         // Ensure calculations are reasonable
         assert!(resources.optimal_worker_threads() <= 1024);
         assert!(resources.optimal_netio_workers() <= 1024);
@@ -414,11 +426,11 @@ mod tests {
     #[test]
     fn test_channel_capacity_scaling() {
         let resources = SystemResources::query();
-        
+
         let egress = resources.optimal_worker_egress_capacity();
         let ingress = resources.optimal_connection_ingress_capacity();
         let stream = resources.optimal_stream_channel_capacity();
-        
+
         // Verify bounds
         assert!(egress >= 512 && egress <= 8192);
         assert!(ingress >= 64 && ingress <= 512);
@@ -428,10 +440,10 @@ mod tests {
     #[test]
     fn test_flow_control_windows() {
         let resources = SystemResources::query();
-        
+
         let conn_window = resources.optimal_quic_recv_window();
         let stream_window = resources.optimal_quic_stream_recv_window();
-        
+
         // Connection window should be at least 10MB
         assert!(conn_window >= 10 * 1024 * 1024);
         // Connection window should not exceed 100MB
@@ -444,7 +456,7 @@ mod tests {
     fn test_idle_timeout_logic() {
         let resources = SystemResources::query();
         let timeout = resources.optimal_idle_timeout_ms();
-        
+
         // Should be either base (30s) or aggressive (5s)
         assert!(timeout == 30_000 || timeout == 5_000);
     }
@@ -453,7 +465,7 @@ mod tests {
     fn test_udp_payload_size() {
         let resources = SystemResources::query();
         let payload_size = resources.optimal_max_udp_payload();
-        
+
         // Should be conservative default
         assert_eq!(payload_size, 1350);
     }
@@ -461,10 +473,10 @@ mod tests {
     #[test]
     fn test_validation_warnings() {
         let resources = SystemResources::query();
-        
+
         // Validation should not panic
         let result = resources.validate_system_limits();
-        
+
         // Either passes or returns warnings
         match result {
             Ok(()) => {

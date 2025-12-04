@@ -35,12 +35,22 @@ fn main() {
     ];
 
     let encoded_1 = encoder.encode(1, &headers_1).unwrap();
-    println!("   Encoded {} headers into {} bytes", headers_1.len(), encoded_1.len());
-    println!("   Dynamic table insert count: {}", encoder.table().insert_count());
+    println!(
+        "   Encoded {} headers into {} bytes",
+        headers_1.len(),
+        encoded_1.len()
+    );
+    println!(
+        "   Dynamic table insert count: {}",
+        encoder.table().insert_count()
+    );
 
     // Process encoder stream instructions
     let encoder_instructions = encoder.drain_encoder_stream();
-    println!("   Generated {} encoder stream instructions", encoder_instructions.len());
+    println!(
+        "   Generated {} encoder stream instructions",
+        encoder_instructions.len()
+    );
     for inst in &encoder_instructions {
         decoder.process_encoder_instruction(inst).unwrap();
     }
@@ -49,7 +59,8 @@ fn main() {
     let decoded_1 = decoder.decode(1, encoded_1.clone()).unwrap();
     println!("   Decoded {} headers", decoded_1.len());
     for header in &decoded_1 {
-        println!("     {}: {}", 
+        println!(
+            "     {}: {}",
             String::from_utf8_lossy(&header.name),
             String::from_utf8_lossy(&header.value)
         );
@@ -57,7 +68,10 @@ fn main() {
 
     // Process decoder stream instructions (acknowledgement)
     let decoder_instructions = decoder.drain_decoder_stream();
-    println!("   Generated {} decoder stream instructions", decoder_instructions.len());
+    println!(
+        "   Generated {} decoder stream instructions",
+        decoder_instructions.len()
+    );
     for inst in &decoder_instructions {
         encoder.process_decoder_instruction(inst).unwrap();
     }
@@ -75,13 +89,22 @@ fn main() {
     ];
 
     let encoded_2 = encoder.encode(2, &headers_2).unwrap();
-    println!("   Encoded {} headers into {} bytes", headers_2.len(), encoded_2.len());
-    println!("   Compression ratio: {:.1}%", 
-        100.0 * (1.0 - encoded_2.len() as f64 / encoded_1.len() as f64));
+    println!(
+        "   Encoded {} headers into {} bytes",
+        headers_2.len(),
+        encoded_2.len()
+    );
+    println!(
+        "   Compression ratio: {:.1}%",
+        100.0 * (1.0 - encoded_2.len() as f64 / encoded_1.len() as f64)
+    );
 
     // Process encoder stream
     let encoder_instructions_2 = encoder.drain_encoder_stream();
-    println!("   Generated {} encoder stream instructions", encoder_instructions_2.len());
+    println!(
+        "   Generated {} encoder stream instructions",
+        encoder_instructions_2.len()
+    );
     for inst in &encoder_instructions_2 {
         decoder.process_encoder_instruction(inst).unwrap();
     }
@@ -107,7 +130,11 @@ fn main() {
     ];
 
     let encoded_3 = encoder.encode(3, &headers_3).unwrap();
-    println!("   Encoded {} headers into {} bytes", headers_3.len(), encoded_3.len());
+    println!(
+        "   Encoded {} headers into {} bytes",
+        headers_3.len(),
+        encoded_3.len()
+    );
 
     // Process streams
     for inst in encoder.drain_encoder_stream() {
@@ -117,7 +144,8 @@ fn main() {
     let decoded_3 = decoder.decode(3, encoded_3).unwrap();
     println!("   Decoded {} headers", decoded_3.len());
     for header in &decoded_3 {
-        println!("     {}: {}", 
+        println!(
+            "     {}: {}",
             String::from_utf8_lossy(&header.name),
             String::from_utf8_lossy(&header.value)
         );
@@ -146,14 +174,20 @@ fn main() {
     let new_capacity = 2048;
     encoder.set_capacity(new_capacity).unwrap();
     println!("   Reduced capacity to {} bytes", new_capacity);
-    println!("   Encoder table size after eviction: {} bytes", encoder.table().size());
+    println!(
+        "   Encoder table size after eviction: {} bytes",
+        encoder.table().size()
+    );
     println!("   Encoder entry count: {}", encoder.table().len());
 
     // Send capacity instruction to decoder
     for inst in encoder.drain_encoder_stream() {
         decoder.process_encoder_instruction(&inst).unwrap();
     }
-    println!("   Decoder table capacity updated: {} bytes", decoder.table().capacity());
+    println!(
+        "   Decoder table capacity updated: {} bytes",
+        decoder.table().capacity()
+    );
     println!();
 
     // Stream 4: Large header set to demonstrate eviction
@@ -164,7 +198,7 @@ fn main() {
         (b":authority".as_slice(), b"api.example.com".as_slice()),
         (b":path".as_slice(), b"/v1/upload".as_slice()),
     ];
-    
+
     // Add many custom headers
     for i in 0..20 {
         let name = format!("x-custom-{}", i);
@@ -176,9 +210,16 @@ fn main() {
     }
 
     let encoded_4 = encoder.encode(4, &large_headers).unwrap();
-    println!("   Encoded {} headers into {} bytes", large_headers.len(), encoded_4.len());
-    println!("   Encoder table size: {} bytes (entries: {})", 
-        encoder.table().size(), encoder.table().len());
+    println!(
+        "   Encoded {} headers into {} bytes",
+        large_headers.len(),
+        encoded_4.len()
+    );
+    println!(
+        "   Encoder table size: {} bytes (entries: {})",
+        encoder.table().size(),
+        encoder.table().len()
+    );
 
     // Process and decode
     for inst in encoder.drain_encoder_stream() {
@@ -187,8 +228,11 @@ fn main() {
 
     let decoded_4 = decoder.decode(4, encoded_4).unwrap();
     println!("   Decoded {} headers", decoded_4.len());
-    println!("   Decoder table size: {} bytes (entries: {})", 
-        decoder.table().size(), decoder.table().len());
+    println!(
+        "   Decoder table size: {} bytes (entries: {})",
+        decoder.table().size(),
+        decoder.table().len()
+    );
 
     for inst in decoder.drain_decoder_stream() {
         encoder.process_decoder_instruction(&inst).unwrap();
@@ -209,10 +253,20 @@ fn main() {
 #[allow(dead_code)]
 fn verify_headers(expected: &[(&[u8], &[u8])], actual: &[HeaderField]) {
     assert_eq!(expected.len(), actual.len(), "Header count mismatch");
-    
+
     for (i, (exp_name, exp_value)) in expected.iter().enumerate() {
-        assert_eq!(actual[i].name.as_ref(), *exp_name, "Name mismatch at index {}", i);
-        assert_eq!(actual[i].value.as_ref(), *exp_value, "Value mismatch at index {}", i);
+        assert_eq!(
+            actual[i].name.as_ref(),
+            *exp_name,
+            "Name mismatch at index {}",
+            i
+        );
+        assert_eq!(
+            actual[i].value.as_ref(),
+            *exp_value,
+            "Value mismatch at index {}",
+            i
+        );
     }
 }
 
@@ -250,14 +304,12 @@ mod tests {
     #[test]
     fn test_capacity_reduction() {
         let mut encoder = Encoder::new(4096, 100);
-        
+
         // Insert several entries
         for i in 0..10 {
             let value = format!("value-{}", i);
             let value_bytes = value.as_bytes();
-            let headers = vec![
-                (b"x-header".as_slice(), value_bytes),
-            ];
+            let headers = vec![(b"x-header".as_slice(), value_bytes)];
             let _ = encoder.encode(i, &headers);
         }
 

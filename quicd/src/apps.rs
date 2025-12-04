@@ -20,12 +20,12 @@
 //! registry.register("h3", Box::new(H3Factory::new()));
 //! ```
 
-use quicd_x::QuicAppFactory;
-use std::collections::HashMap;
-use std::sync::Arc;
 use anyhow::Context;
 use libloading::{Library, Symbol};
+use quicd_x::QuicAppFactory;
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::Arc;
 
 /// Registry of QUIC application factories indexed by ALPN.
 ///
@@ -150,7 +150,8 @@ pub fn load_plugin(path: &str) -> anyhow::Result<Arc<dyn QuicAppFactory>> {
         // Reconstruct the double-boxed factory
         // Note: This assumes the plugin was compiled with the same Rust compiler version
         // and quicd-x version as the server.
-        let wrapper: Box<Box<dyn QuicAppFactory>> = Box::from_raw(raw_ptr as *mut Box<dyn QuicAppFactory>);
+        let wrapper: Box<Box<dyn QuicAppFactory>> =
+            Box::from_raw(raw_ptr as *mut Box<dyn QuicAppFactory>);
         let factory: Box<dyn QuicAppFactory> = *wrapper;
 
         Ok(Arc::from(factory))
