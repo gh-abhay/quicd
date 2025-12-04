@@ -26,7 +26,7 @@ use super::crypto::{create_quiche_config, TlsCredentials};
 use super::prefetch::{prefetch, PrefetchMode};
 use crate::netio::buffer::WorkerBuffer;
 use crate::quic::routing;
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use quiche::ConnectionId;
@@ -40,12 +40,18 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
+use ring::rand::{SecureRandom, SystemRandom};
 
 /// Maximum connection ID length (QUIC allows up to 20 bytes)
 const MAX_CONN_ID_LEN: usize = 20;
 
 /// Size of stream read buffers (64KB - max for efficient UDP/QUIC)
 const STREAM_BUFFER_SIZE: usize = 65536;
+
+/// Maximum datagram/UDP payload size (65KB - RFC 9221, RFC 9000 §14)
+/// Used for both stream buffers and datagram reception.
+/// The actual MTU may be smaller; applications should check conn.dgram_max_writable_len()
+const MAX_DATAGRAM_SIZE: usize = 65536;
 
 /// Convert a borrowed ConnectionId to an owned ConnectionId<'static> using inline storage.
 ///
@@ -73,6 +79,51 @@ fn connection_id_to_owned(cid: &ConnectionId) -> ConnectionId<'static> {
     // If len ≤ 20: uses SmallVec's inline storage, then moves to Vec (still no heap)
     // If len > 20: would heap allocate, but impossible per QUIC spec
     small_vec.to_vec().into()
+}
+
+/// Prefix used by QUIC draft version numbers (RFC 9000 §15).
+const QUIC_DRAFT_VERSION_PREFIX: u32 = 0xff00_0000;
+
+fn format_quic_version(version: u32) -> String {
+    format!("{:#010x}", version)
+}
+
+fn parse_quic_version_label(label: &str) -> Option<u32> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+
+    match lower.as_str() {
+        "v1" | "version1" | "rfc9000" => return Some(quiche::PROTOCOL_VERSION),
+        _ => {}
+    }
+
+    if let Some(rest) = lower
+        .strip_prefix("draft-")
+        .or_else(|| lower.strip_prefix("draft"))
+    {
+        if let Ok(num) = rest.parse::<u32>() {
+            if num <= 0xff {
+                return Some(QUIC_DRAFT_VERSION_PREFIX | num);
+            }
+        }
+    }
+
+    if let Some(hex) = lower.strip_prefix("0x") {
+        if !hex.is_empty() {
+            return u32::from_str_radix(hex, 16).ok();
+        }
+        return None;
+    }
+
+    if lower.len() == 8 && lower.chars().all(|c| c.is_ascii_hexdigit()) {
+        return u32::from_str_radix(&lower, 16).ok();
+    }
+
+    lower.parse::<u32>().ok()
 }
 
 /// Timeout queue entry for priority-based timeout tracking.
@@ -308,8 +359,14 @@ pub struct QuicManager {
     /// QUIC configuration
     config: QuicConfig,
 
-    /// Quiche configuration (shared by all connections)
-    quiche_config: quiche::Config,
+    /// Quiche configurations keyed by wire version
+    quiche_configs: AHashMap<u32, quiche::Config>,
+
+    /// Ordered list of supported QUIC versions (first entry is the default)
+    supported_versions: Vec<u32>,
+
+    /// Fast membership lookup for supported versions
+    supported_versions_set: AHashSet<u32>,
 
     /// Active connections mapped by Connection ID
     /// Key: Destination Connection ID (DCID) from packet header
@@ -414,8 +471,73 @@ impl QuicManager {
             );
         };
 
-        // Create Quiche configuration
-        let quiche_config = create_quiche_config(&credentials, &config)?;
+        // Resolve configured QUIC versions (RFC 9368 §3) starting with RFC 9000 v1
+        let mut version_candidates = vec![quiche::PROTOCOL_VERSION];
+        for label in &config.additional_versions {
+            match parse_quic_version_label(label) {
+                Some(version) => {
+                    if version_candidates.contains(&version) {
+                        trace!(
+                            worker_id,
+                            version = %format_quic_version(version),
+                            %label,
+                            "Ignoring duplicate QUIC version label"
+                        );
+                    } else {
+                        version_candidates.push(version);
+                    }
+                }
+                None => {
+                    warn!(
+                        worker_id,
+                        %label,
+                        "Ignoring invalid QUIC version label"
+                    );
+                }
+            }
+        }
+
+        let mut quiche_configs = AHashMap::new();
+        let mut supported_versions = Vec::new();
+
+        for (index, version) in version_candidates.iter().copied().enumerate() {
+            match create_quiche_config(&credentials, &config, version) {
+                Ok(cfg) => {
+                    quiche_configs.insert(version, cfg);
+                    supported_versions.push(version);
+                }
+                Err(e) => {
+                    if index == 0 {
+                        return Err(e);
+                    }
+
+                    warn!(
+                        worker_id,
+                        version = %format_quic_version(version),
+                        error = ?e,
+                        "Skipping unsupported QUIC version"
+                    );
+                }
+            }
+        }
+
+        if supported_versions.is_empty() {
+            anyhow::bail!("failed to configure any QUIC versions");
+        }
+
+        let supported_versions_set = supported_versions
+            .iter()
+            .copied()
+            .collect::<AHashSet<u32>>();
+
+        info!(
+            worker_id,
+            versions = ?supported_versions
+                .iter()
+                .map(|v| format_quic_version(*v))
+                .collect::<Vec<_>>(),
+            "Resolved QUIC versions"
+        );
 
         // Generate connection ID seed for this worker
         // Each worker has its own seed to avoid connection ID collisions
@@ -444,7 +566,9 @@ impl QuicManager {
             worker_id,
             local_addr,
             config,
-            quiche_config,
+            quiche_configs,
+            supported_versions,
+            supported_versions_set,
             connections,
             connection_aliases: AHashMap::new(),
             conn_id_seed,
@@ -652,15 +776,32 @@ impl QuicManager {
             "Received QUIC packet"
         );
 
-        if hdr.version != quiche::PROTOCOL_VERSION && self.config.enable_version_negotiation {
-            let mut out = [0; MAX_DATAGRAM_SIZE];
-            let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out)
-                .context("failed to negotiate version")?;
+        if !self.supported_versions_set.contains(&hdr.version) {
+            if self.config.enable_version_negotiation {
+                let mut out = [0; MAX_DATAGRAM_SIZE];
+                let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out)
+                    .context("failed to negotiate version")?;
 
-            outgoing_packets.push(OutgoingPacket {
-                to: peer_addr,
-                data: out[..len].to_vec(),
-            });
+                outgoing_packets.push(OutgoingPacket {
+                    to: peer_addr,
+                    data: out[..len].to_vec(),
+                });
+
+                debug!(
+                    worker_id = self.worker_id,
+                    version = %format_quic_version(hdr.version),
+                    peer = %peer_addr,
+                    "Sent version negotiation response"
+                );
+            } else {
+                warn!(
+                    worker_id = self.worker_id,
+                    version = %format_quic_version(hdr.version),
+                    peer = %peer_addr,
+                    "Unsupported QUIC version (version negotiation disabled)"
+                );
+            }
+
             return Ok((None, outgoing_packets));
         }
 
@@ -911,15 +1052,28 @@ impl QuicManager {
     /// - RFC 9002 §7: Congestion state changes
     /// - RFC 9001 §6: Key update events
     fn process_connection_events(&mut self, dcid: &ConnectionId<'static>) -> Result<()> {
-        let conn = self
-            .connections
-            .get_mut(dcid)
-            .ok_or_else(|| anyhow::anyhow!("Connection not found for event processing"))?;
+        {
+            let conn = self
+                .connections
+                .get(dcid)
+                .ok_or_else(|| anyhow::anyhow!("Connection not found for event processing"))?;
 
-        // Only process events if app task is spawned
-        let ingress_tx = match conn.ingress_tx.as_ref() {
+            if conn.ingress_tx.is_none() {
+                self.replenish_source_connection_ids(dcid)?;
+                return Ok(());
+            }
+        }
+
+        {
+            let conn = self
+                .connections
+                .get_mut(dcid)
+                .expect("connection must exist after ingress check");
+
+            // Only process events if app task is spawned
+            let ingress_tx = match conn.ingress_tx.as_ref() {
             Some(tx) => tx.clone(),
-            None => return Ok(()), // No app yet, skip event processing
+            None => unreachable!("ingress channel verified in previous check"),
         };
 
         let connection_id = conn.connection_id;
@@ -1024,6 +1178,39 @@ impl QuicManager {
         // since quiche doesn't expose a direct stream_stopped_by_peer() query API.
         // The error-based detection ensures we catch STOP_SENDING frames immediately
         // when the application attempts to write to the stream.
+
+        // === RFC 9221: QUIC Datagrams ===
+        // Poll for unreliable datagram payloads received from peer.
+        // Datagrams are independent of streams and provide unreliable delivery.
+        // Must be polled in a loop since multiple datagrams may be buffered.
+        let mut dgram_buf = vec![0u8; MAX_DATAGRAM_SIZE]; // Max datagram size
+        loop {
+            match conn.conn.dgram_recv(&mut dgram_buf) {
+                Ok(len) => {
+                    if len > 0 {
+                        trace!(worker_id, connection_id, len, "Datagram received");
+
+                        // Zero-copy: clone only the received portion
+                        let payload = bytes::Bytes::copy_from_slice(&dgram_buf[..len]);
+
+                        let event = quicd_x::AppEvent::Datagram { payload };
+                        send_app_event(worker_id, connection_id, &ingress_tx, event);
+                    } else {
+                        // len == 0 means no more datagrams available
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => {
+                    // No more datagrams to receive
+                    break;
+                }
+                Err(e) => {
+                    // Unexpected error receiving datagram
+                    warn!(worker_id, connection_id, error = ?e, "Error receiving datagram");
+                    break;
+                }
+            }
+        }
 
         // === RFC 9000 §19.16: Stream Finished Events ===
         // Check for streams that have been finished by peer (FIN received)
@@ -1198,24 +1385,57 @@ impl QuicManager {
         for cid in conn.conn.source_ids() {
             let cid_static = quiche::ConnectionId::from_vec(cid.as_ref().to_vec());
 
-            if !conn.known_source_cids.contains(&cid_static) {
+            if conn.known_source_cids.insert(cid_static.clone()) {
+                let cid_bytes = cid.as_ref();
+                let meta = conn.get_source_cid_meta(cid_bytes);
+
+                let (sequence, reset_token) = match meta {
+                    Some(info) => (info.sequence, Some(info.reset_token)),
+                    None => {
+                        warn!(
+                            worker_id,
+                            connection_id,
+                            "Missing metadata for source CID event"
+                        );
+                        (0, None)
+                    }
+                };
+
                 debug!(
                     worker_id,
                     connection_id,
-                    cid_len = cid.as_ref().len(),
+                    cid_len = cid_bytes.len(),
+                    sequence,
                     "New source Connection ID detected"
                 );
 
                 let event =
                     quicd_x::AppEvent::TransportEvent(quicd_x::TransportEvent::NewConnectionId {
-                        sequence: conn.known_source_cids.len() as u64,
-                        cid: bytes::Bytes::copy_from_slice(cid.as_ref()),
-                        reset_token: None, // quiche doesn't expose reset tokens for source CIDs
+                        sequence,
+                        cid: bytes::Bytes::copy_from_slice(cid_bytes),
+                        reset_token,
                     });
                 send_app_event(worker_id, connection_id, &ingress_tx, event);
-
-                conn.known_source_cids.insert(cid_static);
             }
+        }
+
+        while let Some(retired_cid) = conn.conn.retired_scid_next() {
+            let sequence = match conn.retire_source_connection_id(retired_cid.as_ref()) {
+                Some(meta) => meta.sequence,
+                None => {
+                    warn!(
+                        worker_id,
+                        connection_id,
+                        "Peer retired unknown source Connection ID"
+                    );
+                    0
+                }
+            };
+
+            let event = quicd_x::AppEvent::TransportEvent(
+                quicd_x::TransportEvent::ConnectionIdRetired { sequence },
+            );
+            send_app_event(worker_id, connection_id, &ingress_tx, event);
         }
 
         // === RFC 9002 §6: Packet Loss Detection ===
@@ -1335,6 +1555,8 @@ impl QuicManager {
                 });
             send_app_event(worker_id, connection_id, &ingress_tx, event);
         }
+    }
+        self.replenish_source_connection_ids(dcid)?;
 
         Ok(())
     }
@@ -2386,6 +2608,190 @@ impl QuicManager {
         Ok(())
     }
 
+    /// Derive stateless reset token for a connection ID using the worker seed (RFC 9000 §10.3).
+    fn reset_token_for(&self, cid_bytes: &[u8]) -> u128 {
+        let tag = ring::hmac::sign(&self.conn_id_seed, cid_bytes);
+        let mut token = [0u8; 16];
+        token.copy_from_slice(&tag.as_ref()[..16]);
+        u128::from_be_bytes(token)
+    }
+
+    /// Generate a new eBPF-routable Connection ID for this worker.
+    fn generate_worker_connection_id(&self, worker_idx: u8) -> Result<[u8; MAX_CONN_ID_LEN]> {
+        let rng = SystemRandom::new();
+        let mut seed_bytes = [0u8; 4];
+        rng.fill(&mut seed_bytes)
+            .map_err(|_| anyhow::anyhow!("failed to obtain randomness for connection ID generation"))?;
+        let seed = u32::from_be_bytes(seed_bytes);
+        Ok(routing::generate_connection_id(worker_idx, seed))
+    }
+
+    /// Ensure we have provided enough Source Connection IDs to the peer (RFC 9000 §5.1).
+    fn replenish_source_connection_ids(
+        &mut self,
+        dcid: &ConnectionId<'static>,
+    ) -> Result<()> {
+        let worker_idx: u8 = self.worker_id.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "worker_id {} exceeds 255 and cannot be encoded into Connection IDs",
+                self.worker_id
+            )
+        })?;
+
+        let mut minted = 0usize;
+
+        loop {
+            let scids_left = match self.connections.get_mut(dcid) {
+                Some(conn) => conn.conn.scids_left(),
+                None => break,
+            };
+
+            if scids_left == 0 {
+                break;
+            }
+
+            let cid_bytes = self.generate_worker_connection_id(worker_idx)?;
+            let cid_vec = cid_bytes.to_vec();
+            let quiche_cid = quiche::ConnectionId::from_vec(cid_vec.clone());
+            let reset_token = self.reset_token_for(&cid_vec);
+            let reset_token_bytes = reset_token.to_be_bytes();
+
+            let provisioned = match self.connections.get_mut(dcid) {
+                Some(conn) => match conn.conn.new_scid(&quiche_cid, reset_token, true) {
+                    Ok(sequence) => {
+                        conn.record_source_connection_id(&cid_vec, sequence, reset_token_bytes);
+                        true
+                    }
+                    Err(quiche::Error::Done) => false,
+                    Err(e) => {
+                        warn!(
+                            worker_id = self.worker_id,
+                            connection = ?dcid,
+                            error = ?e,
+                            "Failed to provision additional source Connection ID"
+                        );
+                        false
+                    }
+                },
+                None => false,
+            };
+
+            if !provisioned {
+                break;
+            }
+
+            minted += 1;
+        }
+
+        if minted > 0 {
+            info!(
+                worker_id = self.worker_id,
+                connection = ?dcid,
+                minted,
+                "Provisioned {minted} source Connection ID(s) for peer (RFC 9000 §5.1)"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Process MigrateTo command (RFC 9000 §9).
+    fn process_migrate_to(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        new_local_addr: SocketAddr,
+    ) -> Result<()> {
+        let Some(dcid) = self.connection_id_map.get(&connection_id).cloned() else {
+            warn!(worker_id, connection_id, "Connection not found for MigrateTo");
+            return Ok(());
+        };
+
+        let (ingress_tx, peer_addr, is_server) = match self.connections.get(&dcid) {
+            Some(conn) => (conn.ingress_tx.clone(), conn.peer_addr, conn.conn.is_server()),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for migration");
+                return Ok(());
+            }
+        };
+
+        if is_server {
+            warn!(
+                worker_id,
+                connection_id,
+                %new_local_addr,
+                "Active migration requested on server-side connection; rejecting per RFC 9000 §9"
+            );
+
+            if let Some(ingress_tx) = ingress_tx {
+                let reason = format!(
+                    "Active connection migration can only be initiated by clients per RFC 9000 §9. \
+                     Server refused to migrate to {new_local_addr}."
+                );
+                let event = quicd_x::AppEvent::TransportEvent(
+                    quicd_x::TransportEvent::PathValidationFailed {
+                        peer_addr,
+                        reason,
+                    },
+                );
+                send_app_event(worker_id, connection_id, &ingress_tx, event);
+            }
+
+            return Ok(());
+        }
+
+        let migrate_result = match self.connections.get_mut(&dcid) {
+            Some(conn) => conn.conn.migrate_source(new_local_addr),
+            None => {
+                warn!(worker_id, connection_id, "Connection disappeared before migration");
+                return Ok(());
+            }
+        };
+
+        match migrate_result {
+            Ok(dcid_seq) => {
+                info!(
+                    worker_id,
+                    connection_id,
+                    %new_local_addr,
+                    dcid_seq,
+                    "Initiated client-side migration to new local address"
+                );
+
+                if let Some(ingress_tx) = ingress_tx {
+                    let event = quicd_x::AppEvent::TransportEvent(
+                        quicd_x::TransportEvent::MigrationStarted {
+                            new_peer_addr: peer_addr,
+                            local_addr: new_local_addr,
+                        },
+                    );
+                    send_app_event(worker_id, connection_id, &ingress_tx, event);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    worker_id,
+                    connection_id,
+                    %new_local_addr,
+                    error = ?e,
+                    "Failed to initiate migration"
+                );
+
+                if let Some(ingress_tx) = ingress_tx {
+                    let event = quicd_x::AppEvent::TransportEvent(
+                        quicd_x::TransportEvent::PathValidationFailed {
+                            peer_addr,
+                            reason: format!("Migration to {new_local_addr} failed: {e:?}"),
+                        },
+                    );
+                    send_app_event(worker_id, connection_id, &ingress_tx, event);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Process RequestStats command
     fn process_request_stats(
         &mut self,
@@ -2870,14 +3276,7 @@ impl QuicManager {
                     %new_local_addr,
                     "Processing MigrateTo command (RFC 9000 §9)"
                 );
-                // Connection migration is typically client-initiated
-                // Server can probe paths but cannot initiate migration
-                // Log this for now - quiche handles migration automatically
-                warn!(
-                    worker_id,
-                    connection_id,
-                    "MigrateTo command received but server-side migration not implemented"
-                );
+                self.process_migrate_to(worker_id, connection_id, new_local_addr)?;
             }
             EgressCommand::ValidatePath {
                 connection_id,
@@ -3042,13 +3441,27 @@ impl QuicManager {
         // Convert borrowed ConnectionId to owned using inline storage (no heap allocation)
         let initial_dcid = connection_id_to_owned(&hdr.dcid);
 
-        let conn = quiche::accept(
-            &scid,
-            Some(&hdr.dcid),
-            self.local_addr,
-            peer_addr,
-            &mut self.quiche_config,
-        )
+        let requested_version = hdr.version;
+
+        let conn = {
+            let quiche_config =
+                self.quiche_configs
+                    .get_mut(&requested_version)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "missing quiche config for version {:#010x}",
+                            requested_version
+                        )
+                    })?;
+
+            quiche::accept(
+                &scid,
+                Some(&hdr.dcid),
+                self.local_addr,
+                peer_addr,
+                quiche_config,
+            )
+        }
         .context("failed to create connection")?;
 
         debug!(
@@ -3073,6 +3486,15 @@ impl QuicManager {
 
         self.connections.insert(scid.clone(), quic_conn);
         self.connection_aliases.insert(initial_dcid, scid.clone());
+
+        let initial_reset_token = self.reset_token_for(scid.as_ref());
+        if let Some(conn_entry) = self.connections.get_mut(&scid) {
+            conn_entry.record_source_connection_id(
+                scid.as_ref(),
+                0,
+                initial_reset_token.to_be_bytes(),
+            );
+        }
 
         if let Some(deadline) = timeout_deadline {
             self.timeout_queue
@@ -3282,14 +3704,47 @@ impl QuicManager {
     }
 }
 
-/// Maximum UDP datagram size
-const MAX_DATAGRAM_SIZE: usize = 65536;
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn parses_common_version_labels() {
+        assert_eq!(
+            parse_quic_version_label("v1"),
+            Some(quiche::PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            parse_quic_version_label("draft-29"),
+            Some(QUIC_DRAFT_VERSION_PREFIX | 29)
+        );
+        assert_eq!(
+            parse_quic_version_label("0xff00001d"),
+            Some(QUIC_DRAFT_VERSION_PREFIX | 0x1d)
+        );
+        assert_eq!(
+            parse_quic_version_label("ff00001d"),
+            Some(QUIC_DRAFT_VERSION_PREFIX | 0x1d)
+        );
+        assert_eq!(
+            parse_quic_version_label("0x00000001"),
+            Some(quiche::PROTOCOL_VERSION)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_version_labels() {
+        assert_eq!(parse_quic_version_label(""), None);
+        assert_eq!(parse_quic_version_label("notaversion"), None);
+    }
+}
 
 impl std::fmt::Debug for QuicManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuicManager")
             .field("worker_id", &self.worker_id)
             .field("local_addr", &self.local_addr)
+            .field("supported_versions", &self.supported_versions)
             .field("connections", &self.connections.len())
             .field("stats", &self.stats)
             .finish()

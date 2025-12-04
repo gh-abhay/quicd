@@ -67,6 +67,9 @@ pub struct QuicConnection {
     /// Stream ID generator for this connection
     pub stream_id_gen: StreamIdGenerator,
 
+    /// Metadata for each source Connection ID we have issued (RFC 9000 §5.1)
+    pub source_cid_meta: ahash::AHashMap<Vec<u8>, SourceCidMeta>,
+
     // === RFC 9000 Compliance: Event Tracking ===
     /// Track writable state per stream to detect changes (RFC 9000 §4)
     /// Maps stream_id -> is_currently_writable
@@ -222,7 +225,7 @@ impl QuicConnection {
         // Initialize 0-RTT state before moving conn
         let initial_early_data = conn.is_in_early_data();
 
-        Self {
+        let mut connection = Self {
             conn,
             peer_addr,
             scid,
@@ -258,7 +261,9 @@ impl QuicConnection {
 
             // RFC 9001: TLS Key Updates
             was_in_early_data: initial_early_data,
-        }
+            source_cid_meta: ahash::AHashMap::new(),
+        };
+        connection
     }
 
     /// Process an incoming packet
@@ -441,8 +446,6 @@ impl QuicConnection {
         // quiche doesn't expose direct connection-level send capacity
         // We approximate using max_send_udp_payload_size and congestion window
         // A better implementation would track sent vs MAX_DATA directly
-        let stats = self.conn.stats();
-
         // Estimate: if we've sent less than what peer allows, we have capacity
         // This is approximate - ideally quiche would expose send_capacity()
         // For now, return a conservative estimate based on CWND
@@ -460,6 +463,37 @@ impl QuicConnection {
     pub fn dgram_max_writable_len(&self) -> Option<usize> {
         self.conn.dgram_max_writable_len()
     }
+
+    /// Remember the metadata for a source Connection ID we advertise.
+    pub fn record_source_connection_id(
+        &mut self,
+        cid: &[u8],
+        sequence: u64,
+        reset_token: [u8; 16],
+    ) {
+        self.source_cid_meta.insert(
+            cid.to_vec(),
+            SourceCidMeta {
+                sequence,
+                reset_token,
+            },
+        );
+    }
+
+    /// Remove a retired source Connection ID from local tracking and return its metadata.
+    pub fn retire_source_connection_id(&mut self, cid: &[u8]) -> Option<SourceCidMeta> {
+        self.source_cid_meta.remove(cid)
+    }
+
+    pub fn get_source_cid_meta(&self, cid: &[u8]) -> Option<&SourceCidMeta> {
+        self.source_cid_meta.get(cid)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct SourceCidMeta {
+    pub sequence: u64,
+    pub reset_token: [u8; 16],
 }
 
 impl std::fmt::Debug for QuicConnection {
