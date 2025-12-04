@@ -104,12 +104,12 @@ impl ApplicationTypeConfig {
             (ApplicationTypeConfig::Plugin(cfg), ApplicationType::Plugin) => {
                 cfg.validate().map_err(|e| vec![e])
             }
-            (ApplicationTypeConfig::Http3(_), ApplicationType::Plugin) => {
-                Err(vec!["Type mismatch: expected Plugin config but got Http3".to_string()])
-            }
-            (ApplicationTypeConfig::Plugin(_), ApplicationType::Http3) => {
-                Err(vec!["Type mismatch: expected Http3 config but got Plugin".to_string()])
-            }
+            (ApplicationTypeConfig::Http3(_), ApplicationType::Plugin) => Err(vec![
+                "Type mismatch: expected Plugin config but got Http3".to_string(),
+            ]),
+            (ApplicationTypeConfig::Plugin(_), ApplicationType::Http3) => Err(vec![
+                "Type mismatch: expected Http3 config but got Plugin".to_string(),
+            ]),
         }
     }
 
