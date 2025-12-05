@@ -536,21 +536,30 @@ pub fn validate_trailer_headers(trailers: &[(String, String)]) -> Result<(), H3E
         }
 
         // RFC 9110 Section 6.5: Certain headers MUST NOT appear in trailers
+        // RFC 9110 Section 6.5.1: "A sender MUST NOT generate a trailer that contains
+        // a field necessary for message framing, routing, request modifiers, authentication,
+        // response control data, or determining how to process the content"
         match name.as_str() {
-            "content-length"
-            | "content-encoding"
-            | "content-type"
-            | "content-range"
-            | "trailer"
-            | "transfer-encoding"
-            | "authorization"
-            | "set-cookie"
-            | "content-disposition"
-            | "host"
-            | "cache-control"
-            | "max-forwards"
-            | "te"
-            | "www-authenticate" => {
+            // Message framing
+            "content-length" | "transfer-encoding" | "trailer" |
+            // Content metadata (RFC 9110: these define how to interpret the content)
+            "content-encoding" | "content-type" | "content-range" |
+            // Request modifiers
+            "host" | "authorization" | "max-forwards" | "te" |
+            // Response control
+            "cache-control" | "expires" | "age" | "vary" | "location" |
+            "retry-after" | "www-authenticate" | "proxy-authenticate" |
+            // Cookie handling
+            "set-cookie" | "cookie" |
+            // Content negotiation
+            "accept" | "accept-charset" | "accept-encoding" | "accept-language" |
+            // Conditional requests
+            "if-match" | "if-none-match" | "if-modified-since" | "if-unmodified-since" |
+            "if-range" |
+            // Range requests  
+            "range" | "accept-ranges" |
+            // Other control headers
+            "content-disposition" | "content-location" | "date" | "server" | "user-agent" => {
                 return Err(H3Error::Http(format!(
                     "H3_MESSAGE_ERROR: header not allowed in trailers: {}",
                     name

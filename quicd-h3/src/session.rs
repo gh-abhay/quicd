@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Method, Uri};
 
@@ -15,19 +14,19 @@ pub struct H3Request {
 }
 
 /// Handle for sending HTTP/3 responses on a specific stream.
-pub struct H3ResponseSender {
+pub struct H3ResponseSender<'a> {
     pub(crate) send_stream: quicd_x::SendStream,
-    pub(crate) qpack_encoder: std::sync::Arc<tokio::sync::Mutex<quicd_qpack::AsyncEncoder>>,
-    pub(crate) push_manager: Option<std::sync::Arc<tokio::sync::Mutex<PushManager>>>,
+    pub(crate) qpack_encoder: &'a std::cell::RefCell<quicd_qpack::Encoder>,
+    pub(crate) push_manager: Option<&'a std::cell::RefCell<PushManager>>,
     pub(crate) connection_handle: Option<quicd_x::ConnectionHandle>,
     pub(crate) stream_id: u64, // The request stream ID for push promises
-    pub(crate) encoder_send_stream: std::sync::Arc<tokio::sync::Mutex<Option<quicd_x::SendStream>>>,
+    pub(crate) encoder_send_stream: &'a std::cell::RefCell<Option<quicd_x::SendStream>>,
     // QPACK blocking and references are handled internally by quicd-qpack
 }
 
-impl H3ResponseSender {
+impl<'a> H3ResponseSender<'a> {
     /// Send an HTTP/3 response.
-    pub async fn send_response(
+    pub fn send_response(
         &mut self,
         status: u16,
         headers: Vec<(String, String)>,
@@ -41,26 +40,23 @@ impl H3ResponseSender {
         }
 
         // Encode headers with QPACK
-        let mut encoder_guard = self.qpack_encoder.lock().await;
+        let mut encoder_guard = self.qpack_encoder.borrow_mut();
         let encoded_headers = encoder_guard
-            .encoder_mut()
             .encode(self.stream_id, &all_headers)
             .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
 
         // PERF #3: Batch encoder instructions into single write with pre-allocation
         let mut batched_instructions = bytes::BytesMut::with_capacity(256);
-        while let Some(inst) = encoder_guard.encoder_mut().poll_encoder_stream() {
-            batched_instructions.extend_from_slice(&inst);
+        while let Some(inst) = encoder_guard.poll_encoder_stream() {
+            batched_instructions.extend_from_slice(inst.as_ref());
         }
 
-        // Release encoder lock before stream write (reduces lock contention)
+        // Release encoder borrow before stream write
         drop(encoder_guard);
 
         if !batched_instructions.is_empty() {
-            if let Some(encoder_stream) = self.encoder_send_stream.lock().await.as_mut() {
-                let _ = encoder_stream
-                    .write(batched_instructions.freeze(), false)
-                    .await;
+            if let Some(encoder_stream) = self.encoder_send_stream.borrow_mut().as_mut() {
+                let _ = encoder_stream.try_write(batched_instructions.freeze(), false);
             }
         }
 
@@ -68,16 +64,14 @@ impl H3ResponseSender {
         let headers_frame = crate::frames::H3Frame::Headers { encoded_headers };
         let frame_data = headers_frame.encode();
         self.send_stream
-            .write(frame_data, false)
-            .await
+            .try_write(frame_data, false)
             .map_err(|e| H3Error::Stream(format!("write failed: {:?}", e)))?;
 
         // Send DATA frame
         let data_frame = crate::frames::H3Frame::Data { data: body };
         let data_frame_data = data_frame.encode();
         self.send_stream
-            .write(data_frame_data, true)
-            .await
+            .try_write(data_frame_data, true)
             .map_err(|e| H3Error::Stream(format!("write failed: {:?}", e)))?; // FIN
 
         Ok(())
@@ -92,7 +86,7 @@ impl H3ResponseSender {
     /// Interim responses MUST NOT contain:
     /// - content-length, content-type, content-encoding headers
     /// - A message body (no DATA frames)
-    pub async fn send_interim_response(
+    pub fn send_interim_response(
         &mut self,
         status: u16,
         headers: Vec<(String, String)>,
@@ -126,23 +120,20 @@ impl H3ResponseSender {
         )?;
 
         // Encode headers with QPACK
-        let mut encoder_guard = self.qpack_encoder.lock().await;
+        let mut encoder_guard = self.qpack_encoder.borrow_mut();
         let encoded_headers = encoder_guard
-            .encoder_mut()
             .encode(self.stream_id, &all_headers)
             .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
 
         // PERF #3: Batch encoder instructions into single write
         let mut batched_instructions = bytes::BytesMut::new();
-        while let Some(inst) = encoder_guard.encoder_mut().poll_encoder_stream() {
-            batched_instructions.extend_from_slice(&inst);
+        while let Some(inst) = encoder_guard.poll_encoder_stream() {
+            batched_instructions.extend_from_slice(inst.as_ref());
         }
 
         if !batched_instructions.is_empty() {
-            if let Some(encoder_stream) = self.encoder_send_stream.lock().await.as_mut() {
-                let _ = encoder_stream
-                    .write(batched_instructions.freeze(), false)
-                    .await;
+            if let Some(encoder_stream) = self.encoder_send_stream.borrow_mut().as_mut() {
+                let _ = encoder_stream.try_write(batched_instructions.freeze(), false);
             }
         }
 
@@ -150,8 +141,7 @@ impl H3ResponseSender {
         let headers_frame = crate::frames::H3Frame::Headers { encoded_headers };
         let frame_data = headers_frame.encode();
         self.send_stream
-            .write(frame_data, false)
-            .await
+            .try_write(frame_data, false)
             .map_err(|e| H3Error::Stream(format!("write failed: {:?}", e)))?;
 
         Ok(())
@@ -167,7 +157,7 @@ impl H3ResponseSender {
     ///
     /// # Returns
     /// The push ID assigned to this push
-    pub async fn send_push_promise(
+    pub fn send_push_promise(
         &mut self,
         headers: Vec<(String, String)>,
     ) -> Result<u64, H3Error> {
@@ -179,7 +169,7 @@ impl H3ResponseSender {
             .as_ref()
             .ok_or_else(|| H3Error::Http("server push not available".into()))?;
 
-        let mut manager = push_manager.lock().await;
+        let mut manager = push_manager.borrow_mut();
 
         // GAP FIX #4: RFC 9114 Section 7.2.7: Validate push_id against client's MAX_PUSH_ID
         // Note: We need access to max_push_id from H3Session, which isn't available here
@@ -197,27 +187,22 @@ impl H3ResponseSender {
             .map(|(n, v)| (n.as_bytes(), v.as_bytes()))
             .collect();
 
-        let mut encoder_guard = self.qpack_encoder.lock().await;
+        let mut encoder_guard = self.qpack_encoder.borrow_mut();
         let encoded_headers = encoder_guard
-            .encoder_mut()
             .encode(self.stream_id, &headers_bytes)
             .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
 
         // PERF #3: Batch encoder instructions into single write
         let mut batched_instructions = bytes::BytesMut::new();
-        while let Some(inst) = encoder_guard.encoder_mut().poll_encoder_stream() {
-            batched_instructions.extend_from_slice(&inst);
+        while let Some(inst) = encoder_guard.poll_encoder_stream() {
+            batched_instructions.extend_from_slice(inst.as_ref());
         }
 
         if !batched_instructions.is_empty() {
-            if let Some(encoder_stream) = self.encoder_send_stream.lock().await.as_mut() {
-                let _ = encoder_stream
-                    .write(batched_instructions.freeze(), false)
-                    .await;
+            if let Some(encoder_stream) = self.encoder_send_stream.borrow_mut().as_mut() {
+                let _ = encoder_stream.try_write(batched_instructions.freeze(), false);
             }
         }
-
-        drop(manager); // Release lock before async operation
 
         // Send PUSH_PROMISE frame on the request stream
         let push_promise = crate::frames::H3Frame::PushPromise {
@@ -226,96 +211,40 @@ impl H3ResponseSender {
         };
         let frame_data = push_promise.encode();
         self.send_stream
-            .write(frame_data, false)
-            .await
+            .try_write(frame_data, false)
             .map_err(|e| H3Error::Stream(format!("write failed: {:?}", e)))?;
 
         Ok(push_id)
     }
 
-    /// Send a response on a push stream.
+    /// Send an HTTP/3 datagram.
     ///
-    /// Per RFC 9114 Section 4.6: After sending PUSH_PROMISE, the server opens
-    /// a unidirectional push stream to send the response.
+    /// Per RFC 9297: Datagrams carry a flow identifier and payload.
+    /// They are unreliable and may be lost or reordered.
     ///
     /// # Arguments
-    /// - `push_id`: The push ID from send_push_promise()
-    /// - `status`: HTTP status code
-    /// - `headers`: Response headers
-    /// - `body`: Response body
-    pub async fn send_push_response(
-        &mut self,
-        push_id: u64,
-        status: u16,
-        headers: Vec<(String, String)>,
-        body: Bytes,
-    ) -> Result<(), H3Error> {
-        use crate::push::PushResponse;
-
-        let push_manager = self
-            .push_manager
-            .as_ref()
-            .ok_or_else(|| H3Error::Http("server push not available".into()))?;
-
+    /// * `flow_id` - The Quarter Stream ID identifying the datagram flow
+    /// * `payload` - The datagram payload bytes
+    ///
+    /// # Errors
+    /// Returns error if H3_DATAGRAM is not enabled
+    pub fn send_datagram(&mut self, flow_id: u64, payload: Bytes) -> Result<(), H3Error> {
         let handle = self
             .connection_handle
             .as_ref()
             .ok_or_else(|| H3Error::Http("connection handle not available".into()))?;
 
-        // Check if push is cancelled and store response
-        {
-            let mut manager = push_manager.lock().await;
-            if let Some(promise) = manager.get_promise_mut(push_id) {
-                if promise.is_cancelled() {
-                    return Err(H3Error::Http("push was cancelled".into()));
-                }
-                // Store the response data for when the stream opens
-                promise.set_response(PushResponse {
-                    status,
-                    headers,
-                    body,
-                });
-            } else {
-                return Err(H3Error::Http(format!("push ID {} not found", push_id)));
-            }
-        }
+        // Encode flow ID as varint prefix
+        let flow_id_bytes = crate::frames::H3Frame::encode_varint_to_bytes(flow_id);
+        let mut datagram_data =
+            bytes::BytesMut::with_capacity(flow_id_bytes.len() + payload.len());
+        datagram_data.extend_from_slice(&flow_id_bytes);
+        datagram_data.extend_from_slice(&payload);
 
-        // Open a unidirectional stream for the push
-        let request_id = handle
-            .open_uni()
-            .map_err(|e| H3Error::Connection(format!("failed to open push stream: {:?}", e)))?;
-
-        // Register the pending stream
-        {
-            let mut manager = push_manager.lock().await;
-            manager
-                .register_pending_stream(request_id, push_id)
-                .map_err(|e| {
-                    H3Error::Connection(format!("failed to register push stream: {:?}", e))
-                })?;
-        }
-
-        // Note: The actual stream writing happens in h3_session when UniStreamOpened event is received
-        Ok(())
-    }
-
-    /// Cancel the current request stream with an application error code.
-    ///
-    /// Per RFC 9114 Section 4.1.1: Either endpoint can abruptly terminate a stream
-    /// by sending a RESET_STREAM frame. This immediately terminates sending on the stream.
-    ///
-    /// # Arguments
-    /// - `error_code`: Application-specific error code (H3_NO_ERROR = 0x100, H3_REQUEST_CANCELLED = 0x10C, etc.)
-    pub async fn cancel(&mut self, error_code: u64) -> Result<(), H3Error> {
-        let handle = self
-            .connection_handle
-            .as_ref()
-            .ok_or_else(|| H3Error::Http("connection handle not available".into()))?;
-
-        // Send RESET_STREAM to peer
+        // Send datagram
         let _request_id = handle
-            .reset_stream(self.stream_id, error_code)
-            .map_err(|e| H3Error::Connection(format!("Failed to reset stream: {:?}", e)))?;
+            .send_datagram(datagram_data.freeze())
+            .map_err(|e| H3Error::Connection(format!("failed to send datagram: {:?}", e)))?;
 
         Ok(())
     }
@@ -325,7 +254,6 @@ impl H3ResponseSender {
 ///
 /// This trait provides the interface for handling incoming HTTP/3 requests
 /// and sending responses. It's designed to be simple and ergonomic.
-#[async_trait]
 pub trait H3Handler: Send + Sync + 'static {
     /// Handles an incoming HTTP/3 request.
     ///
@@ -335,7 +263,7 @@ pub trait H3Handler: Send + Sync + 'static {
     ///
     /// # Returns
     /// Result indicating success or error
-    async fn handle_request(
+    fn handle_request(
         &self,
         request: H3Request,
         sender: &mut H3ResponseSender,
@@ -355,7 +283,7 @@ pub trait H3Handler: Send + Sync + 'static {
     ///
     /// # Returns
     /// Ok(()) if handled successfully, Err for connection errors
-    async fn handle_datagram(&self, _flow_id: u64, _payload: Bytes) -> Result<(), H3Error> {
+    fn handle_datagram(&self, _flow_id: u64, _payload: Bytes) -> Result<(), H3Error> {
         // Default: ignore datagrams
         Ok(())
     }
@@ -367,35 +295,30 @@ pub trait H3Handler: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct DefaultH3Handler;
 
-#[async_trait]
 impl H3Handler for DefaultH3Handler {
-    async fn handle_request(
+    fn handle_request(
         &self,
         request: H3Request,
         sender: &mut H3ResponseSender,
     ) -> Result<(), H3Error> {
         if request.method == Method::GET && request.uri.path() == "/" {
             let body = Bytes::from("Hello World");
-            sender
-                .send_response(
-                    200,
-                    vec![("content-type".to_string(), "text/plain".to_string())],
-                    body,
-                )
-                .await
+            sender.send_response(
+                200,
+                vec![("content-type".to_string(), "text/plain".to_string())],
+                body,
+            )
         } else {
             let body = Bytes::from("404 Not Found");
-            sender
-                .send_response(
-                    404,
-                    vec![("content-type".to_string(), "text/plain".to_string())],
-                    body,
-                )
-                .await
+            sender.send_response(
+                404,
+                vec![("content-type".to_string(), "text/plain".to_string())],
+                body,
+            )
         }
     }
 
-    async fn handle_datagram(&self, _flow_id: u64, _payload: Bytes) -> Result<(), H3Error> {
+    fn handle_datagram(&self, _flow_id: u64, _payload: Bytes) -> Result<(), H3Error> {
         Ok(())
     }
 }

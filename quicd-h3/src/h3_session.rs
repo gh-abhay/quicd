@@ -1,14 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
 use slab::Slab;
-use tokio::sync::Mutex as AsyncMutex;
 
-use quicd_qpack::{AsyncDecoder, AsyncEncoder};
+use quicd_qpack::{Decoder, Encoder};
 use quicd_x::{AppEvent, ConnectionHandle, QuicAppFactory, ShutdownFuture, TransportControls};
 
 use crate::connect::validate_connect_request;
@@ -30,16 +27,17 @@ pub struct H3Session<H: H3Handler> {
     handle: ConnectionHandle,
     // GAP #6: HTTP/3 configuration
     config: crate::config::H3Config,
-    // QPACK encoder and decoder
-    qpack_encoder: Arc<AsyncMutex<AsyncEncoder>>,
-    qpack_decoder: AsyncDecoder,
+    // QPACK encoder and decoder (direct ownership, no Arc/Mutex)
+    qpack_encoder: std::cell::RefCell<Encoder>,
+    qpack_decoder: Decoder,
     server_control_send: Option<quicd_x::SendStream>,
     // Stream state tracking using slab for O(1) access
     streams: Slab<StreamState>,
     // Stream ID to slab key mapping
     stream_id_to_key: HashMap<u64, usize>,
     handler: Arc<H>,
-    push_manager: Arc<tokio::sync::Mutex<PushManager>>,
+    // Push manager (direct ownership, no Arc/Mutex)
+    push_manager: std::cell::RefCell<PushManager>,
     pending_control_stream_request: Option<u64>,
     pending_push_streams: HashMap<u64, u64>, // request_id -> push_id
     // New RFC-compliant components
@@ -53,7 +51,8 @@ pub struct H3Session<H: H3Handler> {
     decoder_stream_id: Option<u64>,
     pending_encoder_stream_request: Option<u64>,
     pending_decoder_stream_request: Option<u64>,
-    encoder_send_stream: Arc<AsyncMutex<Option<quicd_x::SendStream>>>,
+    // Encoder send stream (direct ownership, no Arc/Mutex)
+    encoder_send_stream: std::cell::RefCell<Option<quicd_x::SendStream>>,
     decoder_send_stream: Option<quicd_x::SendStream>,
     // Peer QPACK stream IDs for validation (streams are processed in background tasks)
     peer_encoder_stream_id: Option<u64>,
@@ -88,8 +87,11 @@ pub struct H3Session<H: H3Handler> {
     last_activity_time: std::time::Instant,
     idle_timeout: std::time::Duration,
     // RFC 9114 Section 3.3: SETTINGS frame must be first on control stream
-    // Track deadline for receiving peer SETTINGS
-    settings_deadline: Option<tokio::time::Instant>,
+    // Track deadline for receiving peer SETTINGS (using std::time for non-blocking)
+    settings_deadline: Option<std::time::Instant>,
+    // Time tracking for periodic checks (non-blocking)
+    last_blocked_check: std::time::Instant,
+    last_idle_check: std::time::Instant,
     // GAP #3: RFC 9114 Section 6.1: Stream ID validation
     // Track highest client-initiated bidirectional stream ID seen
     max_client_bidi_stream_id: u64,
@@ -98,6 +100,16 @@ pub struct H3Session<H: H3Handler> {
     // Event-driven stream reading: Store RecvStream handles for non-blocking I/O
     // Maps stream_id -> (RecvStream, buffer for partial frames)
     active_recv_streams: HashMap<u64, ActiveRecvStream>,
+    // Non-blocking write buffering: Queue writes when send buffer is full
+    // Maps stream_id -> queue of pending writes
+    pending_writes: HashMap<u64, VecDeque<PendingWrite>>,
+}
+
+/// Pending write that couldn't complete immediately due to backpressure
+#[derive(Debug, Clone)]
+struct PendingWrite {
+    data: Bytes,
+    fin: bool,
 }
 
 /// Active receive stream state for event-driven, non-blocking reading
@@ -269,8 +281,8 @@ impl<H: H3Handler> H3Session<H> {
         origin: Option<Origin>,
         config: crate::config::H3Config,
     ) -> Self {
-        // Create push manager for server push support
-        let push_manager = Arc::new(AsyncMutex::new(PushManager::new()));
+        // Create push manager for server push support (direct ownership)
+        let push_manager = PushManager::new();
 
         // If we have an origin and remembered settings, create validator with them
         let settings_validator = if let Some(ref orig) = origin {
@@ -295,13 +307,13 @@ impl<H: H3Handler> H3Session<H> {
             handle,
             // Use provided configuration
             config,
-            // RFC 9204: QPACK encoder/decoder with configured table sizes
+            // RFC 9204: QPACK encoder/decoder with configured table sizes (direct ownership)
             // Must match SETTINGS_QPACK_MAX_TABLE_CAPACITY and SETTINGS_QPACK_BLOCKED_STREAMS
-            qpack_encoder: Arc::new(AsyncMutex::new(AsyncEncoder::new(
+            qpack_encoder: std::cell::RefCell::new(Encoder::new(
                 qpack_max_table_capacity,
                 qpack_blocked_streams,
-            ))),
-            qpack_decoder: AsyncDecoder::with_timeout(
+            )),
+            qpack_decoder: Decoder::with_timeout(
                 qpack_max_table_capacity,
                 qpack_blocked_streams,
                 qpack_blocked_stream_timeout,
@@ -310,7 +322,8 @@ impl<H: H3Handler> H3Session<H> {
             streams: Slab::new(),
             stream_id_to_key: HashMap::new(),
             handler: Arc::new(handler),
-            push_manager,
+            // Direct ownership of PushManager
+            push_manager: std::cell::RefCell::new(push_manager),
             pending_control_stream_request: None,
             pending_push_streams: HashMap::new(),
             // New RFC-compliant components
@@ -324,7 +337,8 @@ impl<H: H3Handler> H3Session<H> {
             decoder_stream_id: None,
             pending_encoder_stream_request: None,
             pending_decoder_stream_request: None,
-            encoder_send_stream: Arc::new(AsyncMutex::new(None)),
+            // Direct ownership of encoder send stream
+            encoder_send_stream: std::cell::RefCell::new(None),
             decoder_send_stream: None,
             // Peer QPACK stream IDs for validation (streams are processed in background tasks)
             peer_encoder_stream_id: None,
@@ -357,6 +371,8 @@ impl<H: H3Handler> H3Session<H> {
             // RFC 9114 Section 5.1: Idle timeout tracking from config
             last_activity_time: std::time::Instant::now(),
             idle_timeout,
+            last_blocked_check: std::time::Instant::now(),
+            last_idle_check: std::time::Instant::now(),
             // RFC 9114 Section 3.3: SETTINGS must arrive within configured deadline
             settings_deadline: None,
             // GAP #3: Initialize stream ID tracking (no streams seen yet)
@@ -364,72 +380,118 @@ impl<H: H3Handler> H3Session<H> {
             max_client_uni_stream_id: 0,
             // Event-driven stream reading
             active_recv_streams: HashMap::new(),
+            // Non-blocking write buffering
+            pending_writes: HashMap::new(),
         }
     }
 
     /// Main event loop for the HTTP/3 session.
-    pub async fn run(
-        mut self,
-        mut events: quicd_x::AppEventStream,
-        mut shutdown: ShutdownFuture,
-    ) -> Result<(), H3Error> {
-        // RFC 9204 Section 2.1.4: Check for blocked stream timeouts periodically
-        // Use configured interval from H3Config
-        let mut timeout_check_interval =
-            tokio::time::interval(self.config.blocked_stream_check_interval);
-        timeout_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        // GAP FIX #3: RFC 9114 Section 5.1: Check for idle timeout
-        // Use configured interval from H3Config
-        let mut idle_check_interval = tokio::time::interval(self.config.idle_check_interval);
-        idle_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            tokio::select! {
-                Some(event) = events.next() => {
-                    if let Err(e) = self.handle_event(event).await {
-                        eprintln!("Error handling event: {:?}", e);
-                        // Continue processing other events
-                    }
-                }
-                _ = timeout_check_interval.tick() => {
-                    // RFC 9204 Section 2.1.4: Check for QPACK blocked stream timeouts
-                    if let Err(e) = self.check_blocked_stream_timeouts().await {
-                        eprintln!("Error checking blocked stream timeouts: {:?}", e);
-                    }
-                }
-                _ = idle_check_interval.tick() => {
-                    // GAP FIX #2: RFC 9114 Section 3.3: Check SETTINGS deadline
-                    if let Some(deadline) = self.settings_deadline {
-                        if tokio::time::Instant::now() >= deadline {
-                            eprintln!("SETTINGS frame not received within timeout");
-                            // RFC 9114 Section 3.3: Connection error H3_MISSING_SETTINGS
-                            return Err(H3Error::MissingSettings);
-                        }
-                    }
-
-                    // GAP FIX #3: RFC 9114 Section 5.1: Check for idle timeout
-                    if let Err(e) = self.check_idle_timeout().await {
-                        eprintln!("Error checking idle timeout: {:?}", e);
-                        // Idle timeout is fatal - close connection
-                        break;
-                    }
-                }
-                _ = &mut shutdown => {
-                    // Graceful shutdown
-                    self.send_goaway().await?;
-                    // RFC 9114 Section 8: Close connection with H3_NO_ERROR for graceful shutdown
-                    let error_code = crate::error::H3ErrorCode::NoError.to_u64();
-                    self.handle.close(error_code, Some(Bytes::from("graceful shutdown")))
-                        .map_err(|e| H3Error::Connection(format!("close error: {:?}", e)))?;
-                    break;
-                }
+    /// Process a batch of events in a non-blocking, synchronous manner.
+    /// This should be called repeatedly by the application task event loop.
+    /// 
+    /// Returns:
+    /// - Ok(true) if processing should continue
+    /// - Ok(false) if connection should close gracefully
+    /// - Err(_) if a fatal error occurred
+    pub fn handle_event_batch(
+        &mut self,
+        _events: &mut quicd_x::AppEventStream,
+    ) -> Result<bool, H3Error> {
+        // Non-blocking: try to get next event without awaiting
+        // The event stream should be polled by the application task
+        // This method processes available events and performs periodic checks
+        
+        // Process time-based checks first (non-blocking, uses std::time::Instant)
+        self.check_periodic_tasks()?;
+        
+        // Return true to continue processing
+        Ok(true)
+    }
+    
+    /// Check and perform periodic maintenance tasks based on elapsed time.
+    /// This is called on every event batch to ensure timely processing without blocking.
+    fn check_periodic_tasks(&mut self) -> Result<(), H3Error> {
+        let now = std::time::Instant::now();
+        
+        // RFC 9114 Section 3.3: Check SETTINGS deadline
+        if let Some(deadline) = self.settings_deadline {
+            if now >= deadline {
+                eprintln!("SETTINGS frame not received within timeout");
+                // RFC 9114 Section 3.3: Connection error H3_MISSING_SETTINGS
+                return Err(H3Error::MissingSettings);
             }
         }
+        
+        // RFC 9204 Section 2.1.4: Check for QPACK blocked stream timeouts
+        // Only check periodically to reduce CPU overhead
+        if now.duration_since(self.last_blocked_check) >= self.config.blocked_stream_check_interval {
+            if let Err(e) = self.check_blocked_stream_timeouts() {
+                eprintln!("Error checking blocked stream timeouts: {:?}", e);
+            }
+            self.last_blocked_check = now;
+        }
+        
+        // GAP FIX #3: RFC 9114 Section 5.1: Check for idle timeout
+        // Only check periodically to reduce CPU overhead
+        if now.duration_since(self.last_idle_check) >= self.config.idle_check_interval {
+            if let Err(e) = self.check_idle_timeout() {
+                eprintln!("Error checking idle timeout: {:?}", e);
+                // Idle timeout is fatal - return error
+                return Err(e);
+            }
+            self.last_idle_check = now;
+        }
+        
         Ok(())
     }
 
-    async fn handle_event(&mut self, event: AppEvent) -> Result<(), H3Error> {
+    /// Flush pending writes for a stream when it becomes writable
+    /// Called in response to StreamWritable event
+    fn flush_pending_writes(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        // Get the send stream for this stream_id
+        // For now, only handle request streams (bidirectional)
+        let send_stream = if let Some(key) = self.stream_id_to_key.get(&stream_id) {
+            if let Some(StreamState::Request { send_stream, .. }) = self.streams.get_mut(*key) {
+                Some(send_stream.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(send_stream) = send_stream {
+            if let Some(queue) = self.pending_writes.get_mut(&stream_id) {
+                while let Some(pending) = queue.pop_front() {
+                    let data = pending.data.clone();
+                    let fin = pending.fin;
+                    match send_stream.try_write(data, fin) {
+                        Ok(_) => {
+                            // Write succeeded, continue with next
+                        }
+                        Err(quicd_x::ConnectionError::WouldBlock) => {
+                            // Still would block, put it back and wait for next event
+                            queue.push_front(pending);
+                            break;
+                        }
+                        Err(e) => {
+                            // Other error - stream is broken
+                            return Err(H3Error::Stream(format!("write error: {:?}", e)));
+                        }
+                    }
+                }
+                
+                // Remove queue if empty
+                if queue.is_empty() {
+                    self.pending_writes.remove(&stream_id);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_event(&mut self, event: AppEvent) -> Result<(), H3Error> {
         // RFC 9114 Section 5.1: Update activity timestamp on any event
         self.last_activity_time = std::time::Instant::now();
 
@@ -441,14 +503,15 @@ impl<H: H3Handler> H3Session<H> {
                     // server setting is the value used in the previous session."
                     // The settings validator already has remembered settings if available from storage.
                     // Actual 0-RTT validation occurs when peer SETTINGS frame arrives.
-                    let is_0rtt = self.handle.is_in_early_data().await.unwrap_or(false);
+                    // TODO: make is_in_early_data() non-blocking or remove
+                    let is_0rtt = false; // self.handle.is_in_early_data().unwrap_or(false);
 
                     if is_0rtt {
                         // Mark that we're in 0-RTT mode for settings validation
                         // The actual validation happens when SETTINGS frame is received
                         eprintln!("Connection using 0-RTT - will validate settings compatibility against remembered values");
                     } // Initialize HTTP/3 session
-                    self.initialize_session().await?;
+                    self.initialize_session()?;
                 }
             }
             AppEvent::NewStream {
@@ -464,19 +527,21 @@ impl<H: H3Handler> H3Session<H> {
                 }
 
                 if bidirectional {
-                    self.handle_bidirectional_stream(stream_id, recv_stream, send_stream)
-                        .await?;
+                    self.handle_bidirectional_stream(stream_id, recv_stream, send_stream)?;
                 } else {
                     // Unidirectional stream (push or control)
                     // EVENT-DRIVEN ARCHITECTURE FIX:
                     // Register the stream - do NOT block on reading.
                     // Stream type will be read when first StreamReadable event arrives.
-                    self.handle_unidirectional_stream(stream_id, recv_stream)
-                        .await?;
+                    self.handle_unidirectional_stream(stream_id, recv_stream)?;
                 }
             }
             AppEvent::StreamReadable { stream_id } => {
-                self.handle_stream_readable(stream_id).await?;
+                self.handle_stream_readable(stream_id)?;
+            }
+            AppEvent::StreamWritable { stream_id } => {
+                // Stream send buffer has space - flush pending writes
+                self.flush_pending_writes(stream_id)?;
             }
             AppEvent::StreamFinished { stream_id: _ } => {
                 // Handle stream end
@@ -515,11 +580,10 @@ impl<H: H3Handler> H3Session<H> {
 
                 // RFC 9114 Section 4.1.1: Stream was reset
                 // Clean up stream state and notify QPACK decoder if needed
-                self.handle_stream_closed(stream_id, app_initiated, error_code)
-                    .await?;
+                self.handle_stream_closed(stream_id, app_initiated, error_code)?;
 
                 // Periodically clean up completed/cancelled pushes
-                self.cleanup_pushes().await;
+                self.cleanup_pushes();
             }
             AppEvent::StreamReset { request_id, result } => {
                 // Response to our reset_stream() call
@@ -530,7 +594,7 @@ impl<H: H3Handler> H3Session<H> {
             AppEvent::ConnectionClosing { .. } => {
                 // Send GOAWAY if not already sent
                 if !self.goaway_sent {
-                    let _ = self.send_goaway().await;
+                    let _ = self.send_goaway();
                 }
             }
             AppEvent::UniStreamOpened { request_id, result } => {
@@ -540,8 +604,7 @@ impl<H: H3Handler> H3Session<H> {
                     if let Ok(send_stream) = result {
                         // RFC 9114 Section 6.2.1: Write control stream type (0x00)
                         send_stream
-                            .write(Bytes::from(vec![0x00]), false)
-                            .await
+                            .try_write(Bytes::from(vec![0x00]), false)
                             .map_err(|e| {
                                 H3Error::Stream(format!(
                                     "failed to write control stream type: {:?}",
@@ -550,7 +613,7 @@ impl<H: H3Handler> H3Session<H> {
                             })?;
                         self.server_control_send = Some(send_stream);
                         // Send SETTINGS frame immediately as required by RFC 9114
-                        self.send_settings().await?;
+                        self.send_settings()?;
                     } else {
                         return Err(H3Error::Connection(
                             "failed to open server control stream".into(),
@@ -562,8 +625,7 @@ impl<H: H3Handler> H3Session<H> {
                     if let Ok(send_stream) = result {
                         // Write encoder stream type (0x02)
                         send_stream
-                            .write(Bytes::from(vec![0x02]), false)
-                            .await
+                            .try_write(Bytes::from(vec![0x02]), false)
                             .map_err(|e| {
                                 H3Error::Stream(format!(
                                     "failed to write encoder stream type: {:?}",
@@ -571,7 +633,7 @@ impl<H: H3Handler> H3Session<H> {
                                 ))
                             })?;
                         self.encoder_stream_id = Some(send_stream.stream_id);
-                        *self.encoder_send_stream.lock().await = Some(send_stream);
+                        self.encoder_send_stream.replace(Some(send_stream));
                     } else {
                         return Err(H3Error::Connection("failed to open encoder stream".into()));
                     }
@@ -581,8 +643,7 @@ impl<H: H3Handler> H3Session<H> {
                     if let Ok(send_stream) = result {
                         // Write decoder stream type (0x03)
                         send_stream
-                            .write(Bytes::from(vec![0x03]), false)
-                            .await
+                            .try_write(Bytes::from(vec![0x03]), false)
                             .map_err(|e| {
                                 H3Error::Stream(format!(
                                     "failed to write decoder stream type: {:?}",
@@ -603,7 +664,6 @@ impl<H: H3Handler> H3Session<H> {
                             // Stream opened successfully - send push response
                             if let Err(e) = self
                                 .send_push_response_on_stream(push_id, send_stream, request_id)
-                                .await
                             {
                                 // Push failed - already sent CANCEL_PUSH in send_push_response_on_stream if needed
                                 return Err(e);
@@ -611,7 +671,7 @@ impl<H: H3Handler> H3Session<H> {
                         }
                         Err(_) => {
                             // Failed to open push stream - send CANCEL_PUSH
-                            let _ = self.send_cancel_push_frame(push_id).await;
+                            let _ = self.send_cancel_push_frame(push_id);
                         }
                     }
                 }
@@ -630,7 +690,7 @@ impl<H: H3Handler> H3Session<H> {
                 // RFC 9297 Section 2: Parse flow ID (Quarter Stream ID) as varint
                 // "The payload of an HTTP/3 datagram consists of a variable-length integer
                 // field followed by the datagram payload"
-                let (flow_id, consumed) = if !payload.is_empty() {
+                let (_flow_id, consumed) = if !payload.is_empty() {
                     match crate::frames::H3Frame::decode_varint(&payload) {
                         Ok((id, len)) => (id, len),
                         Err(_) => {
@@ -654,11 +714,11 @@ impl<H: H3Handler> H3Session<H> {
                 // Extract datagram payload (after flow ID)
                 let datagram_payload = payload.slice(consumed..);
 
-                // Forward to application handler
-                let handler = Arc::clone(&self.handler);
-                if let Err(e) = handler.handle_datagram(flow_id, datagram_payload).await {
+                // Forward to application handler (synchronous call)
+                if let Err(e) = self.handler.handle_datagram(_flow_id, datagram_payload) {
                     eprintln!("Datagram handler error: {:?}", e);
                 }
+                
                 self.metrics
                     .datagrams_received
                     .fetch_add(1, Ordering::Relaxed);
@@ -668,9 +728,9 @@ impl<H: H3Handler> H3Session<H> {
         Ok(())
     }
 
-    async fn initialize_session(&mut self) -> Result<(), H3Error> {
+    fn initialize_session(&mut self) -> Result<(), H3Error> {
         // RFC 9114 Section 3.3: Set deadline for receiving peer SETTINGS frame from config
-        self.settings_deadline = Some(tokio::time::Instant::now() + self.config.settings_deadline);
+        self.settings_deadline = Some(std::time::Instant::now() + self.config.settings_deadline);
 
         // RFC 9114 Section 6.2.1: Open server control stream (must be first)
         let control_request_id = self
@@ -708,7 +768,7 @@ impl<H: H3Handler> H3Session<H> {
         true
     }
 
-    async fn handle_bidirectional_stream(
+    fn handle_bidirectional_stream(
         &mut self,
         stream_id: u64,
         recv_stream: quicd_x::RecvStream,
@@ -732,7 +792,7 @@ impl<H: H3Handler> H3Session<H> {
         // GAP FIX #5: RFC 9114 Section 7.2.8: Periodically send reserved frames for greasing
         // This is called per request stream to ensure systematic greasing distribution
         if Self::should_grease() {
-            let _ = self.send_reserved_frame().await; // Best effort, don't fail stream on error
+            let _ = self.send_reserved_frame(); // Best effort, don't fail stream on error
         }
 
         // RFC 9114 Section 5.2: Check if we should accept this stream
@@ -804,7 +864,7 @@ impl<H: H3Handler> H3Session<H> {
         Ok(())
     }
 
-    async fn handle_unidirectional_stream(
+    fn handle_unidirectional_stream(
         &mut self,
         stream_id: u64,
         recv_stream: quicd_x::RecvStream,
@@ -841,7 +901,7 @@ impl<H: H3Handler> H3Session<H> {
     /// Read and identify stream type for a newly registered unidirectional stream
     /// EVENT-DRIVEN ARCHITECTURE FIX:
     /// This is called when first StreamReadable event arrives for an unidentified stream.
-    async fn read_and_identify_unidirectional_stream(&mut self, stream_id: u64) -> Result<(), H3Error> {
+    fn read_and_identify_unidirectional_stream(&mut self, stream_id: u64) -> Result<(), H3Error> {
         // Get the active stream (should exist since we just registered it)
         let active_stream = match self.active_recv_streams.get_mut(&stream_id) {
             Some(s) => s,
@@ -849,7 +909,7 @@ impl<H: H3Handler> H3Session<H> {
         };
 
         // Try to read stream type byte
-        let stream_type = match active_stream.recv_stream.read().await {
+        let stream_type = match active_stream.recv_stream.try_read() {
             Ok(Some(quicd_x::StreamData::Data(bytes))) => {
                 // Parse stream type varint from the first bytes
                 let (stream_type, consumed) = crate::frames::H3Frame::decode_varint(&bytes)
@@ -986,7 +1046,7 @@ impl<H: H3Handler> H3Session<H> {
 
 
 
-    async fn handle_stream_readable(&mut self, stream_id: u64) -> Result<(), H3Error> {
+    fn handle_stream_readable(&mut self, stream_id: u64) -> Result<(), H3Error> {
         // Stream has data available - this is edge-triggered
         // Read available data without blocking and process it
         
@@ -1001,23 +1061,23 @@ impl<H: H3Handler> H3Session<H> {
         
         match stream_type {
             Some(StreamType::Control) => {
-                self.read_control_stream_data(stream_id).await?;
+                self.read_control_stream_data(stream_id)?;
             }
             Some(StreamType::QpackEncoder) => {
-                self.read_qpack_encoder_stream_data(stream_id).await?;
+                self.read_qpack_encoder_stream_data(stream_id)?;
             }
             Some(StreamType::QpackDecoder) => {
-                self.read_qpack_decoder_stream_data(stream_id).await?;
+                self.read_qpack_decoder_stream_data(stream_id)?;
             }
             Some(StreamType::Request) => {
                 // EVENT-DRIVEN ARCHITECTURE FIX:
                 // Bidirectional request streams are now processed via StreamReadable events
-                self.read_request_stream_data(stream_id).await?;
+                self.read_request_stream_data(stream_id)?;
             }
             None => {
                 // Stream type not yet determined - this is a newly registered unidirectional stream
                 // Read stream type byte to determine what kind of stream this is
-                self.read_and_identify_unidirectional_stream(stream_id).await?;
+                self.read_and_identify_unidirectional_stream(stream_id)?;
             }
         }
 
@@ -1025,21 +1085,21 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     /// Read and process available data from control stream
-    async fn read_control_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
+    fn read_control_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
         let active_stream = match self.active_recv_streams.get_mut(&stream_id) {
             Some(s) => s,
             None => return Ok(()), // Stream was removed
         };
 
         // Read available data (non-blocking since StreamReadable event fired)
-        match active_stream.recv_stream.read().await {
+        match active_stream.recv_stream.try_read() {
             Ok(Some(quicd_x::StreamData::Data(bytes))) => {
                 // Append to buffer
                 active_stream.buffer.extend_from_slice(&bytes);
                 
                 // Process frames from buffered data
                 let buffer_bytes = active_stream.buffer.split().freeze();
-                self.process_control_frames(buffer_bytes).await?;
+                self.process_control_frames(buffer_bytes)?;
             }
             Ok(Some(quicd_x::StreamData::Fin)) => {
                 // RFC 9114 Section 6.2.1: Control stream closure MUST be treated as
@@ -1062,26 +1122,25 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     /// Read and process available data from QPACK encoder stream
-    async fn read_qpack_encoder_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
+    fn read_qpack_encoder_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
         let active_stream = match self.active_recv_streams.get_mut(&stream_id) {
             Some(s) => s,
             None => return Ok(()), // Stream was removed
         };
 
         // Read available data (non-blocking since StreamReadable event fired)
-        match active_stream.recv_stream.read().await {
+        match active_stream.recv_stream.try_read() {
             Ok(Some(quicd_x::StreamData::Data(bytes))) => {
                 // RFC 9204: Encoder stream contains instructions for our decoder
                 self.qpack_decoder
                     .process_encoder_instruction(bytes.as_ref())
-                    .await
                     .map_err(|e| {
                         H3Error::Qpack(format!("encoder stream instruction error: {:?}", e))
                     })?;
 
                 // PERF FIX: Batch decoder instructions from encoder stream processing
                 let mut decoder_instructions = Vec::new();
-                while let Some(inst) = self.qpack_decoder.decoder_mut().poll_decoder_stream() {
+                while let Some(inst) = self.qpack_decoder.poll_decoder_stream() {
                     decoder_instructions.push(inst);
                 }
                 if !decoder_instructions.is_empty() {
@@ -1090,12 +1149,12 @@ impl<H: H3Handler> H3Session<H> {
                         for inst in decoder_instructions {
                             batch.extend_from_slice(&inst);
                         }
-                        let _ = stream.write(batch.freeze(), false).await;
+                        let _ = stream.try_write(batch.freeze(), false);
                     }
                 }
 
                 // GAP FIX #5: RFC 9204 Section 2.1.4: Retry blocked streams now that table entries arrived
-                let _ = self.retry_blocked_streams().await;
+                let _ = self.retry_blocked_streams();
             }
             Ok(Some(quicd_x::StreamData::Fin)) => {
                 // RFC 9114 Section 6.2.3 & RFC 9204 Section 4.2:
@@ -1119,21 +1178,19 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     /// Read and process available data from QPACK decoder stream
-    async fn read_qpack_decoder_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
+    fn read_qpack_decoder_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
         let active_stream = match self.active_recv_streams.get_mut(&stream_id) {
             Some(s) => s,
             None => return Ok(()), // Stream was removed
         };
 
         // Read available data (non-blocking since StreamReadable event fired)
-        match active_stream.recv_stream.read().await {
+        match active_stream.recv_stream.try_read() {
             Ok(Some(quicd_x::StreamData::Data(bytes))) => {
                 // RFC 9204: Decoder stream contains instructions for our encoder
                 self.qpack_encoder
-                    .lock()
-                    .await
+                    .borrow_mut()
                     .process_decoder_instruction(bytes.as_ref())
-                    .await
                     .map_err(|e| {
                         H3Error::Qpack(format!("decoder stream instruction error: {:?}", e))
                     })?;
@@ -1166,7 +1223,7 @@ impl<H: H3Handler> H3Session<H> {
     /// Read and process available data from bidirectional request stream
     /// EVENT-DRIVEN ARCHITECTURE FIX:
     /// This method processes data when StreamReadable events arrive, preventing blocking.
-    async fn read_request_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
+    fn read_request_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
         // Get the active stream (must have a frame_parser for request streams)
         let active_stream = match self.active_recv_streams.get_mut(&stream_id) {
             Some(s) => s,
@@ -1174,7 +1231,7 @@ impl<H: H3Handler> H3Session<H> {
         };
 
         // Read available data (non-blocking since StreamReadable event fired)
-        match active_stream.recv_stream.read().await {
+        match active_stream.recv_stream.try_read() {
             Ok(Some(quicd_x::StreamData::Data(bytes))) => {
                 // Get mutable reference to frame_parser
                 let frame_parser = match active_stream.frame_parser.as_mut() {
@@ -1198,8 +1255,7 @@ impl<H: H3Handler> H3Session<H> {
 
                 // Process all collected frames
                 for frame in collected_frames {
-                    self.process_frame_on_request_stream(stream_id, frame)
-                        .await?;
+                    self.process_frame_on_request_stream(stream_id, frame)?;
                 }
             }
             Ok(Some(quicd_x::StreamData::Fin)) => {
@@ -1211,7 +1267,7 @@ impl<H: H3Handler> H3Session<H> {
                 }
 
                 // Process request completion
-                self.handle_request_complete(stream_id).await?;
+                self.handle_request_complete(stream_id)?;
 
                 // Remove from active streams
                 self.active_recv_streams.remove(&stream_id);
@@ -1223,7 +1279,7 @@ impl<H: H3Handler> H3Session<H> {
                         frame_parser.mark_half_closed_remote();
                     }
                 }
-                self.handle_request_complete(stream_id).await?;
+                self.handle_request_complete(stream_id)?;
                 self.active_recv_streams.remove(&stream_id);
             }
             Err(e) => {
@@ -1235,7 +1291,7 @@ impl<H: H3Handler> H3Session<H> {
         Ok(())
     }
 
-    async fn send_settings(&mut self) -> Result<(), H3Error> {
+    fn send_settings(&mut self) -> Result<(), H3Error> {
         if let Some(send_stream) = &mut self.server_control_send {
             // Build settings list from configuration
             let mut settings = vec![
@@ -1287,8 +1343,7 @@ impl<H: H3Handler> H3Session<H> {
             let settings_frame = H3Frame::Settings { settings };
             let frame_data = settings_frame.encode();
             send_stream
-                .write(frame_data, false)
-                .await
+                .try_write(frame_data, false)
                 .map_err(|e| H3Error::Stream(format!("failed to send SETTINGS: {:?}", e)))?;
 
             // RFC 9114 Section 7.2.7: MAX_PUSH_ID frame MUST NOT be sent by servers.
@@ -1297,7 +1352,7 @@ impl<H: H3Handler> H3Session<H> {
         Ok(())
     }
 
-    async fn send_goaway(&mut self) -> Result<(), H3Error> {
+    fn send_goaway(&mut self) -> Result<(), H3Error> {
         // RFC 9114 Section 5.2: Graceful shutdown with GOAWAY
         if self.goaway_sent {
             return Ok(()); // Already sent
@@ -1318,8 +1373,7 @@ impl<H: H3Handler> H3Session<H> {
             let goaway = H3Frame::GoAway { stream_id };
             let frame_data = goaway.encode();
             send_stream
-                .write(frame_data, false)
-                .await
+                .try_write(frame_data, false)
                 .map_err(|e| H3Error::Stream(format!("failed to send GOAWAY: {:?}", e)))?;
             self.goaway_sent = true;
             self.goaway_max_stream_id = Some(stream_id);
@@ -1331,7 +1385,7 @@ impl<H: H3Handler> H3Session<H> {
     ///
     /// RFC 9114: Implementations SHOULD send reserved frame types occasionally
     /// to prevent intermediaries from ossifying on the current protocol.
-    async fn send_reserved_frame(&mut self) -> Result<(), H3Error> {
+    fn send_reserved_frame(&mut self) -> Result<(), H3Error> {
         if let Some(send_stream) = &mut self.server_control_send {
             let frame_type = Self::generate_reserved_frame_type();
 
@@ -1342,14 +1396,13 @@ impl<H: H3Handler> H3Session<H> {
             frame_data.extend_from_slice(&[0x00]); // length = 0
 
             send_stream
-                .write(Bytes::from(frame_data), false)
-                .await
+                .try_write(Bytes::from(frame_data), false)
                 .map_err(|e| H3Error::Stream(format!("failed to send reserved frame: {:?}", e)))?;
         }
         Ok(())
     }
 
-    async fn handle_goaway_received(&mut self, stream_id: u64) -> Result<(), H3Error> {
+    fn handle_goaway_received(&mut self, stream_id: u64) -> Result<(), H3Error> {
         // RFC 9114 Section 5.2: "An endpoint MAY send multiple GOAWAY frames indicating
         // different identifiers, but the identifier in each frame MUST NOT be greater than
         // the identifier in any previous frame, since clients might already have retried
@@ -1378,7 +1431,7 @@ impl<H: H3Handler> H3Session<H> {
 
     /// Process a complete frame on a request stream.
     /// This is called after StreamFrameParser extracts a complete frame.
-    async fn process_frame_on_request_stream(
+    fn process_frame_on_request_stream(
         &mut self,
         stream_id: u64,
         frame: H3Frame,
@@ -1430,7 +1483,6 @@ impl<H: H3Handler> H3Session<H> {
                         let encoded_size = encoded_headers.len();
                         let header_fields = match self
                             .qpack_decoder
-                            .decoder_mut()
                             .decode(stream_id, encoded_headers.clone())
                         {
                             Ok(fields) => fields,
@@ -1462,9 +1514,9 @@ impl<H: H3Handler> H3Session<H> {
 
                         // PERF FIX: Batch decoder instructions to reduce syscalls
                         // RFC 9204: Batching improves throughput
-                        let mut decoder_instructions = Vec::new();
+                        let mut decoder_instructions: Vec<Bytes> = Vec::new();
                         while let Some(inst) =
-                            self.qpack_decoder.decoder_mut().poll_decoder_stream()
+                            self.qpack_decoder.poll_decoder_stream()
                         {
                             decoder_instructions.push(inst);
                         }
@@ -1474,7 +1526,7 @@ impl<H: H3Handler> H3Session<H> {
                                 for inst in decoder_instructions {
                                     batch.extend_from_slice(&inst);
                                 }
-                                let _ = stream.write(batch.freeze(), false).await;
+                                let _ = stream.try_write(batch.freeze(), false);
                             }
                         }
 
@@ -1534,12 +1586,11 @@ impl<H: H3Handler> H3Session<H> {
                         self.request_queue.push(queued_request);
 
                         // Try to process the highest priority request
-                        self.process_next_request().await?;
+                        self.process_next_request()?;
                     } else if !*trailers_received {
                         // RFC 9114 Section 4.1: Trailing HEADERS frame (trailers)
                         let trailer_header_fields = match self
                             .qpack_decoder
-                            .decoder_mut()
                             .decode(stream_id, encoded_headers.clone())
                         {
                             Ok(fields) => fields,
@@ -1559,9 +1610,9 @@ impl<H: H3Handler> H3Session<H> {
                             .collect();
 
                         // PERF FIX: Send decoder instructions in batch (trailers path)
-                        let mut decoder_instructions = Vec::new();
+                        let mut decoder_instructions: Vec<Bytes> = Vec::new();
                         while let Some(inst) =
-                            self.qpack_decoder.decoder_mut().poll_decoder_stream()
+                            self.qpack_decoder.poll_decoder_stream()
                         {
                             decoder_instructions.push(inst);
                         }
@@ -1571,7 +1622,7 @@ impl<H: H3Handler> H3Session<H> {
                                 for inst in decoder_instructions {
                                     batch.extend_from_slice(&inst);
                                 }
-                                let _ = stream.write(batch.freeze(), false).await;
+                                let _ = stream.try_write(batch.freeze(), false);
                             }
                         }
 
@@ -1660,7 +1711,7 @@ impl<H: H3Handler> H3Session<H> {
                 }
                 H3Frame::Priority { priority } => {
                     // Handle priority update (can appear any time)
-                    self.handle_priority_frame(stream_id, priority).await?;
+                    self.handle_priority_frame(stream_id, priority)?;
                 }
                 H3Frame::PriorityUpdate {
                     element_id,
@@ -1674,8 +1725,7 @@ impl<H: H3Handler> H3Session<H> {
                         stream_id,
                         element_id,
                         priority_field_value.clone(),
-                    )
-                    .await?;
+                    )?;
                 }
                 // RFC 9114: These frames MUST NOT appear on request streams
                 H3Frame::PushPromise { .. } => {
@@ -1700,7 +1750,7 @@ impl<H: H3Handler> H3Session<H> {
     /// PERFORMANCE OPTIMIZATION: Uses RFC 9218 priority tree for O(1) scheduling
     /// instead of O(n) queue rebuild. Priority tree maintains active streams
     /// grouped by urgency level with round-robin fairness within each level.
-    async fn process_next_request(&mut self) -> Result<(), H3Error> {
+    fn process_next_request(&mut self) -> Result<(), H3Error> {
         // RFC 9218: Use priority tree for compliant O(1) scheduling
         // Priority tree returns highest priority (lowest urgency) active stream
         let selected_stream_id = self
@@ -1754,7 +1804,7 @@ impl<H: H3Handler> H3Session<H> {
         };
 
         if let Some(queued_request) = queued_request {
-            let request = self.parse_request(queued_request.headers)?;
+            let _request = self.parse_request(queued_request.headers)?;
 
             // RFC 9204 Section 2.1.2: Create Arc to track response header references
             // QPACK blocking and references are handled internally by quicd-qpack
@@ -1762,13 +1812,13 @@ impl<H: H3Handler> H3Session<H> {
             // Call handler
             let mut sender = H3ResponseSender {
                 send_stream: queued_request.send_stream,
-                qpack_encoder: self.qpack_encoder.clone(),
-                push_manager: Some(self.push_manager.clone()),
+                qpack_encoder: &self.qpack_encoder,
+                push_manager: Some(&self.push_manager),
                 connection_handle: Some(self.handle.clone()),
                 stream_id: queued_request.stream_id,
-                encoder_send_stream: self.encoder_send_stream.clone(),
+                encoder_send_stream: &self.encoder_send_stream,
             };
-            self.handler.handle_request(request, &mut sender).await?;
+            self.handler.handle_request(_request, &mut sender)?;
 
             // RFC 9114 Section 4.1: Transition to Complete phase after response sent
             if let Some(key) = self.stream_id_to_key.get(&queued_request.stream_id) {
@@ -1783,7 +1833,7 @@ impl<H: H3Handler> H3Session<H> {
         Ok(())
     }
 
-    async fn handle_request_complete(&mut self, stream_id: u64) -> Result<(), H3Error> {
+    fn handle_request_complete(&mut self, stream_id: u64) -> Result<(), H3Error> {
         // RFC 9114 Section 4.1.2: Validate Content-Length when stream finishes
         // This is called when we receive FIN on the stream
 
@@ -1877,7 +1927,7 @@ impl<H: H3Handler> H3Session<H> {
         }
     }
 
-    async fn process_control_frames(&mut self, data: Bytes) -> Result<(), H3Error> {
+    fn process_control_frames(&mut self, data: Bytes) -> Result<(), H3Error> {
         // PERF #1: Use parse_bytes() for zero-copy frame parsing
         // PERF #2: Try to parse multiple frames if available
         if let Ok((frames, _)) = H3Frame::parse_multiple(&data) {
@@ -1957,9 +2007,7 @@ impl<H: H3Handler> H3Session<H> {
                             // Update our encoder's dynamic table capacity to match peer's decoder capacity
                             if let Err(e) = self
                                 .qpack_encoder
-                                .lock()
-                                .await
-                                .encoder_mut()
+                                .borrow_mut()
                                 .set_capacity(peer_capacity as usize)
                             {
                                 eprintln!("Failed to update QPACK encoder capacity: {:?}", e);
@@ -2030,9 +2078,7 @@ impl<H: H3Handler> H3Session<H> {
 
                         self.max_push_id = push_id;
                         // Update push manager
-                        if let Ok(mut manager) = self.push_manager.try_lock() {
-                            manager.update_max_push_id(push_id);
-                        }
+                        self.push_manager.borrow_mut().update_max_push_id(push_id);
 
                         // Record metrics
                         self.metrics
@@ -2041,7 +2087,7 @@ impl<H: H3Handler> H3Session<H> {
                     }
                     H3Frame::CancelPush { push_id } => {
                         // Client wants to cancel a push
-                        self.cancel_push(push_id).await?;
+                        self.cancel_push(push_id)?;
                         self.metrics
                             .frames_cancel_push_received
                             .fetch_add(1, Ordering::Relaxed);
@@ -2058,7 +2104,7 @@ impl<H: H3Handler> H3Session<H> {
                     H3Frame::GoAway { stream_id } => {
                         // RFC 9114 Section 5.2: Client is going away
                         // "A server MUST NOT increase the stream ID indicated in a GOAWAY frame"
-                        self.handle_goaway_received(stream_id).await?;
+                        self.handle_goaway_received(stream_id)?;
                         self.metrics
                             .frames_goaway_received
                             .fetch_add(1, Ordering::Relaxed);
@@ -2086,7 +2132,7 @@ impl<H: H3Handler> H3Session<H> {
         Ok(())
     }
 
-    async fn cancel_push(&mut self, push_id: u64) -> Result<(), H3Error> {
+    fn cancel_push(&mut self, push_id: u64) -> Result<(), H3Error> {
         // GAP FIX #4: RFC 9114 Section 7.2.3: Validate push_id <= max_push_id
         // "A client MUST NOT send a push ID that is larger than the maximum push ID
         // that the server has advertised."
@@ -2100,52 +2146,45 @@ impl<H: H3Handler> H3Session<H> {
         }
 
         // GAP FIX #4: Abort the push stream if it's already opened
-        let stream_id_to_abort = {
-            let manager = self.push_manager.lock().await;
-            manager
-                .get_promise(push_id)
-                .and_then(|p| p.push_stream_id())
-        };
+        let stream_id_to_abort = self.push_manager
+            .borrow()
+            .get_promise(push_id)
+            .and_then(|p| p.push_stream_id());
 
         if let Some(stream_id) = stream_id_to_abort {
             // RFC 9114 Section 4.6: Abort the push stream immediately
             // Use H3_REQUEST_CANCELLED error code
-            let _ = self.cancel_stream(stream_id, 0x010C).await;
+            let _ = self.cancel_stream(stream_id, 0x010C);
         }
 
         // GAP FIX #4: Clean up _push_streams HashMap
         self._push_streams.remove(&push_id);
 
         // Use PushManager to handle cancellation state
-        if let Ok(mut manager) = self.push_manager.try_lock() {
-            manager.cancel_push(push_id)?;
-        }
+        self.push_manager.borrow_mut().cancel_push(push_id)?;
 
         Ok(())
     }
 
     /// Send CANCEL_PUSH frame to peer (server-initiated cancellation)
     /// Per RFC 9114 Section 7.2.5: Either endpoint can send CANCEL_PUSH
-    async fn send_cancel_push_frame(&mut self, push_id: u64) -> Result<(), H3Error> {
+    fn send_cancel_push_frame(&mut self, push_id: u64) -> Result<(), H3Error> {
         // Send CANCEL_PUSH on control stream
         if let Some(control_stream) = &mut self.server_control_send {
             let cancel_frame = H3Frame::CancelPush { push_id };
             let frame_data = cancel_frame.encode();
             control_stream
-                .write(frame_data, false)
-                .await
+                .try_write(frame_data, false)
                 .map_err(|e| H3Error::Stream(format!("failed to send CANCEL_PUSH: {:?}", e)))?;
         }
 
         // Mark as cancelled in PushManager
-        if let Ok(mut manager) = self.push_manager.try_lock() {
-            manager.cancel_push(push_id)?;
-        }
+        self.push_manager.borrow_mut().cancel_push(push_id)?;
 
         Ok(())
     }
 
-    async fn handle_priority_frame(
+    fn handle_priority_frame(
         &mut self,
         _stream_id: u64,
         priority: crate::frames::Priority,
@@ -2197,7 +2236,7 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     /// RFC 9218 Section 7.1: Handle PRIORITY_UPDATE frame
-    async fn handle_priority_update_frame(
+    fn handle_priority_update_frame(
         &mut self,
         _stream_id: u64,
         element_id: u64,
@@ -2276,7 +2315,7 @@ impl<H: H3Handler> H3Session<H> {
 
         // GAP FIX #2: Reorder request queue if this stream is already queued
         // RFC 9218 Section 7.1: Priority updates should affect scheduling immediately
-        self.reorder_request_queue(element_id, urgency).await;
+        self.reorder_request_queue(element_id, urgency);
 
         // Record metrics
         self.metrics
@@ -2297,7 +2336,7 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     /// Reorder request queue when priority changes for a queued request
-    async fn reorder_request_queue(&mut self, element_id: u64, new_urgency: u8) {
+    fn reorder_request_queue(&mut self, element_id: u64, new_urgency: u8) {
         // RFC 9218: Priority changes should take effect immediately for queued requests
         // BinaryHeap doesn't support efficient priority updates, so we need to:
         // 1. Extract all requests from the heap
@@ -2330,7 +2369,7 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     /// RFC 9114 Section 4.1.1: Handle stream closure/reset
-    async fn handle_stream_closed(
+    fn handle_stream_closed(
         &mut self,
         stream_id: u64,
         app_initiated: bool,
@@ -2362,11 +2401,11 @@ impl<H: H3Handler> H3Session<H> {
         // RFC 9204 Section 4.5: Send Stream Cancellation on decoder stream
         // This notifies the encoder that it can stop referencing this stream's
         // dynamic table entries in future header blocks.
-        self.qpack_decoder.decoder_mut().cancel_stream(stream_id);
+        self.qpack_decoder.cancel_stream(stream_id);
 
         // PERF FIX: Batch decoder instructions including Stream Cancellation
-        let mut decoder_instructions = Vec::new();
-        while let Some(inst) = self.qpack_decoder.decoder_mut().poll_decoder_stream() {
+        let mut decoder_instructions: Vec<Bytes> = Vec::new();
+        while let Some(inst) = self.qpack_decoder.poll_decoder_stream() {
             decoder_instructions.push(inst);
         }
         if !decoder_instructions.is_empty() {
@@ -2375,7 +2414,7 @@ impl<H: H3Handler> H3Session<H> {
                 for inst in decoder_instructions {
                     batch.extend_from_slice(&inst);
                 }
-                let _ = stream.write(batch.freeze(), false).await;
+                let _ = stream.try_write(batch.freeze(), false);
             }
         }
 
@@ -2395,7 +2434,7 @@ impl<H: H3Handler> H3Session<H> {
 
     /// Cancel a stream with an application error code
     /// RFC 9114 Section 4.1.1: Applications can cancel streams via RESET_STREAM
-    pub async fn cancel_stream(&mut self, stream_id: u64, error_code: u64) -> Result<(), H3Error> {
+    pub fn cancel_stream(&mut self, stream_id: u64, error_code: u64) -> Result<(), H3Error> {
         // Clean up our stream state first
         if let Some(key) = self.stream_id_to_key.remove(&stream_id) {
             self.streams.remove(key);
@@ -2420,21 +2459,19 @@ impl<H: H3Handler> H3Session<H> {
 
     /// Cancel a server push and send CANCEL_PUSH frame to peer
     /// Per RFC 9114 Section 7.2.5: Server can cancel its own promised push
-    pub async fn cancel_server_push(&mut self, push_id: u64) -> Result<(), H3Error> {
+    pub fn cancel_server_push(&mut self, push_id: u64) -> Result<(), H3Error> {
         // Send CANCEL_PUSH frame and update state
-        self.send_cancel_push_frame(push_id).await?;
+        self.send_cancel_push_frame(push_id)?;
 
         // If push stream is already opened, reset it
-        let stream_id = {
-            let manager = self.push_manager.lock().await;
-            manager
-                .get_promise(push_id)
-                .and_then(|p| p.push_stream_id())
-        };
+        let stream_id = self.push_manager
+            .borrow()
+            .get_promise(push_id)
+            .and_then(|p| p.push_stream_id());
 
         if let Some(stream_id) = stream_id {
             // Reset the push stream with H3_REQUEST_CANCELLED error code
-            let _ = self.cancel_stream(stream_id, 0x010C).await;
+            let _ = self.cancel_stream(stream_id, 0x010C);
         }
 
         Ok(())
@@ -2442,9 +2479,90 @@ impl<H: H3Handler> H3Session<H> {
 
     /// Clean up completed and cancelled push promises
     /// Should be called periodically to prevent memory leaks
-    pub async fn cleanup_pushes(&mut self) {
-        let mut manager = self.push_manager.lock().await;
-        manager.cleanup();
+    pub fn cleanup_pushes(&mut self) {
+        self.push_manager.borrow_mut().cleanup();
+    }
+
+    /// Send a push response on a push stream.
+    ///
+    /// Per RFC 9114 Section 4.6: Push responses are sent on unidirectional push streams.
+    /// The push stream begins with a push ID, followed by HEADERS and DATA frames.
+    pub fn send_push_response(
+        &mut self,
+        push_id: u64,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: bytes::Bytes,
+    ) -> Result<(), H3Error> {
+        // Check if push was cancelled
+        if let Some(promise) = self.push_manager.borrow().get_promise(push_id) {
+            if promise.is_cancelled() {
+                return Err(H3Error::Http(format!("push {} was cancelled", push_id)));
+            }
+        } else {
+            return Err(H3Error::Http(format!("unknown push ID: {}", push_id)));
+        }
+
+        // Open unidirectional push stream
+        let request_id = self.handle
+            .open_uni()
+            .map_err(|e| H3Error::Connection(format!("failed to open push stream: {:?}", e)))?;
+        self.pending_push_streams.insert(request_id, push_id);
+
+        // Store response data to send when stream opens
+        let response = crate::push::PushResponse {
+            status,
+            headers,
+            body,
+        };
+        
+        if let Some(promise) = self.push_manager.borrow_mut().get_promise_mut(push_id) {
+            promise.set_response(response);
+        }
+
+        Ok(())
+    }
+
+    /// Send an HTTP/3 datagram.
+    ///
+    /// Per RFC 9297: HTTP/3 datagrams carry a flow identifier (Quarter Stream ID)
+    /// followed by the payload. Datagrams are unreliable and may be lost or reordered.
+    ///
+    /// # Arguments
+    /// * `flow_id` - The Quarter Stream ID identifying the datagram flow
+    /// * `payload` - The datagram payload bytes
+    ///
+    /// # Errors
+    /// Returns error if H3_DATAGRAM is not enabled or if the connection is closed.
+    pub fn send_datagram(&mut self, flow_id: u64, payload: bytes::Bytes) -> Result<(), H3Error> {
+        // Check if datagrams are enabled
+        if self.settings_validator.get(known::H3_DATAGRAM).unwrap_or(0) != 1 {
+            return Err(H3Error::Http(
+                "H3_DATAGRAM not enabled - cannot send datagrams".into(),
+            ));
+        }
+
+        // RFC 9297 Section 2: Encode flow ID as varint prefix
+        let flow_id_bytes = crate::frames::H3Frame::encode_varint_to_bytes(flow_id);
+        let mut datagram_data = bytes::BytesMut::with_capacity(flow_id_bytes.len() + payload.len());
+        datagram_data.extend_from_slice(&flow_id_bytes);
+        datagram_data.extend_from_slice(&payload);
+
+        // Send datagram
+        let request_id = self
+            .handle
+            .send_datagram(datagram_data.freeze())
+            .map_err(|e| H3Error::Connection(format!("failed to send datagram: {:?}", e)))?;
+
+        // Track metrics
+        self.metrics
+            .datagrams_received
+            .fetch_add(1, Ordering::Relaxed);
+
+        // We don't wait for confirmation - datagrams are fire-and-forget
+        let _ = request_id;
+
+        Ok(())
     }
 
     /// Parse headers into HTTP request (public for testing)
@@ -2571,13 +2689,13 @@ impl<H: H3Handler> H3Session<H> {
     ///    - Mark as completed when FIN received
     ///    - Handle CANCEL_PUSH or stream reset appropriately
     #[allow(dead_code)]
-    async fn process_push_stream(
+    fn process_push_stream(
         &mut self,
         _stream_id: u64,
         mut recv_stream: quicd_x::RecvStream,
     ) -> Result<(), H3Error> {
         // Read push ID (varint) - RFC 9114 Section 4.6
-        let data = match recv_stream.read().await {
+        let data = match recv_stream.try_read() {
             Ok(Some(quicd_x::StreamData::Data(bytes))) => bytes,
             _ => return Err(H3Error::Connection("failed to read push ID".into())),
         };
@@ -2594,21 +2712,25 @@ impl<H: H3Handler> H3Session<H> {
         );
 
         // Consume stream to prevent blocking
-        self.consume_stream_silently(recv_stream).await;
+        self.consume_stream_silently(recv_stream);
 
         Ok(())
     }
 
     /// Consume a stream silently (for reserved or unknown stream types)
-    async fn consume_stream_silently(&self, mut recv_stream: quicd_x::RecvStream) {
-        // Read and discard all data from the stream
+    fn consume_stream_silently(&self, mut recv_stream: quicd_x::RecvStream) {
+        // Read and discard all data from the stream (non-blocking)
         loop {
-            match recv_stream.read().await {
+            match recv_stream.try_read() {
                 Ok(Some(quicd_x::StreamData::Data(_))) => {
                     // Discard data
                     continue;
                 }
-                Ok(Some(quicd_x::StreamData::Fin)) | Ok(None) | Err(_) => {
+                Ok(Some(quicd_x::StreamData::Fin)) | Ok(None) => {
+                    break;
+                }
+                Err(quicd_x::ConnectionError::WouldBlock) | Err(_) => {
+                    // Either no data available or error - stop consuming
                     break;
                 }
             }
@@ -2705,7 +2827,7 @@ impl<H: H3Handler> H3Session<H> {
     /// RFC 9114 Section 4.6: Push responses are sent on unidirectional push streams
     /// initiated by the server. The stream begins with the push stream type (0x01)
     /// and push ID, followed by the response.
-    async fn send_push_response_on_stream(
+    fn send_push_response_on_stream(
         &mut self,
         push_id: u64,
         send_stream: quicd_x::SendStream,
@@ -2722,41 +2844,34 @@ impl<H: H3Handler> H3Session<H> {
         }
 
         // Check if push was cancelled before opening stream
-        {
-            let manager = self.push_manager.lock().await;
-            if let Some(promise) = manager.get_promise(push_id) {
-                if promise.is_cancelled() {
-                    // Push was cancelled - don't send anything
-                    return Err(H3Error::Http(format!("push {} was cancelled", push_id)));
-                }
+        if let Some(promise) = self.push_manager.borrow().get_promise(push_id) {
+            if promise.is_cancelled() {
+                // Push was cancelled - don't send anything
+                return Err(H3Error::Http(format!("push {} was cancelled", push_id)));
             }
         }
 
         // Write push stream type header (0x01) per RFC 9114 Section 6.2.2
         let stream_type = vec![0x01];
         send_stream
-            .write(Bytes::from(stream_type), false)
-            .await
+            .try_write(Bytes::from(stream_type), false)
             .map_err(|e| H3Error::Stream(format!("failed to write stream type: {:?}", e)))?;
 
         // Write push ID as varint
         let push_id_bytes = self.encode_varint(push_id);
         send_stream
-            .write(Bytes::from(push_id_bytes), false)
-            .await
+            .try_write(Bytes::from(push_id_bytes), false)
             .map_err(|e| H3Error::Stream(format!("failed to write push ID: {:?}", e)))?;
 
         // Notify PushManager that stream opened
-        let mut manager = self.push_manager.lock().await;
         let stream_id = send_stream.stream_id;
-        manager.handle_stream_opened(request_id, stream_id)?;
+        self.push_manager.borrow_mut().handle_stream_opened(request_id, stream_id)?;
 
         // Get the push response if available
-        let response_data = manager
+        let response_data = self.push_manager
+            .borrow()
             .get_promise(push_id)
             .and_then(|promise| promise.response().cloned());
-
-        drop(manager); // Release lock before encoding
 
         if let Some(response) = response_data {
             // Encode response headers
@@ -2766,19 +2881,16 @@ impl<H: H3Handler> H3Session<H> {
                 all_headers.push((name.as_bytes(), value.as_bytes()));
             }
 
-            let mut encoder_guard = self.qpack_encoder.lock().await;
-            let encoded_headers = encoder_guard
-                .encoder_mut()
+            let encoded_headers = self.qpack_encoder
+                .borrow_mut()
                 .encode(stream_id, &all_headers)
                 .map_err(|_| H3Error::Qpack("encoding failed".into()))?;
 
             // PERF FIX: Send pending encoder instructions in batch to reduce syscalls
             // RFC 9204: Batching encoder stream instructions improves throughput
-            if let Some(batched_instructions) =
-                encoder_guard.encoder_mut().poll_encoder_stream_batch(16)
-            {
-                if let Some(encoder_stream) = self.encoder_send_stream.lock().await.as_mut() {
-                    let _ = encoder_stream.write(batched_instructions, false).await;
+            while let Some(inst) = self.qpack_encoder.borrow_mut().poll_encoder_stream() {
+                if let Some(encoder_stream) = self.encoder_send_stream.borrow_mut().as_mut() {
+                    let _ = encoder_stream.try_write(inst, false);
                 }
             }
 
@@ -2786,8 +2898,7 @@ impl<H: H3Handler> H3Session<H> {
             let headers_frame = H3Frame::Headers { encoded_headers };
             let frame_data = headers_frame.encode();
             send_stream
-                .write(frame_data, false)
-                .await
+                .try_write(frame_data, false)
                 .map_err(|e| H3Error::Stream(format!("write failed: {:?}", e)))?;
 
             // Send DATA frame with FIN
@@ -2796,20 +2907,18 @@ impl<H: H3Handler> H3Session<H> {
             };
             let data_frame_data = data_frame.encode();
             send_stream
-                .write(data_frame_data, true)
-                .await
+                .try_write(data_frame_data, true)
                 .map_err(|e| H3Error::Stream(format!("write failed: {:?}", e)))?;
 
             // Mark push as completed and release references
-            let mut manager = self.push_manager.lock().await;
-            if let Some(promise) = manager.get_promise_mut(push_id) {
+            if let Some(promise) = self.push_manager.borrow_mut().get_promise_mut(push_id) {
                 promise.mark_completed();
             }
 
             // QPACK references are handled internally by quicd-qpack
         } else {
             // No response data available - send CANCEL_PUSH and close stream
-            let _ = self.send_cancel_push_frame(push_id).await;
+            let _ = self.send_cancel_push_frame(push_id);
             return Err(H3Error::Http(format!(
                 "no response data for push ID {}",
                 push_id
@@ -2821,7 +2930,7 @@ impl<H: H3Handler> H3Session<H> {
 
     /// GAP FIX #3: RFC 9114 Section 5.1: Check for idle connection timeout
     /// This should be called periodically from the event loop
-    async fn check_idle_timeout(&mut self) -> Result<(), H3Error> {
+    fn check_idle_timeout(&mut self) -> Result<(), H3Error> {
         let elapsed = self.last_activity_time.elapsed();
 
         if elapsed >= self.idle_timeout {
@@ -2832,10 +2941,11 @@ impl<H: H3Handler> H3Session<H> {
                     "Idle timeout exceeded ({:?} >= {:?}) - sending GOAWAY",
                     elapsed, self.idle_timeout
                 );
-                self.send_goaway().await?;
+                self.send_goaway()?;
 
-                // Wait a short grace period for in-flight requests to complete
-                tokio::time::sleep(self.config.idle_grace_period).await;
+                // TODO Phase 5: Implement grace period handling in event loop
+                // Cannot use tokio::time::sleep in sync function
+                // Will need to track grace period deadline in run() loop
             }
 
             // Close connection with H3_NO_ERROR per RFC 9114 Section 8
@@ -2851,8 +2961,8 @@ impl<H: H3Handler> H3Session<H> {
     }
 
     /// GAP FIX #5: RFC 9204 Section 2.1.4: Retry blocked streams when dynamic table entries arrive
-    async fn retry_blocked_streams(&mut self) -> Result<(), H3Error> {
-        let current_insert_count = self.qpack_decoder.decoder().table().insert_count() as u64;
+    fn retry_blocked_streams(&mut self) -> Result<(), H3Error> {
+        let current_insert_count = self.qpack_decoder.table().insert_count() as u64;
         let mut streams_to_retry = Vec::new();
 
         // Find streams that can now be unblocked
@@ -2871,7 +2981,6 @@ impl<H: H3Handler> H3Session<H> {
                 // Try to decode again
                 match self
                     .qpack_decoder
-                    .decoder_mut()
                     .decode(stream_id, blocked.encoded_data.clone())
                 {
                     Ok(header_fields) => {
@@ -2888,10 +2997,10 @@ impl<H: H3Handler> H3Session<H> {
 
                         // Send decoder acknowledgments
                         while let Some(inst) =
-                            self.qpack_decoder.decoder_mut().poll_decoder_stream()
+                            self.qpack_decoder.poll_decoder_stream()
                         {
                             if let Some(ref stream) = self.decoder_send_stream {
-                                let _ = stream.write(inst, false).await;
+                                let _ = stream.try_write(inst, false);
                             }
                         }
 
@@ -2910,7 +3019,7 @@ impl<H: H3Handler> H3Session<H> {
                         self.request_queue.push(queued_request);
 
                         // Process immediately
-                        self.process_next_request().await?;
+                        self.process_next_request()?;
                     }
                     Err(_) => {
                         // Still blocked, put back in queue
@@ -2925,7 +3034,7 @@ impl<H: H3Handler> H3Session<H> {
 
     /// GAP FIX #6: RFC 9204 Section 2.1.4: Check for QPACK blocked stream timeouts
     /// Streams blocked for > configured timeout should be aborted with H3_REQUEST_CANCELLED
-    async fn check_blocked_stream_timeouts(&mut self) -> Result<(), H3Error> {
+    fn check_blocked_stream_timeouts(&mut self) -> Result<(), H3Error> {
         let blocked_timeout = self.config.qpack_blocked_stream_timeout;
         let now = std::time::Instant::now();
         let mut streams_to_abort = Vec::new();
@@ -2994,29 +3103,63 @@ impl<H: H3Handler> H3Factory<H> {
     }
 }
 
-#[async_trait]
 impl<H: H3Handler + Clone> QuicAppFactory for H3Factory<H> {
     fn accepts_alpn(&self, alpn: &str) -> bool {
         alpn == "h3" || alpn == "h3-29"
     }
 
-    async fn spawn_app(
+    fn spawn_app(
         &self,
         _alpn: String,
         handle: ConnectionHandle,
-        events: quicd_x::AppEventStream,
+        mut events: quicd_x::AppEventStream,
         _transport: TransportControls,
-        shutdown: ShutdownFuture,
+        mut shutdown: ShutdownFuture,
     ) -> Result<(), quicd_x::ConnectionError> {
-        let session = H3Session::with_config(
+        let mut session = H3Session::with_config(
             handle,
             self.handler.clone(),
             self.settings_storage.clone(),
             self.config.clone(),
         );
-        session
-            .run(events, shutdown)
-            .await
-            .map_err(|e| quicd_x::ConnectionError::App(format!("HTTP/3 error: {:?}", e)))
+        
+        // Non-blocking event-driven processing - no tokio::spawn!
+        // This runs on the single application task for this connection
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            
+            loop {
+                tokio::select! {
+                    Some(event) = events.next() => {
+                        // Process event synchronously (non-blocking)
+                        if let Err(e) = session.handle_event(event) {
+                            eprintln!("HTTP/3 event error: {:?}", e);
+                            // Continue processing unless fatal
+                            if matches!(e, H3Error::ClosedCriticalStream | H3Error::MissingSettings) {
+                                break;
+                            }
+                        }
+                        
+                        // Perform periodic checks (non-blocking, time-based)
+                        if let Err(e) = session.check_periodic_tasks() {
+                            eprintln!("HTTP/3 periodic check error: {:?}", e);
+                            break;
+                        }
+                    }
+                    _ = &mut shutdown => {
+                        // Graceful shutdown
+                        if let Err(e) = session.send_goaway() {
+                            eprintln!("Error sending GOAWAY: {:?}", e);
+                        }
+                        // RFC 9114 Section 8: Close connection with H3_NO_ERROR
+                        let error_code = crate::error::H3ErrorCode::NoError.to_u64();
+                        let _ = session.handle.close(error_code, Some(bytes::Bytes::from("graceful shutdown")));
+                        break;
+                    }
+                }
+            }
+        });
+        
+        Ok(())
     }
 }

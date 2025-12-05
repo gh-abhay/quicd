@@ -2141,7 +2141,6 @@ impl QuicManager {
         let task_handle = self.runtime_handle.spawn(async move {
             match factory_clone
                 .spawn_app(alpn, handle, event_stream, transport, shutdown_future)
-                .await
             {
                 Ok(()) => {
                     debug!(alpn = %alpn_for_logging, "Application task completed");

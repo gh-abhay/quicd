@@ -6,7 +6,6 @@
 use crate::error::H3Error;
 use crate::validation::RequestPseudoHeaders;
 use bytes::Bytes;
-use tokio::net::TcpStream;
 
 /// State of a CONNECT tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +30,6 @@ pub struct ConnectTunnel {
     protocol: Option<String>,
     /// Buffered data waiting to be sent through tunnel
     pending_data: Vec<Bytes>,
-    /// TCP connection to target authority
-    tcp_stream: Option<TcpStream>,
 }
 
 impl ConnectTunnel {
@@ -54,7 +51,6 @@ impl ConnectTunnel {
             authority,
             protocol: pseudo_headers.protocol.clone(),
             pending_data: Vec::new(),
-            tcp_stream: None,
         })
     }
 
@@ -65,56 +61,31 @@ impl ConnectTunnel {
     ///
     /// Returns Ok(()) if connection established successfully.
     /// Returns H3Error::ConnectError if TCP connection fails (should be sent as H3_CONNECT_ERROR).
-    pub async fn establish_connection(&mut self) -> Result<(), H3Error> {
-        if self.state != ConnectState::Pending {
-            return Err(H3Error::Http("tunnel not in pending state".into()));
-        }
-
-        // Establish TCP connection to authority
-        match TcpStream::connect(&self.authority).await {
-            Ok(stream) => {
-                self.tcp_stream = Some(stream);
-                Ok(())
-            }
-            Err(e) => {
-                self.state = ConnectState::Closed;
-                Err(H3Error::ConnectError(format!(
-                    "failed to connect to {}: {}",
-                    self.authority, e
-                )))
-            }
-        }
+    pub fn establish_connection(&mut self) -> Result<(), H3Error> {
+        // CONNECT not implemented in this version
+        Err(H3Error::Http("CONNECT method not implemented".into()))
     }
 
     /// Get a mutable reference to the TCP stream, if established.
-    pub fn tcp_stream_mut(&mut self) -> Option<&mut TcpStream> {
-        self.tcp_stream.as_mut()
+    pub fn tcp_stream_mut(&mut self) -> Option<&mut std::net::TcpStream> {
+        // Not implemented
+        None
     }
 
     /// Take ownership of the TCP stream.
     /// This is used when spawning a forwarding task that needs exclusive access.
-    pub fn take_tcp_stream(&mut self) -> Option<TcpStream> {
-        self.tcp_stream.take()
+    pub fn take_tcp_stream(&mut self) -> Option<std::net::TcpStream> {
+        // Not implemented
+        None
     }
 
     /// Write data to the TCP connection.
     ///
     /// Per RFC 9114 Section 4.4: "The payload of any DATA frame sent by the client
     /// is transmitted by the proxy to the TCP server."
-    pub async fn write_to_tcp(&mut self, data: &[u8]) -> Result<(), H3Error> {
-        if self.state != ConnectState::Established {
-            return Err(H3Error::Http("tunnel not established".into()));
-        }
-
-        if let Some(tcp) = &mut self.tcp_stream {
-            use tokio::io::AsyncWriteExt;
-            tcp.write_all(data)
-                .await
-                .map_err(|e| H3Error::ConnectError(format!("TCP write failed: {}", e)))?;
-            Ok(())
-        } else {
-            Err(H3Error::Http("no TCP connection".into()))
-        }
+    pub fn write_to_tcp(&mut self, _data: &[u8]) -> Result<(), H3Error> {
+        // Not implemented
+        Err(H3Error::Http("CONNECT tunneling not implemented".into()))
     }
 
     /// Read data from the TCP connection.
@@ -123,29 +94,9 @@ impl ConnectTunnel {
     /// into DATA frames by the proxy."
     ///
     /// Returns Some(data) if data was read, None if EOF (FIN received from TCP).
-    pub async fn read_from_tcp(&mut self, buf: &mut [u8]) -> Result<Option<usize>, H3Error> {
-        if self.state != ConnectState::Established {
-            return Err(H3Error::Http("tunnel not established".into()));
-        }
-
-        if let Some(tcp) = &mut self.tcp_stream {
-            use tokio::io::AsyncReadExt;
-            match tcp.read(buf).await {
-                Ok(0) => {
-                    // EOF - TCP connection closed by peer
-                    // Per RFC 9114: "When the proxy receives a packet with the FIN bit set,
-                    // it will close the send stream that it sends to the client."
-                    Ok(None)
-                }
-                Ok(n) => Ok(Some(n)),
-                Err(e) => {
-                    // TCP read error - should abort stream with H3_CONNECT_ERROR
-                    Err(H3Error::ConnectError(format!("TCP read failed: {}", e)))
-                }
-            }
-        } else {
-            Err(H3Error::Http("no TCP connection".into()))
-        }
+    pub fn read_from_tcp(&mut self, _buf: &mut [u8]) -> Result<Option<usize>, H3Error> {
+        // Not implemented
+        Err(H3Error::Http("CONNECT tunneling not implemented".into()))
     }
 
     /// Get the stream ID.
@@ -223,101 +174,13 @@ impl ConnectTunnel {
 ///
 /// This function spawns tasks to forward data in both directions and handles
 /// FIN propagation correctly.
-pub async fn forward_connect_tunnel(
-    mut tcp_stream: TcpStream,
-    mut h3_recv_stream: quicd_x::RecvStream,
-    h3_send_stream: quicd_x::SendStream,
+pub fn forward_connect_tunnel(
+    _tcp_stream: std::net::TcpStream,
+    _h3_recv_stream: quicd_x::RecvStream,
+    _h3_send_stream: quicd_x::SendStream,
 ) -> Result<(), H3Error> {
-    use crate::frames::H3Frame;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // Split TCP stream for simultaneous read/write
-    let (mut tcp_read, mut tcp_write) = tcp_stream.split();
-
-    // Task 1: Forward QUIC -> TCP (client to server)
-    let quic_to_tcp = async move {
-        loop {
-            match h3_recv_stream.read().await {
-                Ok(Some(quicd_x::StreamData::Data(data))) => {
-                    // Parse DATA frames from QUIC stream
-                    let mut cursor = 0;
-                    while cursor < data.len() {
-                        match H3Frame::parse(&data[cursor..]) {
-                            Ok((H3Frame::Data { data: payload }, consumed)) => {
-                                cursor += consumed;
-                                // Write payload to TCP
-                                if let Err(e) = tcp_write.write_all(&payload).await {
-                                    return Err(H3Error::ConnectError(format!(
-                                        "TCP write failed: {}",
-                                        e
-                                    )));
-                                }
-                            }
-                            Ok((_, consumed)) => {
-                                // Non-DATA frame - skip (should be validated elsewhere)
-                                cursor += consumed;
-                            }
-                            Err(e) => {
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
-                Ok(Some(quicd_x::StreamData::Fin)) => {
-                    // Client sent FIN - close TCP write side
-                    let _ = tcp_write.shutdown().await;
-                    break;
-                }
-                Ok(None) => {
-                    // Stream closed
-                    break;
-                }
-                Err(e) => {
-                    return Err(H3Error::Stream(format!("QUIC read failed: {:?}", e)));
-                }
-            }
-        }
-        Ok(())
-    };
-
-    // Task 2: Forward TCP -> QUIC (server to client)
-    let tcp_to_quic = async move {
-        let mut buffer = vec![0u8; 16384]; // 16KB buffer for TCP reads
-
-        loop {
-            match tcp_read.read(&mut buffer).await {
-                Ok(0) => {
-                    // TCP FIN received - send FIN on QUIC stream
-                    if let Err(e) = h3_send_stream.write(Bytes::new(), true).await {
-                        return Err(H3Error::Stream(format!("QUIC FIN write failed: {:?}", e)));
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    // Wrap in DATA frame and send
-                    let data_frame = H3Frame::Data {
-                        data: Bytes::copy_from_slice(&buffer[..n]),
-                    };
-                    let frame_data = data_frame.encode();
-
-                    if let Err(e) = h3_send_stream.write(frame_data, false).await {
-                        return Err(H3Error::Stream(format!("QUIC write failed: {:?}", e)));
-                    }
-                }
-                Err(e) => {
-                    // TCP read error - abort QUIC stream with H3_CONNECT_ERROR
-                    return Err(H3Error::ConnectError(format!("TCP read failed: {}", e)));
-                }
-            }
-        }
-        Ok(())
-    };
-
-    // Run both forwarding tasks concurrently
-    tokio::select! {
-        result = quic_to_tcp => result,
-        result = tcp_to_quic => result,
-    }
+    // Not implemented
+    Err(H3Error::Http("CONNECT tunneling not implemented".into()))
 }
 
 /// Validate CONNECT request pseudo-headers.

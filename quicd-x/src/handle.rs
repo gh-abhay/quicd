@@ -486,6 +486,74 @@ impl SendStream {
         self.write(Bytes::new(), true).await.map(|_| ())
     }
 
+    /// Non-blocking write: attempts to write data without blocking.
+    ///
+    /// This is the key method for non-blocking HTTP/3 implementations.
+    /// It attempts to send data immediately without blocking the task.
+    ///
+    /// # Arguments
+    ///
+    /// - `data`: Bytes to send (zero-copy via Bytes reference counting)
+    /// - `fin`: If true, sets the FIN flag to indicate end-of-stream
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(usize)` - Number of bytes written (may be 0 if buffer is full)
+    /// - `Err(ConnectionError::WouldBlock)` - Send buffer full, retry when writable
+    /// - `Err(ConnectionError::Closed)` - Connection closed
+    ///
+    /// # Non-Blocking Pattern
+    ///
+    /// Applications should:
+    /// 1. Call `try_write()` to send data
+    /// 2. If `WouldBlock` is returned, queue data in application buffer
+    /// 3. Wait for `StreamWritable` event before retrying
+    /// 4. Applications must implement their own buffering for partial writes
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// match send_stream.try_write(data, false) {
+    ///     Ok(n) if n == data.len() => {
+    ///         // All data written
+    ///     }
+    ///     Ok(n) => {
+    ///         // Partial write, queue remaining data
+    ///         pending_data = data.slice(n..);
+    ///     }
+    ///     Err(ConnectionError::WouldBlock) => {
+    ///         // Buffer full, queue all data for later
+    ///         pending_data = data;
+    ///     }
+    ///     Err(e) => return Err(e),
+    /// }
+    /// ```
+    pub fn try_write(&self, data: Bytes, fin: bool) -> Result<usize, ConnectionError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        
+        // Try to send without blocking
+        self.inner
+            .tx
+            .try_send(StreamWriteCmd {
+                data,
+                fin,
+                reply: reply_tx,
+            })
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => ConnectionError::WouldBlock,
+                mpsc::error::TrySendError::Closed(_) => {
+                    ConnectionError::Closed("worker unavailable".into())
+                }
+            })?;
+
+        // Wait for reply (this is fast, just getting the result from worker)
+        // The worker has already accepted the write command, so this won't block
+        match reply_rx.blocking_recv() {
+            Ok(result) => result,
+            Err(_) => Err(ConnectionError::Closed("worker unavailable".into())),
+        }
+    }
+
     /// Creates a fluent builder for sending data with optional FIN.
     ///
     /// This enables ergonomic patterns like:
@@ -581,6 +649,57 @@ impl RecvStream {
     /// to the worker thread's buffer pool.
     pub async fn read(&mut self) -> Result<Option<StreamData>, ConnectionError> {
         Ok(self.rx.recv().await)
+    }
+
+    /// Non-blocking read: attempts to read data without blocking.
+    ///
+    /// This is the key method for non-blocking, event-driven HTTP/3 implementations.
+    /// It checks if data is immediately available without blocking the task.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(StreamData::Data(bytes)))` - Data chunk received (zero-copy)
+    /// - `Ok(Some(StreamData::Fin))` - FIN received, no more data will arrive
+    /// - `Ok(None)` - Channel closed (equivalent to FIN)
+    /// - `Err(ConnectionError::WouldBlock)` - No data available, retry when readable
+    ///
+    /// # Non-Blocking Pattern
+    ///
+    /// Applications should:
+    /// 1. Call `try_read()` when receiving a `StreamReadable` event
+    /// 2. Process data until `WouldBlock` is returned
+    /// 3. Wait for the next `StreamReadable` event before retrying
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// loop {
+    ///     match recv_stream.try_read() {
+    ///         Ok(Some(StreamData::Data(bytes))) => {
+    ///             // Process data
+    ///         }
+    ///         Ok(Some(StreamData::Fin)) => {
+    ///             // Stream finished
+    ///             break;
+    ///         }
+    ///         Ok(None) => {
+    ///             // Channel closed
+    ///             break;
+    ///         }
+    ///         Err(ConnectionError::WouldBlock) => {
+    ///             // No more data available, wait for next event
+    ///             break;
+    ///         }
+    ///         Err(e) => return Err(e),
+    ///     }
+    /// }
+    /// ```
+    pub fn try_read(&mut self) -> Result<Option<StreamData>, ConnectionError> {
+        match self.rx.try_recv() {
+            Ok(data) => Ok(Some(data)),
+            Err(mpsc::error::TryRecvError::Empty) => Err(ConnectionError::WouldBlock),
+            Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
+        }
     }
 }
 
