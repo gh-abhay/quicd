@@ -1,8 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use async_trait::async_trait;
-
 use crate::{AppEvent, ConnectionError, ConnectionHandle, TransportControls};
 
 /// Boxed stream of application events.
@@ -77,7 +75,6 @@ pub type ShutdownFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     Ok(())
 /// }
 /// ```
-#[async_trait]
 pub trait QuicAppFactory: Send + Sync + 'static {
     /// Returns true when this factory can serve the supplied ALPN.
     fn accepts_alpn(&self, alpn: &str) -> bool;
@@ -101,7 +98,12 @@ pub trait QuicAppFactory: Send + Sync + 'static {
     /// - Return from this function within 30 seconds
     ///
     /// Failure to complete within the timeout may result in forceful termination.
-    async fn spawn_app(
+    ///
+    /// # Implementation Note
+    ///
+    /// Implementations may spawn a tokio task and return immediately, or block
+    /// until the session completes. The trait does not require async.
+    fn spawn_app(
         &self,
         alpn: String,
         handle: ConnectionHandle,

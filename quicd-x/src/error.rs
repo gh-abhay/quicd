@@ -108,6 +108,17 @@ pub enum ConnectionError {
     #[error("operation blocked: {0}")]
     Blocked(String),
 
+    /// Non-blocking operation would block (no data available or buffer full).
+    ///
+    /// Returned by try_read() when no data is available, or try_write() when
+    /// the send buffer is full. This is not an error condition - the application
+    /// should wait for a readable/writable event and retry.
+    ///
+    /// This error indicates the operation cannot complete immediately without
+    /// blocking, which is expected in non-blocking I/O patterns.
+    #[error("would block")]
+    WouldBlock,
+
     /// Stream is in an invalid state for the requested operation.
     ///
     /// Examples:
