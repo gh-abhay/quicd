@@ -103,8 +103,11 @@ pub struct H3Session<H: H3Handler> {
 /// Active receive stream state for event-driven, non-blocking reading
 struct ActiveRecvStream {
     recv_stream: quicd_x::RecvStream,
-    // Buffered data that hasn't been fully parsed yet
+    // Buffered data that hasn't been fully parsed yet (for control/QPACK streams)
     buffer: bytes::BytesMut,
+    // Frame parser for bidirectional request streams
+    // None for unidirectional streams (control/QPACK) which use simple buffer
+    frame_parser: Option<StreamFrameParser>,
 }
 
 /// Stream type context for validating frame associations
@@ -465,13 +468,11 @@ impl<H: H3Handler> H3Session<H> {
                         .await?;
                 } else {
                     // Unidirectional stream (push or control)
-                    // Register the stream - don't block on reading
+                    // EVENT-DRIVEN ARCHITECTURE FIX:
+                    // Register the stream - do NOT block on reading.
+                    // Stream type will be read when first StreamReadable event arrives.
                     self.handle_unidirectional_stream(stream_id, recv_stream)
                         .await?;
-                    
-                    // Now that stream is registered, read the stream type (first byte)
-                    // This is needed to identify what kind of stream it is
-                    self.process_new_unidirectional_stream(stream_id).await?;
                 }
             }
             AppEvent::StreamReadable { stream_id } => {
@@ -710,7 +711,7 @@ impl<H: H3Handler> H3Session<H> {
     async fn handle_bidirectional_stream(
         &mut self,
         stream_id: u64,
-        mut recv_stream: quicd_x::RecvStream,
+        recv_stream: quicd_x::RecvStream,
         send_stream: Option<quicd_x::SendStream>,
     ) -> Result<(), H3Error> {
         // GAP FIX #3: RFC 9114 Section 6.1: Comprehensive stream ID validation
@@ -786,33 +787,20 @@ impl<H: H3Handler> H3Session<H> {
         });
         self.stream_id_to_key.insert(stream_id, stream_key);
 
-        // Read frames from the stream with proper buffering
-        while let Ok(Some(data)) = recv_stream.read().await {
-            match data {
-                quicd_x::StreamData::Data(bytes) => {
-                    // Use StreamFrameParser for proper frame buffering
-                    // Collect frames first to avoid borrow checker issues
-                    frame_parser.add_data(bytes)?;
+        // EVENT-DRIVEN ARCHITECTURE FIX:
+        // Store the stream for event-driven reading - do NOT block on read.
+        // Data will be processed when StreamReadable events arrive from the worker.
+        // This is critical to prevent blocking the application task event loop.
+        self.active_recv_streams.insert(
+            stream_id,
+            ActiveRecvStream {
+                recv_stream,
+                buffer: bytes::BytesMut::new(),
+                frame_parser: Some(frame_parser),
+            },
+        );
 
-                    let mut collected_frames = Vec::new();
-                    while let Some(frame) = frame_parser.parse_next_frame()? {
-                        collected_frames.push(frame);
-                    }
-
-                    // Process all collected frames
-                    for frame in collected_frames {
-                        self.process_frame_on_request_stream(stream_id, frame)
-                            .await?;
-                    }
-                }
-                quicd_x::StreamData::Fin => {
-                    frame_parser.mark_half_closed_remote();
-                    self.handle_request_complete(stream_id).await?;
-                    break;
-                }
-            }
-        }
-
+        // Return immediately - stream will be processed via StreamReadable events
         Ok(())
     }
 
@@ -842,6 +830,7 @@ impl<H: H3Handler> H3Session<H> {
             ActiveRecvStream {
                 recv_stream,
                 buffer: bytes::BytesMut::new(),
+                frame_parser: None, // Unidirectional streams use simple buffer
             },
         );
 
@@ -849,8 +838,10 @@ impl<H: H3Handler> H3Session<H> {
         Ok(())
     }
 
-    /// Read and process stream type for a newly registered unidirectional stream
-    async fn process_new_unidirectional_stream(&mut self, stream_id: u64) -> Result<(), H3Error> {
+    /// Read and identify stream type for a newly registered unidirectional stream
+    /// EVENT-DRIVEN ARCHITECTURE FIX:
+    /// This is called when first StreamReadable event arrives for an unidentified stream.
+    async fn read_and_identify_unidirectional_stream(&mut self, stream_id: u64) -> Result<(), H3Error> {
         // Get the active stream (should exist since we just registered it)
         let active_stream = match self.active_recv_streams.get_mut(&stream_id) {
             Some(s) => s,
@@ -1001,7 +992,7 @@ impl<H: H3Handler> H3Session<H> {
         
         // Check if this is a stream we're tracking
         if !self.active_recv_streams.contains_key(&stream_id) {
-            // Not a stream we're tracking (bidirectional streams handle their own reading)
+            // Not a stream we're tracking
             return Ok(());
         }
 
@@ -1018,10 +1009,15 @@ impl<H: H3Handler> H3Session<H> {
             Some(StreamType::QpackDecoder) => {
                 self.read_qpack_decoder_stream_data(stream_id).await?;
             }
-            Some(StreamType::Request) | None => {
-                // Bidirectional request streams handle their own reading
-                // in handle_bidirectional_stream via blocking read loop
-                // (will be fixed in a future iteration)
+            Some(StreamType::Request) => {
+                // EVENT-DRIVEN ARCHITECTURE FIX:
+                // Bidirectional request streams are now processed via StreamReadable events
+                self.read_request_stream_data(stream_id).await?;
+            }
+            None => {
+                // Stream type not yet determined - this is a newly registered unidirectional stream
+                // Read stream type byte to determine what kind of stream this is
+                self.read_and_identify_unidirectional_stream(stream_id).await?;
             }
         }
 
@@ -1161,6 +1157,78 @@ impl<H: H3Handler> H3Session<H> {
             Err(e) => {
                 self.active_recv_streams.remove(&stream_id);
                 return Err(H3Error::Stream(format!("decoder stream read error: {:?}", e)));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Read and process available data from bidirectional request stream
+    /// EVENT-DRIVEN ARCHITECTURE FIX:
+    /// This method processes data when StreamReadable events arrive, preventing blocking.
+    async fn read_request_stream_data(&mut self, stream_id: u64) -> Result<(), H3Error> {
+        // Get the active stream (must have a frame_parser for request streams)
+        let active_stream = match self.active_recv_streams.get_mut(&stream_id) {
+            Some(s) => s,
+            None => return Ok(()), // Stream was removed
+        };
+
+        // Read available data (non-blocking since StreamReadable event fired)
+        match active_stream.recv_stream.read().await {
+            Ok(Some(quicd_x::StreamData::Data(bytes))) => {
+                // Get mutable reference to frame_parser
+                let frame_parser = match active_stream.frame_parser.as_mut() {
+                    Some(fp) => fp,
+                    None => {
+                        // Should not happen for request streams
+                        return Err(H3Error::Stream(
+                            "request stream missing frame parser".into(),
+                        ));
+                    }
+                };
+
+                // Add data to frame parser
+                frame_parser.add_data(bytes)?;
+
+                // Collect all parsed frames
+                let mut collected_frames = Vec::new();
+                while let Some(frame) = frame_parser.parse_next_frame()? {
+                    collected_frames.push(frame);
+                }
+
+                // Process all collected frames
+                for frame in collected_frames {
+                    self.process_frame_on_request_stream(stream_id, frame)
+                        .await?;
+                }
+            }
+            Ok(Some(quicd_x::StreamData::Fin)) => {
+                // Mark stream as half-closed remote
+                if let Some(active_stream) = self.active_recv_streams.get_mut(&stream_id) {
+                    if let Some(frame_parser) = active_stream.frame_parser.as_mut() {
+                        frame_parser.mark_half_closed_remote();
+                    }
+                }
+
+                // Process request completion
+                self.handle_request_complete(stream_id).await?;
+
+                // Remove from active streams
+                self.active_recv_streams.remove(&stream_id);
+            }
+            Ok(None) => {
+                // Channel closed - treat as FIN
+                if let Some(active_stream) = self.active_recv_streams.get_mut(&stream_id) {
+                    if let Some(frame_parser) = active_stream.frame_parser.as_mut() {
+                        frame_parser.mark_half_closed_remote();
+                    }
+                }
+                self.handle_request_complete(stream_id).await?;
+                self.active_recv_streams.remove(&stream_id);
+            }
+            Err(e) => {
+                self.active_recv_streams.remove(&stream_id);
+                return Err(H3Error::Stream(format!("request stream read error: {:?}", e)));
             }
         }
 
