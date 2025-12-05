@@ -15,6 +15,7 @@ http = "0.2"
 slab = "0.4"
 serde = { version = "1", features = ["derive"] }
 humantime-serde = "1"
+mio = { version = "0.8", features = ["net", "os-poll"] }
 
 [dev-dependencies]
 criterion = "0.5"
