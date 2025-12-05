@@ -1223,13 +1223,8 @@ impl<H: H3Handler> H3Session<H> {
                 .await
                 .map_err(|e| H3Error::Stream(format!("failed to send SETTINGS: {:?}", e)))?;
 
-            // Send MAX_PUSH_ID frame (advertise that we can send pushes)
-            let max_push_id = H3Frame::MaxPushId { push_id: 1000 }; // Allow up to 1000 pushes
-            let push_id_data = max_push_id.encode();
-            send_stream
-                .write(push_id_data, false)
-                .await
-                .map_err(|e| H3Error::Stream(format!("failed to send MAX_PUSH_ID: {:?}", e)))?;
+            // RFC 9114 Section 7.2.7: MAX_PUSH_ID frame MUST NOT be sent by servers.
+            // Only clients send MAX_PUSH_ID to control the number of pushes they accept.
         }
         Ok(())
     }
