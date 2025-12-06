@@ -69,6 +69,7 @@ fn is_numa_available() -> bool {
 /// Returns None if NUMA is not available or detection fails.
 #[cfg(target_os = "linux")]
 fn get_current_numa_node() -> Option<u32> {
+    #[allow(unused_imports)]
     use std::mem::MaybeUninit;
 
     // Use getcpu() syscall to get current CPU and NUMA node

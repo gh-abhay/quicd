@@ -6,39 +6,38 @@ edition = "2021"
 
 [dependencies]
 quicd-x = { path = "../quicd-x" }
-quicd-h3 = { path = "../quicd-h3" }
-bytes = "1"
-clap = { version = "4.5", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-config = "0.14"
-toml = "0.8"
-anyhow = "1.0"
-sys-info = "0.9"
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "signal", "sync"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-num_cpus = "1.0"
+bytes = "1.11.0"
+clap = { version = "4.5.53", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+config = "0.15.19"
+toml = "0.9.8"
+anyhow = "1.0.100"
+sys-info = "0.9.1"
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
+num_cpus = "1.17.0"
 quiche = "0.24.6"
-datagram-socket = "0.5"
-io-uring = "0.6"
-socket2 = "0.5"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
-libc = "0.2"
-nix = { version = "0.29", features = ["user"] }
-smallvec = "1.13"
-ahash = "0.8"
+datagram-socket = "0.5.0"
+io-uring = "0.7.11"
+socket2 = "0.6.1"
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["fmt", "env-filter", "json"] }
+libc = "0.2.178"
+nix = { version = "0.30.1", features = ["user"] }
+smallvec = "1.15.1"
+ahash = "0.8.12"
 once_cell = "1.21.3"
-crossbeam-channel = "0.5"
-core_affinity = "0.8"
-rcgen = "0.13"
-ring = "0.17"
+crossbeam-channel = "0.5.15"
+core_affinity = "0.8.3"
+rcgen = "0.14.5"
+ring = "0.17.14"
 quicd-ebpf-router = { git = "https://github.com/quicd/quicd-ebpf-router", tag = "0.1.0" }
 
 # OpenTelemetry for metrics and tracing
-opentelemetry = { version = "0.27", features = ["metrics", "trace"] }
-opentelemetry-otlp = { version = "0.27", features = ["metrics", "trace", "grpc-tonic"] }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "metrics", "trace"] }
-opentelemetry-semantic-conventions = "0.27"
-tracing-opentelemetry = "0.28"
+opentelemetry = { version = "0.31.0", features = ["metrics", "trace"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["metrics", "trace", "grpc-tonic"] }
+opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio", "metrics", "trace"] }
+opentelemetry-semantic-conventions = "0.31.0"
+tracing-opentelemetry = "0.32.0"
 libloading = "0.9.0"
