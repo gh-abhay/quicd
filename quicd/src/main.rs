@@ -65,11 +65,11 @@ fn main() -> anyhow::Result<()> {
         match &app_config.config {
             config::application::ApplicationTypeConfig::Http3(h3_cfg) => {
                 if h3_cfg.enabled {
-                    let factory = Arc::new(quicd_h3::H3Factory::with_config(
-                        quicd_h3::DefaultH3Handler,
-                        h3_cfg.h3.clone(),
-                    ));
-                    app_registry = app_registry.register(&app_config.alpn, factory);
+                    // let factory = Arc::new(quicd_h3::H3Factory::with_config(
+                    //     quicd_h3::DefaultH3Handler,
+                    //     h3_cfg.h3.clone(),
+                    // ));
+                    // app_registry = app_registry.register(&app_config.alpn, factory);
                 }
             }
             config::application::ApplicationTypeConfig::Plugin(plugin_cfg) => {
@@ -88,21 +88,21 @@ fn main() -> anyhow::Result<()> {
     // Fallback to default H3 if registry is empty (for backward compatibility)
     if app_registry.is_empty() {
         info!("No applications configured, registering default H3 handlers");
-        app_registry = app_registry
-            .register(
-                "h3",
-                Arc::new(quicd_h3::H3Factory::with_config(
-                    quicd_h3::DefaultH3Handler,
-                    quicd_h3::config::H3Config::default(),
-                )),
-            )
-            .register(
-                "h3-29",
-                Arc::new(quicd_h3::H3Factory::with_config(
-                    quicd_h3::DefaultH3Handler,
-                    quicd_h3::config::H3Config::default(),
-                )),
-            );
+        // app_registry = app_registry
+        //     .register(
+        //         "h3",
+        //         Arc::new(quicd_h3::H3Factory::with_config(
+        //             quicd_h3::DefaultH3Handler,
+        //             quicd_h3::config::H3Config::default(),
+        //         )),
+        //     )
+        //     .register(
+        //         "h3-29",
+        //         Arc::new(quicd_h3::H3Factory::with_config(
+        //             quicd_h3::DefaultH3Handler,
+        //             quicd_h3::config::H3Config::default(),
+        //         )),
+        //     );
     }
 
     info!(

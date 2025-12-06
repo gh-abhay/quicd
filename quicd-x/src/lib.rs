@@ -145,13 +145,16 @@ pub mod system_resources;
 
 pub use crate::config::QuicAppConfig;
 pub use crate::config::QuicTransportConfig;
+pub use crate::config::QuicTransportConfigBuilder;
 pub use crate::config::{
-    CongestionControl, DEFAULT_INITIAL_RTT_MS, DEFAULT_MAX_CONNECTIONS_PER_WORKER,
-    DEFAULT_MAX_IDLE_TIMEOUT_MS, DEFAULT_MAX_STREAMS_BIDI, DEFAULT_MAX_STREAMS_UNI,
-    DEFAULT_MAX_UDP_PAYLOAD_SIZE, DEFAULT_RECV_WINDOW, DEFAULT_STREAM_RECV_WINDOW,
+    CongestionControl, DEFAULT_ACK_DELAY_EXPONENT, DEFAULT_ACTIVE_CID_LIMIT,
+    DEFAULT_AMPLIFICATION_FACTOR, DEFAULT_INITIAL_CWND_PACKETS, DEFAULT_INITIAL_RTT_MS,
+    DEFAULT_MAX_ACK_DELAY, DEFAULT_MAX_CONNECTIONS_PER_WORKER, DEFAULT_MAX_IDLE_TIMEOUT_MS,
+    DEFAULT_MAX_STREAMS_BIDI, DEFAULT_MAX_STREAMS_UNI, DEFAULT_MAX_UDP_PAYLOAD_SIZE,
+    DEFAULT_RECV_WINDOW, DEFAULT_STREAM_RECV_WINDOW,
 };
 pub use crate::error::ConnectionError;
-pub use crate::events::{AppEvent, CongestionState, TransportEvent};
+pub use crate::events::{AppEvent, CongestionState, DatagramDropReason, PathEventType, PathStats, SourceConnectionIdInfo, TransportEvent};
 pub use crate::factory::{AppEventStream, QuicAppFactory, ShutdownFuture};
 pub use crate::handle::{
     ConnectionHandle, ConnectionId, ConnectionStats, RecvStream, SendDataBuilder, SendStream,
@@ -159,7 +162,7 @@ pub use crate::handle::{
 };
 pub use crate::server::{
     new_connection_handle, new_recv_stream, new_send_stream, ConnectionState, EgressCommand,
-    StreamCredits, StreamWriteCmd,
+    PathInfo, PeerTransportParams, StreamCredits, StreamShutdownDirection, StreamWriteCmd,
 };
 
 /// Macro to export a QUIC application factory from a dynamic library.

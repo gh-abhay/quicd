@@ -1,4 +1,3 @@
 [workspace]
-members = ["quicd", "quicd-x", "quicd-h3", "quicd-moq", "quicd-qpack"]
+members = ["quicd"]
 resolver = "2"
-
