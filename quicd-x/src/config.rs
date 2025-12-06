@@ -31,6 +31,21 @@ pub const DEFAULT_STREAM_RECV_WINDOW: u64 = 1024 * 1024;
 /// Default maximum connections per worker
 pub const DEFAULT_MAX_CONNECTIONS_PER_WORKER: usize = 100_000;
 
+/// Default ACK delay exponent (RFC 9000 §18.2)
+pub const DEFAULT_ACK_DELAY_EXPONENT: u64 = 3;
+
+/// Default max ACK delay in milliseconds (RFC 9000 §18.2)
+pub const DEFAULT_MAX_ACK_DELAY: u64 = 25;
+
+/// Default active connection ID limit (RFC 9000 §18.2)
+pub const DEFAULT_ACTIVE_CID_LIMIT: u64 = 2;
+
+/// Default initial congestion window in packets
+pub const DEFAULT_INITIAL_CWND_PACKETS: usize = 10;
+
+/// Default max amplification factor (RFC 9000 §8.1)
+pub const DEFAULT_AMPLIFICATION_FACTOR: usize = 3;
+
 /// Congestion control algorithm selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -135,6 +150,88 @@ pub struct QuicTransportConfig {
     /// Enable connection statistics collection
     #[serde(default = "default_true")]
     pub enable_stats: bool,
+
+    // ====== Extended Transport Parameters (RFC 9000 §18.2) ======
+    
+    /// ACK delay exponent for computing ACK Delay field
+    #[serde(default = "default_ack_delay_exponent")]
+    pub ack_delay_exponent: u64,
+    
+    /// Maximum ACK delay in milliseconds
+    #[serde(default = "default_max_ack_delay")]
+    pub max_ack_delay: u64,
+    
+    /// Active connection ID limit
+    #[serde(default = "default_active_cid_limit")]
+    pub active_connection_id_limit: u64,
+
+    // ====== TLS & Security ======
+    
+    /// Whether to verify peer TLS certificate
+    #[serde(default = "default_true")]
+    pub verify_peer: bool,
+    
+    /// Path to custom CA certificate file for peer verification
+    /// Uses PEM format. If not set, system default CA store is used.
+    #[serde(default)]
+    pub ca_cert_file: Option<String>,
+    
+    /// Path to custom CA certificate directory for peer verification
+    /// Directory should contain PEM-encoded CA certificates with hashed filenames.
+    #[serde(default)]
+    pub ca_cert_dir: Option<String>,
+    
+    /// Session ticket for resumption (not serialized)
+    #[serde(skip)]
+    pub session_ticket: Option<Vec<u8>>,
+    
+    /// Enable TLS key logging for debugging (SSLKEYLOGFILE)
+    #[serde(default)]
+    pub log_keys: bool,
+    
+    /// Stateless reset token (16 bytes, not serialized)
+    #[serde(skip)]
+    pub stateless_reset_token: Option<[u8; 16]>,
+
+    // ====== Congestion Control Tuning ======
+    
+    /// Initial congestion window in packets
+    #[serde(default = "default_initial_cwnd")]
+    pub initial_congestion_window_packets: usize,
+    
+    /// Enable HyStart++ slow start algorithm
+    #[serde(default = "default_true")]
+    pub enable_hystart: bool,
+    
+    /// Max pacing rate in bytes/sec (None = unlimited)
+    #[serde(default)]
+    pub max_pacing_rate: Option<u64>,
+    
+    /// Max amplification factor for anti-amplification (RFC 9000 §8.1)
+    #[serde(default = "default_amplification_factor")]
+    pub max_amplification_factor: usize,
+
+    // ====== Advanced Features ======
+    
+    /// Enable PMTU discovery (RFC 9000 §14)
+    #[serde(default)]
+    pub discover_pmtu: bool,
+    
+    /// Enable GREASE (RFC 9000 §21)
+    #[serde(default = "default_true")]
+    pub grease: bool,
+    
+    /// Disable DCID reuse across paths
+    #[serde(default)]
+    pub disable_dcid_reuse: bool,
+    
+    /// Maximum DATAGRAM receive queue length
+    #[serde(default = "default_dgram_queue_len")]
+    pub dgram_recv_max_queue_len: usize,
+    
+    /// Maximum DATAGRAM send queue length
+    #[serde(default = "default_dgram_queue_len")]
+    pub dgram_send_max_queue_len: usize,
 }
 
 fn default_max_idle_timeout() -> u64 {
@@ -177,6 +274,30 @@ fn default_max_dgram_size() -> usize {
     DEFAULT_MAX_UDP_PAYLOAD_SIZE
 }
 
+fn default_ack_delay_exponent() -> u64 {
+    DEFAULT_ACK_DELAY_EXPONENT
+}
+
+fn default_max_ack_delay() -> u64 {
+    DEFAULT_MAX_ACK_DELAY
+}
+
+fn default_active_cid_limit() -> u64 {
+    DEFAULT_ACTIVE_CID_LIMIT
+}
+
+fn default_initial_cwnd() -> usize {
+    DEFAULT_INITIAL_CWND_PACKETS
+}
+
+fn default_amplification_factor() -> usize {
+    DEFAULT_AMPLIFICATION_FACTOR
+}
+
+fn default_dgram_queue_len() -> usize {
+    1000
+}
+
 impl Default for QuicTransportConfig {
     fn default() -> Self {
         let resources = crate::system_resources::SystemResources::query();
@@ -201,11 +322,51 @@ impl Default for QuicTransportConfig {
             enable_dgram: false,
             max_dgram_size: resources.optimal_max_udp_payload(),
             enable_stats: true,
+            ack_delay_exponent: DEFAULT_ACK_DELAY_EXPONENT,
+            max_ack_delay: DEFAULT_MAX_ACK_DELAY,
+            active_connection_id_limit: DEFAULT_ACTIVE_CID_LIMIT,
+            verify_peer: true,
+            ca_cert_file: None,
+            ca_cert_dir: None,
+            session_ticket: None,
+            log_keys: false,
+            stateless_reset_token: None,
+            initial_congestion_window_packets: DEFAULT_INITIAL_CWND_PACKETS,
+            enable_hystart: true,
+            max_pacing_rate: None,
+            max_amplification_factor: DEFAULT_AMPLIFICATION_FACTOR,
+            discover_pmtu: false,
+            grease: true,
+            disable_dcid_reuse: false,
+            dgram_recv_max_queue_len: 1000,
+            dgram_send_max_queue_len: 1000,
         }
     }
 }
 
 impl QuicTransportConfig {
+    /// Create a new builder for configuring QUIC transport parameters.
+    ///
+    /// Starts with sensible defaults and allows applications to customize
+    /// specific parameters via the builder pattern.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use quicd_x::QuicTransportConfig;
+    ///
+    /// let config = QuicTransportConfig::builder()
+    ///     .max_idle_timeout_ms(60_000)
+    ///     .max_streams_bidi(200)
+    ///     .enable_early_data(true)
+    ///     .congestion_control(quicd_x::CongestionControl::Bbr)
+    ///     .build()
+    ///     .expect("valid config");
+    /// ```
+    pub fn builder() -> QuicTransportConfigBuilder {
+        QuicTransportConfigBuilder::default()
+    }
+
     /// Get idle timeout as Duration
     pub fn idle_timeout(&self) -> Duration {
         Duration::from_millis(self.max_idle_timeout_ms)
@@ -242,12 +403,319 @@ impl QuicTransportConfig {
             return Err("max_connections_per_worker must be > 0".to_string());
         }
 
+        // Validate transport parameters (RFC 9000 §18.2)
+        if self.ack_delay_exponent > 20 {
+            return Err("ack_delay_exponent must be <= 20 (RFC 9000 §18.2)".to_string());
+        }
+
+        if self.max_ack_delay > 16384 {
+            return Err("max_ack_delay must be <= 16384ms (2^14, RFC 9000 §18.2)".to_string());
+        }
+
+        if self.active_connection_id_limit < 2 {
+            return Err("active_connection_id_limit must be >= 2 (RFC 9000 §18.2)".to_string());
+        }
+
+        // Validate congestion control parameters
+        if self.initial_congestion_window_packets == 0 {
+            return Err("initial_congestion_window_packets must be > 0".to_string());
+        }
+
+        if self.max_amplification_factor < 3 {
+            return Err(
+                "max_amplification_factor must be >= 3 (RFC 9000 §8.1 anti-amplification)"
+                    .to_string(),
+            );
+        }
+
+        // Validate datagram queue lengths
+        if self.dgram_recv_max_queue_len == 0 {
+            return Err("dgram_recv_max_queue_len must be > 0".to_string());
+        }
+
+        if self.dgram_send_max_queue_len == 0 {
+            return Err("dgram_send_max_queue_len must be > 0".to_string());
+        }
+
         Ok(())
     }
 
     /// Get the congestion control algorithm
     pub fn congestion_control_algorithm(&self) -> CongestionControl {
         self.congestion_control
+    }
+}
+
+/// Builder for constructing QuicTransportConfig with custom parameters.
+///
+/// Provides a fluent API for configuring QUIC transport parameters.
+/// All methods are optional - sensible defaults are used for unset values.
+///
+/// # Example
+///
+/// ```rust
+/// use quicd_x::{QuicTransportConfig, CongestionControl};
+///
+/// let config = QuicTransportConfig::builder()
+///     .max_idle_timeout_ms(120_000)
+///     .max_streams_bidi(500)
+///     .recv_window(20 * 1024 * 1024)
+///     .congestion_control(CongestionControl::Bbr2)
+///     .enable_dgram(true)
+///     .grease(true)
+///     .build()
+///     .expect("valid configuration");
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct QuicTransportConfigBuilder {
+    inner: QuicTransportConfig,
+}
+
+impl QuicTransportConfigBuilder {
+    /// Set maximum idle timeout in milliseconds (RFC 9000 §10).
+    ///
+    /// Connection will be closed if no packets are received for this duration.
+    /// Minimum: 1ms, typical: 30s-60s, long-lived: 120s+
+    pub fn max_idle_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.inner.max_idle_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Set initial RTT estimate in milliseconds.
+    ///
+    /// Used before actual RTT measurements are available.
+    /// Default: 100ms, low-latency: 50ms, high-latency: 200ms+
+    pub fn initial_rtt_ms(mut self, rtt_ms: u64) -> Self {
+        self.inner.initial_rtt_ms = rtt_ms;
+        self
+    }
+
+    /// Set maximum concurrent bidirectional streams (RFC 9000 §4.6).
+    ///
+    /// Controls peer's stream opening limit via STREAMS_BLOCKED frame.
+    pub fn max_streams_bidi(mut self, count: u64) -> Self {
+        self.inner.max_streams_bidi = count;
+        self
+    }
+
+    /// Set maximum concurrent unidirectional streams (RFC 9000 §4.6).
+    pub fn max_streams_uni(mut self, count: u64) -> Self {
+        self.inner.max_streams_uni = count;
+        self
+    }
+
+    /// Set maximum UDP payload size in bytes.
+    ///
+    /// Must be >= 1200 (QUIC minimum) and <= path MTU to avoid fragmentation.
+    /// Default: 1350 (safe for IPv4), jumbo frames: 9000+
+    pub fn max_udp_payload_size(mut self, size: usize) -> Self {
+        self.inner.max_udp_payload_size = size;
+        self
+    }
+
+    /// Set connection-level receive window (RFC 9000 §4.1).
+    ///
+    /// Total bytes peer can send across all streams. Controls MAX_DATA frame.
+    /// Larger = better throughput, more memory. Default: 10MB
+    pub fn recv_window(mut self, bytes: u64) -> Self {
+        self.inner.recv_window = bytes;
+        self
+    }
+
+    /// Set per-stream receive window (RFC 9000 §4.1).
+    ///
+    /// Bytes peer can send on each stream. Controls MAX_STREAM_DATA frame.
+    /// Default: 1MB
+    pub fn stream_recv_window(mut self, bytes: u64) -> Self {
+        self.inner.stream_recv_window = bytes;
+        self
+    }
+
+    /// Set congestion control algorithm.
+    ///
+    /// Options: Cubic (default), Reno, BBR, BBR2
+    pub fn congestion_control(mut self, algorithm: CongestionControl) -> Self {
+        self.inner.congestion_control = algorithm;
+        self
+    }
+
+    /// Enable 0-RTT early data (RFC 9001 §4.6.1).
+    ///
+    /// ⚠️ Security implications: early data can be replayed by attackers.
+    /// Only enable for idempotent operations.
+    pub fn enable_early_data(mut self, enabled: bool) -> Self {
+        self.inner.enable_early_data = enabled;
+        self
+    }
+
+    /// Disable connection migration (RFC 9000 §9).
+    ///
+    /// If true, connection cannot change IP address or port.
+    pub fn disable_active_migration(mut self, disabled: bool) -> Self {
+        self.inner.disable_active_migration = disabled;
+        self
+    }
+
+    /// Enable packet pacing.
+    ///
+    /// Spreads packet transmission to avoid bursts. Recommended: true
+    pub fn enable_pacing(mut self, enabled: bool) -> Self {
+        self.inner.enable_pacing = enabled;
+        self
+    }
+
+    /// Enable DATAGRAM extension (RFC 9221).
+    ///
+    /// Allows sending unreliable, unordered datagrams over QUIC.
+    /// Useful for: real-time media, game state, telemetry
+    pub fn enable_dgram(mut self, enabled: bool) -> Self {
+        self.inner.enable_dgram = enabled;
+        self
+    }
+
+    /// Set maximum DATAGRAM frame size.
+    ///
+    /// Must be <= max_udp_payload_size - QUIC overhead.
+    pub fn max_dgram_size(mut self, size: usize) -> Self {
+        self.inner.max_dgram_size = size;
+        self
+    }
+
+    /// Set ACK delay exponent (RFC 9000 §18.2).
+    ///
+    /// Used in ACK Delay field encoding. Valid range: 0-20, default: 3
+    pub fn ack_delay_exponent(mut self, exponent: u64) -> Self {
+        self.inner.ack_delay_exponent = exponent;
+        self
+    }
+
+    /// Set maximum ACK delay in milliseconds (RFC 9000 §18.2).
+    ///
+    /// Maximum time to delay sending ACK. Valid range: 0-16384ms, default: 25ms
+    pub fn max_ack_delay(mut self, delay_ms: u64) -> Self {
+        self.inner.max_ack_delay = delay_ms;
+        self
+    }
+
+    /// Set active connection ID limit (RFC 9000 §5.1.1).
+    ///
+    /// Number of connection IDs peer can use simultaneously. Min: 2, default: 2
+    pub fn active_connection_id_limit(mut self, limit: u64) -> Self {
+        self.inner.active_connection_id_limit = limit;
+        self
+    }
+
+    /// Enable peer certificate verification (TLS).
+    ///
+    /// Default: true (recommended for security)
+    pub fn verify_peer(mut self, verify: bool) -> Self {
+        self.inner.verify_peer = verify;
+        self
+    }
+
+    /// Set custom CA certificate file path (PEM format).
+    ///
+    /// Used for peer certificate verification.
+    pub fn ca_cert_file(mut self, path: String) -> Self {
+        self.inner.ca_cert_file = Some(path);
+        self
+    }
+
+    /// Set custom CA certificate directory.
+    ///
+    /// Directory with hashed PEM certificates for peer verification.
+    pub fn ca_cert_dir(mut self, path: String) -> Self {
+        self.inner.ca_cert_dir = Some(path);
+        self
+    }
+
+    /// Set initial congestion window in packets.
+    ///
+    /// Starting point for congestion control. Default: 10 packets
+    pub fn initial_congestion_window_packets(mut self, packets: usize) -> Self {
+        self.inner.initial_congestion_window_packets = packets;
+        self
+    }
+
+    /// Enable HyStart++ slow start algorithm.
+    ///
+    /// Improves slow start performance. Default: true
+    pub fn enable_hystart(mut self, enabled: bool) -> Self {
+        self.inner.enable_hystart = enabled;
+        self
+    }
+
+    /// Set maximum pacing rate in bytes per second.
+    ///
+    /// Limits send rate even when congestion window allows more. None = unlimited
+    pub fn max_pacing_rate(mut self, rate_bps: Option<u64>) -> Self {
+        self.inner.max_pacing_rate = rate_bps;
+        self
+    }
+
+    /// Set maximum amplification factor (RFC 9000 §8.1).
+    ///
+    /// Anti-amplification attack protection. Min: 3, default: 3
+    pub fn max_amplification_factor(mut self, factor: usize) -> Self {
+        self.inner.max_amplification_factor = factor;
+        self
+    }
+
+    /// Enable PMTU discovery (RFC 9000 §14).
+    ///
+    /// Automatically discovers path MTU to optimize packet size.
+    pub fn discover_pmtu(mut self, enabled: bool) -> Self {
+        self.inner.discover_pmtu = enabled;
+        self
+    }
+
+    /// Enable GREASE (RFC 9000 §21).
+    ///
+    /// Sends random reserved values to test protocol extensibility. Default: true
+    pub fn grease(mut self, enabled: bool) -> Self {
+        self.inner.grease = enabled;
+        self
+    }
+
+    /// Disable DCID reuse across network paths.
+    ///
+    /// Each path gets unique destination connection ID.
+    pub fn disable_dcid_reuse(mut self, disabled: bool) -> Self {
+        self.inner.disable_dcid_reuse = disabled;
+        self
+    }
+
+    /// Set maximum DATAGRAM receive queue length.
+    ///
+    /// Number of received datagrams to buffer. Default: 1000
+    pub fn dgram_recv_max_queue_len(mut self, len: usize) -> Self {
+        self.inner.dgram_recv_max_queue_len = len;
+        self
+    }
+
+    /// Set maximum DATAGRAM send queue length.
+    ///
+    /// Number of outgoing datagrams to buffer. Default: 1000
+    pub fn dgram_send_max_queue_len(mut self, len: usize) -> Self {
+        self.inner.dgram_send_max_queue_len = len;
+        self
+    }
+
+    /// Enable connection statistics collection.
+    ///
+    /// When enabled, collects RTT, cwnd, packet loss, etc. Slight overhead.
+    /// Default: true
+    pub fn enable_stats(mut self, enabled: bool) -> Self {
+        self.inner.enable_stats = enabled;
+        self
+    }
+
+    /// Build the configuration, validating all parameters.
+    ///
+    /// Returns an error if any parameter is invalid (e.g., out of RFC-defined ranges).
+    pub fn build(self) -> Result<QuicTransportConfig, String> {
+        self.inner.validate()?;
+        Ok(self.inner)
     }
 }
 
@@ -539,5 +1007,60 @@ mod tests {
         let mut config = QuicAppConfig::default();
         config.connection_cleanup_timeout = Duration::from_secs(301);
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_ack_delay_exponent_defaults() {
+        let config = QuicTransportConfig::default();
+        assert_eq!(config.ack_delay_exponent, 3);
+    }
+
+    #[test]
+    fn test_active_connection_id_limit_defaults() {
+        let config = QuicTransportConfig::default();
+        assert_eq!(config.active_connection_id_limit, 2);
+    }
+
+    #[test]
+    fn test_stateless_reset_token_optional() {
+        let config = QuicTransportConfig::default();
+        assert!(config.stateless_reset_token.is_none());
+    }
+
+    #[test]
+    fn test_ca_cert_paths_optional() {
+        let config = QuicTransportConfig::default();
+        assert!(config.ca_cert_file.is_none());
+        assert!(config.ca_cert_dir.is_none());
+    }
+
+    #[test]
+    fn test_hystart_enabled_by_default() {
+        let config = QuicTransportConfig::default();
+        assert!(config.enable_hystart);
+    }
+
+    #[test]
+    fn test_pacing_enabled_by_default() {
+        let config = QuicTransportConfig::default();
+        assert!(config.enable_pacing);
+    }
+
+    #[test]
+    fn test_pmtu_discovery_disabled_by_default() {
+        let config = QuicTransportConfig::default();
+        assert!(!config.discover_pmtu);
+    }
+
+    #[test]
+    fn test_grease_enabled_by_default() {
+        let config = QuicTransportConfig::default();
+        assert!(config.grease);
+    }
+
+    #[test]
+    fn test_dcid_reuse_enabled_by_default() {
+        let config = QuicTransportConfig::default();
+        assert!(!config.disable_dcid_reuse);
     }
 }

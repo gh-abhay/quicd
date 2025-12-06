@@ -14,7 +14,7 @@ use opentelemetry::{
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     metrics::{PeriodicReader, SdkMeterProvider},
-    runtime, Resource,
+    Resource,
 };
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -523,17 +523,17 @@ pub async fn start_metrics_task(
         .with_endpoint(&config.otlp_endpoint)
         .build()?;
 
-    let reader = PeriodicReader::builder(exporter, runtime::Tokio)
+    let reader = PeriodicReader::builder(exporter)
         .with_interval(Duration::from_secs(config.export_interval_secs))
-        .with_timeout(Duration::from_secs(5)) // Timeout for export operations
+        .build();
+
+    let resource = Resource::builder()
+        .with_service_name(config.service_name.clone())
         .build();
 
     let provider = SdkMeterProvider::builder()
         .with_reader(reader)
-        .with_resource(Resource::new(vec![KeyValue::new(
-            "service.name",
-            config.service_name.clone(),
-        )]))
+        .with_resource(resource)
         .build();
 
     let meter = provider.meter("quicd");
@@ -614,8 +614,18 @@ pub async fn start_metrics_task(
 
         // Shutdown provider to flush final metrics to OTLP collector
         // Note: This may block if OTLP export is slow, but we have a timeout in MetricsHandle::shutdown
-        if let Err(e) = provider.shutdown() {
-            tracing::error!(error = ?e, "Failed to shutdown metrics provider");
+        // Failures are expected if OTLP collector is not available - just log as debug/warning
+        match provider.shutdown() {
+            Ok(_) => {
+                tracing::debug!("Metrics provider shutdown successfully");
+            }
+            Err(e) => {
+                // This is expected if OTLP collector is not running - don't spam errors
+                tracing::warn!(
+                    error = ?e, 
+                    "Failed to flush final metrics (OTLP collector may not be available)"
+                );
+            }
         }
 
         tracing::info!("Metrics task stopped");

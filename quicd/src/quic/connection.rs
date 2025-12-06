@@ -71,6 +71,9 @@ pub struct QuicConnection {
     pub source_cid_meta: ahash::AHashMap<Vec<u8>, SourceCidMeta>,
 
     // === RFC 9000 Compliance: Event Tracking ===
+    /// Track if HANDSHAKE_DONE event was already sent (RFC 9000 §3.2)
+    pub handshake_done_sent: bool,
+
     /// Track writable state per stream to detect changes (RFC 9000 §4)
     /// Maps stream_id -> is_currently_writable
     pub stream_writable_state: ahash::AHashMap<u64, bool>,
@@ -225,7 +228,7 @@ impl QuicConnection {
         // Initialize 0-RTT state before moving conn
         let initial_early_data = conn.is_in_early_data();
 
-        let mut connection = Self {
+        let connection = Self {
             conn,
             peer_addr,
             scid,
@@ -240,6 +243,7 @@ impl QuicConnection {
             stream_id_gen: StreamIdGenerator::default(),
 
             // RFC 9000 Compliance: Event tracking state
+            handshake_done_sent: false,
             stream_writable_state: ahash::AHashMap::new(),
             last_known_mtu: initial_mtu,
             stream_blocked_state: ahash::AHashMap::new(),

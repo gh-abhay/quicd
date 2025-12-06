@@ -1161,7 +1161,6 @@ impl NetIoHandle {
             let join_handle = std::thread::spawn(move || worker.join());
 
             // Poll the join with a timeout
-            let mut elapsed = std::time::Duration::ZERO;
             loop {
                 if join_handle.is_finished() {
                     match join_handle.join() {
@@ -1181,7 +1180,7 @@ impl NetIoHandle {
                     break;
                 }
 
-                elapsed = worker_start.elapsed();
+                let elapsed = worker_start.elapsed();
                 if elapsed >= per_worker_deadline {
                     warn!(
                         worker_id = i,

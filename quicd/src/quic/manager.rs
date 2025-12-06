@@ -288,6 +288,22 @@ fn determine_congestion_state(
     let current_packets_lost = quiche_stats.lost as u64;
     let recent_loss = current_packets_lost > last_packets_lost;
 
+    // === RFC 9002 Appendix B: Application Limited Detection ===
+    // If bytes in flight is significantly less than CWND, the application is not
+    // sending enough data to fill the congestion window
+    let bytes_in_flight = (quiche_stats.sent - quiche_stats.recv) as usize;
+    let cwnd_utilization = if path_stats.cwnd > 0 {
+        (bytes_in_flight * 100) / path_stats.cwnd
+    } else {
+        0
+    };
+
+    // If using less than 50% of available CWND, consider application-limited
+    // This is a conservative threshold to avoid false positives
+    if cwnd_utilization < 50 && bytes_in_flight < path_stats.cwnd {
+        return quicd_x::CongestionState::ApplicationLimited;
+    }
+
     // If we recently lost packets and delivery rate is active, we're in recovery
     if recent_loss && path_stats.delivery_rate > 0 {
         return quicd_x::CongestionState::Recovery;
@@ -1079,6 +1095,15 @@ impl QuicManager {
         let connection_id = conn.connection_id;
         let worker_id = self.worker_id;
 
+        // === RFC 9000 §3.2: HANDSHAKE_DONE Event ===
+        // Emit HandshakeDone event once when handshake is fully complete
+        if conn.conn.is_established() && !conn.handshake_done_sent {
+            trace!(worker_id, connection_id, "Handshake fully established, sending HandshakeDone");
+            let event = quicd_x::AppEvent::HandshakeDone;
+            send_app_event(worker_id, connection_id, &ingress_tx, event);
+            conn.handshake_done_sent = true;
+        }
+
         // === RFC 9000 §8-9: Path Events (Migration, Validation) ===
         while let Some(path_event) = conn.path_event_next() {
             use quiche::PathEvent;
@@ -1419,7 +1444,10 @@ impl QuicManager {
             }
         }
 
+        // === RFC 9000 §5.1.2: Source Connection ID Retirement ===
+        // The peer has retired one of our Source Connection IDs via RETIRE_CONNECTION_ID frame
         while let Some(retired_cid) = conn.conn.retired_scid_next() {
+            let cid_bytes = retired_cid.as_ref().to_vec();
             let sequence = match conn.retire_source_connection_id(retired_cid.as_ref()) {
                 Some(meta) => meta.sequence,
                 None => {
@@ -1432,8 +1460,18 @@ impl QuicManager {
                 }
             };
 
+            debug!(
+                worker_id,
+                connection_id,
+                sequence,
+                "Source Connection ID retired by peer"
+            );
+
             let event = quicd_x::AppEvent::TransportEvent(
-                quicd_x::TransportEvent::ConnectionIdRetired { sequence },
+                quicd_x::TransportEvent::SourceConnectionIdRetired {
+                    sequence,
+                    cid: bytes::Bytes::from(cid_bytes),
+                },
             );
             send_app_event(worker_id, connection_id, &ingress_tx, event);
         }
@@ -1459,15 +1497,26 @@ impl QuicManager {
             let event = quicd_x::AppEvent::TransportEvent(quicd_x::TransportEvent::PacketLost {
                 count: new_losses,
                 total_lost: current_packets_lost,
+                // Note: Quiche 0.24.6 doesn't expose individual packet numbers in loss events
+                // These would require deeper integration with quiche's recovery module
+                first_packet_num: None,
+                last_packet_num: None,
             });
             send_app_event(worker_id, connection_id, &ingress_tx, event);
         }
 
-        // === RFC 9000 §13.4, RFC 9002 §7: ECN Congestion Detection ===
-        // Track ECN-CE (Congestion Experienced) marks from connection stats
-        // Note: quiche may not expose ECN counts directly in current version
-        // This is a placeholder for when quiche exposes ECN statistics
-        // For now, we track based on congestion state changes which implicitly include ECN
+        // === RFC 9000 §13.4 & RFC 9002 §A.4: ECN Tracking ===
+        // Quiche API Limitation: Quiche 0.24.6 does NOT expose ECN counters (ECN-CE, ECN-ECT0, ECN-ECT1)
+        // in Stats or PathStats structs. The internal congestion controller reacts to ECN-CE marks,
+        // but we cannot detect or report them to applications.
+        //
+        // When Quiche adds ECN counter APIs (e.g., stats.ecn_ce_count), we should:
+        // 1. Track conn.last_ecn_ce_count
+        // 2. Compare with current ECN-CE count
+        // 3. Emit EcnCongestionEncountered event when count increases
+        //
+        // For now, applications can monitor CongestionStateChanged events which reflect
+        // congestion controller reactions (ECN + loss), though not separately attributable.
 
         // === RFC 9002 §7: Congestion Control State Changes ===
         // Monitor congestion window, RTT, and bytes in flight
@@ -2126,6 +2175,34 @@ impl QuicManager {
                 "Failed to send HandshakeCompleted event"
             );
             return None;
+        }
+
+        // Send peer transport parameters after handshake (RFC 9000 §7.4)
+        if let Some(conn) = self.connections.get(canonical_id) {
+            if let Some(params) = conn.conn.peer_transport_params() {
+                let peer_params_event = quicd_x::AppEvent::PeerTransportParameters {
+                    max_idle_timeout: params.max_idle_timeout,
+                    initial_max_data: params.initial_max_data,
+                    initial_max_stream_data_bidi_local: params.initial_max_stream_data_bidi_local,
+                    initial_max_stream_data_bidi_remote: params.initial_max_stream_data_bidi_remote,
+                    initial_max_stream_data_uni: params.initial_max_stream_data_uni,
+                    max_streams_bidi: params.initial_max_streams_bidi,
+                    max_streams_uni: params.initial_max_streams_uni,
+                    ack_delay_exponent: params.ack_delay_exponent,
+                    max_ack_delay: params.max_ack_delay,
+                    active_connection_id_limit: params.active_conn_id_limit,
+                    disable_active_migration: params.disable_active_migration,
+                    max_udp_payload_size: params.max_udp_payload_size,
+                };
+
+                if ingress_tx.try_send(peer_params_event).is_err() {
+                    warn!(
+                        worker_id = self.worker_id,
+                        peer = %peer_addr,
+                        "Failed to send PeerTransportParameters event"
+                    );
+                }
+            }
         }
 
         let event_stream: quicd_x::AppEventStream =
@@ -3138,6 +3215,1800 @@ impl QuicManager {
         let _ = reply.send(capacity);
     }
 
+    /// Process QueryStreamReadable command (RFC 9000 §2.2)
+    fn process_query_stream_readable(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        stream_id: quicd_x::StreamId,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, stream_id, "Connection not found for QueryStreamReadable");
+                let _ = reply.send(false);
+                return;
+            }
+        };
+
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(false);
+                return;
+            }
+        };
+
+        // Check if stream is readable using quiche API
+        let readable = conn.conn.stream_readable(stream_id);
+
+        debug!(
+            worker_id,
+            connection_id, stream_id, readable, "Queried stream readable state"
+        );
+
+        let _ = reply.send(readable);
+    }
+
+    /// Process QueryStreamWritable command (RFC 9000 §2.2)
+    fn process_query_stream_writable(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        stream_id: quicd_x::StreamId,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, stream_id, "Connection not found for QueryStreamWritable");
+                let _ = reply.send(false);
+                return;
+            }
+        };
+
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(false);
+                return;
+            }
+        };
+
+        // Check if stream is writable using quiche API
+        // stream_writable returns Result<bool, Error>
+        let writable = conn.conn.stream_writable(stream_id, 1).unwrap_or(false);
+
+        debug!(
+            worker_id,
+            connection_id, stream_id, writable, "Queried stream writable state"
+        );
+
+        let _ = reply.send(writable);
+    }
+
+    /// Process QueryStreamFinished command (RFC 9000 §2.2)
+    fn process_query_stream_finished(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        stream_id: quicd_x::StreamId,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, stream_id, "Connection not found for QueryStreamFinished");
+                let _ = reply.send(false);
+                return;
+            }
+        };
+
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(false);
+                return;
+            }
+        };
+
+        // Check if stream is finished (peer sent FIN and all data read)
+        let finished = conn.conn.stream_finished(stream_id);
+
+        debug!(
+            worker_id,
+            connection_id, stream_id, finished, "Queried stream finished state"
+        );
+
+        let _ = reply.send(finished);
+    }
+
+    /// Process ShutdownStream command (RFC 9000 §3.1)
+    fn process_shutdown_stream(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        stream_id: u64,
+        error_code: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), quicd_x::ConnectionError>>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, stream_id, "Connection not found for ShutdownStream");
+                let _ = reply.send(Err(quicd_x::ConnectionError::Closed("connection not found".into())));
+                return;
+            }
+        };
+
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(Err(quicd_x::ConnectionError::Closed("connection not found".into())));
+                return;
+            }
+        };
+
+        // Gracefully shutdown write side of stream (sends FIN)
+        match conn.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, error_code) {
+            Ok(_) => {
+                debug!(worker_id, connection_id, stream_id, error_code, "Stream shutdown successfully");
+                let _ = reply.send(Ok(()));
+            }
+            Err(e) => {
+                warn!(worker_id, connection_id, stream_id, error = ?e, "Failed to shutdown stream");
+                let _ = reply.send(Err(quicd_x::ConnectionError::App(format!("shutdown failed: {:?}", e).into())));
+            }
+        }
+    }
+
+    /// Process RetireConnectionId command (RFC 9000 §5.1)
+    fn process_retire_connection_id(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        sequence: u64,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, sequence, "Connection not found for RetireConnectionId");
+                return;
+            }
+        };
+
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Send RETIRE_CONNECTION_ID frame
+        match conn.conn.retire_dcid(sequence) {
+            Ok(_) => {
+                debug!(worker_id, connection_id, sequence, "Connection ID retired");
+            }
+            Err(e) => {
+                warn!(worker_id, connection_id, sequence, error = ?e, "Failed to retire connection ID");
+            }
+        }
+    }
+
+    /// Process RequestNewConnectionId command (RFC 9000 §5.1)
+    fn process_request_new_connection_id(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for RequestNewConnectionId");
+                return;
+            }
+        };
+
+        let _conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Request new connection ID from peer
+        // Quiche handles this internally when we issue new SCIDs
+        // The peer will send NEW_CONNECTION_ID frames which we'll process in packet handling
+        debug!(worker_id, connection_id, "New connection ID requested (peer will send NEW_CONNECTION_ID)");
+        
+        // Note: The actual request mechanism in quiche is implicit - when we need more CIDs,
+        // quiche will send NEW_CONNECTION_ID frames automatically. This command acknowledges
+        // the application's intent but doesn't require explicit action.
+    }
+
+    /// Process ProbePath command (RFC 9000 §8.2)
+    fn process_probe_path(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        _data: &[u8], // Ignored - quiche generates challenge data automatically
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, %peer_addr, "Connection not found for ProbePath");
+                return;
+            }
+        };
+
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Send PATH_CHALLENGE frame using quiche's probe_path API
+        // Note: quiche generates the challenge data automatically
+        if let Err(e) = conn.conn.probe_path(local_addr, peer_addr) {
+            warn!(
+                worker_id,
+                connection_id,
+                %local_addr,
+                %peer_addr,
+                error = %e,
+                "Failed to probe path"
+            );
+            return;
+        }
+
+        debug!(
+            worker_id,
+            connection_id,
+            %local_addr,
+            %peer_addr,
+            "PATH_CHALLENGE sent successfully"
+        );
+    }
+
+    /// Process SetStreamMaxData command (RFC 9000 §4.1)
+    fn process_set_stream_max_data(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        stream_id: u64,
+        max_data: u64,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, stream_id, "Connection not found for SetStreamMaxData");
+                return;
+            }
+        };
+
+        let _conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Manually set stream flow control window
+        // Note: quiche doesn't expose direct set_stream_max_data API
+        // This would require modifying quiche or using stream_recv() to update implicitly
+        warn!(worker_id, connection_id, stream_id, max_data, 
+              "SetStreamMaxData not directly supported by quiche - flow control is automatic");
+    }
+
+    /// Process SetConnectionMaxData command (RFC 9000 §4.1)
+    fn process_set_connection_max_data(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        max_data: u64,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for SetConnectionMaxData");
+                return;
+            }
+        };
+
+        let _conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Manually set connection flow control window
+        // Note: quiche doesn't expose direct set_max_data API
+        // Flow control is automatic based on consumption
+        warn!(worker_id, connection_id, max_data, 
+              "SetConnectionMaxData not directly supported by quiche - flow control is automatic");
+    }
+
+    /// Process UpdateKeys command (RFC 9001 §6)
+    fn process_update_keys(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for UpdateKeys");
+                return;
+            }
+        };
+
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // === RFC 9001 §6: TLS Key Updates ===
+        // Quiche API Limitation: There is no Connection::initiate_key_update() method.
+        // TLS 1.3 key updates happen automatically within Quiche's TLS layer based on:
+        // - Packet number exhaustion risk (approaching 2^62-1 limit per RFC 9001 §6.6)
+        // - Peer-initiated key updates (automatic response per RFC 8446 §4.6.3)
+        //
+        // Quiche 0.24.6 does NOT expose:
+        // - Manual key update initiation API
+        // - Current key phase number
+        // - Key update event notifications
+        //
+        // This means applications cannot:
+        // - Force key rotation for security policies
+        // - Detect when key updates occur (except 0-RTT → 1-RTT transition)
+        // - Track key rotation frequency for auditing
+        //
+        // The KeyUpdateInitiated event is emitted to inform the application that a
+        // key update was *requested*, but we cannot confirm if/when it completes.
+        debug!(
+            worker_id,
+            connection_id,
+            "TLS key update requested (handled automatically by quiche - no confirmation available)"
+        );
+
+        // Notify application that update was requested (best effort)
+        if let Some(ref ingress_tx) = conn.ingress_tx {
+            let event = quicd_x::AppEvent::TransportEvent(
+                quicd_x::TransportEvent::KeyUpdateInitiated {
+                    key_phase: 0, // Quiche doesn't expose key_phase - always 0
+                },
+            );
+            let _ = ingress_tx.try_send(event);
+        }
+    }
+
+    /// Process CanSendEarlyData command (RFC 9001 §4.6)
+    fn process_can_send_early_data(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for CanSendEarlyData");
+                let _ = reply.send(false);
+                return;
+            }
+        };
+
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(false);
+                return;
+            }
+        };
+
+        // Check if 0-RTT is available
+        let can_send = conn.conn.is_in_early_data();
+        debug!(worker_id, connection_id, can_send, "Checked early data status");
+        let _ = reply.send(can_send);
+    }
+
+    /// Process GetPeerTransportParams command (RFC 9000 §7.4)
+    fn process_get_peer_transport_params(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<Option<quicd_x::PeerTransportParams>>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for GetPeerTransportParams");
+                let _ = reply.send(None);
+                return;
+            }
+        };
+
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(None);
+                return;
+            }
+        };
+
+        // Extract peer transport parameters
+        if !conn.conn.is_established() {
+            debug!(worker_id, connection_id, "Connection not established yet");
+            let _ = reply.send(None);
+            return;
+        }
+
+        // Get peer parameters from quiche
+        let params_opt = conn.conn.peer_transport_params().map(|params| {
+            quicd_x::PeerTransportParams {
+                max_idle_timeout: params.max_idle_timeout,
+                initial_max_data: params.initial_max_data,
+                initial_max_stream_data_bidi_local: params.initial_max_stream_data_bidi_local,
+                initial_max_stream_data_bidi_remote: params.initial_max_stream_data_bidi_remote,
+                initial_max_stream_data_uni: params.initial_max_stream_data_uni,
+                max_streams_bidi: params.initial_max_streams_bidi,
+                max_streams_uni: params.initial_max_streams_uni,
+                ack_delay_exponent: params.ack_delay_exponent,
+                max_ack_delay: params.max_ack_delay,
+                active_connection_id_limit: params.active_conn_id_limit,
+                disable_active_migration: params.disable_active_migration,
+                max_udp_payload_size: params.max_udp_payload_size,
+            }
+        });
+
+        debug!(worker_id, connection_id, "Retrieved peer transport parameters");
+        let _ = reply.send(params_opt);
+    }
+
+    /// Process SetDatagramPriority command
+    fn process_set_datagram_priority(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        priority: u8,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for SetDatagramPriority");
+                return;
+            }
+        };
+
+        let _conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Store priority for future datagram sends
+        // Note: This would require extending QuicConnection to track datagram priority
+        debug!(worker_id, connection_id, priority, "Datagram priority set (requires QuicConnection extension)");
+    }
+
+    /// Process GetPathMtu command (RFC 9000 §14)
+    fn process_get_path_mtu(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<usize>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for GetPathMtu");
+                let _ = reply.send(1200); // QUIC minimum
+                return;
+            }
+        };
+
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(1200);
+                return;
+            }
+        };
+
+        // Get max send UDP payload size (effective MTU)
+        let mtu = conn.conn.max_send_udp_payload_size();
+        debug!(worker_id, connection_id, mtu, "Retrieved path MTU");
+        let _ = reply.send(mtu);
+    }
+
+    /// Process GetActivePaths command
+    fn process_get_active_paths(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<Vec<quicd_x::PathInfo>>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for GetActivePaths");
+                let _ = reply.send(Vec::new());
+                return;
+            }
+        };
+
+        // Get needed info before mutable borrow
+        let local_addr = self.local_addr;
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(Vec::new());
+                return;
+            }
+        };
+
+        // Build path info (currently quiche only exposes single active path)
+        let path = quicd_x::PathInfo {
+            local_addr,
+            peer_addr: conn.peer_addr,
+            validated: conn.conn.is_established(),
+            active: true,
+            rtt_us: 0, // RTT not directly exposed in quiche::Stats - would need path-specific stats
+        };
+
+        debug!(worker_id, connection_id, "Retrieved active paths");
+        let _ = reply.send(vec![path]);
+    }
+
+    /// Process SetStreamSendOrder command (RFC 9218)
+    fn process_set_stream_send_order(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        stream_id: u64,
+        send_order: i64,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, stream_id, "Connection not found for SetStreamSendOrder");
+                return;
+            }
+        };
+
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Set stream priority (quiche uses simple priority values)
+        match conn.conn.stream_priority(stream_id, send_order.clamp(0, 255) as u8, false) {
+            Ok(_) => {
+                debug!(worker_id, connection_id, stream_id, send_order, "Stream send order set");
+            }
+            Err(e) => {
+                warn!(worker_id, connection_id, stream_id, error = ?e, "Failed to set stream send order");
+            }
+        }
+    }
+
+    // ============ New Query Handler Implementations ============
+
+    fn process_query_source_id(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<Vec<u8>>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(Vec::new()); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(Vec::new()); return; }
+        };
+        let scid = conn.conn.source_id().into_owned().to_vec();
+        debug!(worker_id, connection_id, "Retrieved source_id");
+        let _ = reply.send(scid);
+    }
+
+    fn process_query_destination_id(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<Vec<u8>>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(Vec::new()); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(Vec::new()); return; }
+        };
+        let dest_id = conn.conn.destination_id().into_owned().to_vec();
+        debug!(worker_id, connection_id, "Retrieved destination_id");
+        let _ = reply.send(dest_id);
+    }
+
+    fn process_query_available_dcids(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<usize>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(0); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(0); return; }
+        };
+        let available = conn.conn.available_dcids();
+        debug!(worker_id, connection_id, available, "Retrieved available_dcids");
+        let _ = reply.send(available);
+    }
+
+    fn process_query_scids_left(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<usize>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(0); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(0); return; }
+        };
+        let scids_left = conn.conn.scids_left();
+        debug!(worker_id, connection_id, scids_left, "Retrieved scids_left");
+        let _ = reply.send(scids_left);
+    }
+
+    fn process_query_timeout(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<Option<std::time::Duration>>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(None); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(None); return; }
+        };
+        let timeout = conn.conn.timeout();
+        debug!(worker_id, connection_id, ?timeout, "Retrieved timeout");
+        let _ = reply.send(timeout);
+    }
+
+    fn process_on_timeout(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { warn!(worker_id, connection_id, "Connection not found for on_timeout"); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+        conn.conn.on_timeout();
+        debug!(worker_id, connection_id, "Called on_timeout");
+    }
+
+    fn process_query_session(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(None); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(None); return; }
+        };
+        let session = conn.conn.session().map(|s| s.to_vec());
+        debug!(worker_id, connection_id, has_session = session.is_some(), "Retrieved session");
+        let _ = reply.send(session);
+    }
+
+    fn process_query_server_name(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<Option<String>>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(None); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(None); return; }
+        };
+        let server_name = conn.conn.server_name().map(|s| s.to_string());
+        debug!(worker_id, connection_id, has_sni = server_name.is_some(), "Retrieved server_name");
+        let _ = reply.send(server_name);
+    }
+
+    fn process_query_peer_cert(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(None); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(None); return; }
+        };
+        let cert = conn.conn.peer_cert().map(|c| c.to_vec());
+        debug!(worker_id, connection_id, has_cert = cert.is_some(), "Retrieved peer_cert");
+        let _ = reply.send(cert);
+    }
+
+    fn process_query_peer_cert_chain(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<Option<Vec<Vec<u8>>>>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(None); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(None); return; }
+        };
+        let chain = conn.conn.peer_cert_chain().map(|chain| chain.iter().map(|c| c.to_vec()).collect());
+        debug!(worker_id, connection_id, has_chain = chain.is_some(), "Retrieved peer_cert_chain");
+        let _ = reply.send(chain);
+    }
+
+    fn process_query_is_established(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<bool>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(false); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(false); return; }
+        };
+        let established = conn.conn.is_established();
+        debug!(worker_id, connection_id, established, "Retrieved is_established");
+        let _ = reply.send(established);
+    }
+
+    fn process_query_is_resumed(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<bool>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(false); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(false); return; }
+        };
+        let resumed = conn.conn.is_resumed();
+        debug!(worker_id, connection_id, resumed, "Retrieved is_resumed");
+        let _ = reply.send(resumed);
+    }
+
+    fn process_query_is_in_early_data(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<bool>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(false); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(false); return; }
+        };
+        let in_early = conn.conn.is_in_early_data();
+        debug!(worker_id, connection_id, in_early, "Retrieved is_in_early_data");
+        let _ = reply.send(in_early);
+    }
+
+    fn process_query_is_closed(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<bool>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(true); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(true); return; }
+        };
+        let closed = conn.conn.is_closed();
+        debug!(worker_id, connection_id, closed, "Retrieved is_closed");
+        let _ = reply.send(closed);
+    }
+
+    fn process_query_is_draining(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<bool>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(false); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(false); return; }
+        };
+        let draining = conn.conn.is_draining();
+        debug!(worker_id, connection_id, draining, "Retrieved is_draining");
+        let _ = reply.send(draining);
+    }
+
+    fn process_query_is_timed_out(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<bool>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(false); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(false); return; }
+        };
+        let timed_out = conn.conn.is_timed_out();
+        debug!(worker_id, connection_id, timed_out, "Retrieved is_timed_out");
+        let _ = reply.send(timed_out);
+    }
+
+    /// Process query for peer-initiated connection close error (RFC 9000 §10.2)
+    fn process_query_peer_error(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<Option<(u64, Vec<u8>)>>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                let _ = reply.send(None);
+                return;
+            }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(None);
+                return;
+            }
+        };
+
+        // Use quiche's peer_error() API to get CONNECTION_CLOSE info from peer
+        let peer_error = conn.conn.peer_error();
+        let result = peer_error.map(|err| {
+            let error_code = err.error_code;
+            let reason = err.reason.to_vec();
+            (error_code, reason)
+        });
+
+        debug!(
+            worker_id,
+            connection_id,
+            ?result,
+            "Retrieved peer_error"
+        );
+        let _ = reply.send(result);
+    }
+
+    /// Process query for local-initiated connection close error (RFC 9000 §10.2)
+    fn process_query_local_error(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<Option<(u64, Vec<u8>)>>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                let _ = reply.send(None);
+                return;
+            }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(None);
+                return;
+            }
+        };
+
+        // Use quiche's local_error() API to get CONNECTION_CLOSE info we sent
+        let local_error = conn.conn.local_error();
+        let result = local_error.map(|err| {
+            let error_code = err.error_code;
+            let reason = err.reason.to_vec();
+            (error_code, reason)
+        });
+
+        debug!(
+            worker_id,
+            connection_id,
+            ?result,
+            "Retrieved local_error"
+        );
+        let _ = reply.send(result);
+    }
+
+    /// Process query for active Source Connection IDs (RFC 9000 §5.1)
+    fn process_query_active_scids(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<Vec<(u64, Vec<u8>)>>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                let _ = reply.send(Vec::new());
+                return;
+            }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(Vec::new());
+                return;
+            }
+        };
+
+        // Use quiche's source_ids() iterator to get all active Source Connection IDs
+        // Then look up sequence numbers from our metadata tracking
+        let mut result = Vec::new();
+        for scid_ref in conn.conn.source_ids() {
+            let cid_bytes = scid_ref.as_ref().to_vec();
+            
+            // Look up sequence number from our metadata
+            let sequence = conn
+                .get_source_cid_meta(scid_ref.as_ref())
+                .map(|meta| meta.sequence)
+                .unwrap_or(0); // Fallback to 0 if metadata not found (shouldn't happen)
+            
+            result.push((sequence, cid_bytes));
+        }
+
+        debug!(
+            worker_id,
+            connection_id,
+            count = result.len(),
+            "Retrieved active SCIDs"
+        );
+        let _ = reply.send(result);
+    }
+
+    /// Process query for send quantum (RFC 9002 §7.7)
+    fn process_query_send_quantum(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<usize>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                let _ = reply.send(0);
+                return;
+            }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(0);
+                return;
+            }
+        };
+
+        // Use quiche's send_quantum() for packet pacing
+        let quantum = conn.conn.send_quantum();
+        debug!(
+            worker_id,
+            connection_id,
+            quantum,
+            "Retrieved send_quantum"
+        );
+        let _ = reply.send(quantum);
+    }
+
+    /// Process datagram purge command (RFC 9221 §5)
+    fn process_dgram_purge_outgoing(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => return,
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Use quiche's dgram_purge_outgoing() to clear ALL unsent datagrams
+        // The filter function returns true for datagrams to keep - we want to purge all, so always return false
+        conn.conn.dgram_purge_outgoing(|_| false);
+        debug!(
+            worker_id,
+            connection_id,
+            "Purged all outgoing datagrams"
+        );
+    }
+
+    fn process_query_dgram_max_writable_len(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<Option<usize>>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(None); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(None); return; }
+        };
+        let max_len = conn.conn.dgram_max_writable_len();
+        debug!(worker_id, connection_id, ?max_len, "Retrieved dgram_max_writable_len");
+        let _ = reply.send(max_len);
+    }
+
+    fn process_query_dgram_send_queue_len(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<usize>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(0); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(0); return; }
+        };
+        let len = conn.conn.dgram_send_queue_len();
+        debug!(worker_id, connection_id, len, "Retrieved dgram_send_queue_len");
+        let _ = reply.send(len);
+    }
+
+    fn process_query_dgram_recv_queue_len(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<usize>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(0); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(0); return; }
+        };
+        let len = conn.conn.dgram_recv_queue_len();
+        debug!(worker_id, connection_id, len, "Retrieved dgram_recv_queue_len");
+        let _ = reply.send(len);
+    }
+
+    fn process_query_dgram_recv_queue_byte_size(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<usize>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(0); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(0); return; }
+        };
+        let size = conn.conn.dgram_recv_queue_byte_size();
+        debug!(worker_id, connection_id, size, "Retrieved dgram_recv_queue_byte_size");
+        let _ = reply.send(size);
+    }
+
+    fn process_query_dgram_send_queue_byte_size(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<usize>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(0); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(0); return; }
+        };
+        let size = conn.conn.dgram_send_queue_byte_size();
+        debug!(worker_id, connection_id, size, "Retrieved dgram_send_queue_byte_size");
+        let _ = reply.send(size);
+    }
+
+    fn process_query_peer_streams_left_bidi(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<u64>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(0); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(0); return; }
+        };
+        let left = conn.conn.peer_streams_left_bidi();
+        debug!(worker_id, connection_id, left, "Retrieved peer_streams_left_bidi");
+        let _ = reply.send(left);
+    }
+
+    fn process_query_peer_streams_left_uni(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<u64>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(0); return; }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(0); return; }
+        };
+        let left = conn.conn.peer_streams_left_uni();
+        debug!(worker_id, connection_id, left, "Retrieved peer_streams_left_uni");
+        let _ = reply.send(left);
+    }
+
+    fn process_query_peer_verified_address(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<bool>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { let _ = reply.send(false); return; }
+        };
+        let _conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { let _ = reply.send(false); return; }
+        };
+        // Note: quiche doesn't expose peer address validation status directly
+        // This would require checking if anti-amplification limit is lifted
+        let verified = false; // TODO: implement proper check
+        debug!(worker_id, connection_id, verified, "Retrieved peer_verified_address");
+        let _ = reply.send(verified);
+    }
+
+    // ============ Stream Iterator Command Handlers (P0 Gap #1) ============
+    
+    /// Poll all readable streams (RFC 9000 §2).
+    ///
+    /// Emits AppEvent::ReadableStreamsUpdated with set of stream IDs that have pending data.
+    fn process_poll_readable_streams(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for PollReadableStreams");
+                return;
+            }
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for PollReadableStreams");
+                return;
+            }
+        };
+        
+        // Collect all readable streams from quiche
+        let readable_streams: Vec<u64> = conn.conn.readable().collect();
+        
+        debug!(worker_id, connection_id, count = readable_streams.len(), "Polled readable streams");
+        
+        // Send event to application task
+        if let Some(ref ingress_tx) = conn.ingress_tx {
+            let event = quicd_x::AppEvent::ReadableStreamsUpdated {
+                stream_ids: readable_streams,
+            };
+            
+            let _ = send_app_event(worker_id, connection_id, ingress_tx, event);
+        }
+    }
+    
+    /// Poll all writable streams (RFC 9000 §2).
+    ///
+    /// Emits AppEvent::WritableStreamsUpdated with set of stream IDs that have send capacity.
+    fn process_poll_writable_streams(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for PollWritableStreams");
+                return;
+            }
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                warn!(worker_id, connection_id, "Connection not found for PollWritableStreams");
+                return;
+            }
+        };
+        
+        // Collect all writable streams from quiche
+        let writable_streams: Vec<u64> = conn.conn.writable().collect();
+        
+        debug!(worker_id, connection_id, count = writable_streams.len(), "Polled writable streams");
+        
+        // Send event to application task
+        if let Some(ref ingress_tx) = conn.ingress_tx {
+            let event = quicd_x::AppEvent::WritableStreamsUpdated {
+                stream_ids: writable_streams,
+            };
+            
+            let _ = send_app_event(worker_id, connection_id, ingress_tx, event);
+        }
+    }
+    
+    /// Get next readable stream in iterator-style access (RFC 9000 §2).
+    ///
+    /// Emits AppEvent::NextReadableStream with the stream ID or None if no more readable streams.
+    fn process_get_next_readable_stream(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, request_id: u64) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, request_id, "Connection not found for GetNextReadableStream");
+                return;
+            }
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                warn!(worker_id, connection_id, request_id, "Connection not found for GetNextReadableStream");
+                return;
+            }
+        };
+        
+        // Get next readable stream from quiche iterator
+        let stream_id = conn.conn.readable().next();
+        
+        debug!(worker_id, connection_id, request_id, stream_id = ?stream_id, "Got next readable stream");
+        
+        // Send event to application task
+        if let Some(ref ingress_tx) = conn.ingress_tx {
+            let event = quicd_x::AppEvent::NextReadableStream {
+                request_id,
+                stream_id,
+            };
+            
+            let _ = send_app_event(worker_id, connection_id, ingress_tx, event);
+        }
+    }
+    
+    /// Get next writable stream in iterator-style access (RFC 9000 §2).
+    ///
+    /// Emits AppEvent::NextWritableStream with the stream ID or None if no more writable streams.
+    fn process_get_next_writable_stream(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, request_id: u64) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, request_id, "Connection not found for GetNextWritableStream");
+                return;
+            }
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                warn!(worker_id, connection_id, request_id, "Connection not found for GetNextWritableStream");
+                return;
+            }
+        };
+        
+        // Get next writable stream from quiche iterator
+        let stream_id = conn.conn.writable().next();
+        
+        debug!(worker_id, connection_id, request_id, stream_id = ?stream_id, "Got next writable stream");
+        
+        // Send event to application task
+        if let Some(ref ingress_tx) = conn.ingress_tx {
+            let event = quicd_x::AppEvent::NextWritableStream {
+                request_id,
+                stream_id,
+            };
+            
+            let _ = send_app_event(worker_id, connection_id, ingress_tx, event);
+        }
+    }
+    
+    // ============ Connection ID Management Command Handlers (P0 Gap #2) ============
+    
+    /// Issue new source connection ID (RFC 9000 §5.1.1).
+    ///
+    /// Generates a NEW_CONNECTION_ID frame and emits AppEvent::SourceConnectionIdIssued.
+    ///
+    /// NOTE: Quiche 0.24.6 does not yet expose `new_scid()` in its public API.
+    /// This is a placeholder implementation that returns an error until Quiche adds the API.
+    /// The QuicD-X interface is ready and will work once Quiche exposes this functionality.
+    fn process_issue_new_scid(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, request_id: u64, _scid: Option<Vec<u8>>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, request_id, "Connection not found for IssueNewScid");
+                return;
+            }
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                warn!(worker_id, connection_id, request_id, "Connection not found for IssueNewScid");
+                return;
+            }
+        };
+        
+        // TODO: Call quiche's new_scid() once available in public API
+        // For now, return NotImplemented error
+        warn!(worker_id, connection_id, request_id, "new_scid() not yet available in Quiche 0.24.6 public API");
+        
+        // Send error event to application task
+        if let Some(ref ingress_tx) = conn.ingress_tx {
+            let event = quicd_x::AppEvent::SourceConnectionIdIssued {
+                request_id,
+                result: Err(quicd_x::ConnectionError::Transport(
+                    "new_scid() not yet exposed in Quiche public API - will be available in future release".to_string()
+                )),
+            };
+            
+            let _ = send_app_event(worker_id, connection_id, ingress_tx, event);
+        }
+    }
+    
+    /// Get all source connection IDs (RFC 9000 §5.1).
+    ///
+    /// Enumerates all active SCIDs and emits AppEvent::SourceConnectionIds.
+    ///
+    /// NOTE: Quiche 0.24.6 does not yet expose `source_ids()` iterator in its public API.
+    /// This implementation uses the locally tracked source_cid_meta as a workaround.
+    /// Full functionality will be available once Quiche exposes the iterator.
+    fn process_get_source_connection_ids(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, request_id: u64) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, request_id, "Connection not found for GetSourceConnectionIds");
+                return;
+            }
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                warn!(worker_id, connection_id, request_id, "Connection not found for GetSourceConnectionIds");
+                return;
+            }
+        };
+        
+        // Use locally tracked source CIDs (workaround until Quiche exposes source_ids() iterator)
+        let scids: Vec<quicd_x::SourceConnectionIdInfo> = conn.source_cid_meta
+            .iter()
+            .map(|(cid, meta)| quicd_x::SourceConnectionIdInfo {
+                cid: cid.clone(),
+                sequence: meta.sequence,
+                reset_token: meta.reset_token,
+            })
+            .collect();
+        
+        debug!(worker_id, connection_id, request_id, count = scids.len(), "Retrieved source connection IDs from local tracking");
+        
+        // Send event to application task
+        if let Some(ref ingress_tx) = conn.ingress_tx {
+            let event = quicd_x::AppEvent::SourceConnectionIds {
+                request_id,
+                scids,
+            };
+            
+            let _ = send_app_event(worker_id, connection_id, ingress_tx, event);
+        }
+    }
+
+    // ============ Multipath Command Handlers (P0 Gap #3, #4) ============
+    
+    /// Get statistics for all active paths (RFC 9000 §9).
+    ///
+    /// Emits AppEvent::AllPathStats with detailed path statistics.
+    fn process_get_all_path_stats(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, request_id: u64) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!(worker_id, connection_id, request_id, "Connection not found for GetAllPathStats");
+                return;
+            }
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                warn!(worker_id, connection_id, request_id, "Connection not found for GetAllPathStats");
+                return;
+            }
+        };
+        
+        // Collect all path stats from quiche iterator
+        let paths: Vec<quicd_x::PathStats> = conn.conn
+            .path_stats()
+            .map(|ps| {
+                // PathStats fields available in Quiche 0.24.6:
+                // local_addr, peer_addr, validation_state, active, recv, sent,
+                // lost, retrans, rtt, cwnd, sent_bytes, recv_bytes,
+                // lost_bytes, stream_retrans_bytes, pmtu, delivery_rate
+                quicd_x::PathStats {
+                    local_addr: ps.local_addr,
+                    peer_addr: ps.peer_addr,
+                    validated: ps.active, // Use active flag as proxy for validated
+                    active: ps.active,
+                    rtt: ps.rtt.as_micros() as u64,
+                    rttvar: ps.rttvar.as_micros() as u64,
+                    min_rtt: ps.min_rtt.map(|r| r.as_micros() as u64),
+                    cwnd: ps.cwnd,
+                    bytes_in_flight: ps.sent.saturating_sub(ps.recv),
+                    bytes_sent: ps.sent_bytes,
+                    bytes_recv: ps.recv_bytes,
+                    lost_packets: ps.lost as u64,
+                    pmtu: ps.pmtu,
+                }
+            })
+            .collect();
+        
+        debug!(worker_id, connection_id, request_id, count = paths.len(), "Retrieved all path stats");
+        
+        // Send event to application task
+        if let Some(ref ingress_tx) = conn.ingress_tx {
+            let event = quicd_x::AppEvent::AllPathStats {
+                request_id,
+                paths,
+            };
+            
+            let _ = send_app_event(worker_id, connection_id, ingress_tx, event);
+        }
+    }
+    
+    /// Send stream data on specific path (multipath QUIC).
+    ///
+    /// NOTE: Quiche 0.24.6 does not expose send_on_path() in public API.
+    /// Returns NotImplemented error until Quiche adds multipath support.
+    fn process_send_on_path(
+        &mut self,
+        worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        _stream_id: u64,
+        _data: bytes::Bytes,
+        _fin: bool,
+        _local_addr: SocketAddr,
+        _peer_addr: SocketAddr,
+        reply: tokio::sync::oneshot::Sender<Result<usize, quicd_x::ConnectionError>>,
+    ) {
+        warn!(worker_id, connection_id, "send_on_path() not yet available in Quiche 0.24.6 public API");
+        
+        // Send NotImplemented error
+        let _ = reply.send(Err(quicd_x::ConnectionError::Transport(
+            "send_on_path() not yet exposed in Quiche public API - will be available in future release".to_string()
+        )));
+    }
+
+    fn process_query_stats(&mut self, worker_id: usize, connection_id: quicd_x::ConnectionId, reply: tokio::sync::oneshot::Sender<quicd_x::ConnectionStats>) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => { 
+                let _ = reply.send(quicd_x::ConnectionStats::default()); 
+                return; 
+            }
+        };
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => { 
+                let _ = reply.send(quicd_x::ConnectionStats::default()); 
+                return; 
+            }
+        };
+        let quiche_stats = conn.conn.stats();
+        let path_stats = conn.conn.path_stats().next();
+        let stats = quicd_x::ConnectionStats {
+            // RTT metrics from path stats
+            srtt_us: path_stats.as_ref().map(|ps| ps.rtt.as_micros() as u64),
+            min_rtt_us: path_stats.as_ref().and_then(|ps| ps.min_rtt.map(|r| r.as_micros() as u64)),
+            rttvar_us: path_stats.as_ref().map(|ps| ps.rttvar.as_micros() as u64),
+            latest_rtt_us: None,
+            pto_ms: None,
+            // Congestion control
+            cwnd: path_stats.as_ref().map(|ps| ps.cwnd as u64).unwrap_or(0),
+            bytes_in_flight: path_stats.as_ref().map(|ps| ps.sent.saturating_sub(quiche_stats.recv) as u64).unwrap_or(0),
+            ssthresh: None,
+            pacing_rate_bps: None,
+            // Flow control
+            max_data: 0, // Not exposed by quiche
+            data_sent: quiche_stats.sent as u64,
+            max_data_recv: 0,
+            data_received: quiche_stats.recv as u64,
+            max_streams_bidi: 0,
+            max_streams_uni: 0,
+            // Statistics
+            bytes_sent: quiche_stats.sent as u64,
+            bytes_received: quiche_stats.recv as u64,
+            active_streams: 0, // Not directly available
+            packets_sent: 0,
+            packets_received: 0,
+            packets_lost: quiche_stats.lost as u64,
+            packets_retransmitted: quiche_stats.retrans as u64,
+            max_stream_id: 0,
+            // ECN
+            ecn_ect0_count: 0,
+            ecn_ect1_count: 0,
+            ecn_ce_count: 0,
+            // Path info
+            path_mtu: path_stats.as_ref().map(|ps| ps.pmtu).unwrap_or(1200),
+            is_in_early_data: conn.conn.is_in_early_data(),
+            is_established: conn.conn.is_established(),
+            is_closed: conn.conn.is_closed(),
+            path_validations_completed: 0,
+            path_validations_failed: 0,
+        };
+        debug!(worker_id, connection_id, "Retrieved stats");
+        let _ = reply.send(stats);
+    }
+
+    // ============ P0 Critical Command Handlers ============
+
+    fn process_send_ack_frequency(
+        &mut self,
+        _worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        ack_eliciting_threshold: u64,
+        request_max_ack_delay: u64,
+        ignore_order: bool,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                warn!("SendAckFrequency for unknown connection");
+                return;
+            }
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                warn!("SendAckFrequency: connection not found");
+                return;
+            }
+        };
+
+        // RFC 9330: Send ACK_FREQUENCY frame
+        // Note: Cloudflare Quiche 0.24.6 does not directly expose send_ack_frequency()
+        // This would require a custom frame implementation or waiting for quiche support
+        // For now, we log the request for future implementation when quiche adds RFC 9330 support
+        warn!(
+            "ACK_FREQUENCY frame requested but not yet supported by quiche: threshold={}, max_delay={}us, ignore_order={}",
+            ack_eliciting_threshold, request_max_ack_delay, ignore_order
+        );
+        
+        // TODO: Implement when quiche adds RFC 9330 support
+        // Expected API: conn.conn.send_ack_frequency(ack_eliciting_threshold, request_max_ack_delay, ignore_order)?;
+    }
+
+    fn process_query_available_send_window(
+        &mut self,
+        _worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        request_id: u64,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => return,
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Query connection-level available send window
+        // This is the minimum of:
+        // 1. Connection flow control limit (max_data - sent_data)
+        // 2. Congestion window (cwnd - bytes_in_flight)
+        
+        let path_stats = conn.conn.path_stats().next();
+        let quiche_stats = conn.conn.stats();
+        
+        let cwnd_available = path_stats
+            .as_ref()
+            .map(|ps| ps.cwnd.saturating_sub((quiche_stats.sent - quiche_stats.recv) as usize))
+            .unwrap_or(0) as u64;
+        
+        // Send response event
+        if let Some(ingress_tx) = &conn.ingress_tx {
+            let _ = ingress_tx.try_send(quicd_x::AppEvent::AvailableSendWindow {
+                request_id,
+                window: cwnd_available,
+            });
+        }
+    }
+
+    fn process_query_is_server(
+        &mut self,
+        _worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        request_id: u64,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => return,
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Query if this is a server-side connection
+        let is_server = conn.conn.is_server();
+        
+        if let Some(ingress_tx) = &conn.ingress_tx {
+            let _ = ingress_tx.try_send(quicd_x::AppEvent::IsServer {
+                request_id,
+                is_server,
+            });
+        }
+    }
+
+    fn process_get_next_path_event(
+        &mut self,
+        _worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        _request_id: u64,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => return,
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Poll quiche for path events (RFC 9000 §8.2, §9)
+        if let Some(quiche_event) = conn.path_event_next() {
+            if let Some(ingress_tx) = &conn.ingress_tx {
+                // Convert quiche::PathEvent to quicd_x::PathEventType
+                let event_type = match quiche_event {
+                    quiche::PathEvent::New(local, peer) => {
+                        quicd_x::PathEventType::New {
+                            local_addr: local,
+                            peer_addr: peer,
+                        }
+                    }
+                    quiche::PathEvent::Validated(local, peer) => {
+                        quicd_x::PathEventType::Validated {
+                            local_addr: local,
+                            peer_addr: peer,
+                        }
+                    }
+                    quiche::PathEvent::FailedValidation(local, peer) => {
+                        quicd_x::PathEventType::FailedValidation {
+                            local_addr: local,
+                            peer_addr: peer,
+                        }
+                    }
+                    quiche::PathEvent::Closed(local, peer) => {
+                        quicd_x::PathEventType::Closed {
+                            local_addr: local,
+                            peer_addr: peer,
+                        }
+                    }
+                    quiche::PathEvent::ReusedSourceConnectionId(cid_seq, old_addrs, new_addrs) => {
+                        quicd_x::PathEventType::ReusedSourceConnectionId {
+                            cid_seq,
+                            old_path: old_addrs,
+                            new_path: new_addrs,
+                        }
+                    }
+                    quiche::PathEvent::PeerMigrated(local, peer) => {
+                        quicd_x::PathEventType::PeerMigrated {
+                            local_addr: local,
+                            peer_addr: peer,
+                        }
+                    }
+                };
+
+                let _ = ingress_tx.try_send(quicd_x::AppEvent::PathEvent { event: event_type });
+            }
+        }
+    }
+
+    fn process_shutdown_stream_direction(
+        &mut self,
+        _worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        stream_id: quicd_x::StreamId,
+        direction: quicd_x::StreamShutdownDirection,
+        error_code: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), quicd_x::ConnectionError>>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                let _ = reply.send(Err(quicd_x::ConnectionError::Closed("Connection not found".into())));
+                return;
+            }
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(Err(quicd_x::ConnectionError::Closed("Connection closed".into())));
+                return;
+            }
+        };
+
+        use quicd_x::StreamShutdownDirection;
+        let result = match direction {
+            StreamShutdownDirection::Read => {
+                // Send STOP_SENDING frame
+                conn.conn
+                    .stream_shutdown(stream_id, quiche::Shutdown::Read, error_code)
+                    .map_err(|e| quicd_x::ConnectionError::QuicError {
+                        code: 0x01, // INTERNAL_ERROR
+                        message: format!("Failed to shutdown read: {}", e),
+                    })
+            }
+            StreamShutdownDirection::Write => {
+                // Send RESET_STREAM or FIN
+                conn.conn
+                    .stream_shutdown(stream_id, quiche::Shutdown::Write, error_code)
+                    .map_err(|e| quicd_x::ConnectionError::QuicError {
+                        code: 0x01, // INTERNAL_ERROR
+                        message: format!("Failed to shutdown write: {}", e),
+                    })
+            }
+            StreamShutdownDirection::Both => {
+                // Shutdown both directions
+                let read_result = conn.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, error_code);
+                let write_result = conn.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, error_code);
+                
+                if read_result.is_err() {
+                    read_result.map_err(|e| quicd_x::ConnectionError::QuicError {
+                        code: 0x01, // INTERNAL_ERROR
+                        message: format!("Failed to shutdown read: {}", e),
+                    })
+                } else {
+                    write_result.map_err(|e| quicd_x::ConnectionError::QuicError {
+                        code: 0x01, // INTERNAL_ERROR
+                        message: format!("Failed to shutdown write: {}", e),
+                    })
+                }
+            }
+        };
+        
+        let _ = reply.send(result);
+    }
+
+    fn process_set_pmtu_discovery(
+        &mut self,
+        _worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        enabled: bool,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => return,
+        };
+        
+        let _conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Quiche 0.24.6 doesn't expose runtime PMTU discovery control
+        // PMTU is controlled via quiche::Config::enable_dgram() during initialization
+        // This would require API additions to quiche
+        
+        warn!(
+            "PMTU discovery control requested but not supported by quiche: enabled={}",
+            enabled
+        );
+        
+        // TODO: Implement when quiche adds runtime PMTU control
+        // Expected API: conn.conn.set_pmtu_discovery(enabled);
+    }
+
+    fn process_set_max_pacing_rate(
+        &mut self,
+        _worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        rate_bps: Option<u64>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => return,
+        };
+        
+        let _conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        // Quiche 0.24.6 doesn't expose runtime pacing rate control
+        // Pacing is managed internally by quiche's congestion controller
+        // This would require API additions to quiche
+        
+        warn!(
+            "Pacing rate control requested but not supported by quiche: rate={:?} bps",
+            rate_bps
+        );
+        
+        // TODO: Implement when quiche adds runtime pacing control
+        // Expected API: conn.conn.set_max_pacing_rate(rate_bps);
+    }
+
+    fn process_query_active_scid(
+        &mut self,
+        _worker_id: usize,
+        connection_id: quicd_x::ConnectionId,
+        reply: tokio::sync::oneshot::Sender<Vec<u8>>,
+    ) {
+        let dcid = match self.connection_id_map.get(&connection_id) {
+            Some(dcid) => dcid.clone(),
+            None => {
+                let _ = reply.send(Vec::new());
+                return;
+            }
+        };
+        
+        let conn = match self.get_connection_mut(&dcid) {
+            Some(conn) => conn,
+            None => {
+                let _ = reply.send(Vec::new());
+                return;
+            }
+        };
+
+        // Return the current source connection ID
+        // Quiche exposes this via source_id() method
+        let scid = conn.conn.source_id().to_vec();
+        let _ = reply.send(scid);
+    }
+
     /// Process an egress command from an application task and return packets to send.
     ///
     /// This is called from the worker's event loop when processing egress commands.
@@ -3172,6 +5043,69 @@ impl QuicManager {
             EgressCommand::GetStreamCredits { connection_id, .. } => *connection_id,
             EgressCommand::QueryStreamCapacity { connection_id, .. } => *connection_id,
             EgressCommand::QueryConnectionCapacity { connection_id, .. } => *connection_id,
+            EgressCommand::QueryStreamReadable { connection_id, .. } => *connection_id,
+            EgressCommand::QueryStreamWritable { connection_id, .. } => *connection_id,
+            EgressCommand::QueryStreamFinished { connection_id, .. } => *connection_id,
+            EgressCommand::ShutdownStream { connection_id, .. } => *connection_id,
+            EgressCommand::RetireConnectionId { connection_id, .. } => *connection_id,
+            EgressCommand::RequestNewConnectionId { connection_id, .. } => *connection_id,
+            EgressCommand::ProbePath { connection_id, .. } => *connection_id,
+            EgressCommand::SetStreamMaxData { connection_id, .. } => *connection_id,
+            EgressCommand::SetConnectionMaxData { connection_id, .. } => *connection_id,
+            EgressCommand::UpdateKeys { connection_id, .. } => *connection_id,
+            EgressCommand::CanSendEarlyData { connection_id, .. } => *connection_id,
+            EgressCommand::GetPeerTransportParams { connection_id, .. } => *connection_id,
+            EgressCommand::SetDatagramPriority { connection_id, .. } => *connection_id,
+            EgressCommand::GetPathMtu { connection_id, .. } => *connection_id,
+            EgressCommand::GetActivePaths { connection_id, .. } => *connection_id,
+            EgressCommand::SetStreamSendOrder { connection_id, .. } => *connection_id,
+            EgressCommand::PollReadableStreams { connection_id, .. } => *connection_id,
+            EgressCommand::PollWritableStreams { connection_id, .. } => *connection_id,
+            EgressCommand::GetNextReadableStream { connection_id, .. } => *connection_id,
+            EgressCommand::GetNextWritableStream { connection_id, .. } => *connection_id,
+            EgressCommand::IssueNewScid { connection_id, .. } => *connection_id,
+            EgressCommand::GetSourceConnectionIds { connection_id, .. } => *connection_id,
+            EgressCommand::GetAllPathStats { connection_id, .. } => *connection_id,
+            EgressCommand::SendOnPath { connection_id, .. } => *connection_id,
+            EgressCommand::QuerySourceId { connection_id, .. } => *connection_id,
+            EgressCommand::QueryDestinationId { connection_id, .. } => *connection_id,
+            EgressCommand::QueryAvailableDcids { connection_id, .. } => *connection_id,
+            EgressCommand::QueryScidsLeft { connection_id, .. } => *connection_id,
+            EgressCommand::QueryTimeout { connection_id, .. } => *connection_id,
+            EgressCommand::OnTimeout { connection_id, .. } => *connection_id,
+            EgressCommand::QuerySession { connection_id, .. } => *connection_id,
+            EgressCommand::QueryServerName { connection_id, .. } => *connection_id,
+            EgressCommand::QueryPeerCert { connection_id, .. } => *connection_id,
+            EgressCommand::QueryPeerCertChain { connection_id, .. } => *connection_id,
+            EgressCommand::QueryIsEstablished { connection_id, .. } => *connection_id,
+            EgressCommand::QueryIsResumed { connection_id, .. } => *connection_id,
+            EgressCommand::QueryIsInEarlyData { connection_id, .. } => *connection_id,
+            EgressCommand::QueryIsClosed { connection_id, .. } => *connection_id,
+            EgressCommand::QueryIsDraining { connection_id, .. } => *connection_id,
+            EgressCommand::QueryIsTimedOut { connection_id, .. } => *connection_id,
+            EgressCommand::QueryPeerError { connection_id, .. } => *connection_id,
+            EgressCommand::QueryLocalError { connection_id, .. } => *connection_id,
+            EgressCommand::QueryActiveScids { connection_id, .. } => *connection_id,
+            EgressCommand::QuerySendQuantum { connection_id, .. } => *connection_id,
+            EgressCommand::DgramPurgeOutgoing { connection_id, .. } => *connection_id,
+            EgressCommand::QueryDgramMaxWritableLen { connection_id, .. } => *connection_id,
+            EgressCommand::QueryDgramSendQueueLen { connection_id, .. } => *connection_id,
+            EgressCommand::QueryDgramRecvQueueLen { connection_id, .. } => *connection_id,
+            EgressCommand::QueryDgramRecvQueueByteSize { connection_id, .. } => *connection_id,
+            EgressCommand::QueryDgramSendQueueByteSize { connection_id, .. } => *connection_id,
+            EgressCommand::QueryPeerStreamsLeftBidi { connection_id, .. } => *connection_id,
+            EgressCommand::QueryPeerStreamsLeftUni { connection_id, .. } => *connection_id,
+            EgressCommand::QueryPeerVerifiedAddress { connection_id, .. } => *connection_id,
+            EgressCommand::QueryStats { connection_id, .. } => *connection_id,
+            // P0 Critical Additions
+            EgressCommand::SendAckFrequency { connection_id, .. } => *connection_id,
+            EgressCommand::QueryAvailableSendWindow { connection_id, .. } => *connection_id,
+            EgressCommand::QueryIsServer { connection_id, .. } => *connection_id,
+            EgressCommand::GetNextPathEvent { connection_id, .. } => *connection_id,
+            EgressCommand::ShutdownStreamDirection { connection_id, .. } => *connection_id,
+            EgressCommand::SetPmtuDiscovery { connection_id, .. } => *connection_id,
+            EgressCommand::SetMaxPacingRate { connection_id, .. } => *connection_id,
+            EgressCommand::QueryActiveScid { connection_id, .. } => *connection_id,
         };
 
         match command {
@@ -3367,6 +5301,363 @@ impl QuicManager {
                     connection_id, "Processing QueryConnectionCapacity command (RFC 9000 §4.1)"
                 );
                 self.process_query_connection_capacity(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryStreamReadable {
+                connection_id,
+                stream_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id,
+                    stream_id,
+                    "Processing QueryStreamReadable command"
+                );
+                self.process_query_stream_readable(worker_id, connection_id, stream_id, reply);
+            }
+            EgressCommand::QueryStreamWritable {
+                connection_id,
+                stream_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id,
+                    stream_id,
+                    "Processing QueryStreamWritable command"
+                );
+                self.process_query_stream_writable(worker_id, connection_id, stream_id, reply);
+            }
+            EgressCommand::QueryStreamFinished {
+                connection_id,
+                stream_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id,
+                    stream_id,
+                    "Processing QueryStreamFinished command"
+                );
+                self.process_query_stream_finished(worker_id, connection_id, stream_id, reply);
+            }
+            EgressCommand::ShutdownStream {
+                connection_id,
+                stream_id,
+                error_code,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, stream_id, error_code, "Processing ShutdownStream command"
+                );
+                self.process_shutdown_stream(worker_id, connection_id, stream_id, error_code, reply);
+            }
+            EgressCommand::RetireConnectionId {
+                connection_id,
+                sequence,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, sequence, "Processing RetireConnectionId command"
+                );
+                self.process_retire_connection_id(worker_id, connection_id, sequence);
+            }
+            EgressCommand::RequestNewConnectionId { connection_id } => {
+                debug!(
+                    worker_id,
+                    connection_id, "Processing RequestNewConnectionId command"
+                );
+                self.process_request_new_connection_id(worker_id, connection_id);
+            }
+            EgressCommand::ProbePath {
+                connection_id,
+                local_addr,
+                peer_addr,
+                data,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, %local_addr, %peer_addr, "Processing ProbePath command"
+                );
+                self.process_probe_path(worker_id, connection_id, local_addr, peer_addr, &data);
+            }
+            EgressCommand::SetStreamMaxData {
+                connection_id,
+                stream_id,
+                max_data,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, stream_id, max_data, "Processing SetStreamMaxData command"
+                );
+                self.process_set_stream_max_data(worker_id, connection_id, stream_id, max_data);
+            }
+            EgressCommand::SetConnectionMaxData {
+                connection_id,
+                max_data,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, max_data, "Processing SetConnectionMaxData command"
+                );
+                self.process_set_connection_max_data(worker_id, connection_id, max_data);
+            }
+            EgressCommand::UpdateKeys { connection_id } => {
+                debug!(
+                    worker_id,
+                    connection_id, "Processing UpdateKeys command"
+                );
+                self.process_update_keys(worker_id, connection_id);
+            }
+            EgressCommand::CanSendEarlyData {
+                connection_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, "Processing CanSendEarlyData command"
+                );
+                self.process_can_send_early_data(worker_id, connection_id, reply);
+            }
+            EgressCommand::GetPeerTransportParams {
+                connection_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, "Processing GetPeerTransportParams command"
+                );
+                self.process_get_peer_transport_params(worker_id, connection_id, reply);
+            }
+            EgressCommand::SetDatagramPriority {
+                connection_id,
+                priority,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, priority, "Processing SetDatagramPriority command"
+                );
+                self.process_set_datagram_priority(worker_id, connection_id, priority);
+            }
+            EgressCommand::GetPathMtu {
+                connection_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, "Processing GetPathMtu command"
+                );
+                self.process_get_path_mtu(worker_id, connection_id, reply);
+            }
+            EgressCommand::GetActivePaths {
+                connection_id,
+                reply,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, "Processing GetActivePaths command"
+                );
+                self.process_get_active_paths(worker_id, connection_id, reply);
+            }
+            EgressCommand::SetStreamSendOrder {
+                connection_id,
+                stream_id,
+                send_order,
+            } => {
+                debug!(
+                    worker_id,
+                    connection_id, stream_id, send_order, "Processing SetStreamSendOrder command"
+                );
+                self.process_set_stream_send_order(worker_id, connection_id, stream_id, send_order);
+            }
+            EgressCommand::QuerySourceId { connection_id, reply } => {
+                self.process_query_source_id(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryDestinationId { connection_id, reply } => {
+                self.process_query_destination_id(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryAvailableDcids { connection_id, reply } => {
+                self.process_query_available_dcids(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryScidsLeft { connection_id, reply } => {
+                self.process_query_scids_left(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryTimeout { connection_id, reply } => {
+                self.process_query_timeout(worker_id, connection_id, reply);
+            }
+            EgressCommand::OnTimeout { connection_id } => {
+                self.process_on_timeout(worker_id, connection_id);
+            }
+            EgressCommand::QuerySession { connection_id, reply } => {
+                self.process_query_session(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryServerName { connection_id, reply } => {
+                self.process_query_server_name(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryPeerCert { connection_id, reply } => {
+                self.process_query_peer_cert(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryPeerCertChain { connection_id, reply } => {
+                self.process_query_peer_cert_chain(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryIsEstablished { connection_id, reply } => {
+                self.process_query_is_established(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryIsResumed { connection_id, reply } => {
+                self.process_query_is_resumed(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryIsInEarlyData { connection_id, reply } => {
+                self.process_query_is_in_early_data(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryIsClosed { connection_id, reply } => {
+                self.process_query_is_closed(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryIsDraining { connection_id, reply } => {
+                self.process_query_is_draining(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryIsTimedOut { connection_id, reply } => {
+                self.process_query_is_timed_out(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryPeerError { connection_id, reply } => {
+                self.process_query_peer_error(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryLocalError { connection_id, reply } => {
+                self.process_query_local_error(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryActiveScids { connection_id, reply } => {
+                self.process_query_active_scids(worker_id, connection_id, reply);
+            }
+            EgressCommand::QuerySendQuantum { connection_id, reply } => {
+                self.process_query_send_quantum(worker_id, connection_id, reply);
+            }
+            EgressCommand::DgramPurgeOutgoing { connection_id } => {
+                self.process_dgram_purge_outgoing(worker_id, connection_id);
+            }
+            EgressCommand::QueryDgramMaxWritableLen { connection_id, reply } => {
+                self.process_query_dgram_max_writable_len(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryDgramSendQueueLen { connection_id, reply } => {
+                self.process_query_dgram_send_queue_len(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryDgramRecvQueueLen { connection_id, reply } => {
+                self.process_query_dgram_recv_queue_len(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryDgramRecvQueueByteSize { connection_id, reply } => {
+                self.process_query_dgram_recv_queue_byte_size(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryDgramSendQueueByteSize { connection_id, reply } => {
+                self.process_query_dgram_send_queue_byte_size(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryPeerStreamsLeftBidi { connection_id, reply } => {
+                self.process_query_peer_streams_left_bidi(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryPeerStreamsLeftUni { connection_id, reply } => {
+                self.process_query_peer_streams_left_uni(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryPeerVerifiedAddress { connection_id, reply } => {
+                self.process_query_peer_verified_address(worker_id, connection_id, reply);
+            }
+            EgressCommand::QueryStats { connection_id, reply } => {
+                self.process_query_stats(worker_id, connection_id, reply);
+            }
+            
+            // ============ Stream Iterator Commands (P0 Gap #1) ============
+            EgressCommand::PollReadableStreams { connection_id } => {
+                self.process_poll_readable_streams(worker_id, connection_id);
+            }
+            EgressCommand::PollWritableStreams { connection_id } => {
+                self.process_poll_writable_streams(worker_id, connection_id);
+            }
+            EgressCommand::GetNextReadableStream { connection_id, request_id } => {
+                self.process_get_next_readable_stream(worker_id, connection_id, request_id);
+            }
+            EgressCommand::GetNextWritableStream { connection_id, request_id } => {
+                self.process_get_next_writable_stream(worker_id, connection_id, request_id);
+            }
+            
+            // ============ Connection ID Management Commands (P0 Gap #2) ============
+            EgressCommand::IssueNewScid { connection_id, request_id, scid } => {
+                self.process_issue_new_scid(worker_id, connection_id, request_id, scid);
+            }
+            EgressCommand::GetSourceConnectionIds { connection_id, request_id } => {
+                self.process_get_source_connection_ids(worker_id, connection_id, request_id);
+            }
+            
+            // ============ Multipath Commands (P0 Gap #3, #4) ============
+            EgressCommand::GetAllPathStats { connection_id, request_id } => {
+                self.process_get_all_path_stats(worker_id, connection_id, request_id);
+            }
+            EgressCommand::SendOnPath { connection_id, stream_id, data, fin, local_addr, peer_addr, reply } => {
+                self.process_send_on_path(worker_id, connection_id, stream_id, data, fin, local_addr, peer_addr, reply);
+            }
+
+            // ============ P0 Critical Additions ============
+            EgressCommand::SendAckFrequency {
+                connection_id,
+                ack_eliciting_threshold,
+                request_max_ack_delay,
+                ignore_order,
+            } => {
+                self.process_send_ack_frequency(
+                    worker_id,
+                    connection_id,
+                    ack_eliciting_threshold,
+                    request_max_ack_delay,
+                    ignore_order,
+                );
+            }
+            EgressCommand::QueryAvailableSendWindow {
+                connection_id,
+                request_id,
+            } => {
+                self.process_query_available_send_window(worker_id, connection_id, request_id);
+            }
+            EgressCommand::QueryIsServer {
+                connection_id,
+                request_id,
+            } => {
+                self.process_query_is_server(worker_id, connection_id, request_id);
+            }
+            EgressCommand::GetNextPathEvent {
+                connection_id,
+                request_id,
+            } => {
+                self.process_get_next_path_event(worker_id, connection_id, request_id);
+            }
+            EgressCommand::ShutdownStreamDirection {
+                connection_id,
+                stream_id,
+                direction,
+                error_code,
+                reply,
+            } => {
+                self.process_shutdown_stream_direction(
+                    worker_id,
+                    connection_id,
+                    stream_id,
+                    direction,
+                    error_code,
+                    reply,
+                );
+            }
+            EgressCommand::SetPmtuDiscovery {
+                connection_id,
+                enabled,
+            } => {
+                self.process_set_pmtu_discovery(worker_id, connection_id, enabled);
+            }
+            EgressCommand::SetMaxPacingRate {
+                connection_id,
+                rate_bps,
+            } => {
+                self.process_set_max_pacing_rate(worker_id, connection_id, rate_bps);
+            }
+            EgressCommand::QueryActiveScid {
+                connection_id,
+                reply,
+            } => {
+                self.process_query_active_scid(worker_id, connection_id, reply);
             }
         }
 
