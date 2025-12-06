@@ -103,7 +103,7 @@ pub struct NetworkConfig {
     /// - `"::"` - Bind to all IPv6 interfaces
     /// - `"127.0.0.1"` - Localhost only (testing)
     ///
-    /// **Default:** `"127.0.0.1"`
+    /// **Default:** `"0.0.0.0"`
     pub host: String,
 
     /// UDP port to bind to.
@@ -112,7 +112,7 @@ pub struct NetworkConfig {
     /// - `443` - HTTPS/QUIC (requires root/capabilities)
     /// - `8443` - Common alternative for QUIC
     ///
-    /// **Default:** `8080`
+    /// **Default:** `443`
     pub port: u16,
 
     /// Enable SO_REUSEADDR socket option.
@@ -127,8 +127,8 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".to_string(),
-            port: 8080,
+            host: "0.0.0.0".to_string(),
+            port: 443,
             reuse_addr: true,
         }
     }
@@ -160,13 +160,13 @@ impl NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TlsConfig {
-    /// Path to TLS certificate file (PEM format).
+    /// Path to TLS certificate file (.crt file with PEM encoding).
     ///
-    /// If not provided, a self-signed certificate will be generated.
-    /// For production use, provide a valid certificate.
+    /// REQUIRED: Server certificates must be provided.
+    /// Self-signed certificates are not supported.
     pub cert_path: Option<PathBuf>,
 
-    /// Path to TLS private key file (PEM format).
+    /// Path to TLS private key file (.key file with PEM encoding).
     ///
     /// Must be provided if `cert_path` is specified.
     pub key_path: Option<PathBuf>,
@@ -202,13 +202,13 @@ impl TlsConfig {
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        // If cert is provided, key must also be provided
-        if self.cert_path.is_some() && self.key_path.is_none() {
-            errors.push("cert_path specified without key_path".to_string());
+        // Both cert and key are REQUIRED
+        if self.cert_path.is_none() {
+            errors.push("cert_path is required - self-signed certificates are not supported".to_string());
         }
 
-        if self.key_path.is_some() && self.cert_path.is_none() {
-            errors.push("key_path specified without cert_path".to_string());
+        if self.key_path.is_none() {
+            errors.push("key_path is required - self-signed certificates are not supported".to_string());
         }
 
         // Validate files exist if provided
@@ -404,9 +404,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_global_config_validates() {
+    fn test_default_global_config_requires_certs() {
         let config = GlobalConfig::default();
-        assert!(config.validate().is_ok());
+        let result = config.validate();
+        // Default config should fail validation because certs are required
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("cert_path")));
+        assert!(errors.iter().any(|e| e.contains("key_path")));
     }
 
     #[test]

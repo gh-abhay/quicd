@@ -40,6 +40,67 @@ pub enum CongestionState {
     CongestionAvoidance,
     /// Recovery phase after packet loss
     Recovery,
+    /// Application limited - not sending at full capacity (RFC 9002 Appendix B)
+    ///
+    /// The application is not providing enough data to fill the congestion window.
+    /// This state is used to distinguish between network congestion and application
+    /// rate limiting when measuring delivery rates and adjusting window growth.
+    ApplicationLimited,
+}
+
+/// Reason a DATAGRAM was dropped (RFC 9221).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramDropReason {
+    /// DATAGRAM exceeds maximum allowed size
+    TooLarge,
+    /// Send queue is full (backpressure)
+    QueueFull,
+    /// Peer doesn't support DATAGRAM extension
+    NotNegotiated,
+    /// Connection is closing
+    ConnectionClosing,
+}
+
+/// Information about an issued source connection ID (RFC 9000 §5.1.1).
+#[derive(Debug, Clone)]
+pub struct SourceConnectionIdInfo {
+    /// The connection ID bytes
+    pub cid: Vec<u8>,
+    /// Sequence number for this CID
+    pub sequence: u64,
+    /// Stateless reset token (16 bytes)
+    pub reset_token: [u8; 16],
+}
+
+/// Path statistics for a network path (RFC 9000 §9).
+#[derive(Debug, Clone)]
+pub struct PathStats {
+    /// Local socket address
+    pub local_addr: SocketAddr,
+    /// Peer socket address  
+    pub peer_addr: SocketAddr,
+    /// Whether this path is validated (RFC 9000 §8.2)
+    pub validated: bool,
+    /// Whether this is the active path for transmission
+    pub active: bool,
+    /// Smoothed round-trip time in microseconds (RFC 9002 §5.3)
+    pub rtt: u64,
+    /// RTT variance in microseconds (RFC 9002 §5.3)
+    pub rttvar: u64,
+    /// Minimum RTT observed in microseconds (RFC 9002 §5.2)
+    pub min_rtt: Option<u64>,
+    /// Congestion window in bytes (RFC 9002 §7)
+    pub cwnd: usize,
+    /// Bytes currently in flight (unacknowledged)
+    pub bytes_in_flight: usize,
+    /// Bytes sent on this path
+    pub bytes_sent: u64,
+    /// Bytes received on this path
+    pub bytes_recv: u64,
+    /// Packets lost on this path
+    pub lost_packets: u64,
+    /// Path MTU in bytes (RFC 9000 §14)
+    pub pmtu: usize,
 }
 
 /// Events raised by the worker runtime toward an application task.
@@ -64,6 +125,16 @@ pub enum AppEvent {
         /// Time the handshake completed
         negotiated_at: Instant,
     },
+
+    /// QUIC handshake has fully completed (HANDSHAKE_DONE frame processed).
+    ///
+    /// RFC 9000 §3.2 defines this as the point when handshake confirmation is
+    /// exchanged. This is a precise signal that the handshake is fully complete
+    /// and the connection can safely transmit application data with 1-RTT keys.
+    ///
+    /// This event may arrive shortly after HandshakeCompleted or be delivered
+    /// simultaneously depending on packet timing.
+    HandshakeDone,
 
     /// Peer opened a new bidirectional or unidirectional stream.
     ///
@@ -215,6 +286,206 @@ pub enum AppEvent {
     /// should be prepared to handle this by resending requests or aborting
     /// non-idempotent operations sent during 0-RTT.
     EarlyDataRejected,
+
+    /// Session resumption ticket received from peer (RFC 9001 §4.6.1).
+    ///
+    /// The application can persist this ticket and use it for future
+    /// connections to this server to enable 0-RTT and session resumption.
+    /// Tickets are opaque blobs and should be stored securely.
+    SessionTicketReceived {
+        /// Opaque session ticket data
+        ticket: Vec<u8>,
+        /// Ticket lifetime hint in seconds (0 = unspecified)
+        lifetime_hint: u32,
+    },
+
+    /// Peer transport parameters received (RFC 9000 §7.4).
+    ///
+    /// Delivered after handshake completion, provides the negotiated
+    /// transport parameters advertised by the peer.
+    PeerTransportParameters {
+        /// Peer's max idle timeout (milliseconds)
+        max_idle_timeout: u64,
+        /// Peer's initial max data (connection-level flow control)
+        initial_max_data: u64,
+        /// Peer's initial max stream data (bidirectional local)
+        initial_max_stream_data_bidi_local: u64,
+        /// Peer's initial max stream data (bidirectional remote)
+        initial_max_stream_data_bidi_remote: u64,
+        /// Peer's initial max stream data (unidirectional)
+        initial_max_stream_data_uni: u64,
+        /// Peer's max bidirectional streams limit
+        max_streams_bidi: u64,
+        /// Peer's max unidirectional streams limit
+        max_streams_uni: u64,
+        /// Peer's ACK delay exponent
+        ack_delay_exponent: u64,
+        /// Peer's max ACK delay (milliseconds)
+        max_ack_delay: u64,
+        /// Peer's active connection ID limit
+        active_connection_id_limit: u64,
+        /// Whether peer disabled active migration
+        disable_active_migration: bool,
+        /// Peer's max UDP payload size
+        max_udp_payload_size: u64,
+    },
+
+    /// Receive-side stream capacity updated (app consumed data from buffer).
+    ///
+    /// After the application reads data via `RecvStream::read()`, the worker
+    /// sends this event to notify that receive window credits were freed.
+    /// This triggers automatic MAX_STREAM_DATA frame transmission.
+    StreamReceiveCapacityUpdated {
+        stream_id: StreamId,
+        /// Bytes read/consumed by application
+        bytes_consumed: usize,
+        /// New receive window offset
+        new_max_offset: u64,
+    },
+
+    /// Connection-level receive capacity updated.
+    ///
+    /// Similar to StreamReceiveCapacityUpdated but for connection-level
+    /// flow control. Triggers automatic MAX_DATA frame transmission.
+    ConnectionReceiveCapacityUpdated {
+        /// Total bytes consumed across all streams
+        bytes_consumed: usize,
+        /// New connection-level receive window offset
+        new_max_offset: u64,
+    },
+
+    /// Path challenge received from peer (RFC 9000 §8.2).
+    ///
+    /// The peer is attempting to validate this network path. The worker
+    /// automatically responds with PATH_RESPONSE. This event is informational.
+    PathChallengeReceived {
+        /// Path being challenged
+        peer_addr: SocketAddr,
+        /// Challenge data (8 bytes)
+        data: [u8; 8],
+    },
+
+    /// Path response received from peer (RFC 9000 §8.2).
+    ///
+    /// Response to our PATH_CHALLENGE. Used for path validation.
+    PathResponseReceived {
+        /// Path that responded
+        peer_addr: SocketAddr,
+        /// Response data (8 bytes)
+        data: [u8; 8],
+    },
+
+    /// DATAGRAM was rejected due to queue full or too large.
+    ///
+    /// The application attempted to send a datagram but it couldn't be sent.
+    DatagramDropped {
+        request_id: u64,
+        /// Reason for drop
+        reason: DatagramDropReason,
+    },
+
+    /// List of all readable streams updated (RFC 9000 §2.2).
+    ///
+    /// This event provides efficient access to all streams with buffered data,
+    /// equivalent to Quiche's `Connection::readable()` iterator. Applications
+    /// can use this to implement fair scheduling across multiple streams.
+    ///
+    /// This is an edge-triggered event: it fires when the set of readable
+    /// streams changes. Applications should poll all streams in the list
+    /// until they return WouldBlock.
+    ReadableStreamsUpdated {
+        /// Stream IDs that currently have data available to read
+        stream_ids: Vec<StreamId>,
+    },
+
+    /// List of all writable streams updated (RFC 9000 §2.2).
+    ///
+    /// This event provides efficient access to all streams with send capacity,
+    /// equivalent to Quiche's `Connection::writable()` iterator. Applications
+    /// can use this to resume sending on previously blocked streams.
+    ///
+    /// This is an edge-triggered event: it fires when the set of writable
+    /// streams changes due to flow control updates or new streams opening.
+    WritableStreamsUpdated {
+        /// Stream IDs that currently can accept data for sending
+        stream_ids: Vec<StreamId>,
+    },
+
+    /// Next readable stream ID in priority order (RFC 9000 §2.2).
+    ///
+    /// Response to polling for the next ready stream. Provides the stream ID
+    /// that should be serviced next according to priority scheduling.
+    /// Returns None when no streams are readable.
+    NextReadableStream {
+        request_id: u64,
+        /// Next stream to read from (or None if no streams ready)
+        stream_id: Option<StreamId>,
+    },
+
+    /// Next writable stream ID in priority order (RFC 9000 §2.2).
+    ///
+    /// Response to polling for the next ready stream. Provides the stream ID
+    /// that should be serviced next according to priority scheduling.
+    /// Returns None when no streams are writable.
+    NextWritableStream {
+        request_id: u64,
+        /// Next stream to write to (or None if no streams ready)
+        stream_id: Option<StreamId>,
+    },
+
+    /// New source connection ID issued (RFC 9000 §5.1.1).
+    ///
+    /// Response to manual SCID issuance request. The worker has generated
+    /// a new SCID with stateless reset token and sent NEW_CONNECTION_ID to peer.
+    SourceConnectionIdIssued {
+        request_id: u64,
+        result: Result<SourceConnectionIdInfo, ConnectionError>,
+    },
+
+    /// All source connection IDs (RFC 9000 §5.1).
+    ///
+    /// Response to query for all active SCIDs on this connection.
+    /// Each SCID includes its sequence number and stateless reset token.
+    SourceConnectionIds {
+        request_id: u64,
+        /// List of all source connection IDs with metadata
+        scids: Vec<SourceConnectionIdInfo>,
+    },
+
+    /// All path statistics (RFC 9000 §9).
+    ///
+    /// Response to query for statistics on all active paths.
+    /// Includes RTT, congestion window, bytes in flight, and validation status.
+    AllPathStats {
+        request_id: u64,
+        /// Statistics for each active path
+        paths: Vec<PathStats>,
+    },
+
+    /// Response to ConnectionHandle::available_send_window() query.
+    ///
+    /// Returns the connection-level send window available immediately.
+    AvailableSendWindow {
+        request_id: u64,
+        /// Bytes available to send across all streams
+        window: u64,
+    },
+
+    /// Response to ConnectionHandle::is_server() query.
+    IsServer {
+        request_id: u64,
+        /// True if this is a server-side connection
+        is_server: bool,
+    },
+
+    /// Path event from low-level frame processing.
+    ///
+    /// Provides detailed information about PATH_CHALLENGE/RESPONSE frames
+    /// for diagnostic and debugging purposes.
+    PathEvent {
+        /// Type of path event
+        event: PathEventType,
+    },
 }
 
 /// Transport-level events from the QUIC layer.
@@ -280,6 +551,20 @@ pub enum TransportEvent {
     ConnectionIdRetired {
         /// Sequence number of retired CID
         sequence: u64,
+    },
+
+    /// Source Connection ID retired (RFC 9000 §5.1.2).
+    ///
+    /// A Source Connection ID that we issued has been retired by the peer
+    /// via RETIRE_CONNECTION_ID frame. The sequence number identifies which
+    /// SCID was retired.
+    ///
+    /// This is distinct from ConnectionIdRetired which tracks DCIDs.
+    SourceConnectionIdRetired {
+        /// Sequence number of the retired SCID
+        sequence: u64,
+        /// The actual Connection ID bytes that were retired
+        cid: Bytes,
     },
 
     /// Stream is blocked by flow control (RFC 9000 §4).
@@ -376,32 +661,77 @@ pub enum TransportEvent {
         count: u64,
         /// Total packets lost on this connection
         total_lost: u64,
+        /// Smallest packet number lost in this event
+        ///
+        /// When multiple packets are lost, this identifies the first packet number
+        /// in the range. Use this for detailed loss analysis and diagnostics.
+        first_packet_num: Option<u64>,
+        /// Largest packet number lost in this event
+        ///
+        /// When multiple packets are lost, this identifies the last packet number
+        /// in the range. Together with first_packet_num, defines the loss range.
+        last_packet_num: Option<u64>,
     },
 
     /// ECN-CE mark received (RFC 9000 §13.4, RFC 9002 §7).
     ///
-    /// Explicit Congestion Notification: the network has marked packets
-    /// indicating congestion. The congestion controller reacts to this.
+    /// **Quiche API Limitation**: Quiche 0.24.6 does NOT expose ECN (Explicit Congestion
+    /// Notification) counters in its public Stats or PathStats APIs. This event is defined
+    /// for forward compatibility but will not be emitted with current Quiche versions.
+    ///
+    /// RFC 9000 §13.4 specifies that endpoints should track ECN-CE (Congestion Experienced)
+    /// markings from the network. RFC 9002 §A.4 requires congestion controllers to treat
+    /// ECN-CE marks as congestion signals equivalent to packet loss.
+    ///
+    /// When Quiche adds ECN counter exposure, this event will be emitted when:
+    /// - Network marks packets with ECN-CE
+    /// - `ce_count` increases compared to last observation
+    /// - Congestion controller reacts to ECN feedback
+    ///
+    /// Workaround: Monitor `CongestionStateChanged` events which reflect congestion
+    /// controller reactions (including ECN-triggered reactions, though not distinguishable
+    /// from loss-triggered reactions).
     EcnCongestionEncountered {
-        /// Number of ECN-CE marked packets
+        /// Total number of ECN-CE marked packets received (cumulative counter)
         ce_count: u64,
     },
 
     /// Key update initiated (RFC 9001 §6).
     ///
-    /// The connection is updating its encryption keys. This happens automatically
-    /// but applications may want to log it for security auditing.
+    /// **Quiche API Limitation**: This event is emitted when the application requests
+    /// a key update, but the actual key update happens automatically within Quiche.
+    /// TLS 1.3 key updates (RFC 9001 §6) occur transparently without application
+    /// visibility in Quiche 0.24.6 - there are no APIs to detect or track key phase
+    /// transitions beyond the initial 0-RTT → 1-RTT handshake completion.
+    ///
+    /// Applications may log this for security auditing, but should not rely on it
+    /// for detecting all key rotations.
     KeyUpdateInitiated {
-        /// Key phase number
+        /// Key phase number (always 0 - Quiche doesn't expose actual key_phase)
         key_phase: u64,
     },
 
-    /// Key update completed (RFC 9001 §6).
+    /// Key update completed (RFC 9001 §6 & §4.6).
     ///
-    /// The key update process finished successfully. All subsequent packets
-    /// will use the new keys.
+    /// **Current Usage**: This event is emitted when the connection transitions from
+    /// 0-RTT early data to 1-RTT protected data during handshake completion.
+    /// The `key_phase` will be set to 1 in this case.
+    ///
+    /// **Quiche API Limitation**: Subsequent TLS 1.3 key updates (initiated by either
+    /// peer after handshake) happen transparently within Quiche without application
+    /// visibility. Quiche 0.24.6 does not expose:
+    /// - Current key phase number
+    /// - Key update initiation/completion events
+    /// - Key rotation timestamps
+    ///
+    /// This means applications cannot track post-handshake key rotations for
+    /// security auditing purposes. The limitation exists in the underlying Quiche
+    /// library, not in QuicD-X.
+    ///
+    /// **RFC Compliance Note**: Full RFC 9001 §6 compliance would require visibility
+    /// into all key update events, which is not currently possible with Quiche's API.
     KeyUpdateCompleted {
-        /// New key phase number
+        /// Key phase number (1 for 0-RTT→1-RTT transition, unavailable for other updates)
         key_phase: u64,
     },
 
@@ -434,5 +764,129 @@ pub enum TransportEvent {
     StatelessResetReceived {
         /// Reset token that matched
         reset_token: [u8; 16],
+    },
+
+    /// NEW_TOKEN frame received from peer (RFC 9000 §8.1.3).
+    ///
+    /// Address validation token that can be used in future connections
+    /// to this server to prove address ownership.
+    NewTokenReceived {
+        /// Opaque token data
+        token: Vec<u8>,
+    },
+
+    /// ACK_FREQUENCY frame received from peer (RFC 9330).
+    ///
+    /// The peer is requesting changes to our ACK generation frequency.
+    /// This is used for latency-sensitive applications to control when
+    /// ACKs are sent.
+    AckFrequencyReceived {
+        /// Sequence number of this ACK_FREQUENCY frame
+        sequence: u64,
+        /// Requested packet tolerance before sending ACK
+        ack_eliciting_threshold: u64,
+        /// Maximum ACK delay in microseconds
+        request_max_ack_delay: u64,
+        /// Whether to ignore order of packets
+        ignore_order: bool,
+    },
+}
+
+/// Low-level path events for frame-level introspection (RFC 9000 §8.2, §9).
+///
+/// These events correspond directly to Quiche's `PathEvent` enum and provide
+/// complete visibility into connection migration, path validation, and multi-path
+/// behavior.
+#[derive(Debug, Clone)]
+pub enum PathEventType {
+    /// New network path observed on received packet (RFC 9000 §9.1).
+    ///
+    /// Server-side only. The application may probe this path if desired.
+    New {
+        /// Local address
+        local_addr: SocketAddr,
+        /// Peer address
+        peer_addr: SocketAddr,
+    },
+
+    /// Path validation succeeded (RFC 9000 §8.2).
+    ///
+    /// The path is now validated and can be used for non-probing packets.
+    Validated {
+        /// Local address
+        local_addr: SocketAddr,
+        /// Peer address
+        peer_addr: SocketAddr,
+    },
+
+    /// Path validation failed (RFC 9000 §8.2).
+    ///
+    /// This path will not be used unless the application requests probing again.
+    FailedValidation {
+        /// Local address
+        local_addr: SocketAddr,
+        /// Peer address
+        peer_addr: SocketAddr,
+    },
+
+    /// Path closed and now unusable (RFC 9000 §9.3).
+    ///
+    /// The path has been closed (e.g., due to idle timeout or validation failure)
+    /// and can no longer be used for this connection.
+    Closed {
+        /// Local address
+        local_addr: SocketAddr,
+        /// Peer address
+        peer_addr: SocketAddr,
+    },
+
+    /// Source Connection ID reused on different path (RFC 9000 §5.1).
+    ///
+    /// The peer reused a Source Connection ID (with the given sequence number)
+    /// that was initially used on one path, but is now observed on a different path.
+    ReusedSourceConnectionId {
+        /// Connection ID sequence number
+        cid_seq: u64,
+        /// Original path (local, peer)
+        old_path: (SocketAddr, SocketAddr),
+        /// New path (local, peer)
+        new_path: (SocketAddr, SocketAddr),
+    },
+
+    /// Peer migrated to this path (RFC 9000 §9.2).
+    ///
+    /// Server-side only. Non-probing packets have been received on this validated
+    /// path, indicating the peer has migrated the connection.
+    PeerMigrated {
+        /// Local address
+        local_addr: SocketAddr,
+        /// Peer address
+        peer_addr: SocketAddr,
+    },
+
+    /// PATH_CHALLENGE frame sent (low-level frame event).
+    ///
+    /// For debugging/introspection only. Normal applications should use the
+    /// high-level Validated/FailedValidation events instead.
+    ChallengeSent {
+        /// Local address used
+        local_addr: SocketAddr,
+        /// Peer address
+        peer_addr: SocketAddr,
+        /// Challenge data (8 bytes)
+        data: [u8; 8],
+    },
+
+    /// PATH_RESPONSE frame sent (low-level frame event).
+    ///
+    /// For debugging/introspection only. Normal applications should use the
+    /// high-level Validated/FailedValidation events instead.
+    ResponseSent {
+        /// Local address used
+        local_addr: SocketAddr,
+        /// Peer address
+        peer_addr: SocketAddr,
+        /// Response data (8 bytes)
+        data: [u8; 8],
     },
 }
