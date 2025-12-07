@@ -28,31 +28,36 @@
 [global.network]
 # Host address to bind to
 # Examples: "0.0.0.0" (all IPv4), "::" (all IPv6), "127.0.0.1" (localhost)
+# Default: "0.0.0.0"
 host = "0.0.0.0"
 
 # UDP port to bind to
 # Standard: 443 (requires privileges), 8443 (common alternative)
+# Default: 443
 port = 443
 
 # Enable SO_REUSEADDR socket option
 # Allows quick restarts by reusing recently-closed ports
+# Default: true
 reuse_addr = true
 
 # ----------------------------------------------------------------------------
 # TLS / Cryptographic Settings
 # ----------------------------------------------------------------------------
 [global.tls]
-# Path to TLS certificate file (PEM format)
-# If omitted, a self-signed certificate will be generated
-cert_path = "/server-cert/cert.pem"
+# Path to TLS certificate file (.crt file with PEM encoding)
+# Default: None (REQUIRED - must be provided)
+cert_path = "/server-cert/cert.crt"
 
-# Path to TLS private key file (PEM format)
+# Path to TLS private key file (.key file with PEM encoding)
 # Required if cert_path is specified
-key_path = "/server-cert/key.pem"
+# Default: None (REQUIRED - must be provided)
+key_path = "/server-cert/key.key"
 
 # Enable TLS 1.3 early data (0-RTT)
 # WARNING: 0-RTT data is not forward secret and can be replayed
 # Only enable for idempotent applications
+# Default: false
 enable_early_data = false
 
 # ----------------------------------------------------------------------------
@@ -61,18 +66,22 @@ enable_early_data = false
 [global.runtime]
 # Number of Tokio worker threads for async application tasks
 # Default: Number of CPU cores
-worker_threads = 8
+# worker_threads = 8
 
 # Maximum blocking threads in the pool
+# Default: 512
 max_blocking_threads = 512
 
 # Thread name prefix (for debugging/profiling)
+# Default: "quicd-worker"
 thread_name = "quicd-worker"
 
 # Stack size per thread in bytes
-thread_stack_size = 2097152  # 2 MB
+# Default: 2097152 (2 MB)
+thread_stack_size = 2097152
 
 # Enable thread-local statistics collection
+# Default: false
 enable_thread_stats = false
 
 # ----------------------------------------------------------------------------
@@ -80,17 +89,21 @@ enable_thread_stats = false
 # ----------------------------------------------------------------------------
 [global.logging]
 # Log level: "trace", "debug", "info", "warn", "error"
-level = "debug"
+# Default: "info"
+level = "info"
 
 # Enable structured JSON logging (for machine parsing)
+# Default: false
 json_format = false
 
 # Enable ANSI color codes in logs
 # Disable when logging to files or non-TTY outputs
+# Default: true
 enable_colors = true
 
 # Include source file and line number in logs
 # Has performance overhead
+# Default: false
 include_file_line = false
 
 # ----------------------------------------------------------------------------
@@ -99,58 +112,147 @@ include_file_line = false
 [global.quic]
 # Maximum idle timeout in milliseconds
 # Connections idle longer than this are closed
-max_idle_timeout_ms = 30000  # 30 seconds
+# Default: System-optimized (typically 30000)
+# max_idle_timeout_ms = 30000
 
 # Initial RTT estimate in milliseconds
+# Default: 100
 initial_rtt_ms = 100
 
 # Maximum concurrent bidirectional streams per connection
+# Default: 100
 max_streams_bidi = 100
 
 # Maximum concurrent unidirectional streams per connection
+# Default: 100
 max_streams_uni = 100
 
 # Maximum UDP payload size in bytes
 # Should be ≤ path MTU to avoid fragmentation
 # QUIC minimum: 1200 bytes
-max_udp_payload_size = 1350
+# Default: System-optimized (typically 1350)
+# max_udp_payload_size = 1350
 
 # Connection-level receive window (bytes)
-recv_window = 10485760  # 10 MB
+# Default: System-optimized (typically 10485760 = 10 MB)
+# recv_window = 10485760
 
 # Per-stream receive window (bytes)
-stream_recv_window = 1048576  # 1 MB
+# Default: System-optimized (typically 1048576 = 1 MB)
+# stream_recv_window = 1048576
 
 # Congestion control algorithm
 # Options: "cubic", "bbr", "bbr2", "reno"
+# Default: "cubic"
 congestion_control = "cubic"
 
 # Enable early data (0-RTT) at QUIC layer
+# Default: false
 enable_early_data = false
 
 # Disable active migration (prevents IP/port changes)
+# Default: false
 disable_active_migration = false
 
 # Enable packet pacing
+# Default: true
 enable_pacing = true
 
 # Maximum connections per worker thread
-max_connections_per_worker = 100000
+# Default: System-calculated (typically 100000)
+# max_connections_per_worker = 100000
 
 # Enable QUIC version negotiation
+# Default: true
 enable_version_negotiation = true
 
 # Additional QUIC versions to support (v1 always enabled)
+# Default: []
 # additional_versions = ["draft-29"]
 
 # Enable DATAGRAM extension (RFC 9221)
+# Default: false
 enable_dgram = false
 
 # Maximum DATAGRAM frame size
-max_dgram_size = 1350
+# Default: System-optimized (typically 1350)
+# max_dgram_size = 1350
 
 # Enable connection statistics collection
+# Default: true
 enable_stats = true
+
+# ACK delay exponent (RFC 9000 §13.2.1)
+# Default: 3
+ack_delay_exponent = 3
+
+# Maximum ACK delay in milliseconds (RFC 9000 §13.2.1)
+# Default: 25
+max_ack_delay = 25
+
+# Active connection ID limit (RFC 9000 §5.1.1)
+# Default: 2
+active_connection_id_limit = 2
+
+# Enable peer certificate verification
+# Default: true
+verify_peer = true
+
+# CA certificate file for peer verification
+# Default: None
+# ca_cert_file = "/path/to/ca.crt"
+
+# CA certificate directory for peer verification
+# Default: None
+# ca_cert_dir = "/path/to/ca/dir"
+
+# Session ticket for 0-RTT resumption
+# Default: None
+# session_ticket = "base64-encoded-ticket"
+
+# Log TLS keys for debugging (WARNING: Security risk)
+# Default: false
+log_keys = false
+
+# Stateless reset token
+# Default: None (auto-generated)
+# stateless_reset_token = "0123456789abcdef"
+
+# Initial congestion window in packets
+# Default: 10
+initial_congestion_window_packets = 10
+
+# Enable Hystart++ congestion control
+# Default: true
+enable_hystart = true
+
+# Maximum pacing rate in bytes per second
+# Default: None (unlimited)
+# max_pacing_rate = 10000000
+
+# Maximum amplification factor for anti-amplification
+# Default: 3
+max_amplification_factor = 3
+
+# Enable Path MTU Discovery
+# Default: false
+discover_pmtu = false
+
+# Enable GREASE for protocol compatibility testing
+# Default: true
+grease = true
+
+# Disable destination connection ID reuse
+# Default: false
+disable_dcid_reuse = false
+
+# Maximum DATAGRAM receive queue length
+# Default: 1000
+dgram_recv_max_queue_len = 1000
+
+# Maximum DATAGRAM send queue length
+# Default: 1000
+dgram_send_max_queue_len = 1000
 
 # ----------------------------------------------------------------------------
 # Network I/O Configuration
@@ -161,37 +263,47 @@ enable_stats = true
 workers = 8
 
 # Enable SO_REUSEPORT for load distribution
+# Default: true
 reuse_port = true
 
 # Pin worker threads to specific CPU cores
+# Default: true
 pin_to_cpu = true
 
 # io_uring submission queue entries per worker (must be power of 2)
+# Default: 2048
 uring_entries = 2048
 
 # Kernel receive buffer size (SO_RCVBUF)
 # Larger buffers reduce packet loss under burst traffic
+# Default: None (system default)
 # socket_recv_buffer_size = 2097152  # 2 MB
 
 # Kernel send buffer size (SO_SNDBUF)
+# Default: None (system default)
 # socket_send_buffer_size = 2097152  # 2 MB
 
 # Enable UDP GRO (Generic Receive Offload)
 # Linux 5.0+ only, gracefully degrades on other platforms
+# Default: true
 enable_gro = true
 
 # Enable UDP GSO (Generic Segmentation Offload)
 # Linux 4.18+ only, gracefully degrades on other platforms
+# Default: true
 enable_gso = true
 
 # Maximum size for coalesced UDP packets
+# Default: 1400
 max_coalesced_size = 1400
 
 [global.netio.buffer_pool]
 # Maximum buffers per worker (isolated pools, no sharing)
+# Default: System-calculated
 max_buffers_per_worker = 2048
 
 # Datagram size for buffer trimming
+# Default: 1350
 datagram_size = 1350
 
 # ----------------------------------------------------------------------------
@@ -200,18 +312,22 @@ datagram_size = 1350
 [global.channels]
 # Worker egress channel capacity (app → worker)
 # All app tasks share this channel per worker
+# Default: 2048
 worker_egress_capacity = 2048
 
 # Connection ingress channel capacity (worker → app)
 # Per-connection event stream buffer
+# Default: 1024
 connection_ingress_capacity = 1024
 
 # Stream ingress channel capacity (worker → app)
 # Per-stream data buffer
+# Default: 256
 stream_ingress_capacity = 256
 
 # Stream egress channel capacity (app → worker)
 # Per-stream write command buffer
+# Default: 256
 stream_egress_capacity = 256
 
 # ----------------------------------------------------------------------------
@@ -219,19 +335,24 @@ stream_egress_capacity = 256
 # ----------------------------------------------------------------------------
 [global.telemetry]
 # Enable telemetry system
+# Default: true
 enabled = true
 
 # Metrics export interval in seconds
+# Default: 60
 export_interval_seconds = 60
 
 # OpenTelemetry collector endpoint
+# Default: "http://localhost:4317"
 otlp_endpoint = "http://localhost:4317"
 
 # Service name for telemetry
+# Default: "quicd"
 service_name = "quicd"
 
 # Enable detailed per-connection metrics
 # Warning: High cardinality, may impact performance
+# Default: false
 enable_per_connection_metrics = false
 
 # ============================================================================
@@ -251,76 +372,11 @@ alpn = "h3"
 type = "http3"
 
 # Enable this application
+# Default: true
 enabled = true
 
-# HTTP/3 Protocol Configuration
-# Maximum size of a single HTTP/3 frame payload
-max_frame_size = 16777216  # 16 MB
-
-# Maximum size of a field section (headers) in bytes
-max_field_section_size = 65536  # 64 KB
-
-# QPACK dynamic table capacity
-qpack_max_table_capacity = 4096  # 4 KB
-
-# Maximum number of QPACK blocked streams
-qpack_blocked_streams = 100
-
-# Timeout for QPACK blocked streams
-qpack_blocked_stream_timeout = "60s"
-
-# Maximum concurrent bidirectional streams
-max_concurrent_streams = 100
-
-# Maximum push ID server can send
-max_push_id = 100
-
-# Initial buffer capacity per stream
-stream_buffer_initial_capacity = 16384  # 16 KB
-
-# Maximum buffer size per stream
-stream_buffer_max_size = 1048576  # 1 MB
-
-# Enable extended CONNECT protocol (RFC 9114 Section 4.4)
-enable_connect_protocol = true
-
-# Enable server push (RFC 9114 Section 4.6)
-enable_server_push = false
-
-# Enable HTTP/3 datagrams (RFC 9297)
-enable_datagrams = false
-
-# Probability of sending reserved identifiers (0.0-1.0)
-grease_probability = 0.1
-
-# Interval for checking QPACK blocked stream timeouts
-blocked_stream_check_interval = "10s"
-
-# QPACK encoder instruction batch size
-qpack_encoder_instruction_batch_size = 8
-
-# QPACK decoder instruction batch size
-qpack_decoder_instruction_batch_size = 8
-
-# Idle connection timeout
-idle_timeout = "30s"
-
-# Settings frame deadline
-settings_deadline = "10s"
-
-# Blocked stream timeout check interval
-blocked_stream_timeout_check_interval = "10s"
-
-# Idle check interval
-idle_check_interval = "5s"
-
-# Settings storage TTL
-settings_ttl = "24h"
-
-# Grace period after idle timeout before closing connection
-idle_grace_period = "1s"
-
 # Custom request handler configuration (optional)
+# Default: None
 # [applications.handler]
 # custom_field = "value"
 
@@ -353,10 +409,7 @@ enabled = true
 # [applications.config]
 # library_path = "/usr/local/lib/quicd/libecho_protocol.so"
 #
-# # Plugins coexist with built-in protocols
-# # The server routes connections based on negotiated ALPN during handshake
-#
-# ABI Compatibility Requirements:
+# # ABI Compatibility Requirements:
 # - Plugin must be compiled with the same Rust compiler version as the server
 # - Plugin must use the same quicd-x dependency version
 # - Plugin must be compiled for the same target architecture

@@ -1102,6 +1102,27 @@ impl QuicManager {
             let event = quicd_x::AppEvent::HandshakeDone;
             send_app_event(worker_id, connection_id, &ingress_tx, event);
             conn.handshake_done_sent = true;
+
+            // === RFC 9000 §7.4: Peer Transport Parameters ===
+            // Emit peer transport parameters immediately after handshake completion
+            if let Some(params) = conn.conn.peer_transport_params() {
+                trace!(worker_id, connection_id, "Sending peer transport parameters to application");
+                let event = quicd_x::AppEvent::PeerTransportParameters {
+                    max_idle_timeout: params.max_idle_timeout,
+                    initial_max_data: params.initial_max_data,
+                    initial_max_stream_data_bidi_local: params.initial_max_stream_data_bidi_local,
+                    initial_max_stream_data_bidi_remote: params.initial_max_stream_data_bidi_remote,
+                    initial_max_stream_data_uni: params.initial_max_stream_data_uni,
+                    max_streams_bidi: params.initial_max_streams_bidi,
+                    max_streams_uni: params.initial_max_streams_uni,
+                    ack_delay_exponent: params.ack_delay_exponent,
+                    max_ack_delay: params.max_ack_delay,
+                    active_connection_id_limit: params.active_conn_id_limit,
+                    disable_active_migration: params.disable_active_migration,
+                    max_udp_payload_size: params.max_udp_payload_size,
+                };
+                send_app_event(worker_id, connection_id, &ingress_tx, event);
+            }
         }
 
         // === RFC 9000 §8-9: Path Events (Migration, Validation) ===
