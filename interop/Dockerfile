@@ -18,8 +18,7 @@ COPY Cargo.toml ./
 COPY quicd/ ./quicd/
 COPY quicd-x/ ./quicd-x/
 COPY quicd-qpack/ ./quicd-qpack/
-COPY quicd-h3/ ./quicd-h3/
-COPY quicd-moq/ ./quicd-moq/
+# COPY quicd-h3/ ./quicd-h3/
 
 RUN cargo build --release
 
