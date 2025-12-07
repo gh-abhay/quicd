@@ -3,8 +3,17 @@
 //! This module provides configuration options for QPACK header compression,
 //! allowing operators to tune performance, security, and resource limits.
 
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "std")]
 use std::time::Duration;
+
+#[cfg(not(feature = "std"))]
+use core::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+fn default_timeout() -> Duration {
+    Duration::from_secs(60)
+}
 
 /// Configuration for QPACK header compression.
 ///
@@ -30,7 +39,7 @@ pub struct QpackConfig {
     /// RFC 9204 Section 2.1.4: "Implementations SHOULD impose a timeout"
     /// on blocked streams. Streams blocked longer are reset with
     /// QPACK_DECOMPRESSION_FAILED.
-    #[serde(with = "humantime_serde")]
+    #[serde(default = "default_timeout")]
     pub blocked_stream_timeout: Duration,
 }
 

@@ -13,10 +13,10 @@ use std::collections::{HashMap, VecDeque};
 use bytes::BytesMut;
 
 use crate::error::{QpackError, Result};
-use crate::header_block::{EncodedPrefix, FieldLine};
-use crate::instructions::{DecoderInstruction, EncoderInstruction};
-use crate::static_table;
-use crate::table::DynamicTable;
+use crate::wire::header_block::{EncodedPrefix, FieldLine};
+use crate::wire::instructions::{DecoderInstruction, EncoderInstruction};
+use crate::tables::static_table;
+use crate::tables::DynamicTable;
 
 /// Decoded header field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,20 +135,13 @@ impl Decoder {
 
         // Decode field lines
         while offset < data.len() {
-            let (field_line, consumed) = FieldLine::decode(&data[offset..], base)?;
+            let remaining = data.slice(offset..);
+            let (field_line, consumed) = FieldLine::decode(remaining, base)?;
             offset += consumed;
 
-            let header = self.resolve_field_line(field_line)?;
+            let header = self.resolve_field_line(field_line, base)?;
             headers.push(header);
         }
-
-        // RFC 9204 Section 2.1.4: Section Ack should be sent AFTER the application
-        // processes the headers, not immediately. Applications must call
-        // ack_header_block() explicitly when ready.
-        // Note: For now, we auto-ack to maintain compatibility. In production,
-        // remove this and require explicit acknowledgment.
-        let ack = DecoderInstruction::SectionAck { stream_id };
-        self.decoder_stream_buffer.push_back(ack.encode());
 
         Ok(headers)
     }
@@ -231,7 +224,7 @@ impl Decoder {
     }
 
     /// Resolve a field line to a header field.
-    fn resolve_field_line(&self, field_line: FieldLine) -> Result<HeaderField> {
+    fn resolve_field_line(&self, field_line: FieldLine, base: u64) -> Result<HeaderField> {
         match field_line {
             FieldLine::IndexedStatic { index } => {
                 let entry = static_table::get(index as usize)
@@ -255,7 +248,6 @@ impl Decoder {
 
             FieldLine::IndexedDynamicPost { index } => {
                 // Post-base index: base + index
-                let base = self.table.insert_count();
                 let absolute_index = base + index;
                 let entry = self
                     .table

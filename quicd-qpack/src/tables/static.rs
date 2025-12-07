@@ -1,7 +1,11 @@
 //! QPACK static table per RFC 9204 Appendix A.
 //! Contains 99 predefined header field entries.
 
-use std::collections::HashMap;
+extern crate alloc;
+use hashbrown::HashMap;
+use spin::Once;
+
+use core::hash::{BuildHasher, Hash, Hasher};
 
 /// Static table entry.
 #[derive(Debug, Clone, Copy)]
@@ -436,22 +440,40 @@ impl StaticTableLookup {
     }
 }
 
-lazy_static::lazy_static! {
-    static ref LOOKUP: StaticTableLookup = StaticTableLookup::new();
-}
+static LOOKUP: Once<StaticTableLookup> = Once::new();
 
 /// Find exact match in static table.
 /// Returns Some(index) if found, None otherwise.
 #[inline]
 pub fn find_exact(name: &[u8], value: &[u8]) -> Option<usize> {
-    LOOKUP.exact_match.get(&(name, value)).copied()
+    let lookup = LOOKUP.call_once(StaticTableLookup::new);
+    let mut hasher = lookup.exact_match.hasher().build_hasher();
+    (name, value).hash(&mut hasher);
+    let hash = hasher.finish();
+    if let Some(entry) = lookup.exact_match.raw_entry().from_hash(hash, |(k_name, k_value)| {
+        *k_name == name && *k_value == value
+    }) {
+        Some(*entry.1)
+    } else {
+        None
+    }
 }
 
 /// Find name-only match in static table.
 /// Returns Some(index) of first matching entry, None otherwise.
 #[inline]
 pub fn find_name(name: &[u8]) -> Option<usize> {
-    LOOKUP.name_match.get(name).copied()
+    let lookup = LOOKUP.call_once(StaticTableLookup::new);
+    let mut hasher = lookup.name_match.hasher().build_hasher();
+    name.hash(&mut hasher);
+    let hash = hasher.finish();
+    if let Some(entry) = lookup.name_match.raw_entry().from_hash(hash, |k_name| {
+        *k_name == name
+    }) {
+        Some(*entry.1)
+    } else {
+        None
+    }
 }
 
 /// Get static table entry by index.

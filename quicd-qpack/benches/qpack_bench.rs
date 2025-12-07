@@ -112,13 +112,10 @@ fn bench_table_insert(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements(1));
     group.bench_function("single_insert", |b| {
-        let mut encoder = Encoder::new(4096, 100);
-        let mut counter = 0u64;
         b.iter(|| {
-            let name = format!("header-{}", counter);
-            let headers = vec![(name.as_bytes(), b"test-value".as_slice())];
-            black_box(encoder.encode(counter, &headers).unwrap());
-            counter += 1;
+            let mut encoder = Encoder::new(1024 * 1024, 100000);
+            let headers = vec![(b"header".as_slice(), b"test-value".as_slice())];
+            black_box(encoder.encode(0, &headers).unwrap());
         });
     });
 
@@ -130,6 +127,7 @@ fn bench_table_lookup(c: &mut Criterion) {
 
     // Prepare table with entries
     let mut encoder = Encoder::new(4096, 100);
+    encoder.set_capacity(4096).unwrap();
     for i in 0..100 {
         let name = format!("header-{}", i);
         let headers = vec![(name.as_bytes(), b"value".as_slice())];
@@ -153,7 +151,7 @@ fn bench_table_lookup(c: &mut Criterion) {
 }
 
 fn bench_prefix_integer(c: &mut Criterion) {
-    use quicd_qpack::prefix_int::{decode_int, encode_int};
+    use quicd_qpack::wire::prefix_int::{decode_int, encode_int};
 
     let mut group = c.benchmark_group("prefix_integer");
 
@@ -176,7 +174,7 @@ fn bench_prefix_integer(c: &mut Criterion) {
 }
 
 fn bench_huffman_encode(c: &mut Criterion) {
-    use quicd_qpack::huffman;
+    use quicd_qpack::wire::huffman;
 
     let mut group = c.benchmark_group("huffman_encode");
 
@@ -204,7 +202,7 @@ fn bench_huffman_encode(c: &mut Criterion) {
 }
 
 fn bench_huffman_decode(c: &mut Criterion) {
-    use quicd_qpack::huffman;
+    use quicd_qpack::wire::huffman;
 
     let mut group = c.benchmark_group("huffman_decode");
 
