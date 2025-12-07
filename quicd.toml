@@ -47,12 +47,12 @@ reuse_addr = true
 [global.tls]
 # Path to TLS certificate file (.crt file with PEM encoding)
 # Default: None (REQUIRED - must be provided)
-# cert_path = "certs/cert.crt"
+cert_path = "certs/cert.crt"
 
 # Path to TLS private key file (.key file with PEM encoding)
 # Required if cert_path is specified
 # Default: None (REQUIRED - must be provided)
-# key_path = "certs/key.key"
+key_path = "certs/key.key"
 
 # Enable TLS 1.3 early data (0-RTT)
 # WARNING: 0-RTT data is not forward secret and can be replayed
@@ -260,7 +260,7 @@ dgram_send_max_queue_len = 1000
 [global.netio]
 # Number of network I/O worker threads
 # Default: Number of CPU cores
-# workers = 8
+workers = 8
 
 # Enable SO_REUSEPORT for load distribution
 # Default: true
@@ -277,11 +277,11 @@ uring_entries = 2048
 # Kernel receive buffer size (SO_RCVBUF)
 # Larger buffers reduce packet loss under burst traffic
 # Default: None (system default)
-# socket_recv_buffer_size = 2097152
+# socket_recv_buffer_size = 2097152  # 2 MB
 
 # Kernel send buffer size (SO_SNDBUF)
 # Default: None (system default)
-# socket_send_buffer_size = 2097152
+# socket_send_buffer_size = 2097152  # 2 MB
 
 # Enable UDP GRO (Generic Receive Offload)
 # Linux 5.0+ only, gracefully degrades on other platforms
@@ -300,7 +300,7 @@ max_coalesced_size = 1400
 [global.netio.buffer_pool]
 # Maximum buffers per worker (isolated pools, no sharing)
 # Default: System-calculated
-# max_buffers_per_worker = 2048
+max_buffers_per_worker = 2048
 
 # Datagram size for buffer trimming
 # Default: 1350
@@ -353,88 +353,6 @@ service_name = "quicd"
 # Enable detailed per-connection metrics
 # Warning: High cardinality, may impact performance
 # Default: false
-enable_per_connection_metrics = false
-
-# ----------------------------------------------------------------------------
-# Network I/O Configuration
-# ----------------------------------------------------------------------------
-[global.netio]
-# Number of network I/O worker threads
-# Default: Number of CPU cores
-workers = 8
-
-# Enable SO_REUSEPORT for load distribution
-reuse_port = true
-
-# Pin worker threads to specific CPU cores
-pin_to_cpu = true
-
-# io_uring submission queue entries per worker (must be power of 2)
-uring_entries = 2048
-
-# Kernel receive buffer size (SO_RCVBUF)
-# Larger buffers reduce packet loss under burst traffic
-# socket_recv_buffer_size = 2097152  # 2 MB
-
-# Kernel send buffer size (SO_SNDBUF)
-# socket_send_buffer_size = 2097152  # 2 MB
-
-# Enable UDP GRO (Generic Receive Offload)
-# Linux 5.0+ only, gracefully degrades on other platforms
-enable_gro = true
-
-# Enable UDP GSO (Generic Segmentation Offload)
-# Linux 4.18+ only, gracefully degrades on other platforms
-enable_gso = true
-
-# Maximum size for coalesced UDP packets
-max_coalesced_size = 1400
-
-[global.netio.buffer_pool]
-# Maximum buffers per worker (isolated pools, no sharing)
-max_buffers_per_worker = 2048
-
-# Datagram size for buffer trimming
-datagram_size = 1350
-
-# ----------------------------------------------------------------------------
-# Channel Capacity Configuration
-# ----------------------------------------------------------------------------
-[global.channels]
-# Worker egress channel capacity (app → worker)
-# All app tasks share this channel per worker
-worker_egress_capacity = 2048
-
-# Connection ingress channel capacity (worker → app)
-# Per-connection event stream buffer
-connection_ingress_capacity = 1024
-
-# Stream ingress channel capacity (worker → app)
-# Per-stream data buffer
-stream_ingress_capacity = 256
-
-# Stream egress channel capacity (app → worker)
-# Per-stream write command buffer
-stream_egress_capacity = 256
-
-# ----------------------------------------------------------------------------
-# Telemetry Configuration
-# ----------------------------------------------------------------------------
-[global.telemetry]
-# Enable telemetry system
-enabled = true
-
-# Metrics export interval in seconds
-export_interval_seconds = 60
-
-# OpenTelemetry collector endpoint
-otlp_endpoint = "http://localhost:4317"
-
-# Service name for telemetry
-service_name = "quicd"
-
-# Enable detailed per-connection metrics
-# Warning: High cardinality, may impact performance
 enable_per_connection_metrics = false
 
 # ============================================================================
