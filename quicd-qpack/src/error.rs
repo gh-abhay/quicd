@@ -1,8 +1,18 @@
 //! QPACK error types per RFC 9204.
 
-use std::fmt;
+#[cfg(not(feature = "std"))]
+extern crate alloc;
 
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
+
+use core::fmt;
+
+#[cfg(feature = "std")]
 pub type Result<T> = std::result::Result<T, QpackError>;
+
+#[cfg(not(feature = "std"))]
+pub type Result<T> = core::result::Result<T, QpackError>;
 
 /// QPACK-specific errors that map to HTTP/3 error codes.
 #[cfg_attr(not(feature = "async"), derive(Clone, PartialEq, Eq))]
@@ -38,7 +48,11 @@ pub enum QpackError {
     /// Required Insert Count exceeds actual insert count.
     InvalidRequiredInsertCount,
 
-    /// Stream references entries not yet acknowledged.
+    /// Stream is blocked on dynamic table updates.
+    /// This is not a fatal error, but indicates the stream cannot be processed yet.
+    Blocked,
+
+    /// Blocked stream limit exceeded.
     BlockedStreamLimitExceeded,
 
     /// Buffer underflow during parsing.
@@ -46,6 +60,9 @@ pub enum QpackError {
 
     /// Huffman decoding error.
     HuffmanDecodingError(String),
+
+    /// Huffman encoding error.
+    HuffmanEncodingError(String),
 
     /// Internal error.
     Internal(String),
@@ -69,9 +86,11 @@ impl fmt::Display for QpackError {
             }
             QpackError::TableCapacityExceeded => write!(f, "Dynamic table capacity exceeded"),
             QpackError::InvalidRequiredInsertCount => write!(f, "Invalid Required Insert Count"),
+            QpackError::Blocked => write!(f, "Stream blocked on dynamic table"),
             QpackError::BlockedStreamLimitExceeded => write!(f, "Blocked stream limit exceeded"),
             QpackError::UnexpectedEof => write!(f, "Unexpected end of buffer"),
             QpackError::HuffmanDecodingError(msg) => write!(f, "Huffman decoding error: {}", msg),
+            QpackError::HuffmanEncodingError(msg) => write!(f, "Huffman encoding error: {}", msg),
             QpackError::Internal(msg) => write!(f, "Internal error: {}", msg),
             #[cfg(feature = "async")]
             QpackError::Io(err) => write!(f, "I/O error: {}", err),
@@ -86,4 +105,5 @@ impl From<std::io::Error> for QpackError {
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for QpackError {}
