@@ -274,7 +274,7 @@ fn test_zero_copy_semantics() {
 /// RFC 9204 Section 4.1.2: Test Huffman encoding is applied automatically
 #[test]
 fn test_huffman_encoding_automatic() {
-    use quicd_qpack::huffman;
+    use quicd_qpack::wire::huffman;
 
     let mut encoder = Encoder::new(4096, 100);
     let mut decoder = Decoder::new(4096, 100);
@@ -307,7 +307,7 @@ fn test_huffman_encoding_automatic() {
 /// RFC 9204 Section 4.1.2: Test Huffman roundtrip for various inputs
 #[test]
 fn test_huffman_roundtrip_comprehensive() {
-    use quicd_qpack::huffman;
+    use quicd_qpack::wire::huffman;
 
     let test_cases = vec![
         b"www.example.com" as &[u8],
@@ -439,7 +439,7 @@ fn test_sensitive_pattern_detection() {
 /// RFC 9204: Test Huffman encoding performance benefit
 #[test]
 fn test_huffman_compression_ratio() {
-    use quicd_qpack::huffman;
+    use quicd_qpack::wire::huffman;
 
     let test_cases = vec![
         // Common HTTP header values - actual compression varies by character frequency
@@ -535,14 +535,28 @@ fn test_encoder_instruction_batching() {
 fn test_capacity_reduction_eviction() {
     let mut encoder = Encoder::new(4096, 100);
     encoder.set_capacity(4096).unwrap();
+    let mut decoder = Decoder::new(4096, 100);
 
     // Fill table with entries
     for i in 0..20 {
         let name = format!("header-{}", i);
         let value = "x".repeat(100); // 100 bytes each
         let headers = vec![(name.as_bytes(), value.as_bytes())];
-        let _ = encoder.encode(i as u64, &headers).unwrap();
-        let _ = encoder.drain_encoder_stream();
+        let encoded = encoder.encode(i as u64, &headers).unwrap();
+        
+        // Process encoder instructions to sync tables
+        while let Some(inst) = encoder.poll_encoder_stream() {
+            decoder.process_encoder_instruction(&inst).unwrap();
+        }
+        
+        // Decode to generate acknowledgments
+        let _ = decoder.decode(i as u64, encoded).unwrap();
+        decoder.ack_header_block(i as u64);
+        
+        // Process decoder acknowledgments to clear blocked streams
+        while let Some(ack) = decoder.poll_decoder_stream() {
+            encoder.process_decoder_instruction(&ack).unwrap();
+        }
     }
 
     let initial_count = encoder.table().insert_count();
@@ -575,7 +589,7 @@ fn test_section_ack_explicit() {
 fn test_known_received_count_overflow() {
     use quicd_qpack::DynamicTable;
 
-    let table = DynamicTable::new(4096);
+    let mut table = DynamicTable::new(4096);
 
     // Update with large increment near u64::MAX
     table.update_known_received_count(u64::MAX - 100);

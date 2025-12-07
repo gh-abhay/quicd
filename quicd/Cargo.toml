@@ -6,6 +6,7 @@ edition = "2021"
 
 [dependencies]
 quicd-x = { path = "../quicd-x" }
+quicd-qpack = { path = "../quicd-qpack" }
 bytes = "1.11.0"
 clap = { version = "4.5.53", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
