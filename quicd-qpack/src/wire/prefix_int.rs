@@ -1,6 +1,9 @@
 //! Prefix integer encoding and decoding per RFC 7541 Section 5.1.
 //! Used throughout QPACK for encoding indexes, lengths, and counts.
 
+extern crate alloc;
+use alloc::vec::Vec;
+
 use crate::error::{QpackError, Result};
 
 /// Decode a prefix integer from a byte slice.

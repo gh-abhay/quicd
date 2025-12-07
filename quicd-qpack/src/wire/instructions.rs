@@ -11,11 +11,14 @@
 //! - Stream Cancellation
 //! - Insert Count Increment
 
+extern crate alloc;
+use alloc::vec::Vec;
+
 use bytes::{Bytes, BytesMut};
 
 use crate::error::{QpackError, Result};
-use crate::huffman;
-use crate::prefix_int::{decode_int, encode_int_with_prefix};
+use crate::wire::huffman;
+use crate::wire::prefix_int::{decode_int, encode_int_with_prefix};
 
 /// Encoder stream instruction types.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +203,14 @@ impl DecoderInstruction {
         } else {
             // 00 | Increment (6+)
             let (increment, consumed) = decode_int(data, 6)?;
+            
+            // RFC 9204 Section 4.3.2.3: The Increment field MUST NOT be zero.
+            if increment == 0 {
+                return Err(QpackError::DecoderStreamError(
+                    "Insert Count Increment must not be zero".into(),
+                ));
+            }
+
             data = &data[consumed..];
             DecoderInstruction::InsertCountIncrement { increment }
         };
@@ -211,16 +222,28 @@ impl DecoderInstruction {
 
 /// Encode a string with optional Huffman encoding.
 /// Pattern: H | Length (7+) | Data
+/// 
+/// Zero-allocation fast path: uses stack buffer for strings <= 16KB.
 #[inline]
 fn encode_string(data: &[u8], huffman: bool, buf: &mut BytesMut) {
+    const STACK_BUF_SIZE: usize = 16384; // 16KB stack buffer (P1 optimization)
+    
     if huffman {
         // Use Huffman encoding if beneficial
         let huffman_size = huffman::encoded_size(data);
         if huffman_size < data.len() {
             buf.extend_from_slice(&encode_int_with_prefix(huffman_size as u64, 7, 0x80));
-            let mut encoded = Vec::new();
-            huffman::encode(data, &mut encoded);
-            buf.extend_from_slice(&encoded);
+            
+            // Zero-allocation fast path
+            if huffman_size <= STACK_BUF_SIZE {
+                let mut stack_buf = [0u8; STACK_BUF_SIZE];
+                let written = huffman::encode_into(data, &mut stack_buf[..huffman_size]).unwrap();
+                buf.extend_from_slice(&stack_buf[..written]);
+            } else {
+                let mut encoded = Vec::new();
+                huffman::encode(data, &mut encoded);
+                buf.extend_from_slice(&encoded);
+            }
             return;
         }
     }
@@ -231,6 +254,8 @@ fn encode_string(data: &[u8], huffman: bool, buf: &mut BytesMut) {
 }
 
 /// Encode a string with custom prefix bits and mask.
+/// 
+/// Zero-allocation fast path: uses stack buffer for strings <= 256KB.
 #[inline]
 fn encode_string_with_prefix(
     data: &[u8],
@@ -239,6 +264,8 @@ fn encode_string_with_prefix(
     prefix_mask: u8,
     buf: &mut BytesMut,
 ) {
+    const STACK_BUF_SIZE: usize = 262144; // 256KB stack buffer (covers all practical headers)
+    
     if huffman {
         let huffman_size = huffman::encoded_size(data);
         if huffman_size < data.len() {
@@ -249,9 +276,17 @@ fn encode_string_with_prefix(
                 prefix_bits,
                 full_prefix,
             ));
-            let mut encoded = Vec::new();
-            huffman::encode(data, &mut encoded);
-            buf.extend_from_slice(&encoded);
+            
+            // Zero-allocation fast path
+            if huffman_size <= STACK_BUF_SIZE {
+                let mut stack_buf = [0u8; STACK_BUF_SIZE];
+                let written = huffman::encode_into(data, &mut stack_buf[..huffman_size]).unwrap();
+                buf.extend_from_slice(&stack_buf[..written]);
+            } else {
+                let mut encoded = Vec::new();
+                huffman::encode(data, &mut encoded);
+                buf.extend_from_slice(&encoded);
+            }
             return;
         }
     }
@@ -267,8 +302,12 @@ fn encode_string_with_prefix(
 
 /// Decode a string (with 7-bit length prefix).
 /// Returns (data, bytes_consumed).
+/// 
+/// Zero-allocation fast path: uses stack buffer for strings <= 256KB.
 #[inline]
 fn decode_string(data: &[u8]) -> Result<(Bytes, usize)> {
+    const STACK_BUF_SIZE: usize = 262144; // 256KB stack buffer (covers all practical headers)
+    
     if data.is_empty() {
         return Err(QpackError::UnexpectedEof);
     }
@@ -284,9 +323,17 @@ fn decode_string(data: &[u8]) -> Result<(Bytes, usize)> {
     offset += len as usize;
 
     let decoded_data = if huffman {
-        let mut decoded = Vec::new();
-        huffman::decode(string_data, &mut decoded)?;
-        Bytes::from(decoded)
+        // Zero-allocation fast path for all practical header sizes
+        if string_data.len() * 2 <= STACK_BUF_SIZE {
+            let mut stack_buf = [0u8; STACK_BUF_SIZE];
+            let written = huffman::decode_into(string_data, &mut stack_buf)?;
+            Bytes::copy_from_slice(&stack_buf[..written])
+        } else {
+            // Fallback for extremely large headers (rare)
+            let mut decoded = Vec::new();
+            huffman::decode(string_data, &mut decoded)?;
+            Bytes::from(decoded)
+        }
     } else {
         Bytes::copy_from_slice(string_data)
     };
@@ -296,8 +343,12 @@ fn decode_string(data: &[u8]) -> Result<(Bytes, usize)> {
 
 /// Decode a string with custom prefix bits.
 /// Returns (data, bytes_consumed).
+/// 
+/// Zero-allocation fast path: uses stack buffer for strings <= 256KB.
 #[inline]
 fn decode_string_with_prefix(data: &[u8], prefix_bits: u8) -> Result<(Bytes, usize)> {
+    const STACK_BUF_SIZE: usize = 262144; // 256KB stack buffer (covers all practical headers)
+    
     if data.is_empty() {
         return Err(QpackError::UnexpectedEof);
     }
@@ -313,9 +364,17 @@ fn decode_string_with_prefix(data: &[u8], prefix_bits: u8) -> Result<(Bytes, usi
     offset += len as usize;
 
     let decoded_data = if huffman {
-        let mut decoded = Vec::new();
-        huffman::decode(string_data, &mut decoded)?;
-        Bytes::from(decoded)
+        // Zero-allocation fast path for all practical header sizes
+        if string_data.len() * 2 <= STACK_BUF_SIZE {
+            let mut stack_buf = [0u8; STACK_BUF_SIZE];
+            let written = huffman::decode_into(string_data, &mut stack_buf)?;
+            Bytes::copy_from_slice(&stack_buf[..written])
+        } else {
+            // Fallback for extremely large headers (rare)
+            let mut decoded = Vec::new();
+            huffman::decode(string_data, &mut decoded)?;
+            Bytes::from(decoded)
+        }
     } else {
         Bytes::copy_from_slice(string_data)
     };

@@ -2,8 +2,7 @@
 //!
 //! Demonstrates realistic usage of QPACK encoder/decoder in an HTTP/3 context.
 
-use quicd_qpack::{Decoder, Encoder, HeaderField};
-use std::collections::HashMap;
+use quicd_qpack::{Decoder, Encoder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== QPACK Production Example ===\n");
@@ -66,7 +65,7 @@ fn simulate_request_response_cycle(
 
     // SERVER: Process encoder instructions
     for inst in encoder_instructions {
-        decoder.process_encoder_instruction(&inst)?;
+        let _ = decoder.process_encoder_instruction(&inst)?;
     }
 
     // SERVER: Decode request headers

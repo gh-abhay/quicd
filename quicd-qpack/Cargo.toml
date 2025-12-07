@@ -4,27 +4,38 @@ version = "0.1.0"
 edition = "2021"
 authors = ["QUICD Team"]
 license = "MIT OR Apache-2.0"
-description = "Production-grade, lock-free, zero-copy QPACK (RFC 9204) implementation for HTTP/3"
+description = "Production-grade, safe, zero-copy QPACK (RFC 9204) implementation for HTTP/3"
 repository = "https://github.com/gh-abhay/quicd"
 keywords = ["http3", "qpack", "compression", "quic", "rfc9204"]
 categories = ["network-programming", "encoding", "compression"]
 readme = "README.md"
 
 [dependencies]
-bytes = "1.5"
-humantime-serde = "1.1.1"
-lazy_static = "1.4"
-serde = { version = "1.0.228", features = ["derive"] }
+bytes = { version = "1.5", default-features = false }
+hashbrown = { version = "0.14", default-features = false, features = ["ahash", "inline-more"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "alloc"] }
+smallvec = { version = "1.13", default-features = false }
+spin = { version = "0.9", default-features = false, features = ["once"] }
 tokio = { version = "1.35", features = ["io-util", "sync"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.35", features = ["full", "rt-multi-thread", "macros"] }
 criterion = "0.5"
+proptest = "1.4"
 
 [features]
-default = ["async"]
-async = ["tokio"]
+default = ["std"]
+std = ["bytes/std", "hashbrown/default", "serde/std", "smallvec/write"]
+async = ["tokio", "std"]
 
 [[bench]]
 name = "qpack_bench"
+harness = false
+
+[[bench]]
+name = "qpack_optimized"
+harness = false
+
+[[bench]]
+name = "huffman_zero_alloc"
 harness = false

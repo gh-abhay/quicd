@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let encoder_insts2 = encoder.drain_encoder_stream();
     println!("Encoder instructions: {}", encoder_insts2.len());
     for inst in encoder_insts2 {
-        decoder.process_encoder_instruction(&inst)?;
+        let _ = decoder.process_encoder_instruction(&inst)?;
     }
 
     // Decode headers
@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("New encoder instructions: {}", encoder_insts3.len());
 
     for inst in encoder_insts3 {
-        decoder.process_encoder_instruction(&inst)?;
+        let _ = decoder.process_encoder_instruction(&inst)?;
     }
 
     let decoded3 = decoder.decode(stream_id3, encoded3)?;

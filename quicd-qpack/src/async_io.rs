@@ -133,7 +133,7 @@ pub mod async_support {
         }
 
         /// Process encoder instruction asynchronously.
-        pub async fn process_encoder_instruction(&mut self, data: &[u8]) -> Result<()> {
+        pub async fn process_encoder_instruction(&mut self, data: &[u8]) -> Result<Vec<(u64, Vec<crate::HeaderField>)>> {
             self.decoder.process_encoder_instruction(data)
         }
     }

@@ -7,9 +7,10 @@
 //!
 //! - **100% RFC 9204 compliant**: Full support for static table, dynamic table,
 //!   encoder/decoder streams, and all instruction types.
-//! - **Lock-free**: Concurrent readers, single writer with atomic operations.
+//! - **Safe**: 100% Safe Rust implementation with no `unsafe` blocks.
 //! - **Zero-copy**: Bytes-based storage and parsing minimizes allocations.
 //! - **High performance**: Optimized for >10M header block ops/sec.
+//! - **no_std compatible**: Works in embedded environments with `alloc`.
 //!
 //! # Example
 //!
@@ -31,16 +32,19 @@
 //! let decoded = decoder.decode(0, encoded).unwrap();
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate std;
+
 pub mod config;
 pub mod decoder;
 pub mod encoder;
 pub mod error;
-pub mod header_block;
-pub mod huffman;
-pub mod instructions;
-pub mod prefix_int;
-pub mod static_table;
-pub mod table;
+pub mod tables;
+pub mod wire;
 
 #[cfg(feature = "async")]
 pub mod async_io;
@@ -50,11 +54,12 @@ pub use config::QpackConfig;
 pub use decoder::{Decoder, HeaderField};
 pub use encoder::{should_never_index, Encoder};
 pub use error::{QpackError, Result};
-pub use table::DynamicTable;
+pub use tables::DynamicTable;
 
 #[cfg(feature = "async")]
 pub use async_io::{AsyncDecoder, AsyncEncoder};
 
 // Re-export utilities for benchmarking and testing
-pub use huffman::{decode as huffman_decode, encode, encoded_size};
-pub use prefix_int::{decode_int, encode_int};
+pub use wire::huffman::{decode as huffman_decode, decode_into as huffman_decode_into, 
+                   encode, encode_into as huffman_encode_into, encoded_size};
+pub use wire::prefix_int::{decode_int, encode_int};

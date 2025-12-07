@@ -78,18 +78,16 @@
 //!
 //! ```rust,no_run
 //! use quicd_x::{QuicAppFactory, AppEvent, ConnectionHandle, StreamData};
-//! use async_trait::async_trait;
 //! use futures::StreamExt;
 //!
 //! struct MyAppFactory;
 //!
-//! #[async_trait]
 //! impl QuicAppFactory for MyAppFactory {
 //!     fn accepts_alpn(&self, alpn: &str) -> bool {
 //!         alpn == "myapp"
 //!     }
 //!
-//!     async fn spawn_app(
+//!     fn spawn_app(
 //!         &self,
 //!         alpn: String,
 //!         handle: ConnectionHandle,
@@ -97,38 +95,40 @@
 //!         _transport: quicd_x::TransportControls,
 //!         mut shutdown: quicd_x::ShutdownFuture,
 //!     ) -> Result<(), quicd_x::ConnectionError> {
-//!         loop {
-//!             tokio::select! {
-//!                 Some(event) = events.next() => {
-//!                     match event {
-//!                         AppEvent::HandshakeCompleted { .. } => {
-//!                             // Connection established
-//!                         }
-//!                         AppEvent::NewStream { stream_id, mut recv_stream, send_stream, .. } => {
-//!                             if let Some(send) = send_stream {
-//!                                 // Echo using fluent API
-//!                                 while let Ok(Some(StreamData::Data(data))) = recv_stream.read().await {
-//!                                     send.send_data(data).with_fin(false).send().await?;
-//!                                 }
-//!                                 send.finish().await?;
+//!         tokio::spawn(async move {
+//!             loop {
+//!                 tokio::select! {
+//!                     Some(event) = events.next() => {
+//!                         match event {
+//!                             AppEvent::HandshakeCompleted { .. } => {
+//!                                 // Connection established
 //!                             }
+//!                             AppEvent::NewStream { stream_id, mut recv_stream, send_stream, .. } => {
+//!                                 if let Some(send) = send_stream {
+//!                                     // Echo using fluent API
+//!                                     while let Ok(Some(StreamData::Data(data))) = recv_stream.read().await {
+//!                                         let _ = send.send_data(data).with_fin(false).send().await;
+//!                                     }
+//!                                     let _ = send.finish().await;
+//!                                 }
+//!                             }
+//!                             AppEvent::StreamReadable { stream_id } => {
+//!                                 // Stream has buffered data - can read without blocking
+//!                             }
+//!                             AppEvent::ConnectionClosing { .. } => {
+//!                                 // Graceful cleanup
+//!                                 break;
+//!                             }
+//!                             _ => {}
 //!                         }
-//!                         AppEvent::StreamReadable { stream_id } => {
-//!                             // Stream has buffered data - can read without blocking
-//!                         }
-//!                         AppEvent::ConnectionClosing { .. } => {
-//!                             // Graceful cleanup
-//!                             break;
-//!                         }
-//!                         _ => {}
+//!                     }
+//!                     _ = &mut shutdown => {
+//!                         // Global shutdown - cleanup and exit
+//!                         break;
 //!                     }
 //!                 }
-//!                 _ = &mut shutdown => {
-//!                     // Global shutdown - cleanup and exit
-//!                     break;
-//!                 }
 //!             }
-//!         }
+//!         });
 //!         Ok(())
 //!     }
 //! }
@@ -180,18 +180,27 @@ pub use crate::server::{
 /// # Example
 ///
 /// ```rust
-/// use quicd_x::{QuicAppFactory, export_quic_app};
-/// use async_trait::async_trait;
+/// use quicd_x::{QuicAppFactory, export_quic_app, ConnectionHandle, AppEventStream, TransportControls, ShutdownFuture, ConnectionError};
 ///
 /// #[derive(Default)]
 /// struct MyAppFactory;
 ///
-/// #[async_trait]
 /// impl QuicAppFactory for MyAppFactory {
 ///     fn accepts_alpn(&self, alpn: &str) -> bool {
 ///         alpn == "my-proto"
 ///     }
-///     // ... implement other required methods
+///     
+///     fn spawn_app(
+///         &self,
+///         alpn: String,
+///         handle: ConnectionHandle,
+///         events: AppEventStream,
+///         transport: TransportControls,
+///         shutdown: ShutdownFuture,
+///     ) -> Result<(), ConnectionError> {
+///         // Spawn app task here
+///         Ok(())
+///     }
 /// }
 ///
 /// export_quic_app!(MyAppFactory);
