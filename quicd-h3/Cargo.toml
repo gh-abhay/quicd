@@ -6,16 +6,16 @@ edition = "2021"
 [dependencies]
 quicd-x = { path = "../quicd-x" }
 quicd-qpack = { path = "../quicd-qpack" }
-tokio = { version = "1.0", features = ["full"] }
-bytes = "1.0"
-futures = "0.3"
-async-trait = "0.1"
-thiserror = "1.0"
-http = "0.2"
-slab = "0.4"
-serde = { version = "1", features = ["derive"] }
-humantime-serde = "1"
-mio = { version = "0.8", features = ["net", "os-poll"] }
+tokio = { workspace = true, features = ["full"] }
+bytes = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+http = { workspace = true }
+slab = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+humantime-serde = { workspace = true }
+mio = { workspace = true, features = ["net", "os-poll"] }
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = { workspace = true }

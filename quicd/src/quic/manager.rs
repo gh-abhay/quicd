@@ -25,7 +25,7 @@ use super::connection::QuicConnection;
 use super::crypto::{create_quiche_config, TlsCredentials};
 use super::prefetch::{prefetch, PrefetchMode};
 use crate::netio::buffer::WorkerBuffer;
-use crate::quic::routing;
+use crate::routing;
 use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result};
 use bytes::Bytes;

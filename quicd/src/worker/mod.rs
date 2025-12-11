@@ -117,7 +117,7 @@ impl NetworkWorker {
         let socket_fd = socket.as_raw_fd();
 
         // Register socket with eBPF router (mandatory for connection affinity)
-        let routing_cookie = crate::quic::routing::register_worker_socket(id, &socket)
+        let routing_cookie = crate::routing::register_worker_socket(id, &socket)
             .with_context(|| {
                 format!(
                     "failed to register worker {id} socket with eBPF router - eBPF is mandatory"
@@ -910,7 +910,7 @@ impl NetworkWorker {
 impl Drop for NetworkWorker {
     fn drop(&mut self) {
         let cookie = self.routing_cookie;
-        if let Err(e) = crate::quic::routing::unregister_worker_socket(self.id) {
+        if let Err(e) = crate::routing::unregister_worker_socket(self.id) {
             warn!(worker_id = self.id, cookie, error = ?e, "Failed to unregister worker socket from eBPF map");
         } else if cookie != 0 {
             info!(
