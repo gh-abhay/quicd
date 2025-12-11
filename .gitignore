@@ -1,8 +1,8 @@
-target/
 /certs/
+.github/copilot-instructions.md
 
 # Added by cargo
 #
 # already existing elements were commented out
 
-#/target
+target/
