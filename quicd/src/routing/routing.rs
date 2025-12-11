@@ -14,7 +14,7 @@ use std::sync::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use quicd_ebpf_router::{ConnectionId, Cookie, Router};
+use super::router::{ConnectionId, Cookie, Router};
 use tracing::{debug, info, warn};
 
 /// Shared router state used by all workers.
@@ -200,14 +200,14 @@ pub fn validate_and_extract_worker(cid: &[u8]) -> Option<u8> {
 #[allow(dead_code)]
 pub fn is_valid_cookie(cookie: u16) -> bool {
     let generation = current_generation();
-    quicd_ebpf_router::is_valid_worker_cookie(cookie, generation)
+    super::router::is_valid_worker_cookie(cookie, generation)
 }
 
 /// Get the expected cookie for a worker (for debugging/verification).
 #[allow(dead_code)]
 pub fn get_expected_cookie(worker_idx: u8) -> u16 {
     let generation = current_generation();
-    quicd_ebpf_router::get_worker_cookie(generation, worker_idx)
+    super::router::get_worker_cookie(generation, worker_idx)
 }
 
 #[cfg(test)]
