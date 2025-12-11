@@ -3,6 +3,7 @@ mod channel_config;
 mod config;
 mod netio;
 mod quic;
+mod routing;
 mod runtime;
 mod telemetry;
 mod worker;
@@ -51,7 +52,7 @@ fn main() -> anyhow::Result<()> {
 
     // Initialize eBPF-based routing for connection affinity
     info!("Initializing eBPF-based QUIC routing");
-    crate::quic::routing::initialize_router().with_context(|| {
+    crate::routing::initialize_router().with_context(|| {
         "failed to initialize eBPF routing - eBPF is mandatory for connection affinity"
     })?;
 
