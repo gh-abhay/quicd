@@ -1,0 +1,19 @@
+[package]
+name = "ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "quicd-ebpf-router"
+path = "src/main.rs"
+required-features = []
