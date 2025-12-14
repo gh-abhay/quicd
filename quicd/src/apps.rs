@@ -79,6 +79,11 @@ impl AppRegistry {
         self.factories.contains_key(alpn)
     }
 
+    /// Get list of all registered ALPN protocols
+    pub fn alpn_list(&self) -> Vec<String> {
+        self.factories.keys().cloned().collect()
+    }
+
     /// Get all registered ALPNs
     pub fn alpns(&self) -> Vec<String> {
         self.factories.keys().cloned().collect()

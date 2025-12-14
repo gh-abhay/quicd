@@ -183,26 +183,74 @@ impl Http3Connection {
     async fn handle_frame(&mut self, stream_id: StreamId, frame: H3Frame, conn: &ConnectionHandle) -> Result<()> {
         match frame {
             H3Frame::Headers(payload) => {
-                // Decode headers
-                // For default handler: Respond 200 OK
-                
-                if let Some(mut send_stream) = self.send_streams.remove(&stream_id) {
-                    let headers = vec![
-                        (b":status".as_slice(), b"200".as_slice()),
-                        (b"content-length".as_slice(), b"0".as_slice()),
-                    ];
-                    
-                    let encoded = self.encoder.encode(stream_id, &headers).map_err(|_| H3Error::CompressionError)?;
-                    let header_frame = H3Frame::Headers(encoded);
-                    
-                    self.send_frame(&mut send_stream, header_frame).await?;
-                    self.write_stream(&mut send_stream, Bytes::new(), true).await?; // FIN
+                // Decode QPACK-encoded headers
+                match self.decoder.decode(stream_id, payload) {
+                    Ok(headers) => {
+                        // Parse HTTP/3 request
+                        let mut method = None;
+                        let mut path = None;
+                        let mut authority = None;
+                        
+                        for hdr in &headers {
+                            match hdr.name.as_ref() {
+                                b":method" => method = Some(String::from_utf8_lossy(&hdr.value).into_owned()),
+                                b":path" => path = Some(String::from_utf8_lossy(&hdr.value).into_owned()),
+                                b":authority" => authority = Some(String::from_utf8_lossy(&hdr.value).into_owned()),
+                                _ => {}
+                            }
+                        }
+                        
+                        info!(
+                            "HTTP/3 Request: {} {} (authority: {})",
+                            method.as_deref().unwrap_or("?"),
+                            path.as_deref().unwrap_or("?"),
+                            authority.as_deref().unwrap_or("?")
+                        );
+                        
+                        // Generate response
+                        if let Some(mut send_stream) = self.send_streams.remove(&stream_id) {
+                            // Default 200 OK response with minimal body
+                            let response_body = b"Hello from quicd HTTP/3 server!\n";
+                            let content_length_str = response_body.len().to_string();
+                            let response_headers = vec![
+                                (b":status".as_slice(), b"200".as_slice()),
+                                (b"content-type".as_slice(), b"text/plain".as_slice()),
+                                (b"content-length".as_slice(), content_length_str.as_bytes()),
+                            ];
+                            
+                            // Encode response headers
+                            let encoded = self.encoder.encode(stream_id, &response_headers)
+                                .map_err(|_| H3Error::CompressionError)?;
+                            let header_frame = H3Frame::Headers(encoded);
+                            
+                            // Send HEADERS frame
+                            self.send_frame(&mut send_stream, header_frame).await?;
+                            
+                            // Send DATA frame
+                            let data_frame = H3Frame::Data(Bytes::from_static(response_body));
+                            self.send_frame(&mut send_stream, data_frame).await?;
+                            
+                            // Send FIN
+                            self.write_stream(&mut send_stream, Bytes::new(), true).await?;
+                            
+                            info!("HTTP/3 Response sent: 200 OK ({} bytes)", response_body.len());
+                        }
+                    }
+                    Err(e) => {
+                        error!("QPACK decode error on stream {}: {:?}", stream_id, e);
+                        return Err(H3Error::CompressionError);
+                    }
                 }
             }
             H3Frame::Settings(settings) => {
                 debug!("Received SETTINGS: {:?}", settings);
             }
-            _ => {}
+            H3Frame::Data(data) => {
+                debug!("Received DATA frame on stream {}: {} bytes", stream_id, data.len());
+            }
+            _ => {
+                debug!("Received other H3 frame on stream {}", stream_id);
+            }
         }
         Ok(())
     }
