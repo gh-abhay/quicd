@@ -5,11 +5,9 @@ use quicd_x::{ConnectionHandle, AppEvent, EgressCommand, RecvStream, SendStream,
 use quicd_qpack::{Encoder, Decoder};
 use bytes::{Bytes, BytesMut, Buf, BufMut};
 use std::collections::HashMap;
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use async_trait::async_trait;
-use tokio_stream::{StreamMap, StreamExt};
-use tokio_stream::wrappers::ReceiverStream;
+use crossbeam_channel::{Sender, bounded};
 
 pub struct Http3Connection {
     // QPACK
@@ -85,21 +83,22 @@ impl Http3Connection {
     }
 
     async fn open_uni_stream(&self, conn: &ConnectionHandle) -> Result<(SendStream, RecvStream)> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = bounded(1);
         conn.send_command(EgressCommand::OpenStream { 
             connection_id: conn.connection_id.clone(),
             bidirectional: false, 
             reply: tx 
         }).await.map_err(|_| H3Error::InternalError)?;
         
-        match rx.await {
-            Ok(Ok((id, Some(tx_cmd), Some(rx_data)))) => {
+        // Wait for reply using block_in_place
+        match tokio::task::block_in_place(|| rx.recv().ok()) {
+            Some(Ok((id, Some(tx_cmd), Some(rx_data)))) => {
                 Ok((
                     quicd_x::new_send_stream(id, tx_cmd),
                     quicd_x::new_recv_stream(id, rx_data, conn.egress_tx.clone(), conn.connection_id.clone())
                 ))
             },
-            Ok(Err(e)) => Err(H3Error::Quic(anyhow::anyhow!("Connection Error: {:?}", e))),
+            Some(Err(e)) => Err(H3Error::Quic(anyhow::anyhow!("Connection Error: {:?}", e))),
             _ => Err(H3Error::InternalError),
         }
     }
@@ -122,16 +121,18 @@ impl Http3Connection {
     }
 
     async fn write_stream(&self, stream: &mut SendStream, data: Bytes, fin: bool) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = bounded(1);
         stream.tx.send(StreamWriteCmd {
             stream_id: stream.id,
             data,
             fin,
             reply: tx,
-        }).await.map_err(|_| H3Error::InternalError)?;
+        }).map_err(|_| H3Error::InternalError)?;
         
-        rx.await.map_err(|_| H3Error::InternalError)?
-            .map_err(|e| H3Error::Quic(anyhow::anyhow!("Write Error: {:?}", e)))?;
+        // Wait for reply using block_in_place
+        let result = tokio::task::block_in_place(|| rx.recv())
+            .map_err(|_| H3Error::InternalError)?;
+        result.map_err(|e| H3Error::Quic(anyhow::anyhow!("Write Error: {:?}", e)))?;
         Ok(())
     }
 
@@ -216,36 +217,56 @@ impl QuicApplication for Http3Connection {
             return;
         }
         
-        let mut active_streams = StreamMap::new();
+        // Store RecvStream for each active stream
+        let mut recv_streams: HashMap<StreamId, RecvStream> = HashMap::new();
         
         loop {
-            tokio::select! {
-                Some(event) = conn.recv_event() => {
-                    match event {
-                        AppEvent::NewStream { stream_id, bidirectional, recv_stream, send_stream } => {
-                            let stream = ReceiverStream::new(recv_stream.rx);
-                            active_streams.insert(stream_id, stream);
-                            
-                            if bidirectional {
-                                if let Some(ss) = send_stream {
-                                    h3_conn.send_streams.insert(stream_id, ss);
-                                }
-                            } else {
-                                // Unidirectional: We need to read type.
-                                // We don't know type yet.
-                            }
+            // Poll for connection events
+            match conn.recv_event().await {
+                Some(AppEvent::NewStream { stream_id, bidirectional, recv_stream, send_stream }) => {
+                    debug!("New stream {}, bidirectional: {}", stream_id, bidirectional);
+                    
+                    // Store the receive stream for reading
+                    recv_streams.insert(stream_id, recv_stream);
+                    
+                    if bidirectional {
+                        if let Some(ss) = send_stream {
+                            h3_conn.send_streams.insert(stream_id, ss);
                         }
-                        AppEvent::ConnectionClosed => {
-                            info!("Connection closed");
-                            break;
-                        }
-                        _ => {}
+                    }
+                    
+                    // For bidirectional streams (requests), spawn a task to handle it
+                    if bidirectional {
+                        // TODO: Read request and send response
+                        // This will be implemented in Phase 4
                     }
                 }
-                Some((stream_id, stream_data)) = active_streams.next() => {
+                Some(AppEvent::ConnectionClosed) => {
+                    info!("Connection closed");
+                    break;
+                }
+                Some(AppEvent::StreamData { stream_id, data, fin }) => {
+                    debug!("Stream {} data received, fin: {}", stream_id, fin);
+                    let stream_data = if fin {
+                        StreamData::Fin
+                    } else {
+                        StreamData::Data(data)
+                    };
                     if let Err(e) = h3_conn.handle_stream_data(stream_id, stream_data, &conn).await {
                         error!("Stream error on {}: {:?}", stream_id, e);
                     }
+                }
+                Some(AppEvent::StreamFinished { stream_id }) => {
+                    debug!("Stream {} finished", stream_id);
+                    recv_streams.remove(&stream_id);
+                }
+                Some(AppEvent::StreamClosed { stream_id, error_code, app_initiated }) => {
+                    warn!("Stream {} closed with error {}, app_initiated: {}", stream_id, error_code, app_initiated);
+                    recv_streams.remove(&stream_id);
+                }
+                None => {
+                    debug!("Connection handle closed");
+                    break;
                 }
             }
         }

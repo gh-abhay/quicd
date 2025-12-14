@@ -1,6 +1,8 @@
 //! Cryptographic primitives and traits.
 
 mod traits;
+pub mod kdf;
+
 #[cfg(feature = "rustls-tls")]
 pub mod rustls_impl;
 #[cfg(feature = "boringssl")]

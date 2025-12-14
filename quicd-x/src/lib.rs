@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 use bytes::Bytes;
 use thiserror::Error;
 use serde::{Deserialize, Serialize};
+use crossbeam_channel::{Sender, Receiver, bounded};
 
 pub type StreamId = u64;
 
@@ -14,8 +14,8 @@ pub enum StreamData {
 
 pub struct RecvStream {
     pub id: StreamId,
-    pub rx: mpsc::Receiver<StreamData>,
-    pub fc_tx: mpsc::Sender<EgressCommand>,
+    pub rx: Receiver<StreamData>,
+    pub fc_tx: Sender<EgressCommand>,
     pub connection_id: Bytes,
 }
 
@@ -30,15 +30,17 @@ impl std::fmt::Debug for RecvStream {
 
 impl RecvStream {
     pub async fn read(&mut self) -> Option<Bytes> {
-        match self.rx.recv().await {
+        // Use tokio blocking task to bridge sync channel to async
+        let rx = self.rx.clone();
+        match tokio::task::block_in_place(|| rx.recv().ok()) {
             Some(StreamData::Data(data)) => {
                 let len = data.len() as u64;
-                // Signal consumption to worker for flow control
-                let _ = self.fc_tx.send(EgressCommand::StreamConsumed { 
+                // Signal consumption to worker for flow control (non-blocking)
+                let _ = self.fc_tx.try_send(EgressCommand::StreamConsumed { 
                     connection_id: self.connection_id.clone(),
                     stream_id: self.id, 
                     amount: len 
-                }).await;
+                });
                 Some(data)
             },
             Some(StreamData::Fin) => None,
@@ -49,7 +51,7 @@ impl RecvStream {
 
 pub struct SendStream {
     pub id: StreamId,
-    pub tx: mpsc::Sender<StreamWriteCmd>,
+    pub tx: Sender<StreamWriteCmd>,
 }
 
 impl std::fmt::Debug for SendStream {
@@ -60,11 +62,11 @@ impl std::fmt::Debug for SendStream {
     }
 }
 
-pub fn new_recv_stream(id: StreamId, rx: mpsc::Receiver<StreamData>, fc_tx: mpsc::Sender<EgressCommand>, connection_id: Bytes) -> RecvStream {
+pub fn new_recv_stream(id: StreamId, rx: Receiver<StreamData>, fc_tx: Sender<EgressCommand>, connection_id: Bytes) -> RecvStream {
     RecvStream { id, rx, fc_tx, connection_id }
 }
 
-pub fn new_send_stream(id: StreamId, tx: mpsc::Sender<StreamWriteCmd>) -> SendStream {
+pub fn new_send_stream(id: StreamId, tx: Sender<StreamWriteCmd>) -> SendStream {
     SendStream { id, tx }
 }
 
@@ -101,7 +103,7 @@ pub enum EgressCommand {
     OpenStream {
         connection_id: Bytes,
         bidirectional: bool,
-        reply: tokio::sync::oneshot::Sender<Result<(u64, Option<mpsc::Sender<StreamWriteCmd>>, Option<mpsc::Receiver<StreamData>>), ConnectionError>>,
+        reply: Sender<Result<(u64, Option<Sender<StreamWriteCmd>>, Option<Receiver<StreamData>>), ConnectionError>>,
     },
 }
 
@@ -110,7 +112,7 @@ pub struct StreamWriteCmd {
     pub stream_id: u64,
     pub data: Bytes,
     pub fin: bool,
-    pub reply: tokio::sync::oneshot::Sender<Result<usize, ConnectionError>>,
+    pub reply: Sender<Result<usize, ConnectionError>>,
 }
 
 #[derive(Debug, Error)]
@@ -123,40 +125,43 @@ pub enum ConnectionError {
 
 pub struct ConnectionHandle {
     pub connection_id: Bytes,
-    pub ingress_rx: mpsc::Receiver<AppEvent>,
-    pub egress_tx: mpsc::Sender<EgressCommand>,
+    pub ingress_rx: Receiver<AppEvent>,
+    pub egress_tx: Sender<EgressCommand>,
 }
 
 impl ConnectionHandle {
-    pub fn new(connection_id: Bytes, ingress_rx: mpsc::Receiver<AppEvent>, egress_tx: mpsc::Sender<EgressCommand>) -> Self {
+    pub fn new(connection_id: Bytes, ingress_rx: Receiver<AppEvent>, egress_tx: Sender<EgressCommand>) -> Self {
         Self { connection_id, ingress_rx, egress_tx }
     }
     
     pub async fn recv_event(&mut self) -> Option<AppEvent> {
-        self.ingress_rx.recv().await
+        // Bridge sync channel to async using block_in_place
+        let rx = self.ingress_rx.clone();
+        tokio::task::block_in_place(|| rx.recv().ok())
     }
     
     pub async fn send_command(&self, cmd: EgressCommand) -> Result<(), ConnectionError> {
-        self.egress_tx.send(cmd).await.map_err(|_| ConnectionError::ChannelClosed)
+        self.egress_tx.send(cmd).map_err(|_| ConnectionError::ChannelClosed)
     }
 
     /// Open a new bidirectional stream
     pub async fn open_bi_stream(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = crossbeam_channel::bounded(1);
         self.send_command(EgressCommand::OpenStream { 
             connection_id: self.connection_id.clone(),
             bidirectional: true, 
             reply: tx 
         }).await?;
         
-        match rx.await {
-            Ok(Ok((id, Some(tx_cmd), Some(rx_data)))) => {
+        // Wait for reply using block_in_place to bridge sync to async
+        match tokio::task::block_in_place(|| rx.recv().ok()) {
+            Some(Ok((id, Some(tx_cmd), Some(rx_data)))) => {
                 Ok((
                     SendStream { id, tx: tx_cmd },
                     RecvStream { id, rx: rx_data, fc_tx: self.egress_tx.clone(), connection_id: self.connection_id.clone() }
                 ))
             },
-            Ok(Err(e)) => Err(e),
+            Some(Err(e)) => Err(e),
             _ => Err(ConnectionError::ChannelClosed),
         }
     }

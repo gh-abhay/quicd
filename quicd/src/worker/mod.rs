@@ -37,7 +37,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use tokio::sync::mpsc;
+use crossbeam_channel::bounded;
 use tracing::{debug, error, info, warn};
 
 /// User data for io_uring operations.
@@ -95,8 +95,8 @@ pub struct NetworkWorker {
     routing_cookie: u16,
     runtime_handle: tokio::runtime::Handle,
     app_registry: crate::apps::AppRegistry,
-    egress_tx: mpsc::Sender<quicd_x::EgressCommand>,
-    egress_rx: Option<mpsc::Receiver<quicd_x::EgressCommand>>,
+    egress_tx: crossbeam_channel::Sender<quicd_x::EgressCommand>,
+    egress_rx: Option<crossbeam_channel::Receiver<quicd_x::EgressCommand>>,
 }
 
 impl NetworkWorker {
@@ -134,7 +134,7 @@ impl NetworkWorker {
 
         // Create egress channel for receiving commands from app tasks
         // Use configured capacity for worker egress channel
-        let (egress_tx, egress_rx) = mpsc::channel(channel_config.worker_egress_capacity);
+        let (egress_tx, egress_rx) = bounded(channel_config.worker_egress_capacity);
 
         debug!(
             worker_id = id,
@@ -432,8 +432,8 @@ impl NetworkWorker {
                             }
                         }
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         warn!(worker_id, "Egress channel disconnected");
                         break;
                     }
