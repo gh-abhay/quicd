@@ -7,6 +7,7 @@ edition = "2021"
 [dependencies]
 quicd-x = { path = "../quicd-x" }
 quicd-qpack = { path = "../quicd-qpack" }
+quicd-quic = { path = "../quicd-quic" }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
@@ -18,9 +19,10 @@ sys-info = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 num_cpus = { workspace = true }
-quiche = { workspace = true }
 datagram-socket = { workspace = true }
 io-uring = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 socket2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"] }
@@ -48,6 +50,7 @@ siphasher = "1.0"
 getrandom = "0.2"
 log = "0.4"
 ebpf = { path = "../ebpf" }
+rand = "0.9.2"
 
 [build-dependencies]
 anyhow = { workspace = true }

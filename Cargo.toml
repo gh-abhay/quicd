@@ -1,6 +1,6 @@
 [workspace]
-members = ["quicd", "ebpf", "quicd-x", "quicd-qpack", "quicd-h3"]
-default-members = ["quicd", "quicd-x", "quicd-qpack", "quicd-h3"]
+members = ["quicd", "ebpf", "quicd-quic", "quicd-x"]
+default-members = ["quicd", "quicd-quic", "quicd-x"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -34,7 +34,8 @@ opentelemetry = "0.31.0"
 opentelemetry-otlp = "0.31.0"
 opentelemetry_sdk = "0.31.0"
 opentelemetry-semantic-conventions = "0.31.0"
-quiche = "0.24.6"
+rustls = "0.23"
+rustls-pemfile = "2.2"
 rcgen = "0.14.5"
 ring = "0.17.14"
 serde = "1.0.228"

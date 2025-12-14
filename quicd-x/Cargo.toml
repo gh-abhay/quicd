@@ -4,17 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bytes = { workspace = true }
-futures-core = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
-tokio-stream = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-humantime-serde = { workspace = true }
-sys-info = { workspace = true }
-num_cpus = { workspace = true }
-libc = { workspace = true }
-
-[dev-dependencies]
-futures = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { version = "1.43", features = ["full"] }
+async-trait = "0.1"
+bytes = "1.9"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }

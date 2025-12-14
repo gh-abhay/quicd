@@ -119,7 +119,19 @@ impl WorkerBufPool {
         if buffers.len() < self.max_buffers {
             // Trim buffer to target size to prevent unbounded growth
             buffer.clear();
-            buffer.shrink_to(self.buffer_size);
+            
+            // Optimization: If buffer is already at MAX_UDP_PAYLOAD capacity (from recvmsg),
+            // keep it that way to avoid reallocation when reused for recvmsg.
+            // Only shrink if it's excessively large or if we want to enforce small buffers.
+            // Since we use MAX_UDP_PAYLOAD for receive, keeping it is better.
+            if buffer.capacity() > MAX_UDP_PAYLOAD {
+                buffer.shrink_to(self.buffer_size);
+            } else if buffer.capacity() < self.buffer_size {
+                // If it's smaller than target (unlikely if used for recv), grow it?
+                // No, just leave it.
+            }
+            // If capacity is between buffer_size and MAX_UDP_PAYLOAD, keep it.
+            // This covers the case where it was resized to MAX_UDP_PAYLOAD.
 
             // Push to end (LIFO: next to be allocated)
             buffers.push(buffer);
@@ -243,6 +255,16 @@ impl WorkerBuffer {
         }
     }
 
+    pub fn from_vec(data: Vec<u8>, pool: &Arc<WorkerBufPool>) -> Self {
+        let mut buf = pool.take();
+        buf.clear();
+        buf.extend_from_slice(&data);
+        Self {
+            inner: PooledBuffer::new(buf, pool.clone()),
+            len: data.len(),
+        }
+    }
+
     /// Get the length of received data
     #[inline]
     pub fn len(&self) -> usize {
@@ -269,13 +291,25 @@ impl WorkerBuffer {
     pub fn as_mut_slice_for_io(&mut self) -> &mut [u8] {
         let inner = &mut *self.inner;
 
-        // Ensure buffer can hold max UDP datagram
+        // Ensure buffer has capacity for max UDP datagram
+        // We need to set the length to the actual capacity, not MAX_UDP_PAYLOAD,
+        // because the allocator might not give us exactly what we asked for.
         if inner.capacity() < MAX_UDP_PAYLOAD {
+            // Reserve the difference to reach MAX_UDP_PAYLOAD capacity
             inner.reserve(MAX_UDP_PAYLOAD - inner.capacity());
         }
 
-        // Resize to max capacity for recvmsg
-        inner.resize(MAX_UDP_PAYLOAD, 0);
+        // Get the actual capacity and use that as the length
+        // This way we use all available space for receiving
+        let actual_capacity = inner.capacity();
+        
+        // Resize to actual capacity for recvmsg
+        // SAFETY: We are passing this buffer to the kernel to fill via recvmsg.
+        // We do not read the uninitialized bytes before the kernel writes to them.
+        // Using set_len avoids the expensive zero-initialization of the buffer.
+        unsafe {
+            inner.set_len(actual_capacity);
+        }
 
         inner.as_mut_slice()
     }

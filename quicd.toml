@@ -112,8 +112,8 @@ include_file_line = false
 [global.quic]
 # Maximum idle timeout in milliseconds
 # Connections idle longer than this are closed
-# Default: System-optimized (typically 30000)
-# max_idle_timeout_ms = 30000
+# Default: 30000
+max_idle_timeout_ms = 30000
 
 # Initial RTT estimate in milliseconds
 # Default: 100
@@ -130,129 +130,36 @@ max_streams_uni = 100
 # Maximum UDP payload size in bytes
 # Should be ≤ path MTU to avoid fragmentation
 # QUIC minimum: 1200 bytes
-# Default: System-optimized (typically 1350)
-# max_udp_payload_size = 1350
+# Default: 1350
+max_udp_payload_size = 1350
 
 # Connection-level receive window (bytes)
-# Default: System-optimized (typically 10485760 = 10 MB)
-# recv_window = 10485760
+# Default: 10485760 (10 MB)
+recv_window = 10485760
 
 # Per-stream receive window (bytes)
-# Default: System-optimized (typically 1048576 = 1 MB)
-# stream_recv_window = 1048576
-
-# Congestion control algorithm
-# Options: "cubic", "bbr", "bbr2", "reno"
-# Default: "cubic"
-congestion_control = "cubic"
-
-# Enable early data (0-RTT) at QUIC layer
-# Default: false
-enable_early_data = false
+# Default: 1048576 (1 MB)
+stream_recv_window = 1048576
 
 # Disable active migration (prevents IP/port changes)
 # Default: false
 disable_active_migration = false
-
-# Enable packet pacing
-# Default: true
-enable_pacing = true
-
-# Maximum connections per worker thread
-# Default: System-calculated (typically 100000)
-# max_connections_per_worker = 100000
-
-# Enable QUIC version negotiation
-# Default: true
-enable_version_negotiation = true
-
-# Additional QUIC versions to support (v1 always enabled)
-# Default: []
-# additional_versions = ["draft-29"]
 
 # Enable DATAGRAM extension (RFC 9221)
 # Default: false
 enable_dgram = false
 
 # Maximum DATAGRAM frame size
-# Default: System-optimized (typically 1350)
-# max_dgram_size = 1350
+# Default: 1350
+max_dgram_size = 1350
 
-# Enable connection statistics collection
+# Enable packet pacing
 # Default: true
-enable_stats = true
+enable_pacing = true
 
-# ACK delay exponent (RFC 9000 §13.2.1)
-# Default: 3
-ack_delay_exponent = 3
-
-# Maximum ACK delay in milliseconds (RFC 9000 §13.2.1)
-# Default: 25
-max_ack_delay = 25
-
-# Active connection ID limit (RFC 9000 §5.1.1)
-# Default: 2
-active_connection_id_limit = 2
-
-# Enable peer certificate verification
-# Default: true
-verify_peer = true
-
-# CA certificate file for peer verification
-# Default: None
-# ca_cert_file = "/path/to/ca.crt"
-
-# CA certificate directory for peer verification
-# Default: None
-# ca_cert_dir = "/path/to/ca/dir"
-
-# Session ticket for 0-RTT resumption
-# Default: None
-# session_ticket = "base64-encoded-ticket"
-
-# Log TLS keys for debugging (WARNING: Security risk)
-# Default: false
-log_keys = false
-
-# Stateless reset token
-# Default: None (auto-generated)
-# stateless_reset_token = "0123456789abcdef"
-
-# Initial congestion window in packets
-# Default: 10
-initial_congestion_window_packets = 10
-
-# Enable Hystart++ congestion control
-# Default: true
-enable_hystart = true
-
-# Maximum pacing rate in bytes per second
-# Default: None (unlimited)
-# max_pacing_rate = 10000000
-
-# Maximum amplification factor for anti-amplification
-# Default: 3
-max_amplification_factor = 3
-
-# Enable Path MTU Discovery
-# Default: false
-discover_pmtu = false
-
-# Enable GREASE for protocol compatibility testing
-# Default: true
-grease = true
-
-# Disable destination connection ID reuse
-# Default: false
-disable_dcid_reuse = false
-
-# Maximum DATAGRAM receive queue length
-# Default: 1000
-dgram_recv_max_queue_len = 1000
-
-# Maximum DATAGRAM send queue length
-# Default: 1000
-dgram_send_max_queue_len = 1000
+# Maximum pacing rate in bytes per second (0 = unlimited)
+# Default: 0
+max_pacing_rate = 0
 
 # ----------------------------------------------------------------------------
 # Network I/O Configuration

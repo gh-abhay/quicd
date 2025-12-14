@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 /// This struct is heap-allocated and stored in the `in_flight_recv` map.
 pub struct RecvOpState {
     /// Buffer to receive data into
-    pub buffer: WorkerBuffer,
+    pub buffer: Option<WorkerBuffer>,
 
     /// Socket address storage for peer address
     pub addr_storage: Box<libc::sockaddr_storage>,
@@ -64,7 +64,7 @@ impl RecvOpState {
         // We'll set up the pointers after boxing everything.
 
         let mut state = Box::new(Self {
-            buffer,
+            buffer: Some(buffer),
             addr_storage,
             iov,
             msg,
@@ -114,20 +114,45 @@ impl RecvOpState {
             }
         }
     }
+
+    /// Reset the state for reuse with a new buffer.
+    ///
+    /// This allows reusing the heap-allocated structures (RecvOpState, sockaddr_storage,
+    /// iovec, msghdr) without reallocating them.
+    pub fn reset(&mut self, mut buffer: WorkerBuffer) {
+        // Reset iovec to point to new buffer
+        let buf_slice = buffer.as_mut_slice_for_io();
+        self.iov.iov_base = buf_slice.as_mut_ptr() as *mut libc::c_void;
+        self.iov.iov_len = buf_slice.len();
+        
+        self.buffer = Some(buffer);
+        
+        // Reset msghdr fields that might have been modified or need refresh
+        // msg_name and msg_namelen should be preserved/reset
+        self.msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+        // msg_iov and msg_iovlen are stable
+        // msg_control and msg_controllen are 0/null
+        self.msg.msg_flags = 0;
+    }
+    
+    /// Take the buffer from the state.
+    pub fn take_buffer(&mut self) -> Option<WorkerBuffer> {
+        self.buffer.take()
+    }
 }
 
 /// State for a send operation.
 ///
 /// All fields must remain valid until the kernel completes the sendmsg operation.
 pub struct SendOpState {
-    /// Packet data to send
-    pub data: Vec<u8>,
+    /// Packet data to send (multiple buffers for scatter/gather)
+    pub data: Vec<WorkerBuffer>,
 
     /// Socket address storage for destination
     pub addr_storage: Box<libc::sockaddr_storage>,
 
-    /// iovec structure pointing to data
-    pub iov: Box<libc::iovec>,
+    /// iovec structures pointing to data
+    pub iovs: Vec<libc::iovec>,
 
     /// msghdr structure for sendmsg
     pub msg: Box<libc::msghdr>,
@@ -135,7 +160,7 @@ pub struct SendOpState {
 
 impl SendOpState {
     /// Create a new send operation state.
-    pub fn new(data: Vec<u8>, to: SocketAddr) -> Box<Self> {
+    pub fn new(data: Vec<WorkerBuffer>, to: SocketAddr) -> Box<Self> {
         use socket2::SockAddr;
 
         // Convert SocketAddr to SockAddr for libc compatibility
@@ -153,11 +178,11 @@ impl SendOpState {
             );
         }
 
-        // Create iovec on heap
-        let iov = Box::new(libc::iovec {
-            iov_base: data.as_ptr() as *mut libc::c_void,
-            iov_len: data.len(),
-        });
+        // Create iovecs on heap (in Vec)
+        let mut iovs: Vec<libc::iovec> = data.iter().map(|buf| libc::iovec {
+            iov_base: buf.as_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        }).collect();
 
         // SAFETY: Zero-initialization is safe for msghdr as we set all required
         // fields below before use
@@ -166,17 +191,50 @@ impl SendOpState {
         let mut state = Box::new(Self {
             data,
             addr_storage,
-            iov,
+            iovs,
             msg,
         });
 
         // Set up pointers in msghdr
         state.msg.msg_name = &*state.addr_storage as *const _ as *mut libc::c_void;
         state.msg.msg_namelen = sock_addr.len();
-        state.msg.msg_iov = &*state.iov as *const _ as *mut _;
-        state.msg.msg_iovlen = 1;
+        state.msg.msg_iov = state.iovs.as_mut_ptr();
+        state.msg.msg_iovlen = state.iovs.len();
 
         state
+    }
+
+    /// Reset the state for reuse with new data.
+    pub fn reset(&mut self, data: Vec<WorkerBuffer>, to: SocketAddr) {
+        use socket2::SockAddr;
+        
+        self.data = data;
+        
+        // Update address
+        let sock_addr = SockAddr::from(to);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                sock_addr.as_ptr() as *const libc::sockaddr_storage,
+                &mut *self.addr_storage as *mut libc::sockaddr_storage,
+                1,
+            );
+        }
+        
+        // Update iovecs
+        self.iovs.clear();
+        for buf in &self.data {
+            self.iovs.push(libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            });
+        }
+        
+        // Update msghdr
+        self.msg.msg_name = &*self.addr_storage as *const _ as *mut libc::c_void;
+        self.msg.msg_namelen = sock_addr.len();
+        self.msg.msg_iov = self.iovs.as_mut_ptr();
+        self.msg.msg_iovlen = self.iovs.len();
+        self.msg.msg_flags = 0;
     }
 
     /// Get a pointer to the msghdr for io_uring submission.

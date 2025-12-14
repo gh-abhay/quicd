@@ -1,0 +1,15 @@
+[package]
+name = "quicd-quic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+log = "0.4"
+rand = "0.8"
+smallvec = { workspace = true }
+bitflags = "2.6"
+anyhow = { workspace = true }
+rustls = { workspace = true, features = ["ring", "logging", "std"] }
+ring = { workspace = true }

@@ -1,229 +1,220 @@
-//! Common interfaces shared between the `quicd` core and pluggable QUIC applications.
-//!
-//! # Architecture
-//!
-//! This crate defines the contract between the QUIC server core (`quicd`) and pluggable
-//! applications (like HTTP/3, MOQ, DOQ, etc.) that run on top of it.
-//!
-//! ## Design Philosophy
-//!
-//! ### Event-Driven, Non-Blocking
-//! The entire interface is designed around async events and channels to ensure:
-//! - **Worker threads NEVER block** on application tasks
-//! - **Zero-copy data transfer** using `bytes::Bytes`
-//! - **Backpressure handling** via bounded channels
-//! - **Fair resource allocation** across millions of connections
-//!
-//! ### Separation of Concerns
-//! - **Worker threads** (sync): Handle network I/O, QUIC protocol, timeouts
-//! - **App tasks** (async): Implement application logic on Tokio runtime
-//! - **Channels**: Bidirectional communication without blocking
-//!
-//! ## Key Concepts
-//!
-//! ### Connection Lifecycle
-//! - **Application Registration**: Apps implement `QuicAppFactory` and register via `ALPN`.
-//! - **Connection Handshake**: Worker threads negotiate QUIC handshakes and determine ALPN.
-//! - **App Task Spawning**: Once handshake completes, a single `Tokio` task is spawned per
-//!   connection on a shared runtime, implementing the app's protocol logic.
-//! - **Connection Cleanup**: App task ends when connection closes.
-//!
-//! ### Data Flow (Ingress: Server → App)
-//! - **Connection Events**: `AppEvent::HandshakeCompleted`, `AppEvent::ConnectionClosing`
-//! - **Stream Events**: `AppEvent::NewStream` when peer opens a stream
-//! - **Stream Data**: Via `RecvStream::read()` (zero-copy `Bytes`)
-//! - **Stream Readable**: `AppEvent::StreamReadable` for efficient backpressure signaling
-//! - **Datagrams**: `AppEvent::Datagram` for unreliable packets
-//! - **Command Responses**: `AppEvent::StreamOpened`, `AppEvent::DatagramSent`, etc.
-//!
-//! ### Data Flow (Egress: App → Server)
-//! - **Stream Operations**: Via `ConnectionHandle::open_bi()`, `open_uni()`
-//! - **Stream Writes**: Via `SendStream::write()` (zero-copy `Bytes`)
-//! - **Fluent API**: Use `send_data().with_fin(true).send()` for ergonomic patterns
-//! - **Datagrams**: Via `ConnectionHandle::send_datagram()`
-//! - **Stream Control**: Via `ConnectionHandle::reset_stream()`, `close()`
-//! - **Stats**: Via `ConnectionHandle::stats()`
-//!
-//! ## Event-Driven, Non-Blocking Design
-//!
-//! The entire interface is designed to be non-blocking and event-driven:
-//! - **Worker Thread**: Never blocked by app tasks; handles ingress/egress for all connections
-//! - **App Task**: Driven by events from `AppEventStream`; uses channels for all I/O
-//! - **Channel Backpressure**: If ingress channel fills, worker will block (but other connections unaffected)
-//! - **Zero-Copy**: Uses `bytes::Bytes` throughout to avoid unnecessary allocations
-//!
-//! ## API Refinements (v0.2)
-//!
-//! ### Backpressure Signaling
-//! - **`AppEvent::StreamReadable`**: Edge-triggered notification when buffered data is available
-//! - Helps apps implement efficient polling without constant `read()` calls
-//! - Enables better flow control and resource management
-//!
-//! ### Ergonomic Builders
-//! - **`SendStream::send_data()`**: Fluent builder for HTTP/3 patterns
-//! - Example: `send_stream.send_data(body).with_fin(true).send().await`
-//! - Keeps the API ergonomic without added complexity
-//!
-//! ### Enhanced Error Handling
-//! - **`ConnectionError::QuicError`**: RFC 9000 compliant error codes
-//! - **`ConnectionError::TlsFail`**: Specific TLS handshake failures
-//! - Better error propagation for protocol-aware applications
-//!
-//! ### Graceful Shutdown
-//! - **30-second timeout**: Apps have grace period after `ConnectionClosing`
-//! - **`ShutdownFuture`**: Global shutdown signal independent of connection events
-//! - Prevents zombie tasks and ensures clean resource cleanup
-//!
-//! # Example
-//!
-//! ```rust,no_run
-//! use quicd_x::{QuicAppFactory, AppEvent, ConnectionHandle, StreamData};
-//! use futures::StreamExt;
-//!
-//! struct MyAppFactory;
-//!
-//! impl QuicAppFactory for MyAppFactory {
-//!     fn accepts_alpn(&self, alpn: &str) -> bool {
-//!         alpn == "myapp"
-//!     }
-//!
-//!     fn spawn_app(
-//!         &self,
-//!         alpn: String,
-//!         handle: ConnectionHandle,
-//!         mut events: quicd_x::AppEventStream,
-//!         _transport: quicd_x::TransportControls,
-//!         mut shutdown: quicd_x::ShutdownFuture,
-//!     ) -> Result<(), quicd_x::ConnectionError> {
-//!         tokio::spawn(async move {
-//!             loop {
-//!                 tokio::select! {
-//!                     Some(event) = events.next() => {
-//!                         match event {
-//!                             AppEvent::HandshakeCompleted { .. } => {
-//!                                 // Connection established
-//!                             }
-//!                             AppEvent::NewStream { stream_id, mut recv_stream, send_stream, .. } => {
-//!                                 if let Some(send) = send_stream {
-//!                                     // Echo using fluent API
-//!                                     while let Ok(Some(StreamData::Data(data))) = recv_stream.read().await {
-//!                                         let _ = send.send_data(data).with_fin(false).send().await;
-//!                                     }
-//!                                     let _ = send.finish().await;
-//!                                 }
-//!                             }
-//!                             AppEvent::StreamReadable { stream_id } => {
-//!                                 // Stream has buffered data - can read without blocking
-//!                             }
-//!                             AppEvent::ConnectionClosing { .. } => {
-//!                                 // Graceful cleanup
-//!                                 break;
-//!                             }
-//!                             _ => {}
-//!                         }
-//!                     }
-//!                     _ = &mut shutdown => {
-//!                         // Global shutdown - cleanup and exit
-//!                         break;
-//!                     }
-//!                 }
-//!             }
-//!         });
-//!         Ok(())
-//!     }
-//! }
-//! ```
+use async_trait::async_trait;
+use tokio::sync::mpsc;
+use bytes::Bytes;
+use thiserror::Error;
+use serde::{Deserialize, Serialize};
 
-mod error;
-mod events;
-mod factory;
-mod handle;
-mod server;
+pub type StreamId = u64;
 
-pub mod config;
-pub mod system_resources;
+#[derive(Debug, Clone)]
+pub enum StreamData {
+    Data(Bytes),
+    Fin,
+}
 
-pub use crate::config::QuicAppConfig;
-pub use crate::config::QuicTransportConfig;
-pub use crate::config::QuicTransportConfigBuilder;
-pub use crate::config::{
-    CongestionControl, DEFAULT_ACK_DELAY_EXPONENT, DEFAULT_ACTIVE_CID_LIMIT,
-    DEFAULT_AMPLIFICATION_FACTOR, DEFAULT_INITIAL_CWND_PACKETS, DEFAULT_INITIAL_RTT_MS,
-    DEFAULT_MAX_ACK_DELAY, DEFAULT_MAX_CONNECTIONS_PER_WORKER, DEFAULT_MAX_IDLE_TIMEOUT_MS,
-    DEFAULT_MAX_STREAMS_BIDI, DEFAULT_MAX_STREAMS_UNI, DEFAULT_MAX_UDP_PAYLOAD_SIZE,
-    DEFAULT_RECV_WINDOW, DEFAULT_STREAM_RECV_WINDOW,
-};
-pub use crate::error::ConnectionError;
-pub use crate::events::{AppEvent, CongestionState, DatagramDropReason, PathEventType, PathStats, SourceConnectionIdInfo, TransportEvent};
-pub use crate::factory::{AppEventStream, QuicAppFactory, ShutdownFuture};
-pub use crate::handle::{
-    ConnectionHandle, ConnectionId, ConnectionStats, RecvStream, SendDataBuilder, SendStream,
-    StreamData, StreamId, TransportControls,
-};
-pub use crate::server::{
-    new_connection_handle, new_recv_stream, new_send_stream, ConnectionState, EgressCommand,
-    PathInfo, PeerTransportParams, StreamCredits, StreamShutdownDirection, StreamWriteCmd,
-};
+pub struct RecvStream {
+    pub id: StreamId,
+    pub rx: mpsc::Receiver<StreamData>,
+    pub fc_tx: mpsc::Sender<EgressCommand>,
+    pub connection_id: Bytes,
+}
 
-/// Macro to export a QUIC application factory from a dynamic library.
-///
-/// This macro generates the necessary C-ABI entry point for the `quicd` server
-/// to load and instantiate the application factory.
-///
-/// # Requirements
-///
-/// - The factory type must implement `Default`
-/// - The factory type must implement `QuicAppFactory`
-/// - The library must be compiled as a `cdylib` (set in Cargo.toml)
-/// - The `quicd-x` version must match the server's version
-///
-/// # Example
-///
-/// ```rust
-/// use quicd_x::{QuicAppFactory, export_quic_app, ConnectionHandle, AppEventStream, TransportControls, ShutdownFuture, ConnectionError};
-///
-/// #[derive(Default)]
-/// struct MyAppFactory;
-///
-/// impl QuicAppFactory for MyAppFactory {
-///     fn accepts_alpn(&self, alpn: &str) -> bool {
-///         alpn == "my-proto"
-///     }
-///     
-///     fn spawn_app(
-///         &self,
-///         alpn: String,
-///         handle: ConnectionHandle,
-///         events: AppEventStream,
-///         transport: TransportControls,
-///         shutdown: ShutdownFuture,
-///     ) -> Result<(), ConnectionError> {
-///         // Spawn app task here
-///         Ok(())
-///     }
-/// }
-///
-/// export_quic_app!(MyAppFactory);
-/// ```
-///
-/// # Cargo.toml Configuration
-///
-/// ```toml
-/// [lib]
-/// crate-type = ["cdylib"]
-///
-/// [dependencies]
-/// quicd-x = "0.1"  # Must match server version
-/// ```
-#[macro_export]
-macro_rules! export_quic_app {
-    ($factory_type:ty) => {
-        #[no_mangle]
-        pub extern "C" fn _quicd_create_factory() -> *mut std::ffi::c_void {
-            let factory: Box<dyn $crate::QuicAppFactory> = Box::new(<$factory_type>::default());
-            // Double-box to convert fat pointer (trait object) to thin pointer
-            let wrapper: Box<Box<dyn $crate::QuicAppFactory>> = Box::new(factory);
-            Box::into_raw(wrapper) as *mut std::ffi::c_void
+// Manual Debug impl because Receiver doesn't implement Debug
+impl std::fmt::Debug for RecvStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecvStream")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl RecvStream {
+    pub async fn read(&mut self) -> Option<Bytes> {
+        match self.rx.recv().await {
+            Some(StreamData::Data(data)) => {
+                let len = data.len() as u64;
+                // Signal consumption to worker for flow control
+                let _ = self.fc_tx.send(EgressCommand::StreamConsumed { 
+                    connection_id: self.connection_id.clone(),
+                    stream_id: self.id, 
+                    amount: len 
+                }).await;
+                Some(data)
+            },
+            Some(StreamData::Fin) => None,
+            None => None,
         }
-    };
+    }
+}
+
+pub struct SendStream {
+    pub id: StreamId,
+    pub tx: mpsc::Sender<StreamWriteCmd>,
+}
+
+impl std::fmt::Debug for SendStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendStream")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+pub fn new_recv_stream(id: StreamId, rx: mpsc::Receiver<StreamData>, fc_tx: mpsc::Sender<EgressCommand>, connection_id: Bytes) -> RecvStream {
+    RecvStream { id, rx, fc_tx, connection_id }
+}
+
+pub fn new_send_stream(id: StreamId, tx: mpsc::Sender<StreamWriteCmd>) -> SendStream {
+    SendStream { id, tx }
+}
+
+#[derive(Debug)]
+pub enum AppEvent {
+    NewStream { 
+        stream_id: u64, 
+        bidirectional: bool,
+        recv_stream: RecvStream,
+        send_stream: Option<SendStream>,
+    },
+    StreamData { stream_id: u64, data: Bytes, fin: bool },
+    StreamFinished { stream_id: u64 },
+    StreamClosed { stream_id: u64, error_code: u64, app_initiated: bool },
+    ConnectionClosed,
+}
+
+#[derive(Debug)]
+pub enum EgressCommand {
+    WriteStream {
+        connection_id: Bytes,
+        cmd: StreamWriteCmd,
+    },
+    StreamConsumed {
+        connection_id: Bytes,
+        stream_id: u64,
+        amount: u64,
+    },
+    CloseConnection {
+        connection_id: Bytes,
+        error_code: u64,
+        reason: String,
+    },
+    OpenStream {
+        connection_id: Bytes,
+        bidirectional: bool,
+        reply: tokio::sync::oneshot::Sender<Result<(u64, Option<mpsc::Sender<StreamWriteCmd>>, Option<mpsc::Receiver<StreamData>>), ConnectionError>>,
+    },
+}
+
+#[derive(Debug)]
+pub struct StreamWriteCmd {
+    pub stream_id: u64,
+    pub data: Bytes,
+    pub fin: bool,
+    pub reply: tokio::sync::oneshot::Sender<Result<usize, ConnectionError>>,
+}
+
+#[derive(Debug, Error)]
+pub enum ConnectionError {
+    #[error("Connection closed")]
+    Closed,
+    #[error("Channel closed")]
+    ChannelClosed,
+}
+
+pub struct ConnectionHandle {
+    pub connection_id: Bytes,
+    pub ingress_rx: mpsc::Receiver<AppEvent>,
+    pub egress_tx: mpsc::Sender<EgressCommand>,
+}
+
+impl ConnectionHandle {
+    pub fn new(connection_id: Bytes, ingress_rx: mpsc::Receiver<AppEvent>, egress_tx: mpsc::Sender<EgressCommand>) -> Self {
+        Self { connection_id, ingress_rx, egress_tx }
+    }
+    
+    pub async fn recv_event(&mut self) -> Option<AppEvent> {
+        self.ingress_rx.recv().await
+    }
+    
+    pub async fn send_command(&self, cmd: EgressCommand) -> Result<(), ConnectionError> {
+        self.egress_tx.send(cmd).await.map_err(|_| ConnectionError::ChannelClosed)
+    }
+
+    /// Open a new bidirectional stream
+    pub async fn open_bi_stream(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.send_command(EgressCommand::OpenStream { 
+            connection_id: self.connection_id.clone(),
+            bidirectional: true, 
+            reply: tx 
+        }).await?;
+        
+        match rx.await {
+            Ok(Ok((id, Some(tx_cmd), Some(rx_data)))) => {
+                Ok((
+                    SendStream { id, tx: tx_cmd },
+                    RecvStream { id, rx: rx_data, fc_tx: self.egress_tx.clone(), connection_id: self.connection_id.clone() }
+                ))
+            },
+            Ok(Err(e)) => Err(e),
+            _ => Err(ConnectionError::ChannelClosed),
+        }
+    }
+}
+
+#[async_trait]
+pub trait QuicApplication: Send + Sync {
+    async fn on_connection(&self, conn: ConnectionHandle);
+}
+
+pub trait QuicAppFactory: Send + Sync {
+    fn create(&self) -> Box<dyn QuicApplication>;
+}
+
+impl<F> QuicAppFactory for F
+where
+    F: Fn() -> Box<dyn QuicApplication> + Send + Sync,
+{
+    fn create(&self) -> Box<dyn QuicApplication> {
+        self()
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct QuicTransportConfig {
+    pub max_idle_timeout_ms: u64,
+    pub max_udp_payload_size: u64,
+    pub recv_window: u64,
+    pub stream_recv_window: u64,
+    pub max_streams_bidi: u64,
+    pub max_streams_uni: u64,
+    pub disable_active_migration: bool,
+    pub initial_rtt_ms: u64,
+    pub enable_dgram: bool,
+    pub max_dgram_size: u64,
+    pub enable_pacing: bool,
+    pub max_pacing_rate: u64,
+}
+
+impl QuicTransportConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub mod system_resources {
+    pub struct SystemResources;
+    impl SystemResources {
+        pub fn query() -> Self { Self }
+        pub fn optimal_worker_egress_capacity(&self) -> usize { 256 }
+        pub fn optimal_connection_ingress_capacity(&self) -> usize { 256 }
+        pub fn optimal_stream_channel_capacity(&self) -> usize { 256 }
+        pub fn optimal_worker_threads(&self) -> usize { 1 }
+        pub fn validate_system_limits(&self) -> Result<(), Vec<String>> { Ok(()) }
+        pub fn optimal_buffers_per_worker(&self) -> usize { 1024 }
+        pub fn optimal_netio_workers(&self) -> usize { 1 }
+        pub fn optimal_io_uring_entries(&self) -> u32 { 1024 }
+        pub fn optimal_udp_recv_buf(&self) -> usize { 1024 * 1024 }
+        pub fn optimal_udp_send_buf(&self) -> usize { 1024 * 1024 }
+    }
 }

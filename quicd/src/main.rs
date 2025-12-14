@@ -15,6 +15,11 @@ use tokio::sync::Notify;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
+    // Initialize Rustls crypto provider (required before any TLS operations)
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("Failed to install default crypto provider"))?;
+
     // Check if running with sufficient privileges for eBPF
     if !nix::unistd::Uid::effective().is_root() {
         anyhow::bail!("quicd must be run with root privileges (sudo) for eBPF functionality");
