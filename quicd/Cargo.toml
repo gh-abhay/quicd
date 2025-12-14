@@ -7,7 +7,7 @@ edition = "2021"
 [dependencies]
 quicd-x = { path = "../quicd-x" }
 quicd-qpack = { path = "../quicd-qpack" }
-quicd-quic = { path = "../quicd-quic" }
+quicd-quic = { path = "../quicd-quic", features = ["rustls-tls"] }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }

@@ -11,5 +11,12 @@ rand = "0.8"
 smallvec = { workspace = true }
 bitflags = "2.6"
 anyhow = { workspace = true }
-rustls = { workspace = true, features = ["ring", "logging", "std"] }
-ring = { workspace = true }
+rustls = { workspace = true, features = ["ring", "logging", "std"], optional = true }
+ring = { workspace = true, optional = true }
+boring = { version = "4.0", optional = true }
+foreign-types = "0.5"
+
+[features]
+default = ["boringssl"]
+boringssl = ["dep:boring"]
+rustls-tls = ["dep:rustls", "dep:ring"]

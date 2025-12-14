@@ -5,5 +5,5 @@ pub mod loss;
 mod congestion;
 
 pub use rtt::RttEstimator;
-pub use loss::{LossDetector, SentPacket};
+pub use loss::{LossDetector, SentPacket, LossDetectionEvent};
 pub use congestion::{CongestionController, NewReno};
