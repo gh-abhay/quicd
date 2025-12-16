@@ -38,6 +38,7 @@ use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use tracing::{debug, error, info, warn};
@@ -520,7 +521,7 @@ impl NetworkWorker {
                         // Take buffer from state to pass to QUIC layer
                         if let Some(buffer) = state.take_buffer() {
                             // Pass packet to connection manager for processing
-                            let response_packets = conn_manager.handle_packet(buffer, peer_addr);
+                            let response_packets = conn_manager.handle_packet(buffer, peer_addr, Instant::now());
                             outgoing_packets.extend(response_packets);
                         }
                         
@@ -562,13 +563,7 @@ impl NetworkWorker {
                     }
                     
                     // Allocate buffer and write data
-                    // TODO: Optimize this - ideally WorkerBuffer should support writing
-                    // For now we'll just create a temporary buffer
-                    // This is a limitation that should be addressed in buffer.rs
-                    let mut buffer = WorkerBuffer::new_from_pool(buffer_pool.clone());
-                    // Since we can't mutate, we skip for now
-                    // In production, WorkerBuffer needs a write API
-                    Some(buffer)
+                    Some(WorkerBuffer::from_vec(data, &buffer_pool))
                 }).collect();
                 
                 if buffers.is_empty() {
