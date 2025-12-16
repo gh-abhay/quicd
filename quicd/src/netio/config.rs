@@ -20,10 +20,10 @@ pub struct BufferPoolConfig {
 
 impl Default for BufferPoolConfig {
     fn default() -> Self {
-        let resources = quicd_x::system_resources::SystemResources::query();
+        // let resources = quicd_x::system_resources::SystemResources::query();
 
         Self {
-            max_buffers_per_worker: resources.optimal_buffers_per_worker(),
+            max_buffers_per_worker: 65536, // Default value
             datagram_size: DEFAULT_DATAGRAM_SIZE,
         }
     }
@@ -109,19 +109,16 @@ fn default_max_coalesced_size() -> usize {
 
 impl Default for NetIoConfig {
     fn default() -> Self {
-        let resources = quicd_x::system_resources::SystemResources::query();
+        // let resources = quicd_x::system_resources::SystemResources::query();
 
         Self {
-            workers: resources.optimal_netio_workers(),
+            workers: num_cpus::get(), // Default to number of CPUs
             reuse_port: true,
             pin_to_cpu: true,
-            uring_entries: resources.optimal_io_uring_entries(),
-            socket_recv_buffer_size: Some(resources.optimal_udp_recv_buf()),
-            socket_send_buffer_size: Some(resources.optimal_udp_send_buf()),
-            buffer_pool: BufferPoolConfig {
-                max_buffers_per_worker: resources.optimal_buffers_per_worker(),
-                datagram_size: DEFAULT_DATAGRAM_SIZE,
-            },
+            uring_entries: 1024, // Default value
+            socket_recv_buffer_size: Some(1024 * 1024), // 1MB default
+            socket_send_buffer_size: Some(1024 * 1024), // 1MB default
+            buffer_pool: BufferPoolConfig::default(),
             enable_gro: true, // Enable by default (no-op on unsupported platforms)
             enable_gso: true, // Enable by default (no-op on unsupported platforms)
             max_coalesced_size: default_max_coalesced_size(),

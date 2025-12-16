@@ -1,6 +1,6 @@
 [workspace]
-members = ["quicd", "ebpf", "quicd-quic", "quicd-x", "quicd-h3"]
-default-members = ["quicd", "quicd-quic", "quicd-x", "quicd-h3"]
+members = ["ebpf", "quicd", "quicd-quic", "quicd-x"]
+default-members = ["quicd"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -26,6 +26,7 @@ http = "0.2"
 io-uring = "0.7.11"
 libc = "0.2.178"
 libloading = "0.9.0"
+log = "0.4"
 mio = "0.8"
 nix = "0.30.1"
 num_cpus = "1.17.0"

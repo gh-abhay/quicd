@@ -26,8 +26,8 @@ pub struct GlobalConfig {
     /// Logging and observability configuration
     pub logging: LoggingConfig,
 
-    /// QUIC transport configuration
-    pub quic: quicd_x::QuicTransportConfig,
+    // QUIC transport configuration removed
+    // pub quic: quicd_x::QuicTransportConfig,
 
     /// Network I/O configuration
     pub netio: crate::netio::NetIoConfig,
@@ -46,7 +46,7 @@ impl Default for GlobalConfig {
             tls: TlsConfig::default(),
             runtime: RuntimeConfig::default(),
             logging: LoggingConfig::default(),
-            quic: quicd_x::QuicTransportConfig::default(),
+            // quic: quicd_x::QuicTransportConfig::default(),
             netio: crate::netio::NetIoConfig::default(),
             channels: crate::channel_config::ChannelConfig::default(),
             telemetry: crate::telemetry::TelemetryConfig::default(),
@@ -75,9 +75,9 @@ impl GlobalConfig {
         }
 
         // Validate QUIC config
-        if let Err(e) = self.quic.validate() {
-            errors.push(e);
-        }
+        // if let Err(e) = self.quic.validate() {
+        //     errors.push(e);
+        // }
 
         // Validate channel config
         if let Err(e) = self.channels.validate() {
@@ -277,10 +277,10 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        let resources = quicd_x::system_resources::SystemResources::query();
+        // let resources = quicd_x::system_resources::SystemResources::query();
 
         Self {
-            worker_threads: resources.optimal_worker_threads(),
+            worker_threads: num_cpus::get(), // Default to number of CPUs
             max_blocking_threads: 512,
             thread_name: "quicd-worker".to_string(),
             thread_stack_size: 2 * 1024 * 1024, // 2MB

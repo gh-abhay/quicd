@@ -17,18 +17,21 @@
 //! - **Thread-local data only** (no locks, no mutexes, no atomic contention)
 
 pub mod io_state;
-pub mod streams;
+pub mod connection_manager;
 
 use crate::netio::{
     buffer::{create_worker_pool, WorkerBufPool, WorkerBuffer},
     config::NetIoConfig,
     socket::create_udp_socket,
 };
-use crate::quic::QuicManager;
 use crate::telemetry::{record_metric, MetricsEvent};
 use crate::worker::io_state::{RecvOpState, SendOpState};
+use crate::worker::connection_manager::ConnectionManager;
 use anyhow::{Context, Result};
+use crossbeam_channel::bounded;
 use io_uring::{opcode, types, IoUring};
+use quicd_quic::ConnectionConfig;
+use quicd_x::Command;
 use std::collections::HashMap;
 use std::io;
 use std::mem::ManuallyDrop;
@@ -37,7 +40,6 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use crossbeam_channel::bounded;
 use tracing::{debug, error, info, warn};
 
 /// User data for io_uring operations.
@@ -88,15 +90,12 @@ pub struct NetworkWorker {
     bind_addr: SocketAddr,
     buffer_pool: Arc<WorkerBufPool>,
     config: NetIoConfig,
-    quic_config: crate::quic::QuicConfig,
     channel_config: crate::channel_config::ChannelConfig,
-    tls_credentials: crate::quic::crypto::TlsCredentials,
     shutdown: Arc<AtomicBool>,
     routing_cookie: u16,
     runtime_handle: tokio::runtime::Handle,
-    app_registry: crate::apps::AppRegistry,
-    egress_tx: crossbeam_channel::Sender<quicd_x::EgressCommand>,
-    egress_rx: Option<crossbeam_channel::Receiver<quicd_x::EgressCommand>>,
+    // egress_tx: crossbeam_channel::Sender<quicd_x::EgressCommand>,
+    // egress_rx: Option<crossbeam_channel::Receiver<quicd_x::EgressCommand>>,
 }
 
 impl NetworkWorker {
@@ -105,12 +104,9 @@ impl NetworkWorker {
         id: usize,
         bind_addr: SocketAddr,
         config: NetIoConfig,
-        quic_config: crate::quic::QuicConfig,
         channel_config: crate::channel_config::ChannelConfig,
-        tls_credentials: crate::quic::crypto::TlsCredentials,
         shutdown: Arc<AtomicBool>,
         runtime_handle: tokio::runtime::Handle,
-        app_registry: crate::apps::AppRegistry,
     ) -> Result<Self> {
         // Create UDP socket with SO_REUSEPORT
         let socket = create_udp_socket(bind_addr, &config)?;
@@ -134,7 +130,7 @@ impl NetworkWorker {
 
         // Create egress channel for receiving commands from app tasks
         // Use configured capacity for worker egress channel
-        let (egress_tx, egress_rx) = bounded(channel_config.worker_egress_capacity);
+        // let (egress_tx, egress_rx) = bounded(channel_config.worker_egress_capacity);
 
         debug!(
             worker_id = id,
@@ -151,15 +147,12 @@ impl NetworkWorker {
             bind_addr,
             buffer_pool,
             config,
-            quic_config,
             channel_config,
-            tls_credentials,
             shutdown,
             routing_cookie,
             runtime_handle,
-            app_registry,
-            egress_tx,
-            egress_rx: Some(egress_rx),
+            // egress_tx,
+            // egress_rx: Some(egress_rx),
         })
     }
 
@@ -222,29 +215,6 @@ impl NetworkWorker {
         // Clone the Arc for use in this worker
         // The pool will be properly dropped when all Arc references are released
         let buffer_pool = self.buffer_pool.clone();
-
-        // Create QUIC manager for this worker
-        let mut quic_manager = match QuicManager::new(
-            worker_id,
-            self.bind_addr,
-            self.quic_config.clone(),
-            Some(self.tls_credentials.clone()),
-            self.runtime_handle.clone(),
-            self.app_registry.clone(),
-            self.egress_tx.clone(),
-            self.channel_config.clone(),
-            self.routing_cookie,
-            buffer_pool.clone(),
-        ) {
-            Ok(manager) => manager,
-            Err(e) => {
-                error!(worker_id, error = ?e, "Failed to create QUIC manager");
-                record_metric(MetricsEvent::WorkerStopped);
-                return Err(e);
-            }
-        };
-
-        info!(worker_id, "QUIC manager initialized");
 
         // Create io_uring instance
         let mut ring = IoUring::builder()
@@ -315,7 +285,16 @@ impl NetworkWorker {
         let shutdown = &self.shutdown;
 
         // Extract egress_rx for the event loop
-        let mut egress_rx = self.egress_rx.take().expect("egress_rx already taken");
+        // Create egress channel for receiving commands from app tasks
+        let (egress_tx, egress_rx) = bounded(self.channel_config.worker_egress_capacity);
+        
+        // Create connection manager for this worker (with routing-aware CID generator)
+        let mut conn_manager = ConnectionManager::new(
+            ConnectionConfig::default(),
+            self.runtime_handle.clone(),
+            egress_tx,
+            self.id as u8,
+        );
 
         // Timeout tracking for QUIC - use adaptive timeout from manager
         let mut last_timeout_check = std::time::Instant::now();
@@ -375,43 +354,21 @@ impl NetworkWorker {
             // - Reduces wasted CPU from unnecessary timeout checks
             // - Improves responsiveness (processes timeouts exactly when needed)
             // - Uses O(1) queue peek instead of O(n) connection iteration
-            let quic_timeout = quic_manager
-                .next_timeout()
-                .unwrap_or(max_timeout_interval) // Use max interval when no timeouts pending
-                .min(max_timeout_interval); // Safety cap for very long timeouts
+            let quic_timeout = max_timeout_interval;
 
             // Check if we should process timeouts now
             let now = std::time::Instant::now();
             let should_check_timeouts = now.duration_since(last_timeout_check) >= quic_timeout;
 
             if should_check_timeouts {
-                match quic_manager.handle_timeouts() {
-                    Ok(timeout_packets) => {
-                        // Group timeout packets by destination
-                        let mut by_dest_timeout: std::collections::HashMap<std::net::SocketAddr, Vec<WorkerBuffer>> = std::collections::HashMap::new();
-                        for packet in timeout_packets {
-                            by_dest_timeout.entry(packet.to).or_default().push(packet.data);
-                        }
-
-                        for (dest, packets) in by_dest_timeout {
-                            if let Err(e) = submit_send_op(
-                                &mut ring,
-                                socket_fd,
-                                dest,
-                                packets,
-                                &mut send_in_flight,
-                                &mut next_send_id,
-                                &mut send_op_pool,
-                            ) {
-                                error!(worker_id, peer = %dest, error = ?e, "Failed to submit timeout packet");
-                                record_metric(MetricsEvent::NetworkSendError);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!(worker_id, error = ?e, "QUIC timeout handling failed");
-                    }
+                // Process QUIC timeouts via connection manager
+                let timeout_packets = conn_manager.poll_timeouts();
+                
+                // Send timeout-generated packets
+                for (dest, packet_data) in timeout_packets {
+                    // TODO: Convert to WorkerBuffer and submit
                 }
+                
                 last_timeout_check = now;
             }
 
@@ -422,15 +379,9 @@ impl NetworkWorker {
             for _ in 0..128 {
                 match egress_rx.try_recv() {
                     Ok(command) => {
-                        // Process egress command and collect packets to send
-                        match quic_manager.process_egress_command(worker_id, command) {
-                            Ok(packets) => {
-                                egress_packets.extend(packets);
-                            }
-                            Err(e) => {
-                                error!(worker_id, error = ?e, "Failed to process egress command");
-                            }
-                        }
+                        // Process command through connection manager
+                        let cmd_packets = conn_manager.handle_command(command);
+                        egress_packets.extend(cmd_packets);
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -442,36 +393,29 @@ impl NetworkWorker {
 
             // Process stream writes from all connections (egress path)
             // This polls all stream managers for pending writes and generates packets
-            match quic_manager.process_stream_writes() {
-                Ok(packets) => {
-                    egress_packets.extend(packets);
-                }
-                Err(e) => {
-                    error!(worker_id, error = ?e, "Failed to process stream writes");
-                }
-            }
+            // TODO: Process stream writes
 
             // Group egress packets by destination
-            let mut by_dest_egress: std::collections::HashMap<std::net::SocketAddr, Vec<WorkerBuffer>> = std::collections::HashMap::new();
-            for packet in egress_packets {
-                by_dest_egress.entry(packet.to).or_default().push(packet.data);
-            }
+            // let mut by_dest_egress: std::collections::HashMap<std::net::SocketAddr, Vec<WorkerBuffer>> = std::collections::HashMap::new();
+            // for packet in egress_packets {
+            //     by_dest_egress.entry(packet.to).or_default().push(packet.data);
+            // }
 
             // Submit grouped egress packets
-            for (dest, packets) in by_dest_egress {
-                if let Err(e) = submit_send_op(
-                    &mut ring,
-                    socket_fd,
-                    dest,
-                    packets,
-                    &mut send_in_flight,
-                    &mut next_send_id,
-                    &mut send_op_pool,
-                ) {
-                    error!(worker_id, peer = %dest, error = ?e, "Failed to submit egress packet");
-                    record_metric(MetricsEvent::NetworkSendError);
-                }
-            }
+            // for (dest, packets) in by_dest_egress {
+            //     if let Err(e) = submit_send_op(
+            //         &mut ring,
+            //         socket_fd,
+            //         dest,
+            //         packets,
+            //         &mut send_in_flight,
+            //         &mut next_send_id,
+            //         &mut send_op_pool,
+            //     ) {
+            //         error!(worker_id, peer = %dest, error = ?e, "Failed to submit egress packet");
+            //         record_metric(MetricsEvent::NetworkSendError);
+            //     }
+            // }
 
             // Wait for io_uring completions (non-blocking check)
             // This allows the loop to be responsive to egress commands and shutdown
@@ -575,24 +519,9 @@ impl NetworkWorker {
 
                         // Take buffer from state to pass to QUIC layer
                         if let Some(buffer) = state.take_buffer() {
-                            // Pass packet to QUIC layer for processing
-                            match quic_manager.process_ingress(buffer, peer_addr, self.bind_addr, now) {
-                                Ok((maybe_connection_id, packets)) => {
-                                    // New app spawned if connection_id is Some
-                                    if let Some(connection_id) = maybe_connection_id {
-                                        debug!(
-                                            worker_id,
-                                            connection_id = ?connection_id, "New app spawned for connection"
-                                        );
-                                    }
-
-                                    // Collect outgoing packets for batched submission
-                                    outgoing_packets.extend(packets);
-                                }
-                                Err(e) => {
-                                    error!(worker_id, peer = %peer_addr, error = ?e, "QUIC processing failed");
-                                }
-                            }
+                            // Pass packet to connection manager for processing
+                            let response_packets = conn_manager.handle_packet(buffer, peer_addr);
+                            outgoing_packets.extend(response_packets);
                         }
                         
                         // Return state to pool (buffer is gone, but state structure is reused)
@@ -611,20 +540,46 @@ impl NetworkWorker {
             // using multiple iovecs, without copying data.
             // ═══════════════════════════════════════════════════════════════════
             
+            // Combine egress packets and QUIC response packets
+            outgoing_packets.extend(egress_packets);
+            
             // Group packets by destination
-            let mut by_dest: std::collections::HashMap<std::net::SocketAddr, Vec<WorkerBuffer>> = std::collections::HashMap::new();
-            for packet in outgoing_packets {
-                by_dest.entry(packet.to).or_default().push(packet.data);
+            let mut by_dest: std::collections::HashMap<std::net::SocketAddr, Vec<Vec<u8>>> = std::collections::HashMap::new();
+            for (dest, packet_data) in outgoing_packets {
+                by_dest.entry(dest).or_default().push(packet_data);
             }
 
-            // Batch submit all outgoing packets from QUIC processing
+            // Batch submit all outgoing packets
             let mut send_sq_full = false;
             for (dest, packets) in by_dest {
+                // Convert Vec<u8> to WorkerBuffer for sending
+                // We allocate new buffers and copy data since WorkerBuffer doesn't expose mutable API
+                let buffers: Vec<WorkerBuffer> = packets.into_iter().filter_map(|data| {
+                    // For now, skip packets that are too large for buffer
+                    if data.len() > 2048 {
+                        warn!(worker_id, "Packet too large: {} bytes", data.len());
+                        return None;
+                    }
+                    
+                    // Allocate buffer and write data
+                    // TODO: Optimize this - ideally WorkerBuffer should support writing
+                    // For now we'll just create a temporary buffer
+                    // This is a limitation that should be addressed in buffer.rs
+                    let mut buffer = WorkerBuffer::new_from_pool(buffer_pool.clone());
+                    // Since we can't mutate, we skip for now
+                    // In production, WorkerBuffer needs a write API
+                    Some(buffer)
+                }).collect();
+                
+                if buffers.is_empty() {
+                    continue;
+                }
+                
                 match submit_send_op(
                     &mut ring,
                     socket_fd,
                     dest,
-                    packets,
+                    buffers,
                     &mut send_in_flight,
                     &mut next_send_id,
                     &mut send_op_pool,
@@ -792,13 +747,8 @@ impl NetworkWorker {
         // Step 1: Stop accepting new connections (already done - loop exited)
 
         // Step 2: Gracefully close all active QUIC connections
-        let shutdown_packets = match quic_manager.shutdown_all_connections() {
-            Ok(packets) => packets,
-            Err(e) => {
-                error!(worker_id, error = ?e, "Failed to shutdown connections gracefully");
-                Vec::new()
-            }
-        };
+        // TODO: Implement graceful shutdown for connections if needed
+        let shutdown_packets: Vec<Vec<u8>> = Vec::new();
 
         // Step 3: Send CONNECTION_CLOSE frames to all peers
         info!(
@@ -808,24 +758,24 @@ impl NetworkWorker {
         );
 
         // Group shutdown packets by destination
-        let mut by_dest_shutdown: std::collections::HashMap<std::net::SocketAddr, Vec<WorkerBuffer>> = std::collections::HashMap::new();
-        for packet in shutdown_packets {
-            by_dest_shutdown.entry(packet.to).or_default().push(packet.data);
-        }
+        // let mut by_dest_shutdown: std::collections::HashMap<std::net::SocketAddr, Vec<WorkerBuffer>> = std::collections::HashMap::new();
+        // for packet in shutdown_packets {
+        //     by_dest_shutdown.entry(packet.to).or_default().push(packet.data);
+        // }
 
-        for (dest, packets) in by_dest_shutdown {
-            if let Err(e) = submit_send_op(
-                &mut ring,
-                self.socket_fd,
-                dest,
-                packets,
-                &mut send_in_flight,
-                &mut next_send_id,
-                &mut send_op_pool,
-            ) {
-                debug!(worker_id, peer = %dest, error = ?e, "Failed to submit shutdown packet");
-            }
-        }
+        // for (dest, packets) in by_dest_shutdown {
+        //     if let Err(e) = submit_send_op(
+        //         &mut ring,
+        //         self.socket_fd,
+        //         dest,
+        //         packets,
+        //         &mut send_in_flight,
+        //         &mut next_send_id,
+        //         &mut send_op_pool,
+        //     ) {
+        //         debug!(worker_id, peer = %dest, error = ?e, "Failed to submit shutdown packet");
+        //     }
+        // }
 
         // Submit the shutdown packets
         if let Err(e) = ring.submit() {
@@ -1250,11 +1200,8 @@ impl Drop for NetIoHandle {
 pub fn spawn(
     bind_addr: SocketAddr,
     config: NetIoConfig,
-    quic_config: crate::quic::QuicConfig,
-    tls_config: crate::config::global::TlsConfig,
     channel_config: crate::channel_config::ChannelConfig,
     runtime_handle: tokio::runtime::Handle,
-    app_registry: crate::apps::AppRegistry,
 ) -> Result<NetIoHandle> {
     use std::path::Path;
 
@@ -1271,39 +1218,6 @@ pub fn spawn(
         "Initializing network layer with io_uring"
     );
 
-    // ═══════════════════════════════════════════════════════════════════
-    // LOAD TLS CREDENTIALS ONCE (CRITICAL FIX)
-    // ═══════════════════════════════════════════════════════════════════
-    // Load TLS credentials once in the main thread before spawning workers.
-    // This prevents race conditions where multiple workers try to read the
-    // same certificate files simultaneously, causing TLS failures.
-    //
-    // Benefits:
-    // - Eliminates file I/O contention during worker startup
-    // - Fails fast if certificates are invalid (before spawning workers)
-    // - Each worker clones the in-memory credentials (cheap)
-    // - More predictable startup behavior
-    //
-    // CRITICAL: We require valid certificates - no self-signed fallback!
-    // Production deployments must provide proper TLS certificates.
-    // ═══════════════════════════════════════════════════════════════════
-    let shared_credentials = if let (Some(cert_path), Some(key_path)) =
-        (&tls_config.cert_path, &tls_config.key_path)
-    {
-        info!(
-            cert = %cert_path.display(),
-            key = %key_path.display(),
-            "Loading TLS credentials from files (shared across all workers)"
-        );
-        crate::quic::crypto::TlsCredentials::load_from_files(Path::new(cert_path), Path::new(key_path))?
-    } else {
-        anyhow::bail!(
-            "TLS certificate and key are required. \
-                 Please provide cert_path and key_path in configuration. \
-                 Self-signed certificates are not supported for security reasons."
-        );
-    };
-
     // Shared shutdown flag (only for coordination, not hot path)
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -1313,24 +1227,18 @@ pub fn spawn(
     for worker_id in 0..config.workers {
         let bind_addr = bind_addr;
         let config = config.clone();
-        let quic_config = quic_config.clone();
         let channel_config = channel_config.clone();
-        let credentials = shared_credentials.clone();
         let shutdown = Arc::clone(&shutdown);
         let runtime_handle = runtime_handle.clone();
-        let app_registry = app_registry.clone();
 
         // Create worker (in main thread)
         let worker = NetworkWorker::new(
             worker_id,
             bind_addr,
             config,
-            quic_config,
             channel_config,
-            credentials,
             shutdown,
             runtime_handle,
-            app_registry,
         )?;
 
         // Spawn native thread and move worker into it

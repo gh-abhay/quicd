@@ -5,23 +5,13 @@ edition = "2021"
 
 [dependencies]
 bytes = { workspace = true }
-thiserror = { workspace = true }
-log = "0.4"
-rand = "0.8"
-smallvec = { workspace = true }
-bitflags = "2.6"
-anyhow = { workspace = true }
-rustls = { workspace = true, features = ["ring", "logging", "std"], optional = true }
 ring = { workspace = true }
-boring = { version = "4.0", optional = true }
-foreign-types = "0.5"
-aes = "0.8"
-cipher = { version = "0.4", features = ["block-padding"] }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+smallvec = { workspace = true }
+ahash = { workspace = true }
+log = { workspace = true }
 
 [dev-dependencies]
-hex = "0.4"
-
-[features]
-default = ["boringssl"]
-boringssl = ["dep:boring"]
-rustls-tls = ["dep:rustls"]
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+rcgen = { workspace = true }

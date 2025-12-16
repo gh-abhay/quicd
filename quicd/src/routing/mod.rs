@@ -1,6 +1,8 @@
+pub mod cid_generator;
 pub mod router;
 pub mod routing;
 
+pub use cid_generator::RoutingConnectionIdGenerator;
 pub use router::{
     CID_LENGTH,
     ConnectionId,

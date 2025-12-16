@@ -1,8 +1,6 @@
-mod apps;
 mod channel_config;
 mod config;
 mod netio;
-mod quic;
 mod routing;
 mod runtime;
 mod telemetry;
@@ -15,11 +13,6 @@ use tokio::sync::Notify;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
-    // Initialize Rustls crypto provider (required before any TLS operations)
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .map_err(|_| anyhow::anyhow!("Failed to install default crypto provider"))?;
-
     // Check if running with sufficient privileges for eBPF
     if !nix::unistd::Uid::effective().is_root() {
         anyhow::bail!("quicd must be run with root privileges (sudo) for eBPF functionality");
@@ -35,7 +28,6 @@ fn main() -> anyhow::Result<()> {
     .parse()
     .with_context(|| "invalid bind address")?;
     let netio_cfg = config.global.netio.clone();
-    let quic_cfg = config.global.quic.clone();
     let telemetry_cfg = config.global.telemetry.clone();
 
     // Create tokio runtime for non-critical async tasks (telemetry, future app logic)
@@ -63,69 +55,13 @@ fn main() -> anyhow::Result<()> {
 
     info!("eBPF routing initialized successfully");
 
-    // Create application registry
-    info!("Initializing application registry");
-    let mut app_registry = apps::AppRegistry::new();
-
-    for app_config in &config.apps {
-        match &app_config.config {
-            config::application::ApplicationTypeConfig::Http3(h3_cfg) => {
-                if h3_cfg.enabled {
-                    // let factory = Arc::new(quicd_h3::H3Factory::with_config(
-                    //     quicd_h3::DefaultH3Handler,
-                    //     h3_cfg.h3.clone(),
-                    // ));
-                    // app_registry = app_registry.register(&app_config.alpn, factory);
-                }
-            }
-            config::application::ApplicationTypeConfig::Plugin(plugin_cfg) => {
-                info!(
-                    "Loading plugin for ALPN {}: {}",
-                    app_config.alpn, plugin_cfg.library_path
-                );
-                let factory = apps::load_plugin(&plugin_cfg.library_path).with_context(|| {
-                    format!("Failed to load plugin for ALPN {}", app_config.alpn)
-                })?;
-                app_registry = app_registry.register(&app_config.alpn, factory);
-            }
-        }
-    }
-
-    // Fallback to default H3 if registry is empty (for backward compatibility)
-    if app_registry.is_empty() {
-        info!("No applications configured, registering default H3 handlers");
-        // app_registry = app_registry
-        //     .register(
-        //         "h3",
-        //         Arc::new(quicd_h3::H3Factory::with_config(
-        //             quicd_h3::DefaultH3Handler,
-        //             quicd_h3::config::H3Config::default(),
-        //         )),
-        //     )
-        //     .register(
-        //         "h3-29",
-        //         Arc::new(quicd_h3::H3Factory::with_config(
-        //             quicd_h3::DefaultH3Handler,
-        //             quicd_h3::config::H3Config::default(),
-        //         )),
-        //     );
-    }
-
-    info!(
-        registered_alpns = ?app_registry.alpns(),
-        "Application registry initialized"
-    );
-
     // Spawn network workers as native threads (NOT on tokio runtime)
     info!("Spawning network worker threads");
     let netio_handle = worker::spawn(
         bind_addr,
         netio_cfg,
-        quic_cfg,
-        config.global.tls.clone(),
         config.global.channels.clone(),
         runtime_handle.clone(),
-        app_registry,
     )
     .with_context(|| "failed to spawn network layer")?;
 

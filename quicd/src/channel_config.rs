@@ -81,13 +81,12 @@ fn default_stream_egress_capacity() -> usize {
 
 impl Default for ChannelConfig {
     fn default() -> Self {
-        let resources = quicd_x::system_resources::SystemResources::query();
-
+        // Default values without querying system resources
         Self {
-            worker_egress_capacity: resources.optimal_worker_egress_capacity(),
-            connection_ingress_capacity: resources.optimal_connection_ingress_capacity(),
-            stream_ingress_capacity: resources.optimal_stream_channel_capacity(),
-            stream_egress_capacity: resources.optimal_stream_channel_capacity(),
+            worker_egress_capacity: 256,
+            connection_ingress_capacity: 128,
+            stream_ingress_capacity: 64,
+            stream_egress_capacity: 64,
         }
     }
 }

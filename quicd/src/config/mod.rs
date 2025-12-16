@@ -83,7 +83,7 @@ impl ServerConfig {
     /// - System resource pre-flight checks
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        let mut warnings = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
 
         // Validate global config
         if let Err(e) = self.global.validate() {
@@ -118,15 +118,15 @@ impl ServerConfig {
         }
 
         // System resource pre-flight checks
-        let resources = quicd_x::system_resources::SystemResources::query();
-        match resources.validate_system_limits() {
-            Ok(()) => {
-                // System looks good
-            }
-            Err(warns) => {
-                warnings.extend(warns);
-            }
-        }
+        // let resources = quicd_x::system_resources::SystemResources::query();
+        // match resources.validate_system_limits() {
+        //     Ok(()) => {
+        //         // System looks good
+        //     }
+        //     Err(warns) => {
+        //         warnings.extend(warns);
+        //     }
+        // }
 
         // Convert warnings to errors if they're critical
         for warning in warnings {

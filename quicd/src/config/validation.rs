@@ -35,17 +35,17 @@ pub fn validate_resource_limits(config: &ServerConfig) -> Result<(), Vec<String>
     }
 
     // Check if max_streams * stream_buffer can fit in memory
-    let max_streams = config.global.quic.max_streams_bidi;
-    let stream_buffer = config.global.channels.stream_ingress_capacity;
-    let estimated_memory_mb = (max_streams * stream_buffer as u64 * 64 * 1024) / (1024 * 1024);
+    // let max_streams = config.global.quic.max_streams_bidi;
+    // let stream_buffer = config.global.channels.stream_ingress_capacity;
+    // let estimated_memory_mb = (max_streams * stream_buffer as u64 * 64 * 1024) / (1024 * 1024);
 
-    if estimated_memory_mb > 1024 {
-        warnings.push(format!(
-            "Warning: max_streams_bidi ({}) * stream_ingress_capacity ({}) \
-             may use ~{}MB per connection. Consider reducing these values.",
-            max_streams, stream_buffer, estimated_memory_mb
-        ));
-    }
+    // if estimated_memory_mb > 1024 {
+    //     warnings.push(format!(
+    //         "Warning: max_streams_bidi ({}) * stream_ingress_capacity ({}) \
+    //          may use ~{}MB per connection. Consider reducing these values.",
+    //         max_streams, stream_buffer, estimated_memory_mb
+    //     ));
+    // }
 
     // Check if runtime worker threads vs network workers makes sense
     let runtime_workers = config.global.runtime.worker_threads;

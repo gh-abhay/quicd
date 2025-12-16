@@ -5,9 +5,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-quicd-x = { path = "../quicd-x" }
-quicd-qpack = { path = "../quicd-qpack" }
-quicd-quic = { path = "../quicd-quic", features = ["rustls-tls"] }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
@@ -43,6 +40,10 @@ opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "metrics", "trac
 opentelemetry-semantic-conventions = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 libloading = { workspace = true }
+
+# Internal crates
+quicd-quic = { path = "../quicd-quic" }
+quicd-x = { path = "../quicd-x" }
 
 # eBPF routing dependencies
 aya = { workspace = true }
