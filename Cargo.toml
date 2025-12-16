@@ -1,6 +1,6 @@
 [workspace]
 members = ["ebpf", "quicd", "quicd-qpack", "quicd-quic", "quicd-x"]
-default-members = ["quicd"]
+default-members = ["quicd", "quicd-qpack", "quicd-quic", "quicd-x"]
 resolver = "2"
 
 [workspace.dependencies]

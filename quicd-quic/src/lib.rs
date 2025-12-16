@@ -36,6 +36,8 @@ pub mod crypto;
 pub mod recovery;
 pub mod cid;
 pub mod varint;
+pub mod error;
+pub mod params;
 
 // Re-export key types
 pub use connection::{Connection, ConnectionConfig, ConnectionError, ConnectionState};
@@ -45,3 +47,5 @@ pub use stream::{Stream, StreamId, StreamError};
 pub use crypto::{TlsSession, KeySchedule};
 pub use recovery::{CongestionController, LossDetector};
 pub use cid::ConnectionId;
+pub use error::Error;
+pub use params::TransportParams;
