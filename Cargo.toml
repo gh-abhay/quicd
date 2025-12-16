@@ -1,5 +1,5 @@
 [workspace]
-members = ["ebpf", "quicd", "quicd-quic", "quicd-x"]
+members = ["ebpf", "quicd", "quicd-qpack", "quicd-quic", "quicd-x"]
 default-members = ["quicd"]
 resolver = "2"
 
