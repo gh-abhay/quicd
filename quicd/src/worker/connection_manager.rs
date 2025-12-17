@@ -175,7 +175,7 @@ impl ConnectionManager {
             // We need to clone scid to use it for lookup to avoid borrow checker issues
             let scid = scid.clone();
             if let Some(state) = self.connections.get_mut(&scid) {
-                if let Err(e) = state.conn.process_packet(packet, now) {
+                if let Err(e) = state.conn.process_packet(packet, datagram_size, now) {
                     error!("Connection error: {}", e);
                 }
                 
@@ -200,7 +200,7 @@ impl ConnectionManager {
             
             let mut conn = Connection::new(self.config.clone(), scid.clone(), packet.header.scid.clone().unwrap(), tls);
             
-            if let Err(e) = conn.process_packet(packet, now) {
+            if let Err(e) = conn.process_packet(packet, datagram_size, now) {
                 error!("Failed to process initial packet: {}", e);
                 return vec![];
             }
