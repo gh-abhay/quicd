@@ -6,11 +6,13 @@
 use bytes::Bytes;
 use crate::netio::buffer::WorkerBuffer;
 use crate::routing::{RoutingConnectionIdGenerator, current_generation};
-use anyhow::Result;
 use crossbeam_channel::{Sender, Receiver, bounded};
-use quicd_quic::{Connection, ConnectionConfig, ConnectionError, Packet, PacketType};
+use quicd_quic::{Connection, ConnectionConfig, Packet, PacketType};
 use quicd_quic::cid::{ConnectionIdGenerator, ConnectionId};
 use quicd_quic::crypto::TlsSession;
+use quicd_quic::stream::{Stream, StreamId};
+use quicd_quic::frame::Frame;
+use quicd_quic::connection::ConnectionState as QuicConnectionState;
 use quicd_x::{ConnectionHandle, Event, Command};
 use quicd_x::ConnectionId as XConnectionId;
 use std::collections::HashMap;
@@ -18,7 +20,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::runtime::Handle as TokioHandle;
-use tracing::{debug, error, warn, info};
+use tracing::{error, info};
 
 /// Maps incoming packets to QUIC connections.
 pub struct ConnectionManager {
@@ -173,7 +175,7 @@ impl ConnectionManager {
                 bytes[..len].copy_from_slice(&scid_bytes[..len]);
                 let conn_id_u64 = u64::from_le_bytes(bytes);
                 
-                let handle = ConnectionHandle::new(
+                let _handle = ConnectionHandle::new(
                     XConnectionId(conn_id_u64),
                     rx,
                     self.egress_tx.clone(),
@@ -199,17 +201,193 @@ impl ConnectionManager {
     }
     
     fn flush_events_to_app(&mut self, scid: &ConnectionId) {
-        // TODO: Pop events from connection and send to ingress_tx
+        if let Some(state) = self.connections.get_mut(scid) {
+            // Check for pending datagrams
+            while let Some(data) = state.conn.pending_datagrams.pop_front() {
+                let _ = state.ingress_tx.try_send(Event::DatagramReceived { data });
+            }
+            
+            // Check for stream data
+            for (stream_id, stream) in &mut state.conn.streams {
+                if stream.has_data() {
+                    if let Ok((data, fin)) = stream.read() {
+                        let _ = state.ingress_tx.try_send(Event::StreamData {
+                            stream_id: quicd_x::StreamId(stream_id.0),
+                            data,
+                            fin,
+                        });
+                    }
+                }
+            }
+        }
     }
     
     pub fn handle_command(&mut self, cmd: Command) -> Vec<(SocketAddr, Vec<u8>)> {
-        // TODO: Handle commands
+        match cmd {
+            Command::WriteStreamData { conn_id, stream_id, data, fin } => {
+                // Find connection by ID (convert u64 to ConnectionId)
+                let mut target_scid: Option<ConnectionId> = None;
+                for (scid, state) in &mut self.connections {
+                    // Convert scid to u64 for comparison
+                    let mut bytes = [0u8; 8];
+                    let scid_bytes = scid.as_bytes();
+                    let len = std::cmp::min(scid_bytes.len(), 8);
+                    bytes[..len].copy_from_slice(&scid_bytes[..len]);
+                    let conn_id_u64 = u64::from_le_bytes(bytes);
+                    
+                    if conn_id_u64 == conn_id.0 {
+                        // Queue data on stream
+                        // Convert quicd_x::StreamId to quicd_quic::StreamId
+                        let quic_stream_id = quicd_quic::stream::StreamId(stream_id.0);
+                        if let Some(stream) = state.conn.streams.get_mut(&quic_stream_id) {
+                            let _ = stream.queue_send(data, fin);
+                        }
+                        target_scid = Some(scid.clone());
+                        break;
+                    }
+                }
+                if let Some(scid) = target_scid {
+                    let now = Instant::now();
+                    return self.generate_packets(&scid, now);
+                }
+            }
+            Command::OpenBiStream { conn_id } | Command::OpenUniStream { conn_id } => {
+                let bidirectional = matches!(cmd, Command::OpenBiStream { .. });
+                for (scid, state) in &mut self.connections {
+                    let mut bytes = [0u8; 8];
+                    let scid_bytes = scid.as_bytes();
+                    let len = std::cmp::min(scid_bytes.len(), 8);
+                    bytes[..len].copy_from_slice(&scid_bytes[..len]);
+                    let conn_id_u64 = u64::from_le_bytes(bytes);
+                    
+                    if conn_id_u64 == conn_id.0 {
+                        // Allocate new stream ID
+                        let stream_id = if bidirectional {
+                            let id = state.conn.next_stream_id_bidi;
+                            state.conn.next_stream_id_bidi += 4;
+                            id
+                        } else {
+                            let id = state.conn.next_stream_id_uni;
+                            state.conn.next_stream_id_uni += 4;
+                            id
+                        };
+                        
+                        // Create stream
+                        let max_data = if bidirectional {
+                            state.conn.config.initial_max_stream_data_bidi_local
+                        } else {
+                            state.conn.config.initial_max_stream_data_uni
+                        };
+                        let stream = Stream::new(StreamId(stream_id), max_data);
+                        state.conn.streams.insert(StreamId(stream_id), stream);
+                        
+                        // Notify application with quicd_x::StreamId
+                        let _ = state.ingress_tx.try_send(Event::StreamOpened { 
+                            stream_id: quicd_x::StreamId(stream_id), 
+                            is_bidirectional: bidirectional 
+                        });
+                        break;
+                    }
+                }
+            }
+            Command::SendDatagram { conn_id, data } => {
+                let mut target_scid: Option<ConnectionId> = None;
+                for (scid, state) in &mut self.connections {
+                    let mut bytes = [0u8; 8];
+                    let scid_bytes = scid.as_bytes();
+                    let len = std::cmp::min(scid_bytes.len(), 8);
+                    bytes[..len].copy_from_slice(&scid_bytes[..len]);
+                    let conn_id_u64 = u64::from_le_bytes(bytes);
+                    
+                    if conn_id_u64 == conn_id.0 {
+                        // Queue DATAGRAM frame
+                        state.conn.pending_frames.push_back(Frame::Datagram { data });
+                        target_scid = Some(scid.clone());
+                        break;
+                    }
+                }
+                if let Some(scid) = target_scid {
+                    let now = Instant::now();
+                    return self.generate_packets(&scid, now);
+                }
+            }
+            Command::CloseConnection { conn_id, error_code, reason } => {
+                let mut target_scid: Option<ConnectionId> = None;
+                for (scid, state) in &mut self.connections {
+                    let mut bytes = [0u8; 8];
+                    let scid_bytes = scid.as_bytes();
+                    let len = std::cmp::min(scid_bytes.len(), 8);
+                    bytes[..len].copy_from_slice(&scid_bytes[..len]);
+                    let conn_id_u64 = u64::from_le_bytes(bytes);
+                    
+                    if conn_id_u64 == conn_id.0 {
+                        state.conn.state = QuicConnectionState::Closing;
+                        state.conn.pending_frames.push_back(Frame::ConnectionClose {
+                            error_code,
+                            frame_type: None,
+                            reason,
+                            is_application: true,
+                        });
+                        target_scid = Some(scid.clone());
+                        break;
+                    }
+                }
+                if let Some(scid) = target_scid {
+                    let now = Instant::now();
+                    return self.generate_packets(&scid, now);
+                }
+            }
+            Command::ResetStream { conn_id: _, stream_id: _, error_code: _ } |
+            Command::StopSending { conn_id: _, stream_id: _, error_code: _ } |
+            Command::AbortConnection { conn_id: _, error_code: _ } |
+            Command::StreamDataRead { conn_id: _, stream_id: _, len: _ } => {
+                // TODO: Implement these command handlers
+            }
+        }
         vec![]
     }
     
     pub fn poll_timeouts(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
-        // TODO: Check timeouts
-        vec![]
+        let responses = Vec::new();
+        let _now = Instant::now();
+        
+        // TODO: Implement timeout handling
+        // Check each connection for timeouts
+        // let mut to_close = Vec::new();
+        // for (scid, state) in &mut self.connections {
+        //     // Check loss detection timeout
+        //     if let Some(timeout) = state.conn.loss_detector.get_loss_detection_timeout() {
+        //         if now >= timeout {
+        //             // Handle timeout - detect lost packets or send PTO probes
+        //             let lost_packets = state.conn.loss_detector.on_ack(...);
+        //             
+        //             if lost_packets.is_empty() {
+        //                 // PTO timeout - send probe packets
+        //                 let pto_packets = state.conn.loss_detector.on_pto_timeout(now);
+        //                 // Retransmit data from lost packets
+        //                 for _pkt in pto_packets {
+        //                     // Queue retransmission frames
+        //                     // In a full implementation, we'd retransmit the actual packet data
+        //                 }
+        //             }
+        //             
+        //             // Generate packets
+        //             let pkts = self.generate_packets(scid, now);
+        //             responses.extend(pkts);
+        //         }
+        //     }
+        //     
+        //     // Check idle timeout per RFC 9000 Section 10.1
+        //     // (Simplified - would need to track last activity time)
+        // }
+        // 
+        // // Remove closed connections
+        // for scid in to_close {
+        //     self.connections.remove(&scid);
+        //     // Also clean up DCID mappings
+        // }
+        
+        responses
     }
     
     fn generate_packets(&mut self, scid: &ConnectionId, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {

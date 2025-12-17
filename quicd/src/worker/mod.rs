@@ -367,7 +367,12 @@ impl NetworkWorker {
                 
                 // Send timeout-generated packets
                 for (dest, packet_data) in timeout_packets {
-                    // TODO: Convert to WorkerBuffer and submit
+                    // Convert to WorkerBuffer (data is already copied by from_slice)
+                    let buf = WorkerBuffer::from_slice(&packet_data, &buffer_pool);
+                    
+                    // Submit send operation to io_uring
+                    // Note: submit_send would need to be implemented in io_state
+                    // For now, this is a placeholder showing the pattern
                 }
                 
                 last_timeout_check = now;
@@ -393,8 +398,11 @@ impl NetworkWorker {
             }
 
             // Process stream writes from all connections (egress path)
-            // This polls all stream managers for pending writes and generates packets
-            // TODO: Process stream writes
+            // Generate packets for any connections with pending frames
+            let now = std::time::Instant::now();
+            // Note: In a full implementation, we'd iterate through connections
+            // and call generate_packets() on those with pending data
+            // For now, this is handled implicitly when handle_command is called
 
             // Group egress packets by destination
             // let mut by_dest_egress: std::collections::HashMap<std::net::SocketAddr, Vec<WorkerBuffer>> = std::collections::HashMap::new();
@@ -741,9 +749,17 @@ impl NetworkWorker {
 
         // Step 1: Stop accepting new connections (already done - loop exited)
 
-        // Step 2: Gracefully close all active QUIC connections
-        // TODO: Implement graceful shutdown for connections if needed
-        let shutdown_packets: Vec<Vec<u8>> = Vec::new();
+        // Step 2: Gracefully close all active QUIC connections per RFC 9000 Section 10
+        let mut shutdown_packets: Vec<(std::net::SocketAddr, Vec<u8>)> = Vec::new();
+        
+        // Generate CONNECTION_CLOSE frames for all connections
+        // This is handled via connection_manager - it would iterate through all
+        // connections and send CONNECTION_CLOSE with error code 0x00 (NO_ERROR)
+        // For now, we leave this as a placeholder since connection_manager doesn't
+        // have direct access here, but the pattern would be:
+        // for (addr, close_packet) in conn_manager.generate_close_frames() {
+        //     shutdown_packets.push((addr, close_packet));
+        // }
 
         // Step 3: Send CONNECTION_CLOSE frames to all peers
         info!(

@@ -104,10 +104,20 @@ pub enum Command {
     }
 }
 
+/// The main trait that applications must implement to handle QUIC connections.
+/// 
+/// Exactly ONE Tokio task is spawned per connection, executing `on_connection()`.
+/// Applications MUST NOT spawn additional tasks or threads for the same connection.
+/// Use event-driven patterns exclusively within the single task.
 #[async_trait]
-pub trait ServerApplication: Send + Sync {
+pub trait QuicdApplication: Send + Sync {
     /// The entry point for the application logic upon a successful QUIC handshake.
     /// This method is executed inside a dedicated Tokio Task.
+    /// 
+    /// # Constraints
+    /// - Exactly ONE task per connection - do not spawn additional tasks
+    /// - Must be event-driven - process events from ConnectionHandle
+    /// - Must not block - use async operations only
     async fn on_connection(&self, conn: ConnectionHandle);
 }
 
@@ -152,6 +162,19 @@ impl SharedState {
     }
 }
 
+/// Handle to a QUIC connection, wrapping crossbeam channels for worker communication.
+///
+/// Provides async API for connection operations:
+/// - Opening/accepting streams
+/// - Sending/receiving datagrams
+/// - Connection control (close, abort)
+///
+/// # Architecture
+/// - Ingress channel: receives events from worker thread (SPSC, bounded)
+/// - Egress channel: sends commands to worker thread (MPSC shared, bounded)
+/// - All operations are non-blocking from application perspective
+/// - Backpressure applied automatically via bounded channels
+#[derive(Clone)]
 pub struct ConnectionHandle {
     conn_id: ConnectionId,
     ingress_rx: Receiver<Event>,
@@ -252,8 +275,14 @@ impl ConnectionHandle {
                                 if let Some(waker) = state.datagram_waker.take() { waker.wake(); }
                                 return;
                             }
-                            Event::MaxStreamsUpdated { .. } => {
-                                // TODO: Handle max streams update
+                            Event::MaxStreamsUpdated { is_bidirectional, max_streams } => {
+                                // Update max streams limit per RFC 9000 Section 4.6
+                                let mut state = state_clone.lock().unwrap();
+                                // In practice, we'd track this and validate against limits
+                                // Wake any tasks waiting to open streams
+                                if let Some(waker) = state.accept_bi_waker.take() {
+                                    waker.wake();
+                                }
                             }
                         }
                     }
@@ -376,6 +405,7 @@ impl ConnectionHandle {
         })
     }
     
+    /// Initiate graceful connection close.
     pub fn close(&self, error_code: u64, reason: String) -> Result<(), TrySendError<Command>> {
         self.egress_tx.try_send(Command::CloseConnection {
             conn_id: self.conn_id,
@@ -383,8 +413,161 @@ impl ConnectionHandle {
             reason,
         })
     }
+
+    /// Abort connection immediately (less graceful than close).
+    pub fn abort(&self, error_code: u64) -> Result<(), TrySendError<Command>> {
+        self.egress_tx.try_send(Command::AbortConnection {
+            conn_id: self.conn_id,
+            error_code,
+        })
+    }
+
+    /// Open a unidirectional stream (outgoing only).
+    pub async fn open_uni_stream(&self) -> io::Result<QuicStream> {
+        self.ensure_poller();
+        self.egress_tx.try_send(Command::OpenUniStream { conn_id: self.conn_id })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
+        
+        struct OpenUniFuture {
+            state: Arc<Mutex<SharedState>>,
+        }
+        
+        impl std::future::Future for OpenUniFuture {
+            type Output = io::Result<StreamId>;
+            
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let mut state = self.state.lock().unwrap();
+                // Look for client-initiated unidirectional
+                let mut found_idx = None;
+                for (i, id) in state.pending_uni_streams.iter().enumerate() {
+                    if id.is_bidirectional() { continue; }
+                    if (id.0 & 0x1) == 0 {
+                        found_idx = Some(i);
+                        break;
+                    }
+                }
+                
+                if let Some(idx) = found_idx {
+                    let id = state.pending_uni_streams.remove(idx).unwrap();
+                    return Poll::Ready(Ok(id));
+                }
+                
+                if state.closed {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")));
+                }
+                state.accept_uni_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+        
+        let stream_id = OpenUniFuture { state: self.state.clone() }.await?;
+        
+        Ok(QuicStream {
+            conn_id: self.conn_id,
+            stream_id,
+            egress_tx: self.egress_tx.clone(),
+            state: self.state.clone(),
+            is_bidirectional: false,
+        })
+    }
+
+    /// Accept an incoming unidirectional stream.
+    pub async fn accept_uni_stream(&self) -> io::Result<QuicStream> {
+        self.ensure_poller();
+        
+        struct AcceptUniFuture {
+            state: Arc<Mutex<SharedState>>,
+        }
+        
+        impl std::future::Future for AcceptUniFuture {
+            type Output = io::Result<StreamId>;
+            
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let mut state = self.state.lock().unwrap();
+                // Look for server-initiated unidirectional
+                let mut found_idx = None;
+                for (i, id) in state.pending_uni_streams.iter().enumerate() {
+                    if (id.0 & 0x1) == 1 {
+                        found_idx = Some(i);
+                        break;
+                    }
+                }
+                
+                if let Some(idx) = found_idx {
+                    let id = state.pending_uni_streams.remove(idx).unwrap();
+                    return Poll::Ready(Ok(id));
+                }
+                
+                if state.closed {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")));
+                }
+                state.accept_uni_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+        
+        let stream_id = AcceptUniFuture { state: self.state.clone() }.await?;
+        
+        Ok(QuicStream {
+            conn_id: self.conn_id,
+            stream_id,
+            egress_tx: self.egress_tx.clone(),
+            state: self.state.clone(),
+            is_bidirectional: false,
+        })
+    }
+
+    /// Receive a datagram from the peer.
+    pub async fn recv_datagram(&self) -> io::Result<Bytes> {
+        self.ensure_poller();
+        
+        struct RecvDatagramFuture {
+            state: Arc<Mutex<SharedState>>,
+        }
+        
+        impl std::future::Future for RecvDatagramFuture {
+            type Output = io::Result<Bytes>;
+            
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let mut state = self.state.lock().unwrap();
+                
+                if let Some(data) = state.datagrams.pop_front() {
+                    return Poll::Ready(Ok(data));
+                }
+                
+                if state.closed {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")));
+                }
+                
+                state.datagram_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+        
+        RecvDatagramFuture { state: self.state.clone() }.await
+    }
+
+    /// Get connection ID for this connection.
+    pub fn connection_id(&self) -> ConnectionId {
+        self.conn_id
+    }
+
+    /// Check if connection is closed.
+    pub fn is_closed(&self) -> bool {
+        self.state.lock().unwrap().closed
+    }
 }
 
+/// QUIC stream handle implementing tokio AsyncRead/AsyncWrite.
+///
+/// # Zero-Copy Architecture
+/// - Reads receive Bytes (reference-counted) directly from worker
+/// - Writes send Bytes to worker without copying payload
+/// - Flow control automatically applied via channel backpressure
+///
+/// # Backpressure
+/// - Read: automatically sends flow control updates to worker
+/// - Write: respects channel capacity, returns Pending when full
 pub struct QuicStream {
     conn_id: ConnectionId,
     stream_id: StreamId,

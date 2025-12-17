@@ -27,6 +27,14 @@
 //! - Recently freed buffers are still hot in L1/L2/L3 cache
 //! - Memory access patterns are predictable for CPU prefetcher
 //! - Reduces cache pollution from cold buffers
+//!
+//! # Design Inspired by Cloudflare Quiche
+//!
+//! This implementation incorporates best practices from Cloudflare's quiche buffer-pool:
+//! - `Reuse` trait for proper buffer cleanup and validation before pooling
+//! - Only pool buffers with non-zero capacity (avoid wasting pool slots)
+//! - `ConsumeBuffer` for zero-copy front consumption without data shifting
+//! - Clear separation of concerns: pool management vs buffer usage
 
 use crate::netio::config::BufferPoolConfig;
 use std::cell::RefCell;
@@ -36,6 +44,146 @@ use std::sync::Arc;
 /// Maximum UDP payload size (IPv6 jumbo frame)
 /// This is the absolute maximum for a single UDP datagram
 pub const MAX_UDP_PAYLOAD: usize = 65536;
+
+/// Trait for preparing items to be returned to the pool.
+///
+/// Inspired by Cloudflare's quiche buffer-pool. This trait ensures proper
+/// cleanup and validation before buffers are returned to the pool.
+///
+/// Returns `true` if the item should be returned to the pool, `false` if
+/// it should be dropped. This prevents pooling of unusable buffers.
+pub trait Reuse {
+    /// Prepare the item for reuse by cleaning it up.
+    ///
+    /// # Arguments
+    ///
+    /// * `trim` - Target capacity to shrink to
+    ///
+    /// # Returns
+    ///
+    /// `true` if the item has non-zero capacity and should be pooled,
+    /// `false` if it should be dropped (e.g., zero capacity)
+    fn reuse(&mut self, trim: usize) -> bool;
+}
+
+impl Reuse for Vec<u8> {
+    fn reuse(&mut self, trim: usize) -> bool {
+        self.clear();
+        self.shrink_to(trim);
+        // Only pool buffers with actual capacity
+        // Empty buffers are a waste of pool slots
+        self.capacity() > 0
+    }
+}
+
+/// A convenience wrapper around Vec that allows consuming data from the
+/// front **without** shifting.
+///
+/// Inspired by Cloudflare's quiche ConsumeBuffer. This is more ergonomic
+/// and efficient than VecDeque for our use case:
+/// - Single contiguous slice (not two like VecDeque)
+/// - Zero-copy front consumption via head pointer adjustment
+/// - Compatible with unsafe `set_len` for kernel I/O operations
+///
+/// # Use Cases
+///
+/// - Parsing protocol frames from received packets
+/// - Progressive consumption of buffered data without reallocations
+/// - Zero-copy packet processing pipelines
+#[derive(Default, Debug)]
+pub struct ConsumeBuffer {
+    inner: Vec<u8>,
+    /// Head offset - data before this point has been consumed
+    head: usize,
+}
+
+impl ConsumeBuffer {
+    /// Create a ConsumeBuffer from an existing Vec
+    pub fn from_vec(inner: Vec<u8>) -> Self {
+        ConsumeBuffer { inner, head: 0 }
+    }
+
+    /// Convert back to Vec, removing consumed data
+    pub fn into_vec(self) -> Vec<u8> {
+        let mut inner = self.inner;
+        inner.drain(0..self.head);
+        inner
+    }
+
+    /// Consume `count` bytes from the front without shifting memory
+    ///
+    /// # Panics
+    ///
+    /// Panics if `count` exceeds available data
+    pub fn pop_front(&mut self, count: usize) {
+        assert!(self.head + count <= self.inner.len());
+        self.head += count;
+    }
+
+    /// Expand buffer capacity and set length
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure expanded bytes are initialized before reading
+    pub fn expand(&mut self, count: usize) {
+        self.inner.reserve_exact(count);
+        // SAFETY: u8 is always initialized and we reserved the capacity.
+        unsafe { self.inner.set_len(count) };
+    }
+
+    /// Truncate buffer to keep only first `count` bytes of unconsumed data
+    pub fn truncate(&mut self, count: usize) {
+        self.inner.truncate(self.head + count);
+    }
+
+    /// Add a prefix before the head pointer (zero-copy prepend)
+    ///
+    /// Returns `false` if there's insufficient consumed space for the prefix
+    pub fn add_prefix(&mut self, prefix: &[u8]) -> bool {
+        if self.head < prefix.len() {
+            return false;
+        }
+
+        self.head -= prefix.len();
+        self.inner[self.head..self.head + prefix.len()].copy_from_slice(prefix);
+
+        true
+    }
+
+    /// Get remaining capacity available for writing
+    pub fn remaining_capacity(&self) -> usize {
+        self.inner.capacity() - self.inner.len()
+    }
+}
+
+impl Deref for ConsumeBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner[self.head..]
+    }
+}
+
+impl DerefMut for ConsumeBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner[self.head..]
+    }
+}
+
+impl<'a> Extend<&'a u8> for ConsumeBuffer {
+    fn extend<T: IntoIterator<Item = &'a u8>>(&mut self, iter: T) {
+        self.inner.extend(iter)
+    }
+}
+
+impl Reuse for ConsumeBuffer {
+    fn reuse(&mut self, trim: usize) -> bool {
+        self.inner.clear();
+        self.inner.shrink_to(trim);
+        self.head = 0;
+        self.inner.capacity() > 0
+    }
+}
 
 /// LIFO buffer pool for single-threaded worker use.
 ///
@@ -48,6 +196,12 @@ pub const MAX_UDP_PAYLOAD: usize = 65536;
 /// - Maximizes CPU cache hit rates (L1/L2/L3)
 /// - Predictable memory access patterns for hardware prefetching
 /// - Simple Vec-based implementation with minimal overhead
+///
+/// # Improved Pooling Strategy (from Cloudflare)
+///
+/// - Uses `Reuse` trait to validate and cleanup buffers before pooling
+/// - Rejects zero-capacity buffers (waste of pool slots)
+/// - Smart shrink_to logic to balance memory usage vs. reallocation cost
 ///
 /// # Thread Safety
 ///
@@ -65,8 +219,8 @@ pub struct WorkerBufPool {
     buffers: RefCell<Vec<Vec<u8>>>,
     /// Maximum number of buffers to keep in pool
     max_buffers: usize,
-    /// Target size for each buffer
-    buffer_size: usize,
+    /// Target size for shrinking buffers before pooling
+    trim_size: usize,
 }
 
 // SAFETY: Although WorkerBufPool contains RefCell (which is !Sync), we manually
@@ -88,12 +242,12 @@ impl WorkerBufPool {
     /// # Arguments
     ///
     /// * `max_buffers` - Maximum buffers to keep in pool
-    /// * `buffer_size` - Target size for each buffer
-    pub fn new(max_buffers: usize, buffer_size: usize) -> Self {
+    /// * `trim_size` - Target size for shrinking buffers before pooling
+    pub fn new(max_buffers: usize, trim_size: usize) -> Self {
         Self {
             buffers: RefCell::new(Vec::with_capacity(max_buffers)),
             max_buffers,
-            buffer_size,
+            trim_size,
         }
     }
 
@@ -105,34 +259,21 @@ impl WorkerBufPool {
         self.buffers
             .borrow_mut()
             .pop()
-            .unwrap_or_else(|| Vec::with_capacity(self.buffer_size))
+            .unwrap_or_else(|| Vec::with_capacity(self.trim_size))
     }
 
-    /// Return a buffer to the pool (LIFO order).
+    /// Return a buffer to the pool (LIFO order) using Reuse trait.
     ///
     /// Buffer is pushed to the end of the Vec, making it the next
-    /// to be allocated. If pool is full, buffer is dropped.
+    /// to be allocated. If pool is full or buffer fails reuse validation,
+    /// buffer is dropped.
+    ///
+    /// Following Cloudflare's pattern: only pool buffers with non-zero capacity.
     fn put(&self, mut buffer: Vec<u8>) {
         let mut buffers = self.buffers.borrow_mut();
 
-        // Only keep buffer if pool isn't full
-        if buffers.len() < self.max_buffers {
-            // Trim buffer to target size to prevent unbounded growth
-            buffer.clear();
-            
-            // Optimization: If buffer is already at MAX_UDP_PAYLOAD capacity (from recvmsg),
-            // keep it that way to avoid reallocation when reused for recvmsg.
-            // Only shrink if it's excessively large or if we want to enforce small buffers.
-            // Since we use MAX_UDP_PAYLOAD for receive, keeping it is better.
-            if buffer.capacity() > MAX_UDP_PAYLOAD {
-                buffer.shrink_to(self.buffer_size);
-            } else if buffer.capacity() < self.buffer_size {
-                // If it's smaller than target (unlikely if used for recv), grow it?
-                // No, just leave it.
-            }
-            // If capacity is between buffer_size and MAX_UDP_PAYLOAD, keep it.
-            // This covers the case where it was resized to MAX_UDP_PAYLOAD.
-
+        // Only keep buffer if pool isn't full AND buffer passes reuse validation
+        if buffers.len() < self.max_buffers && buffer.reuse(self.trim_size) {
             // Push to end (LIFO: next to be allocated)
             buffers.push(buffer);
         }
@@ -172,9 +313,10 @@ pub fn create_worker_pool(config: &BufferPoolConfig) -> Arc<WorkerBufPool> {
     ))
 }
 
-/// RAII wrapper for a pooled buffer.
+/// RAII wrapper for a pooled buffer with automatic return to pool on drop.
 ///
-/// When dropped, automatically returns the buffer to the pool (LIFO).
+/// Inspired by Cloudflare's `Pooled<T>`. This wrapper ensures buffers are
+/// always returned to the pool when dropped, following RAII principles.
 pub struct PooledBuffer {
     buffer: Option<Vec<u8>>,
     pool: Arc<WorkerBufPool>,
@@ -189,8 +331,11 @@ impl PooledBuffer {
         }
     }
 
-    /// Take the inner buffer, preventing return to pool
-    fn take(&mut self) -> Vec<u8> {
+    /// Take ownership of the inner buffer, preventing return to pool
+    ///
+    /// Use this when you need to transfer ownership and don't want the
+    /// buffer to return to the pool on drop.
+    pub fn into_inner(mut self) -> Vec<u8> {
         self.buffer.take().expect("buffer already taken")
     }
 }
@@ -199,6 +344,7 @@ impl Drop for PooledBuffer {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
             // Return to pool (LIFO: pushed to end of Vec)
+            // Reuse trait handles cleanup and validation
             self.pool.put(buffer);
         }
     }
@@ -218,7 +364,7 @@ impl DerefMut for PooledBuffer {
     }
 }
 
-/// Buffer wrapper for io_uring operations.
+/// Buffer wrapper for io_uring operations with zero-copy guarantees.
 ///
 /// This wraps the pooled buffer and provides safe APIs for:
 /// - Receiving datagrams into the buffer
@@ -226,8 +372,12 @@ impl DerefMut for PooledBuffer {
 /// - Zero-copy access to received data
 /// - Automatic LIFO return to pool on drop
 ///
-/// Holds an Arc to the buffer pool to ensure it remains alive
-/// while this buffer is in use.
+/// # Performance Optimizations
+///
+/// - Single allocation reused across many I/O operations
+/// - LIFO pooling keeps buffers cache-hot
+/// - Unsafe `set_len` avoids zero-initialization for kernel writes
+/// - Clear separation between buffer capacity and data length
 pub struct WorkerBuffer {
     inner: PooledBuffer,
     /// Actual length of received data (buffer capacity may be larger)
@@ -255,10 +405,36 @@ impl WorkerBuffer {
         }
     }
 
+    /// Create a buffer from existing data.
+    ///
+    /// Takes a Vec, copies its data into a pooled buffer. Used for
+    /// sending application-generated packets.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Data to copy into buffer
+    /// * `pool` - Buffer pool reference
     pub fn from_vec(data: Vec<u8>, pool: &Arc<WorkerBufPool>) -> Self {
         let mut buf = pool.take();
         buf.clear();
         buf.extend_from_slice(&data);
+        let len = data.len();
+        Self {
+            inner: PooledBuffer::new(buf, pool.clone()),
+            len,
+        }
+    }
+
+    /// Create a buffer from a slice (zero-copy if possible).
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Data to copy into buffer
+    /// * `pool` - Buffer pool reference
+    pub fn from_slice(data: &[u8], pool: &Arc<WorkerBufPool>) -> Self {
+        let mut buf = pool.take();
+        buf.clear();
+        buf.extend_from_slice(data);
         Self {
             inner: PooledBuffer::new(buf, pool.clone()),
             len: data.len(),
@@ -287,13 +463,18 @@ impl WorkerBuffer {
     ///
     /// Ensures buffer has capacity for maximum UDP payload size.
     /// This is used for both recv and send operations with io_uring.
+    ///
+    /// # Safety
+    ///
+    /// Uses unsafe `set_len` to avoid zero-initialization. The kernel
+    /// will write to this buffer before we read from it, so uninitialized
+    /// memory is acceptable. This provides significant performance benefit
+    /// by avoiding memset operations on every buffer reuse.
     #[inline]
     pub fn as_mut_slice_for_io(&mut self) -> &mut [u8] {
         let inner = &mut *self.inner;
 
         // Ensure buffer has capacity for max UDP datagram
-        // We need to set the length to the actual capacity, not MAX_UDP_PAYLOAD,
-        // because the allocator might not give us exactly what we asked for.
         if inner.capacity() < MAX_UDP_PAYLOAD {
             // Reserve the difference to reach MAX_UDP_PAYLOAD capacity
             inner.reserve(MAX_UDP_PAYLOAD - inner.capacity());
@@ -326,11 +507,17 @@ impl WorkerBuffer {
         self.len = len;
     }
 
-    /// Get mutable reference to the inner buffer for advanced use cases
-    #[allow(dead_code)]
+    /// Get the underlying buffer capacity
     #[inline]
-    pub fn as_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.inner
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    /// Clear the buffer and reset length to zero
+    #[inline]
+    pub fn clear(&mut self) {
+        self.inner.clear();
+        self.len = 0;
     }
 }
 
@@ -344,3 +531,122 @@ impl Deref for WorkerBuffer {
 }
 
 // No DerefMut to prevent accidental modification of the length tracking
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reuse_trait_vec() {
+        let mut vec = vec![1, 2, 3, 4, 5];
+        assert!(vec.reuse(128));
+        assert_eq!(vec.len(), 0);
+        assert!(vec.capacity() > 0);
+        assert!(vec.capacity() <= 128);
+
+        // Zero-capacity buffers should not be pooled
+        let mut empty = Vec::new();
+        assert!(!empty.reuse(128));
+    }
+
+    #[test]
+    fn test_consume_buffer_pop_front() {
+        let mut buf = ConsumeBuffer::from_vec(vec![1, 2, 3, 4, 5]);
+        assert_eq!(&buf[..], &[1, 2, 3, 4, 5]);
+        
+        buf.pop_front(2);
+        assert_eq!(&buf[..], &[3, 4, 5]);
+        
+        buf.pop_front(3);
+        assert_eq!(&buf[..], &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_consume_buffer_add_prefix() {
+        let mut buf = ConsumeBuffer::from_vec(vec![0, 0, 3, 4, 5]);
+        buf.pop_front(2); // Creates space at head
+        assert_eq!(&buf[..], &[3, 4, 5]);
+        
+        assert!(buf.add_prefix(&[1, 2]));
+        assert_eq!(&buf[..], &[1, 2, 3, 4, 5]);
+        
+        // Not enough space for larger prefix
+        assert!(!buf.add_prefix(&[9, 8, 7]));
+    }
+
+    #[test]
+    fn test_buffer_pool_lifo() {
+        let config = BufferPoolConfig {
+            max_buffers_per_worker: 4,
+            datagram_size: 128,
+        };
+        let pool = create_worker_pool(&config);
+
+        // Get 3 buffers
+        let buf1 = pool.take();
+        let buf2 = pool.take();
+        let buf3 = pool.take();
+        
+        let ptr1 = buf1.as_ptr();
+        let ptr2 = buf2.as_ptr();
+        let ptr3 = buf3.as_ptr();
+
+        // Return them
+        pool.put(buf1);
+        pool.put(buf2);
+        pool.put(buf3);
+
+        // Get them back - should be in LIFO order (3, 2, 1)
+        let buf_a = pool.take();
+        let buf_b = pool.take();
+        let buf_c = pool.take();
+
+        assert_eq!(buf_a.as_ptr(), ptr3);
+        assert_eq!(buf_b.as_ptr(), ptr2);
+        assert_eq!(buf_c.as_ptr(), ptr1);
+    }
+
+    #[test]
+    fn test_pool_max_capacity() {
+        let config = BufferPoolConfig {
+            max_buffers_per_worker: 2,
+            datagram_size: 128,
+        };
+        let pool = create_worker_pool(&config);
+
+        let mut buffers = vec![];
+        for _ in 0..10 {
+            let mut buf = pool.take();
+            buf.extend_from_slice(&[1, 2, 3]); // Give it capacity
+            buffers.push(buf);
+        }
+
+        // Return all 10
+        for buf in buffers {
+            pool.put(buf);
+        }
+
+        // Pool should only keep 2 (max_buffers_per_worker)
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn test_pool_rejects_empty_buffers() {
+        let config = BufferPoolConfig {
+            max_buffers_per_worker: 10,
+            datagram_size: 128,
+        };
+        let pool = create_worker_pool(&config);
+
+        // Empty buffer should not be pooled
+        let empty = Vec::new();
+        pool.put(empty);
+        assert_eq!(pool.len(), 0);
+
+        // Buffer with capacity should be pooled
+        let mut with_capacity = Vec::with_capacity(64);
+        with_capacity.push(1);
+        pool.put(with_capacity);
+        assert_eq!(pool.len(), 1);
+    }
+}

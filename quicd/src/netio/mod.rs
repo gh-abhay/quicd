@@ -14,7 +14,7 @@ pub mod numa;
 pub(crate) mod socket;
 
 #[allow(unused_imports)]
-pub use buffer::{create_worker_pool, WorkerBufPool, WorkerBuffer};
+pub use buffer::{create_worker_pool, ConsumeBuffer, Reuse, WorkerBufPool, WorkerBuffer};
 pub use config::NetIoConfig;
 pub use numa::configure_numa_for_worker;
 #[allow(unused_imports)]
