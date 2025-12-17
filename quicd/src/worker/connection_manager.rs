@@ -7,7 +7,7 @@ use bytes::Bytes;
 use crate::netio::buffer::WorkerBuffer;
 use crate::routing::{RoutingConnectionIdGenerator, current_generation};
 use crossbeam_channel::{Sender, Receiver, bounded};
-use quicd_quic::{Connection, ConnectionConfig, Packet, PacketType};
+use quicd_quic::{Connection, ConnectionConfig, Packet, PacketType, VERSION_1, VERSION_NEGOTIATION};
 use quicd_quic::cid::{ConnectionIdGenerator, ConnectionId};
 use quicd_quic::crypto::TlsSession;
 use quicd_quic::stream::{Stream, StreamId};
@@ -18,9 +18,9 @@ use quicd_x::ConnectionId as XConnectionId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle as TokioHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn, debug};
 
 /// Maps incoming packets to QUIC connections.
 pub struct ConnectionManager {
@@ -43,6 +43,11 @@ pub struct ConnectionManager {
     cid_generator: Arc<dyn ConnectionIdGenerator>,
     
     worker_id: u8,
+    
+    /// DDoS protection: Rate limiting for Version Negotiation packets.
+    /// Maps source address to (count, window_start_time).
+    /// RFC 9000 Section 5.2.2: "A server MAY limit the number of Version Negotiation packets it sends."
+    vn_rate_limiter: HashMap<SocketAddr, (u32, Instant)>,
 }
 
 /// Per-connection state managed by the worker.
@@ -83,10 +88,13 @@ impl ConnectionManager {
             egress_tx,
             cid_generator,
             worker_id,
+            vn_rate_limiter: HashMap::new(),
         }
     }
     
     pub fn handle_packet(&mut self, buffer: WorkerBuffer, peer_addr: SocketAddr, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+        let datagram_size = buffer.len();
+        
         // Parse packet from buffer
         let bytes = Bytes::copy_from_slice(&buffer);
         let packet = match Packet::parse(bytes) {
@@ -98,6 +106,69 @@ impl ConnectionManager {
         };
 
         let dcid = packet.header.dcid.clone();
+        
+        // ========================================================================
+        // RFC 8999 Section 6 + RFC 9000 Section 5.2.2: Version Negotiation
+        // ========================================================================
+        // 
+        // "If a server receives a packet that indicates an unsupported version
+        // and if the packet is large enough to initiate a new connection for
+        // any supported version, the server SHOULD send a Version Negotiation
+        // packet as described in Section 6.1."
+        //
+        // Only long header packets with version field can trigger VN:
+        // - Initial, 0-RTT, Handshake, Retry packets have version field
+        // - Short header packets do not have version field (RFC 8999 Section 5.2)
+        // - Version Negotiation packets MUST NOT trigger VN response (prevent loops)
+        //
+        if matches!(packet.header.ty, PacketType::Initial | PacketType::ZeroRtt | 
+                    PacketType::Handshake | PacketType::Retry) {
+            
+            // Check if version is supported
+            if packet.header.version != VERSION_1 {
+                debug!("Received packet with unsupported version: 0x{:08X} from {}", 
+                       packet.header.version, peer_addr);
+                
+                // RFC 9000 Section 14.1: "A server MUST discard an Initial packet that 
+                // is carried in a UDP datagram with a payload that is smaller than the 
+                // smallest allowed maximum datagram size of 1200 bytes."
+                //
+                // "Servers MUST drop smaller packets that specify unsupported versions."
+                if datagram_size < 1200 {
+                    debug!("Dropping undersized packet ({} bytes) with unsupported version from {}", 
+                           datagram_size, peer_addr);
+                    return vec![];
+                }
+                
+                // DDoS protection: Rate limit Version Negotiation packets
+                // RFC 9000 Section 5.2.2: "A server MAY limit the number of Version 
+                // Negotiation packets it sends."
+                if !self.should_send_version_negotiation(peer_addr, now) {
+                    warn!("Rate limiting Version Negotiation packet to {}", peer_addr);
+                    return vec![];
+                }
+                
+                // Generate and send Version Negotiation packet
+                // RFC 9000 Section 17.2.1: Echo CIDs correctly
+                let vn_packet = Packet::create_version_negotiation(
+                    packet.header.dcid.clone(),
+                    packet.header.scid.clone().unwrap_or_else(ConnectionId::empty),
+                    vec![VERSION_1], // List of supported versions
+                );
+                
+                match vn_packet.serialize() {
+                    Ok(serialized) => {
+                        info!("Sent Version Negotiation packet to {} (unsupported version 0x{:08X})", 
+                              peer_addr, packet.header.version);
+                        return vec![(peer_addr, serialized.to_vec())];
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize Version Negotiation packet: {}", e);
+                        return vec![];
+                    }
+                }
+            }
+        }
         
         // Check if existing connection
         if let Some(scid) = self.dcid_to_conn.get(&dcid) {
@@ -115,8 +186,15 @@ impl ConnectionManager {
             }
         }
         
-        // New connection?
+        // New connection with supported version
         if packet.header.ty == PacketType::Initial {
+            // RFC 9000 Section 14.1: Validate minimum datagram size for Initial packets
+            if datagram_size < 1200 {
+                debug!("Dropping undersized Initial packet ({} bytes) from {}", 
+                       datagram_size, peer_addr);
+                return vec![];
+            }
+            
             let scid = self.cid_generator.generate(8); // Use 8 bytes for SCID
             let tls = TlsSession::new_server();
             
@@ -219,6 +297,43 @@ impl ConnectionManager {
                     }
                 }
             }
+        }
+    }
+    
+    /// DDoS protection: Rate limit Version Negotiation packets.
+    /// 
+    /// RFC 9000 Section 5.2.2: \"A server MAY limit the number of Version Negotiation packets it sends.\"
+    /// 
+    /// Implements a sliding window rate limiter to prevent amplification attacks.
+    /// Allows max 10 VN packets per source address per 1-second window.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `peer_addr` - Source address of the packet
+    /// * `now` - Current timestamp
+    /// 
+    /// # Returns
+    /// 
+    /// `true` if VN packet should be sent, `false` if rate limit exceeded
+    fn should_send_version_negotiation(&mut self, peer_addr: SocketAddr, now: Instant) -> bool {
+        const MAX_VN_PER_WINDOW: u32 = 10;
+        const WINDOW_DURATION: Duration = Duration::from_secs(1);
+        
+        let entry = self.vn_rate_limiter.entry(peer_addr).or_insert((0, now));
+        
+        // Check if window has expired
+        if now.duration_since(entry.1) > WINDOW_DURATION {
+            // Reset window
+            entry.0 = 1;
+            entry.1 = now;
+            true
+        } else if entry.0 < MAX_VN_PER_WINDOW {
+            // Within limit
+            entry.0 += 1;
+            true
+        } else {
+            // Rate limit exceeded
+            false
         }
     }
     
