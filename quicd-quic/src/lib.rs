@@ -83,4 +83,4 @@ pub use crypto::{TlsSession, KeySchedule};
 pub use recovery::{CongestionController, LossDetector};
 pub use cid::ConnectionId;
 pub use error::Error;
-pub use params::TransportParams;
+pub use params::{TransportParams, Role};
