@@ -275,7 +275,7 @@ impl ConnectionHandle {
                                 if let Some(waker) = state.datagram_waker.take() { waker.wake(); }
                                 return;
                             }
-                            Event::MaxStreamsUpdated { is_bidirectional, max_streams } => {
+                            Event::MaxStreamsUpdated { is_bidirectional: _, max_streams: _ } => {
                                 // Update max streams limit per RFC 9000 Section 4.6
                                 let mut state = state_clone.lock().unwrap();
                                 // In practice, we'd track this and validate against limits
@@ -573,6 +573,7 @@ pub struct QuicStream {
     stream_id: StreamId,
     egress_tx: Sender<Command>,
     state: Arc<Mutex<SharedState>>,
+    #[allow(dead_code)] // May be used for future validation
     is_bidirectional: bool,
 }
 

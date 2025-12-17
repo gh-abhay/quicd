@@ -15,3 +15,12 @@ log = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 rcgen = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "packet_parsing"
+harness = false
+
+[[bench]]
+name = "frame_parsing"
+harness = false

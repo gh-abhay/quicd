@@ -1839,6 +1839,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "bytes",
+ "criterion",
  "log",
  "rcgen",
  "ring",

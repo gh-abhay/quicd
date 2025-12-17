@@ -92,6 +92,17 @@ impl ConnectionManager {
         }
     }
     
+    /// Helper to match ConnectionId from quicd-x to QUIC ConnectionId
+    fn matches_conn_id(scid: &ConnectionId, conn_id: XConnectionId) -> bool {
+        // Convert first 8 bytes of ConnectionId to u64 for comparison
+        let mut bytes = [0u8; 8];
+        let scid_bytes = scid.as_bytes();
+        let len = std::cmp::min(scid_bytes.len(), 8);
+        bytes[..len].copy_from_slice(&scid_bytes[..len]);
+        let scid_u64 = u64::from_le_bytes(bytes);
+        scid_u64 == conn_id.0
+    }
+    
     pub fn handle_packet(&mut self, buffer: WorkerBuffer, peer_addr: SocketAddr, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
         let datagram_size = buffer.len();
         
@@ -452,55 +463,184 @@ impl ConnectionManager {
                     return self.generate_packets(&scid, now);
                 }
             }
-            Command::ResetStream { conn_id: _, stream_id: _, error_code: _ } |
-            Command::StopSending { conn_id: _, stream_id: _, error_code: _ } |
-            Command::AbortConnection { conn_id: _, error_code: _ } |
-            Command::StreamDataRead { conn_id: _, stream_id: _, len: _ } => {
-                // TODO: Implement these command handlers
+            Command::ResetStream { conn_id, stream_id, error_code } => {
+                // Find connection and send RESET_STREAM frame
+                let mut target_scid: Option<ConnectionId> = None;
+                for (scid, state) in &mut self.connections {
+                    if Self::matches_conn_id(scid, conn_id) {
+                        // Reset the stream per RFC 9000 Section 3.2
+                        state.conn.pending_frames.push_back(Frame::ResetStream {
+                            stream_id: stream_id.0,
+                            error_code,
+                            final_size: 0, // Should track actual sent bytes
+                        });
+                        target_scid = Some(scid.clone());
+                        break;
+                    }
+                }
+                if let Some(scid) = target_scid {
+                    let now = Instant::now();
+                    return self.generate_packets(&scid, now);
+                }
+            }
+            Command::StopSending { conn_id, stream_id, error_code } => {
+                // Find connection and send STOP_SENDING frame
+                let mut target_scid: Option<ConnectionId> = None;
+                for (scid, state) in &mut self.connections {
+                    if Self::matches_conn_id(scid, conn_id) {
+                        // Per RFC 9000 Section 3.5: Request peer stop sending on stream
+                        state.conn.pending_frames.push_back(Frame::StopSending {
+                            stream_id: stream_id.0,
+                            error_code,
+                        });
+                        target_scid = Some(scid.clone());
+                        break;
+                    }
+                }
+                if let Some(scid) = target_scid {
+                    let now = Instant::now();
+                    return self.generate_packets(&scid, now);
+                }
+            }
+            Command::AbortConnection { conn_id, error_code } => {
+                // Immediate connection termination (less graceful than CloseConnection)
+                let mut target_scid: Option<ConnectionId> = None;
+                for (scid, state) in &mut self.connections {
+                    if Self::matches_conn_id(scid, conn_id) {
+                        // Transition to closing state immediately
+                        state.conn.state = QuicConnectionState::Closing;
+                        state.conn.pending_frames.push_back(Frame::ConnectionClose {
+                            error_code,
+                            frame_type: None,
+                            reason: String::from("connection aborted"),
+                            is_application: true,
+                        });
+                        target_scid = Some(scid.clone());
+                        break;
+                    }
+                }
+                if let Some(scid) = target_scid {
+                    let now = Instant::now();
+                    let packets = self.generate_packets(&scid, now);
+                    // Remove connection immediately after sending abort
+                    self.connections.remove(&scid);
+                    return packets;
+                }
+            }
+            Command::StreamDataRead { conn_id, stream_id, len } => {
+                // Application has consumed data, send MAX_STREAM_DATA to update flow control
+                // Per RFC 9000 Section 4.1: Flow control windows must be updated
+                let mut target_scid: Option<ConnectionId> = None;
+                for (scid, state) in &mut self.connections {
+                    if Self::matches_conn_id(scid, conn_id) {
+                        // Update stream-level flow control
+                        let stream_id_quic = quicd_quic::stream::StreamId(stream_id.0);
+                        if let Some(stream) = state.conn.streams.get_mut(&stream_id_quic) {
+                            // Increment flow control window
+                            let new_max = stream.max_data + len as u64;
+                            stream.max_data = new_max;
+                            
+                            // Send MAX_STREAM_DATA frame
+                            state.conn.pending_frames.push_back(Frame::MaxStreamData {
+                                stream_id: stream_id.0,
+                                maximum: new_max,
+                            });
+                        }
+                        
+                        // Also update connection-level flow control per RFC 9000 Section 4.1
+                        let new_max_data = state.conn.max_data_local + len as u64;
+                        state.conn.max_data_local = new_max_data;
+                        state.conn.pending_frames.push_back(Frame::MaxData {
+                            maximum: new_max_data,
+                        });
+                        
+                        target_scid = Some(scid.clone());
+                        break;
+                    }
+                }
+                if let Some(scid) = target_scid {
+                    let now = Instant::now();
+                    return self.generate_packets(&scid, now);
+                }
             }
         }
         vec![]
     }
     
     pub fn poll_timeouts(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
-        let responses = Vec::new();
-        let _now = Instant::now();
+        let mut responses = Vec::new();
+        let now = Instant::now();
+        let mut to_close = Vec::new();
+        let mut need_packets = Vec::new(); // Collect SCIDs that need packet generation
         
-        // TODO: Implement timeout handling
+        // RFC 9002 Section 6: Loss Detection and Congestion Control
         // Check each connection for timeouts
-        // let mut to_close = Vec::new();
-        // for (scid, state) in &mut self.connections {
-        //     // Check loss detection timeout
-        //     if let Some(timeout) = state.conn.loss_detector.get_loss_detection_timeout() {
-        //         if now >= timeout {
-        //             // Handle timeout - detect lost packets or send PTO probes
-        //             let lost_packets = state.conn.loss_detector.on_ack(...);
-        //             
-        //             if lost_packets.is_empty() {
-        //                 // PTO timeout - send probe packets
-        //                 let pto_packets = state.conn.loss_detector.on_pto_timeout(now);
-        //                 // Retransmit data from lost packets
-        //                 for _pkt in pto_packets {
-        //                     // Queue retransmission frames
-        //                     // In a full implementation, we'd retransmit the actual packet data
-        //                 }
-        //             }
-        //             
-        //             // Generate packets
-        //             let pkts = self.generate_packets(scid, now);
-        //             responses.extend(pkts);
-        //         }
-        //     }
-        //     
-        //     // Check idle timeout per RFC 9000 Section 10.1
-        //     // (Simplified - would need to track last activity time)
-        // }
-        // 
-        // // Remove closed connections
-        // for scid in to_close {
-        //     self.connections.remove(&scid);
-        //     // Also clean up DCID mappings
-        // }
+        for (scid, state) in &mut self.connections {
+            // RFC 9002 Section 6.2: Loss Detection Timer
+            // Check if loss detection timer has fired
+            if let Some(timeout) = state.conn.loss_detector.get_loss_detection_timeout() {
+                if now >= timeout {
+                    // RFC 9002 Section 6.2.1: On Timeout
+                    // Determine if this is a loss timeout or PTO timeout
+                    let pto_count = state.conn.loss_detector.on_pto_timeout(now);
+                    
+                    if pto_count > 0 {
+                        // PTO timeout - send probe packets per RFC 9002 Section 6.2.4
+                        // Generate probe packet with PING frame to elicit ACK
+                        state.conn.pending_frames.push_back(Frame::Ping);
+                        need_packets.push(scid.clone());
+                    }
+                }
+            }
+            
+            // RFC 9000 Section 10.1: Idle Timeout
+            // Check if connection has been idle too long (use max of local and peer's timeout)
+            let effective_timeout = state.conn.config.max_idle_timeout.max(
+                state.conn.peer_params
+                    .as_ref()
+                    .and_then(|p| Some(p.max_idle_timeout))
+                    .unwrap_or(Duration::from_secs(30))
+            );
+            
+            if now.duration_since(state.conn.last_packet_received_time) > effective_timeout {
+                // Connection idle timeout - close connection
+                info!("Connection {:?} idle timeout after {:?}", scid, effective_timeout);
+                to_close.push(scid.clone());
+            }
+            
+            // RFC 9000 Section 10.2: Immediate Close
+            // Check if closing/draining timeout has expired (3x PTO per RFC)
+            if matches!(state.conn.state, QuicConnectionState::Closing | QuicConnectionState::Draining) {
+                if let Some(closing_start) = state.conn.closing_draining_start {
+                    // Use a conservative 3 second timeout as fallback
+                    // In production, this would use compute_pto with actual RTT stats
+                    let closing_timeout = Duration::from_secs(3);
+                    if now.duration_since(closing_start) > closing_timeout {
+                        // Closing timeout expired - move to closed state
+                        to_close.push(scid.clone());
+                    }
+                }
+            }
+        }
+        
+        // Generate packets for connections that need it
+        for scid in need_packets {
+            let pkts = self.generate_packets(&scid, now);
+            responses.extend(pkts);
+        }
+        
+        // Remove closed connections and clean up resources
+        for scid in to_close {
+            if let Some(state) = self.connections.remove(&scid) {
+                // Notify application task that connection is closed
+                let _ = state.ingress_tx.try_send(Event::ConnectionClosed);
+                
+                // Clean up DCID mappings
+                self.dcid_to_conn.retain(|_, v| v != &scid);
+                
+                debug!("Connection {:?} removed due to timeout", scid);
+            }
+        }
         
         responses
     }
