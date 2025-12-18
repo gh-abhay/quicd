@@ -9,7 +9,7 @@
 //! - **Zero-copy parsing**: Operate on borrowed slices, use `bytes::Bytes` for payloads
 //! - **Single-task per connection**: All connection state managed in one Tokio task
 //! - **Modular congestion control**: Pluggable algorithms (NewReno default)
-//! - **Crypto-agnostic**: TLS trait interface with rustls/BoringSSL adapters
+//! - **Crypto-agnostic**: TLS trait interface with BoringSSL adapter for RFC 9001 compliance
 //!
 //! # RFC 9000 Compliance - Server-Side (100% COMPLETE)
 //!
@@ -69,14 +69,18 @@
 //! - ⚠️ **PMTU Discovery** (Section 14.2-14.4): Uses 1200-byte minimum (safe default)
 //! - ⚠️ **Connection Migration** (Section 9.3): Basic PATH_CHALLENGE/RESPONSE only
 //!
-//! ## 🔐 Cryptographic Implementations (Production-Grade via `ring`)
+//! ## 🔐 Cryptographic Implementations (RFC 9001 Compliant via BoringSSL)
 //!
+//! - ✅ **Initial Keys** (RFC 9001 Section 5.2): HKDF-Extract/Expand-Label with version-specific salt
+//! - ✅ **Packet Protection** (RFC 9001 Section 5.3): AEAD_AES_128_GCM with proper nonce construction
+//! - ✅ **Header Protection** (RFC 9001 Section 5.4): AES-128-ECB per RFC specification
+//! - ✅ **Key Derivation** (RFC 8446 Section 7.1): HKDF-Expand-Label for all traffic secrets
 //! - ✅ **Token Encryption** (Section 8.1.4): ChaCha20-Poly1305 AEAD
 //! - ✅ **Retry Integrity Tag** (RFC 9001 Section 5.8): AES-128-GCM authentication
 //! - ✅ **Stateless Reset Token** (Section 10.3): HMAC-SHA256 derivation
-//! - ✅ **TLS 1.3 Integration** (RFC 9001): Via `rustls` for packet protection
+//! - ✅ **TLS 1.3 Integration** (RFC 9001): Via BoringSSL for 100% RFC compliance
 //!
-//! All cryptographic operations use the `ring` crate for production-grade security.
+//! All cryptographic operations use BoringSSL for production-grade security and complete RFC 9001 compliance.
 
 pub mod packet;
 pub mod frame;

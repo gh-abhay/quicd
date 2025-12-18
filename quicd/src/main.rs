@@ -66,6 +66,24 @@ fn main() -> anyhow::Result<()> {
 
     info!("eBPF routing initialized successfully");
 
+    // TLS configuration is now handled at the QUIC connection level using BoringSSL
+    // Certificate paths are validated but loading is deferred to connection establishment
+    info!("Validating TLS configuration");
+    let cert_path = config.global.tls.cert_path.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Missing certificate path"))?;
+    let key_path = config.global.tls.key_path.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Missing private key path"))?;
+
+    // Verify files exist
+    if !std::path::Path::new(cert_path).exists() {
+        anyhow::bail!("Certificate file not found: {}", cert_path);
+    }
+    if !std::path::Path::new(key_path).exists() {
+        anyhow::bail!("Private key file not found: {}", key_path);
+    }
+    
+    info!("TLS certificate and key files validated");
+
     // Spawn network workers as native threads (NOT on tokio runtime)
     info!("Spawning network worker threads");
     let netio_handle = worker::spawn(

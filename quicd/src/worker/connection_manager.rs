@@ -32,7 +32,7 @@ pub struct ConnectionManager {
     
     /// Configuration for new connections.
     config: ConnectionConfig,
-    
+
     /// Tokio runtime handle for spawning application tasks.
     tokio_handle: TokioHandle,
     
@@ -108,7 +108,7 @@ impl ConnectionManager {
         
         // Parse packet from buffer
         let bytes = Bytes::copy_from_slice(&buffer);
-        let packet = match Packet::parse(bytes) {
+        let mut packet = match Packet::parse(bytes.clone()) {
              Ok(p) => p,
              Err(e) => {
                  error!("Failed to parse packet: {}", e);
@@ -186,6 +186,29 @@ impl ConnectionManager {
             // We need to clone scid to use it for lookup to avoid borrow checker issues
             let scid = scid.clone();
             if let Some(state) = self.connections.get_mut(&scid) {
+                // RFC 9001 Section 5.4: Remove header protection BEFORE decryption
+                // Determine encryption level from packet type
+                let encryption_level = match packet.header.ty {
+                    PacketType::Initial => quicd_quic::crypto::EncryptionLevel::Initial,
+                    PacketType::Handshake => quicd_quic::crypto::EncryptionLevel::Handshake,
+                    PacketType::Short => quicd_quic::crypto::EncryptionLevel::OneRtt,
+                    _ => {
+                        error!("Unsupported packet type for existing connection: {:?}", packet.header.ty);
+                        return vec![];
+                    }
+                };
+                
+                // Get HP key from the connection's TLS session
+                if let Some(hp_key) = state.conn.get_hp_key(encryption_level) {
+                    if let Err(e) = packet.remove_header_protection(hp_key, bytes.as_ref()) {
+                        error!("Failed to remove header protection: {}", e);
+                        return vec![];
+                    }
+                } else {
+                    error!("HP key not available for encryption level: {:?}", encryption_level);
+                    return vec![];
+                }
+                
                 if let Err(e) = state.conn.process_packet(packet, datagram_size, now) {
                     error!("Connection error: {}", e);
                 }
@@ -213,13 +236,37 @@ impl ConnectionManager {
             // RFC 9001 Section 5.2: Initial keys are derived from DCID from Initial packet
             // Use the DCID from the packet header to initialize TLS session
             let dcid_bytes = packet.header.dcid.as_bytes();
-            let tls = match TlsSession::new(false, dcid_bytes) {
+            let tls = match TlsSession::new_server_with_config(self.server_config.clone(), dcid_bytes) {
                 Ok(tls) => tls,
                 Err(e) => {
                     error!("Failed to create TLS session: {:?}", e);
                     return vec![];
                 }
             };
+            
+            // RFC 9001 Section 5.4: Remove header protection BEFORE decryption
+            // Initial packets use keys derived from the DCID
+            // Server uses client's HP key to unprotect client-sent packets
+            use quicd_quic::crypto::{KeySchedule, EncryptionLevel};
+            let key_schedule = match KeySchedule::new_initial(dcid_bytes) {
+                Ok(ks) => ks,
+                Err(e) => {
+                    error!("Failed to derive initial keys: {:?}", e);
+                    return vec![];
+                }
+            };
+            
+            // Get client's HP key (server=true means get server's keys, which have client HP as remote)
+            if let Some(hp_key) = key_schedule.get_hp_key(EncryptionLevel::Initial, true) {
+                // Remove header protection from the packet
+                if let Err(e) = packet.remove_header_protection(hp_key, bytes.as_ref()) {
+                    error!("Failed to remove header protection: {}", e);
+                    return vec![];
+                }
+            } else {
+                error!("HP key not available");
+                return vec![];
+            }
             
             let mut conn = Connection::new(self.config.clone(), scid.clone(), packet.header.scid.clone().unwrap(), tls);
             

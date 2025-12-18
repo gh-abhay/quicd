@@ -5,8 +5,7 @@ edition = "2021"
 
 [dependencies]
 bytes = { workspace = true }
-ring = { workspace = true }
-rustls = { workspace = true }
+boring = { workspace = true }
 thiserror = { workspace = true }
 smallvec = { workspace = true }
 ahash = { workspace = true }
