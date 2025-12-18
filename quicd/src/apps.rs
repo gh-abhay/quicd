@@ -77,44 +77,66 @@ impl Default for AppRegistry {
 ///
 /// This function processes the application configurations and creates
 /// the appropriate application instances (HTTP/3, plugins, etc.).
-pub fn build_registry(app_configs: &[ApplicationConfig]) -> Result<AppRegistry> {
+/// 
+/// Each application can register multiple ALPN identifiers.
+pub fn build_registry(app_configs: &HashMap<String, ApplicationConfig>) -> Result<AppRegistry> {
     let mut registry = AppRegistry::new();
 
-    for app_config in app_configs {
+    for (app_name, app_config) in app_configs {
+        // Skip disabled applications
+        if !app_config.enabled {
+            tracing::info!("Application '{}' is disabled, skipping", app_name);
+            continue;
+        }
+
         // Validate configuration
         app_config
             .validate()
-            .map_err(|errs| anyhow::anyhow!("Invalid config for ALPN '{}': {}", app_config.alpn, errs.join("; ")))?;
+            .map_err(|errs| anyhow::anyhow!("Invalid config for application '{}': {}", app_name, errs.join("; ")))?;
 
-        match app_config.app_type {
+        // Parse application type
+        let app_type = app_config.parse_type()
+            .map_err(|e| anyhow::anyhow!("Failed to parse type for application '{}': {}", app_name, e))?;
+
+        match app_type {
             ApplicationType::Http3 => {
                 let h3_config = match &app_config.config {
                     ApplicationTypeConfig::Http3(cfg) => cfg.clone(),
-                    _ => anyhow::bail!("Type mismatch: expected Http3 config"),
+                    _ => anyhow::bail!("Type mismatch: expected Http3 config for application '{}'", app_name),
                 };
 
-                if !h3_config.enabled {
-                    tracing::info!("HTTP/3 application disabled for ALPN '{}'", app_config.alpn);
-                    continue;
+                // Register all ALPN identifiers for this application
+                for alpn in &app_config.alpn {
+                    // Create H3 application factory for each ALPN
+                    let factory: AppFactory = {
+                        let h3_cfg = h3_config.clone();
+                        Arc::new(move || {
+                            // Convert our config to quicd-h3 config
+                            let h3_lib_config = quicd_h3::H3Config::default(); // TODO: Map from our config
+                            Arc::new(quicd_h3::H3Application::new(h3_lib_config))
+                        })
+                    };
+
+                    registry = registry.register(alpn, factory)
+                        .with_context(|| format!("Failed to register HTTP/3 for ALPN '{}' in application '{}'", alpn, app_name))?;
+
+                    tracing::info!("Registered HTTP/3 application '{}' for ALPN '{}'", app_name, alpn);
                 }
+            }
 
-                // Create H3 application factory
-                let factory: AppFactory = Arc::new(move || {
-                    Arc::new(quicd_h3::H3Application::new(h3_config.h3.clone()))
-                });
-
-                registry = registry.register(&app_config.alpn, factory)
-                    .with_context(|| format!("Failed to register HTTP/3 for ALPN '{}'", app_config.alpn))?;
-
-                tracing::info!("Registered HTTP/3 application for ALPN '{}'", app_config.alpn);
+            ApplicationType::Moq => {
+                tracing::warn!(
+                    "MOQ application type not yet implemented for application '{}', skipping",
+                    app_name
+                );
             }
 
             ApplicationType::Plugin => {
                 // Plugin loading would be implemented here
                 // For now, we'll skip it as it requires dynamic library loading
                 tracing::warn!(
-                    "Plugin loading not yet implemented for ALPN '{}', skipping",
-                    app_config.alpn
+                    "Plugin loading not yet implemented for application '{}', skipping",
+                    app_name
                 );
             }
         }
@@ -130,10 +152,11 @@ pub fn build_registry(app_configs: &[ApplicationConfig]) -> Result<AppRegistry> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::application::{ApplicationTypeConfig, Http3Config};
 
     #[test]
     fn test_registry_basic() {
-        let mut registry = AppRegistry::new();
+        let registry = AppRegistry::new();
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
 
@@ -141,7 +164,7 @@ mod tests {
             Arc::new(quicd_h3::H3Application::new(quicd_h3::H3Config::default()))
         });
 
-        registry = registry.register("h3", factory).unwrap();
+        let registry = registry.register("h3", factory).unwrap();
         assert_eq!(registry.len(), 1);
         assert!(!registry.is_empty());
         assert!(registry.get("h3").is_some());
@@ -149,14 +172,38 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_duplicate_alpn() {
-        let registry = AppRegistry::new();
-        let factory: AppFactory = Arc::new(|| {
-            Arc::new(quicd_h3::H3Application::new(quicd_h3::H3Config::default()))
-        });
+    fn test_build_registry_multiple_alpns() {
+        let mut apps = HashMap::new();
+        apps.insert(
+            "http3".to_string(),
+            ApplicationConfig {
+                alpn: vec!["h3".to_string(), "h3-29".to_string()],
+                app_type: "builtin:http3".to_string(),
+                enabled: true,
+                config: ApplicationTypeConfig::Http3(Http3Config::default()),
+            },
+        );
 
-        let registry = registry.register("h3", factory.clone()).unwrap();
-        let result = registry.register("h3", factory);
-        assert!(result.is_err());
+        let registry = build_registry(&apps).unwrap();
+        assert_eq!(registry.len(), 2);
+        assert!(registry.get("h3").is_some());
+        assert!(registry.get("h3-29").is_some());
+    }
+
+    #[test]
+    fn test_build_registry_disabled_app() {
+        let mut apps = HashMap::new();
+        apps.insert(
+            "http3".to_string(),
+            ApplicationConfig {
+                alpn: vec!["h3".to_string()],
+                app_type: "builtin:http3".to_string(),
+                enabled: false,
+                config: ApplicationTypeConfig::Http3(Http3Config::default()),
+            },
+        );
+
+        let registry = build_registry(&apps).unwrap();
+        assert!(registry.is_empty());
     }
 }

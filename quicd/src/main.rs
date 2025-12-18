@@ -23,11 +23,11 @@ fn main() -> anyhow::Result<()> {
     info!("Configuration loaded successfully");
 
     // Build application registry from configuration
-    let app_registry = apps::build_registry(&config.apps)
+    let app_registry = apps::build_registry(&config.applications)
         .with_context(|| "failed to build application registry")?;
 
     info!(
-        "Application registry initialized with {} application(s): {}",
+        "Application registry initialized with {} ALPN(s): {}",
         app_registry.len(),
         app_registry.alpns().join(", ")
     );
