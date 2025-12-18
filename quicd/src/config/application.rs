@@ -139,8 +139,8 @@ impl ApplicationTypeConfig {
 #[serde(default)]
 pub struct Http3Config {
     /// Core HTTP/3 protocol configuration
-    // #[serde(flatten)]
-    // pub h3: quicd_h3::H3Config,
+    #[serde(flatten)]
+    pub h3: quicd_h3::H3Config,
 
     /// Enable HTTP/3 server
     ///
@@ -158,7 +158,7 @@ pub struct Http3Config {
 impl Default for Http3Config {
     fn default() -> Self {
         Self {
-            // h3: quicd_h3::H3Config::default(),
+            h3: quicd_h3::H3Config::default(),
             enabled: true,
             handler: None,
         }
@@ -167,8 +167,12 @@ impl Default for Http3Config {
 
 impl Http3Config {
     pub fn validate(&self) -> Result<(), String> {
-        // self.h3.validate()
-        Ok(())
+        let errors = self.h3.validate();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 }
 

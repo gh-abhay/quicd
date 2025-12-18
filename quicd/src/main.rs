@@ -1,3 +1,4 @@
+mod apps;
 mod channel_config;
 mod config;
 mod netio;
@@ -20,6 +21,16 @@ fn main() -> anyhow::Result<()> {
     let config = config::load_config()?;
 
     info!("Configuration loaded successfully");
+
+    // Build application registry from configuration
+    let app_registry = apps::build_registry(&config.apps)
+        .with_context(|| "failed to build application registry")?;
+
+    info!(
+        "Application registry initialized with {} application(s): {}",
+        app_registry.len(),
+        app_registry.alpns().join(", ")
+    );
 
     let bind_addr: SocketAddr = format!(
         "{}:{}",

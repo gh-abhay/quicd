@@ -251,6 +251,7 @@ impl Error {
                     | ErrorCode::StreamCreationError
                     | ErrorCode::ClosedCriticalStream
                     | ErrorCode::FrameUnexpected
+                    | ErrorCode::FrameError
                     | ErrorCode::ExcessiveLoad
                     | ErrorCode::IdError
                     | ErrorCode::SettingsError

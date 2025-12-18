@@ -4,12 +4,12 @@
 //! the HTTP/3 protocol implementation that runs as a single Tokio task per connection.
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::{Bytes, BytesMut, BufMut};
 use quicd_x::{ConnectionHandle, QuicdApplication, StreamId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::Duration;
+use tokio::time::{Duration, timeout};
 use tracing::{debug, error, info, warn};
 
 use crate::config::H3Config;
@@ -162,6 +162,9 @@ impl H3Connection {
         self.open_qpack_streams().await?;
 
         // Step 3: Main event loop
+        // Note: In this simplified implementation, we handle one stream at a time.
+        // A production implementation would use FuturesUnordered to handle multiple
+        // concurrent streams within the single task.
         loop {
             tokio::select! {
                 // Accept incoming bidirectional streams (HTTP requests)
@@ -170,7 +173,13 @@ impl H3Connection {
                         Ok(stream) => {
                             let stream_id = stream.stream_id();
                             debug!("Accepted bidirectional stream: {:?}", stream_id);
-                            self.handle_new_request_stream(stream).await?;
+                            // Handle request stream (blocks until complete)
+                            if let Err(e) = self.handle_new_request_stream(stream).await {
+                                error!("Error handling request stream: {}", e);
+                                if e.is_connection_error() {
+                                    return Err(e);
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!("Error accepting bidirectional stream: {}", e);
@@ -184,20 +193,31 @@ impl H3Connection {
                     match stream_result {
                         Ok(mut stream) => {
                             debug!("Accepted unidirectional stream");
-                            // Read stream type
-                            let mut type_buf = BytesMut::with_capacity(8);
-                            if let Err(e) = stream.read_buf(&mut type_buf).await {
-                                warn!("Error reading stream type: {}", e);
-                                continue;
-                            }
-                            
-                            match read_stream_type(&mut type_buf) {
-                                Ok(stream_type) => {
-                                    self.handle_unidirectional_stream(stream, stream_type).await?;
+                            // Read stream type (variable-length integer at start of stream)
+                            let mut type_buffer = vec![0u8; 8];
+                            match stream.read(&mut type_buffer).await {
+                                Ok(n) if n > 0 => {
+                                    let mut buf = BytesMut::from(&type_buffer[..n]);
+                                    match read_stream_type(&mut buf) {
+                                        Ok(stream_type) => {
+                                            if let Err(e) = self.handle_unidirectional_stream(stream, stream_type).await {
+                                                error!("Error handling unidirectional stream: {}", e);
+                                                if e.is_connection_error() {
+                                                    return Err(e);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Invalid stream type: {}", e);
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                                Ok(_) => {
+                                    warn!("Stream closed before type could be read");
                                 }
                                 Err(e) => {
-                                    error!("Invalid stream type: {}", e);
-                                    return Err(e);
+                                    warn!("Error reading stream type: {}", e);
                                 }
                             }
                         }
@@ -303,17 +323,17 @@ impl H3Connection {
         });
 
         // Read from stream in loop
-        let mut buffer = BytesMut::with_capacity(8192);
+        let mut buffer = vec![0u8; 8192];
         loop {
-            match stream.read_buf(&mut buffer).await {
+            match stream.read(&mut buffer).await {
                 Ok(0) => {
                     // EOF - process complete request
-                    self.process_request_stream(stream_id, &mut stream, true).await?;
+                    self.process_request_stream_data(stream_id, &mut stream, &[], true).await?;
                     break;
                 }
                 Ok(n) => {
                     debug!("Read {} bytes from stream {:?}", n, stream_id);
-                    self.process_request_stream(stream_id, &mut stream, false).await?;
+                    self.process_request_stream_data(stream_id, &mut stream, &buffer[..n], false).await?;
                 }
                 Err(e) => {
                     error!("Error reading from stream {:?}: {}", stream_id, e);
@@ -326,14 +346,18 @@ impl H3Connection {
     }
 
     /// Process frames from a request stream.
-    async fn process_request_stream(
+    async fn process_request_stream_data(
         &mut self,
         stream_id: StreamId,
         stream: &mut quicd_x::QuicStream,
+        data: &[u8],
         fin: bool,
     ) -> Result<()> {
         let state = self.request_streams.get_mut(&stream_id)
             .ok_or_else(|| Error::Internal("stream state not found".to_string()))?;
+
+        // Append new data to buffer
+        state.body_buffer.put_slice(data);
 
         // Parse frames from buffer
         let frames = state.parser.parse(state.body_buffer.split().freeze())?;
@@ -493,11 +517,12 @@ impl H3Connection {
         }
 
         let mut parser = FrameParser::new();
-        let mut buffer = BytesMut::with_capacity(4096);
+        let mut buffer = vec![0u8; 4096];
+        let mut data_buf = BytesMut::new();
         let mut settings_received = false;
 
         loop {
-            match stream.read_buf(&mut buffer).await {
+            match stream.read(&mut buffer).await {
                 Ok(0) => {
                     // Control stream closed - this is a connection error
                     return Err(Error::protocol(
@@ -505,8 +530,9 @@ impl H3Connection {
                         "control stream closed",
                     ));
                 }
-                Ok(_) => {
-                    let frames = parser.parse(buffer.split().freeze())?;
+                Ok(n) => {
+                    data_buf.put_slice(&buffer[..n]);
+                    let frames = parser.parse(data_buf.split().freeze())?;
 
                     for frame in frames {
                         match frame {
@@ -570,14 +596,13 @@ impl H3Connection {
 
     /// Handle QPACK encoder stream (from peer).
     async fn handle_qpack_encoder_stream(&mut self, mut stream: quicd_x::QuicStream) -> Result<()> {
-        let mut buffer = BytesMut::with_capacity(4096);
+        let mut buffer = vec![0u8; 4096];
 
         loop {
-            match stream.read_buf(&mut buffer).await {
+            match stream.read(&mut buffer).await {
                 Ok(0) => break,
-                Ok(_) => {
-                    self.qpack.process_encoder_stream_data(&buffer)?;
-                    buffer.clear();
+                Ok(n) => {
+                    self.qpack.process_encoder_stream_data(&buffer[..n])?;
                 }
                 Err(e) => {
                     return Err(Error::Io(e));
@@ -590,14 +615,13 @@ impl H3Connection {
 
     /// Handle QPACK decoder stream (from peer).
     async fn handle_qpack_decoder_stream(&mut self, mut stream: quicd_x::QuicStream) -> Result<()> {
-        let mut buffer = BytesMut::with_capacity(4096);
+        let mut buffer = vec![0u8; 4096];
 
         loop {
-            match stream.read_buf(&mut buffer).await {
+            match stream.read(&mut buffer).await {
                 Ok(0) => break,
-                Ok(_) => {
-                    self.qpack.process_decoder_stream_data(&buffer)?;
-                    buffer.clear();
+                Ok(n) => {
+                    self.qpack.process_decoder_stream_data(&buffer[..n])?;
                 }
                 Err(e) => {
                     return Err(Error::Io(e));

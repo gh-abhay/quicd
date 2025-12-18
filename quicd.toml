@@ -282,10 +282,65 @@ type = "http3"
 # Default: true
 enabled = true
 
-# Custom request handler configuration (optional)
-# Default: None
-# [applications.handler]
-# custom_field = "value"
+# QPACK Configuration (RFC 9204)
+[applications.qpack]
+# Maximum dynamic table capacity in bytes
+# Default: 4096
+max_table_capacity = 4096
+
+# Maximum number of blocked streams waiting for QPACK updates
+# Default: 100
+blocked_streams = 100
+
+# Server Push Configuration
+[applications.push]
+# Enable server push
+# Default: false
+enabled = false
+
+# Maximum concurrent push streams
+# Default: 100
+max_concurrent = 100
+
+# HTTP Handler Configuration
+[applications.handler]
+# Enable file serving
+# Default: true
+file_serving_enabled = true
+
+# File serving root directory
+# Default: "./www"
+file_root = "./www"
+
+# Enable directory listing (security consideration)
+# Default: false
+directory_listing = false
+
+# Enable compression (gzip, brotli)
+# Default: true
+compression_enabled = true
+
+# Compression algorithms to use
+# Default: ["gzip", "br"]
+compression_algorithms = ["gzip", "br"]
+
+# Index file names
+# Default: ["index.html", "index.htm"]
+index_files = ["index.html", "index.htm"]
+
+# Connection Limits
+[applications.limits]
+# Maximum field section (header) size in bytes
+# Default: 16384
+max_field_section_size = 16384
+
+# Maximum concurrent bidirectional streams per connection
+# Default: 100
+max_concurrent_streams = 100
+
+# Connection idle timeout in seconds
+# Default: 30
+idle_timeout_secs = 30
 
 # ----------------------------------------------------------------------------
 # HTTP/3 (Draft 29) - For backwards compatibility
@@ -293,6 +348,7 @@ enabled = true
 [[applications]]
 alpn = "h3-29"
 type = "http3"
+# Uses default configuration
 enabled = true
 # Inherits same defaults as h3, override as needed
 

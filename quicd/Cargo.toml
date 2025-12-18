@@ -44,6 +44,7 @@ libloading = { workspace = true }
 # Internal crates
 quicd-quic = { path = "../quicd-quic" }
 quicd-x = { path = "../quicd-x" }
+quicd-h3 = { path = "../quicd-h3" }
 
 # eBPF routing dependencies
 aya = { workspace = true }

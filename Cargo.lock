@@ -1850,6 +1850,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "quicd-h3",
  "quicd-quic",
  "quicd-x",
  "rand",

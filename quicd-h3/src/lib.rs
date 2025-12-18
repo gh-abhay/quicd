@@ -71,10 +71,10 @@ pub mod error;
 pub mod frame;
 pub mod stream_type;
 pub mod varint;
+pub mod message;
 
 // Core implementation modules
 mod connection;
-mod message;
 mod handler;
 mod qpack_mgr;
 
