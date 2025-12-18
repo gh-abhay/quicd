@@ -76,10 +76,10 @@ fn main() -> anyhow::Result<()> {
 
     // Verify files exist
     if !std::path::Path::new(cert_path).exists() {
-        anyhow::bail!("Certificate file not found: {}", cert_path);
+        anyhow::bail!("Certificate file not found: {}", cert_path.display());
     }
     if !std::path::Path::new(key_path).exists() {
-        anyhow::bail!("Private key file not found: {}", key_path);
+        anyhow::bail!("Private key file not found: {}", key_path.display());
     }
     
     info!("TLS certificate and key files validated");

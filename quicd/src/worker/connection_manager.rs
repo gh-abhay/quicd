@@ -236,7 +236,7 @@ impl ConnectionManager {
             // RFC 9001 Section 5.2: Initial keys are derived from DCID from Initial packet
             // Use the DCID from the packet header to initialize TLS session
             let dcid_bytes = packet.header.dcid.as_bytes();
-            let tls = match TlsSession::new_server_with_config(self.server_config.clone(), dcid_bytes) {
+            let tls = match TlsSession::new_server_with_config(dcid_bytes) {
                 Ok(tls) => tls,
                 Err(e) => {
                     error!("Failed to create TLS session: {:?}", e);
