@@ -577,6 +577,18 @@ pub struct QuicStream {
     is_bidirectional: bool,
 }
 
+impl QuicStream {
+    /// Get the stream ID.
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    /// Get the connection ID.
+    pub fn conn_id(&self) -> ConnectionId {
+        self.conn_id
+    }
+}
+
 impl AsyncRead for QuicStream {
     fn poll_read(
         self: Pin<&mut Self>,

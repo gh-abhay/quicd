@@ -1,0 +1,51 @@
+[package]
+name = "quicd-h3"
+version = "0.1.0"
+edition = "2021"
+authors = ["quicd Contributors"]
+license = "MIT OR Apache-2.0"
+description = "Production-ready HTTP/3 (RFC 9114) implementation for the quicd QUIC server"
+repository = "https://github.com/quicd/quicd"
+keywords = ["http3", "quic", "h3", "rfc9114", "server"]
+categories = ["network-programming", "web-programming"]
+
+[dependencies]
+# quicd ecosystem
+quicd-x = { path = "../quicd-x" }
+quicd-qpack = { path = "../quicd-qpack" }
+quicd-quic = { path = "../quicd-quic" }
+
+# Async runtime
+tokio = { version = "1.48", features = ["rt", "sync", "time", "io-util", "macros", "fs"] }
+async-trait = "0.1"
+
+# Data structures and zero-copy buffers
+bytes = "1.11"
+crossbeam-channel = "0.5"
+
+# Serialization for configuration
+serde = { version = "1.0", features = ["derive"] }
+
+# Error handling
+thiserror = "2.0"
+
+# HTTP utilities
+http = "1.2"
+mime_guess = "2.0"
+
+# Logging
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["full", "test-util"] }
+proptest = "1.6"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.15"
+
+[[bench]]
+name = "frame_parsing"
+harness = false
+
+[[bench]]
+name = "qpack_encoding"
+harness = false
