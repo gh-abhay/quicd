@@ -206,8 +206,20 @@ impl ConnectionManager {
                 return vec![];
             }
             
-            let scid = self.cid_generator.generate(8); // Use 8 bytes for SCID
-            let tls = TlsSession::new_server();
+            // RFC 9000: Server chooses its own CID length (1-20 bytes).
+            // Use 20 bytes for maximum entropy, routing cookie, and SipHash protection.
+            let scid = self.cid_generator.generate(20);
+            
+            // RFC 9001 Section 5.2: Initial keys are derived from DCID from Initial packet
+            // Use the DCID from the packet header to initialize TLS session
+            let dcid_bytes = packet.header.dcid.as_bytes();
+            let tls = match TlsSession::new(false, dcid_bytes) {
+                Ok(tls) => tls,
+                Err(e) => {
+                    error!("Failed to create TLS session: {:?}", e);
+                    return vec![];
+                }
+            };
             
             let mut conn = Connection::new(self.config.clone(), scid.clone(), packet.header.scid.clone().unwrap(), tls);
             

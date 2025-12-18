@@ -266,57 +266,131 @@ enable_per_connection_metrics = false
 # APPLICATION CONFIGURATIONS
 # ============================================================================
 # Define application protocols and their ALPN mappings.
-# Each application has its own configuration schema.
+# Each application is defined as a named table under [applications.<name>].
+# This ensures no key collisions between applications.
+#
+# Structure:
+# - 'type': distinguishes built-in ("builtin:<name>") from plugins ("plugin")
+# - 'alpn': array of ALPN identifiers (one app can handle multiple ALPNs)
+# - 'enabled': controls if the application is active (default: true)
+# - 'config': subsection for type-specific configuration
 
 # ----------------------------------------------------------------------------
 # HTTP/3 Application
 # ----------------------------------------------------------------------------
-[[applications]]
-# ALPN identifier (used during QUIC handshake)
-alpn = "h3"
+[applications.http3]
+type = "builtin:http3"
+alpn = ["h3", "h3-29"]  # Handles both standard h3 and draft-29
+enabled = true
 
-# Application type: "http3" or "plugin"
-type = "http3"
+# QPACK Configuration (RFC 9204)
+[applications.http3.config.qpack]
+# Maximum dynamic table capacity in bytes
+# Default: 4096
+max_table_capacity = 4096
 
-# Enable this application
+# Maximum number of blocked streams waiting for QPACK updates
+# Default: 100
+blocked_streams = 100
+
+# Server Push Configuration
+[applications.http3.config.push]
+# Enable HTTP/3 server push
+# Default: false
+enabled = false
+
+# Maximum concurrent push streams
+# Default: 100
+max_concurrent = 100
+
+# HTTP Handler Configuration
+[applications.http3.config.handler]
+# Enable file serving
 # Default: true
-enabled = true
+file_serving_enabled = true
 
-# Custom request handler configuration (optional)
-# Default: None
-# [applications.handler]
-# custom_field = "value"
+# File serving root directory
+# Default: "./www"
+file_root = "./www"
+
+# Enable directory listing (security consideration)
+# Default: false
+directory_listing = false
+
+# Enable compression (gzip, brotli)
+# Default: true
+compression_enabled = true
+
+# Compression algorithms to use
+# Default: ["gzip", "br"]
+compression_algorithms = ["gzip", "br"]
+
+# Index file names
+# Default: ["index.html", "index.htm"]
+index_files = ["index.html", "index.htm"]
+
+# Connection Limits
+[applications.http3.config.limits]
+# Maximum field section (header) size in bytes
+# Default: 16384 (16 KB)
+max_field_section_size = 16384
+
+# Maximum concurrent bidirectional streams per connection
+# Default: 100
+max_concurrent_streams = 100
+
+# Connection idle timeout in seconds
+# Default: 30
+idle_timeout_secs = 30
 
 # ----------------------------------------------------------------------------
-# HTTP/3 (Draft 29) - For backwards compatibility
+# MOQ (Media over QUIC) Application (Example - Not Implemented Yet)
 # ----------------------------------------------------------------------------
-[[applications]]
-alpn = "h3-29"
-type = "http3"
-enabled = true
-# Inherits same defaults as h3, override as needed
+# [applications.moq]
+# type = "builtin:moq"
+# alpn = ["moq"]
+# enabled = true
+#
+# [applications.moq.config]
+# # MOQ-specific settings
+# max_streams = 50
+# track_sources = true
 
 # ----------------------------------------------------------------------------
 # Plugin Protocol Example
 # ----------------------------------------------------------------------------
 # Load a custom protocol from a dynamic library (.so/.dylib/.dll)
 # The plugin must be compiled with quicd-x and export the factory using
-# the export_quic_app! macro. See PLUGIN_DEVELOPMENT.md for details.
+# the export_quic_app! macro.
 #
-# [[applications]]
-# alpn = "my-custom-proto"
+# [applications.echo]
 # type = "plugin"
-# [applications.config]
-# library_path = "/path/to/libmy_custom_proto.so"
+# alpn = ["echo"]
+# enabled = true
 #
-# # You can load multiple plugins
-# [[applications]]
-# alpn = "echo"
-# type = "plugin"
-# [applications.config]
+# [applications.echo.config.plugin]
+# # Required: Path to the dynamic library
 # library_path = "/usr/local/lib/quicd/libecho_protocol.so"
 #
-# # ABI Compatibility Requirements:
+# # Optional: Additional config passed directly to the plugin
+# [applications.echo.config.custom]
+# buffer_size = 8192
+# log_level = "debug"
+#
+# # Another plugin example with multiple ALPNs
+# [applications.custom-media]
+# type = "plugin"
+# alpn = ["my-media-v1", "my-media-v2"]
+# enabled = true
+#
+# [applications.custom-media.config.plugin]
+# library_path = "/path/to/libcustom_media.so"
+#
+# [applications.custom-media.config.media]
+# max_bitrate = 5000
+# supported_codecs = ["h264", "vp9"]
+#
+# ABI Compatibility Requirements:
 # - Plugin must be compiled with the same Rust compiler version as the server
 # - Plugin must use the same quicd-x dependency version
 # - Plugin must be compiled for the same target architecture

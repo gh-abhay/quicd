@@ -16,3 +16,4 @@ log = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 rcgen = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
+hex = "0.4"

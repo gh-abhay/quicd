@@ -53,32 +53,56 @@ impl RoutingConnectionIdGenerator {
 
 impl ConnectionIdGenerator for RoutingConnectionIdGenerator {
     fn generate(&self, length: usize) -> ConnectionId {
-        assert_eq!(
-            length,
-            router::CID_LENGTH,
-            "RoutingConnectionIdGenerator only supports {}-byte CIDs",
-            router::CID_LENGTH
+        // Validate length: must be 8-20 bytes
+        // - Minimum 8 bytes to fit cookie at bytes 6-7
+        // - Maximum 20 bytes per RFC 9000 Section 17.2
+        assert!(
+            length >= 8 && length <= router::CID_LENGTH,
+            "RoutingConnectionIdGenerator requires 8-20 byte CIDs for cookie embedding (got {})",
+            length
         );
 
         let generation = self.generation.load(Ordering::Relaxed);
         
-        // Generate entropy for the CID
-        let mut entropy = [0u8; 17];
-        if let Err(e) = getrandom::getrandom(&mut entropy) {
-            // Fallback to deterministic generation if randomness fails
-            // (should never happen in production)
+        // For 20-byte CIDs, use the optimized full-entropy generation
+        if length == router::CID_LENGTH {
+            // Generate entropy for the CID (6 + 11 = 17 bytes)
+            let mut entropy = [0u8; 17];
+            if let Err(e) = getrandom::getrandom(&mut entropy) {
+                // Fallback to deterministic generation if randomness fails
+                // (should never happen in production)
+                tracing::warn!("Failed to get random bytes for CID: {:?}", e);
+                for (i, byte) in entropy.iter_mut().enumerate() {
+                    *byte = (i as u8).wrapping_mul(137);
+                }
+            }
+
+            // Use router's CID generation with embedded cookie
+            let cid_bytes = router::ConnectionId::generate_with_entropy(
+                generation,
+                self.worker_idx,
+                entropy,
+            );
+
+            return ConnectionId::from_slice(&cid_bytes);
+        }
+
+        // For shorter CIDs (8-19 bytes), manually construct with cookie at bytes 6-7
+        let cookie = router::Cookie::generate(generation, self.worker_idx);
+        let cookie_bytes = cookie.to_be_bytes();
+
+        let mut cid_bytes = vec![0u8; length];
+        
+        // Fill with random data
+        if let Err(e) = getrandom::getrandom(&mut cid_bytes) {
             tracing::warn!("Failed to get random bytes for CID: {:?}", e);
-            for (i, byte) in entropy.iter_mut().enumerate() {
+            for (i, byte) in cid_bytes.iter_mut().enumerate() {
                 *byte = (i as u8).wrapping_mul(137);
             }
         }
-
-        // Use router's CID generation with embedded cookie
-        let cid_bytes = router::ConnectionId::generate_with_entropy(
-            generation,
-            self.worker_idx,
-            entropy,
-        );
+        
+        // Embed cookie at bytes 6-7 (always present for length >= 8)
+        cid_bytes[6..8].copy_from_slice(&cookie_bytes);
 
         ConnectionId::from_slice(&cid_bytes)
     }
