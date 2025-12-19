@@ -93,6 +93,7 @@ fn main() -> anyhow::Result<()> {
         runtime_handle.clone(),
         cert_path.clone(),
         key_path.clone(),
+        Arc::new(app_registry),
     )
     .with_context(|| "failed to spawn network layer")?;
 

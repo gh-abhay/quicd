@@ -4,7 +4,7 @@
 //! the HTTP/3 protocol implementation that runs as a single Tokio task per connection.
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::{Bytes, BytesMut, BufMut, Buf};
 use quicd_x::{ConnectionHandle, QuicdApplication, StreamId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -95,6 +95,17 @@ struct H3Connection {
     our_decoder_stream: Option<StreamId>,
     peer_encoder_stream: Option<StreamId>,
     peer_decoder_stream: Option<StreamId>,
+    
+    // Active stream handles for non-blocking I/O
+    peer_control_stream: Option<quicd_x::QuicStream>,
+    peer_encoder_stream_handle: Option<quicd_x::QuicStream>,
+    peer_decoder_stream_handle: Option<quicd_x::QuicStream>,
+    
+    // Incremental parsing buffers for unidirectional streams
+    control_stream_buffer: BytesMut,
+    control_stream_parser: FrameParser,
+    encoder_stream_buffer: BytesMut,
+    decoder_stream_buffer: BytesMut,
 }
 
 /// Peer's SETTINGS configuration.
@@ -147,6 +158,13 @@ impl H3Connection {
             our_decoder_stream: None,
             peer_encoder_stream: None,
             peer_decoder_stream: None,
+            peer_control_stream: None,
+            peer_encoder_stream_handle: None,
+            peer_decoder_stream_handle: None,
+            control_stream_buffer: BytesMut::new(),
+            control_stream_parser: FrameParser::new(),
+            encoder_stream_buffer: BytesMut::new(),
+            decoder_stream_buffer: BytesMut::new(),
         }
     }
 
@@ -161,10 +179,12 @@ impl H3Connection {
         // Step 2: Open QPACK encoder and decoder streams
         self.open_qpack_streams().await?;
 
-        // Step 3: Main event loop
-        // Note: In this simplified implementation, we handle one stream at a time.
-        // A production implementation would use FuturesUnordered to handle multiple
-        // concurrent streams within the single task.
+        // Step 3: Main event loop - multiplex ALL streams simultaneously
+        let mut type_read_buffer = vec![0u8; 8192];
+        let mut control_read_buffer = vec![0u8; 8192];
+        let mut encoder_read_buffer = vec![0u8; 8192];
+        let mut decoder_read_buffer = vec![0u8; 8192];
+        
         loop {
             tokio::select! {
                 // Accept incoming bidirectional streams (HTTP requests)
@@ -172,8 +192,10 @@ impl H3Connection {
                     match stream_result {
                         Ok(stream) => {
                             let stream_id = stream.stream_id();
+                            eprintln!("H3: Accepted bidirectional stream: {:?}", stream_id);
                             debug!("Accepted bidirectional stream: {:?}", stream_id);
                             // Handle request stream (blocks until complete)
+                            // TODO: This should also be refactored to be non-blocking
                             if let Err(e) = self.handle_new_request_stream(stream).await {
                                 error!("Error handling request stream: {}", e);
                                 if e.is_connection_error() {
@@ -188,22 +210,102 @@ impl H3Connection {
                     }
                 }
 
+                // Accept incoming unidirectional streams (control, QPACK)
+                uni_stream_result = self.conn.accept_uni_stream() => {
+                    match uni_stream_result {
+                        Ok(mut stream) => {
+                            eprintln!("H3: Accepted unidirectional stream");
+                            debug!("Accepted unidirectional stream");
+                            // Read stream type
+                            match stream.read(&mut type_read_buffer).await {
+                                Ok(n) if n > 0 => {
+                                    let mut buf = BytesMut::from(&type_read_buffer[..n]);
+                                    match read_stream_type(&mut buf) {
+                                        Ok(stream_type) => {
+                                            eprintln!("H3: Unidirectional stream type: {:?}", stream_type);
+                                            match stream_type {
+                                                StreamType::Control => {
+                                                    eprintln!("H3: Handling control stream");
+                                                    // TODO: Handle control stream
+                                                }
+                                                StreamType::Push => {
+                                                    eprintln!("H3: Handling push stream");
+                                                    // TODO: Handle push stream
+                                                }
+                                                StreamType::QpackEncoder => {
+                                                    eprintln!("H3: Handling QPACK encoder stream");
+                                                    // TODO: Handle QPACK encoder stream
+                                                }
+                                                StreamType::QpackDecoder => {
+                                                    eprintln!("H3: Handling QPACK decoder stream");
+                                                    // TODO: Handle QPACK decoder stream
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to read stream type: {}", e);
+                                        }
+                                    }
+                                }
+                                Ok(_) => {
+                                    // Empty stream, ignore
+                                }
+                                Err(e) => {
+                                    error!("Error reading from unidirectional stream: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Error accepting unidirectional stream: {}", e);
+                            break;
+                        }
+                    }
+                }
+
                 // Accept incoming unidirectional streams (control, QPACK, etc.)
                 stream_result = self.conn.accept_uni_stream() => {
                     match stream_result {
                         Ok(mut stream) => {
                             debug!("Accepted unidirectional stream");
                             // Read stream type (variable-length integer at start of stream)
-                            let mut type_buffer = vec![0u8; 8];
-                            match stream.read(&mut type_buffer).await {
+                            match stream.read(&mut type_read_buffer).await {
                                 Ok(n) if n > 0 => {
-                                    let mut buf = BytesMut::from(&type_buffer[..n]);
+                                    let mut buf = BytesMut::from(&type_read_buffer[..n]);
                                     match read_stream_type(&mut buf) {
                                         Ok(stream_type) => {
-                                            if let Err(e) = self.handle_unidirectional_stream(stream, stream_type).await {
-                                                error!("Error handling unidirectional stream: {}", e);
-                                                if e.is_connection_error() {
-                                                    return Err(e);
+                                            debug!("Unidirectional stream type: {:?}", stream_type);
+                                            // Store the stream handle based on type
+                                            match stream_type {
+                                                StreamType::Control => {
+                                                    if self.peer_control_stream.is_some() {
+                                                        error!("Duplicate control stream");
+                                                        return Err(Error::protocol(
+                                                            ErrorCode::StreamCreationError,
+                                                            "duplicate control stream",
+                                                        ));
+                                                    }
+                                                    self.peer_control_stream = Some(stream);
+                                                    // Process any remaining data after stream type
+                                                    if buf.remaining() > 0 {
+                                                        self.control_stream_buffer.put(buf);
+                                                    }
+                                                }
+                                                StreamType::QpackEncoder => {
+                                                    self.peer_encoder_stream = Some(stream.stream_id());
+                                                    self.peer_encoder_stream_handle = Some(stream);
+                                                    if buf.remaining() > 0 {
+                                                        self.encoder_stream_buffer.put(buf);
+                                                    }
+                                                }
+                                                StreamType::QpackDecoder => {
+                                                    self.peer_decoder_stream = Some(stream.stream_id());
+                                                    self.peer_decoder_stream_handle = Some(stream);
+                                                    if buf.remaining() > 0 {
+                                                        self.decoder_stream_buffer.put(buf);
+                                                    }
+                                                }
+                                                StreamType::Push => {
+                                                    warn!("Received push stream (not implemented)");
                                                 }
                                             }
                                         }
@@ -224,6 +326,90 @@ impl H3Connection {
                         Err(e) => {
                             warn!("Error accepting unidirectional stream: {}", e);
                             break;
+                        }
+                    }
+                }
+
+                // Process peer's control stream incrementally
+                result = async {
+                    if let Some(ref mut stream) = self.peer_control_stream {
+                        stream.read(&mut control_read_buffer).await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    match result {
+                        Ok(0) => {
+                            error!("Control stream closed by peer");
+                            return Err(Error::protocol(
+                                ErrorCode::ClosedCriticalStream,
+                                "control stream closed",
+                            ));
+                        }
+                        Ok(n) => {
+                            self.control_stream_buffer.put_slice(&control_read_buffer[..n]);
+                            if let Err(e) = self.process_control_stream_data().await {
+                                error!("Error processing control stream: {}", e);
+                                return Err(e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error reading control stream: {}", e);
+                            return Err(Error::Io(e));
+                        }
+                    }
+                }
+
+                // Process peer's QPACK encoder stream incrementally
+                result = async {
+                    if let Some(ref mut stream) = self.peer_encoder_stream_handle {
+                        stream.read(&mut encoder_read_buffer).await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    match result {
+                        Ok(0) => {
+                            debug!("QPACK encoder stream closed");
+                            self.peer_encoder_stream_handle = None;
+                        }
+                        Ok(n) => {
+                            self.encoder_stream_buffer.put_slice(&encoder_read_buffer[..n]);
+                            if let Err(e) = self.qpack.process_encoder_stream_data(&self.encoder_stream_buffer) {
+                                error!("Error processing encoder stream: {}", e);
+                                return Err(e);
+                            }
+                            self.encoder_stream_buffer.clear();
+                        }
+                        Err(e) => {
+                            warn!("Error reading encoder stream: {}", e);
+                        }
+                    }
+                }
+
+                // Process peer's QPACK decoder stream incrementally
+                result = async {
+                    if let Some(ref mut stream) = self.peer_decoder_stream_handle {
+                        stream.read(&mut decoder_read_buffer).await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    match result {
+                        Ok(0) => {
+                            debug!("QPACK decoder stream closed");
+                            self.peer_decoder_stream_handle = None;
+                        }
+                        Ok(n) => {
+                            self.decoder_stream_buffer.put_slice(&decoder_read_buffer[..n]);
+                            if let Err(e) = self.qpack.process_decoder_stream_data(&self.decoder_stream_buffer) {
+                                error!("Error processing decoder stream: {}", e);
+                                return Err(e);
+                            }
+                            self.decoder_stream_buffer.clear();
+                        }
+                        Err(e) => {
+                            warn!("Error reading decoder stream: {}", e);
                         }
                     }
                 }
@@ -478,93 +664,43 @@ impl H3Connection {
         Ok(())
     }
 
-    /// Handle a unidirectional stream based on its type.
-    async fn handle_unidirectional_stream(
-        &mut self,
-        mut stream: quicd_x::QuicStream,
-        stream_type: StreamType,
-    ) -> Result<()> {
-        match stream_type {
-            StreamType::Control => {
-                self.handle_control_stream(stream).await?;
-            }
-            StreamType::QpackEncoder => {
-                let stream_id = stream.stream_id();
-                self.peer_encoder_stream = Some(stream_id);
-                self.handle_qpack_encoder_stream(stream).await?;
-            }
-            StreamType::QpackDecoder => {
-                let stream_id = stream.stream_id();
-                self.peer_decoder_stream = Some(stream_id);
-                self.handle_qpack_decoder_stream(stream).await?;
-            }
-            StreamType::Push => {
-                // Push streams not fully implemented
-                warn!("Received push stream (not implemented)");
+    /// Handle peer's control stream.
+    async fn handle_control_stream(&mut self, mut stream: quicd_x::QuicStream) -> Result<()> {
+        // This method is no longer used - replaced by incremental processing in run()
+        Ok(())
+    }
+
+    /// Process control stream data incrementally (non-blocking).
+    async fn process_control_stream_data(&mut self) -> Result<()> {
+        // Parse frames from accumulated buffer
+        let frames = self.control_stream_parser.parse(self.control_stream_buffer.split().freeze())?;
+
+        for frame in frames {
+            match frame {
+                Frame::Settings(settings_frame) => {
+                    if self.control_stream_received {
+                        return Err(Error::protocol(
+                            ErrorCode::FrameUnexpected,
+                            "duplicate SETTINGS frame",
+                        ));
+                    }
+
+                    self.process_settings_frame(&settings_frame)?;
+                    self.control_stream_received = true;
+                    debug!("Received and processed SETTINGS frame");
+                }
+                Frame::Goaway(_) => {
+                    // Peer is closing - handle gracefully
+                    info!("Received GOAWAY from peer");
+                }
+                _ => {
+                    // Other control frames - log and continue
+                    debug!("Received control frame: {:?}", frame.frame_type());
+                }
             }
         }
 
         Ok(())
-    }
-
-    /// Handle peer's control stream.
-    async fn handle_control_stream(&mut self, mut stream: quicd_x::QuicStream) -> Result<()> {
-        if self.control_stream_received {
-            return Err(Error::protocol(
-                ErrorCode::StreamCreationError,
-                "duplicate control stream",
-            ));
-        }
-
-        let mut parser = FrameParser::new();
-        let mut buffer = vec![0u8; 4096];
-        let mut data_buf = BytesMut::new();
-        let mut settings_received = false;
-
-        loop {
-            match stream.read(&mut buffer).await {
-                Ok(0) => {
-                    // Control stream closed - this is a connection error
-                    return Err(Error::protocol(
-                        ErrorCode::ClosedCriticalStream,
-                        "control stream closed",
-                    ));
-                }
-                Ok(n) => {
-                    data_buf.put_slice(&buffer[..n]);
-                    let frames = parser.parse(data_buf.split().freeze())?;
-
-                    for frame in frames {
-                        match frame {
-                            Frame::Settings(settings_frame) => {
-                                if settings_received {
-                                    return Err(Error::protocol(
-                                        ErrorCode::FrameUnexpected,
-                                        "duplicate SETTINGS frame",
-                                    ));
-                                }
-
-                                self.process_settings_frame(&settings_frame)?;
-                                settings_received = true;
-                                self.control_stream_received = true;
-                            }
-                            Frame::Goaway(_) => {
-                                // Peer is closing - handle gracefully
-                                info!("Received GOAWAY from peer");
-                                return Ok(());
-                            }
-                            _ => {
-                                // Other control frames - log and continue
-                                debug!("Received control frame: {:?}", frame.frame_type());
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(Error::Io(e));
-                }
-            }
-        }
     }
 
     /// Process SETTINGS frame from peer.
@@ -596,39 +732,13 @@ impl H3Connection {
 
     /// Handle QPACK encoder stream (from peer).
     async fn handle_qpack_encoder_stream(&mut self, mut stream: quicd_x::QuicStream) -> Result<()> {
-        let mut buffer = vec![0u8; 4096];
-
-        loop {
-            match stream.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    self.qpack.process_encoder_stream_data(&buffer[..n])?;
-                }
-                Err(e) => {
-                    return Err(Error::Io(e));
-                }
-            }
-        }
-
+        // This method is no longer used - replaced by incremental processing in run()
         Ok(())
     }
 
     /// Handle QPACK decoder stream (from peer).
     async fn handle_qpack_decoder_stream(&mut self, mut stream: quicd_x::QuicStream) -> Result<()> {
-        let mut buffer = vec![0u8; 4096];
-
-        loop {
-            match stream.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    self.qpack.process_decoder_stream_data(&buffer[..n])?;
-                }
-                Err(e) => {
-                    return Err(Error::Io(e));
-                }
-            }
-        }
-
+        // This method is no longer used - replaced by incremental processing in run()
         Ok(())
     }
 }

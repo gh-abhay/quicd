@@ -15,7 +15,7 @@ use quicd_quic::frame::Frame;
 use quicd_quic::connection::ConnectionState as QuicConnectionState;
 use quicd_x::{ConnectionHandle, Event, Command};
 use quicd_x::ConnectionId as XConnectionId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,6 +44,9 @@ pub struct ConnectionManager {
     
     worker_id: u8,
     
+    /// Application registry for ALPN-based routing.
+    app_registry: Arc<crate::apps::AppRegistry>,
+    
     /// DDoS protection: Rate limiting for Version Negotiation packets.
     /// Maps source address to (count, window_start_time).
     /// RFC 9000 Section 5.2.2: "A server MAY limit the number of Version Negotiation packets it sends."
@@ -66,6 +69,18 @@ struct ConnectionState {
     
     /// Has the application task been spawned?
     app_spawned: bool,
+    
+    /// Set of streams for which we've sent StreamOpened events.
+    notified_streams: HashSet<StreamId>,
+    
+    /// Length of the server's local Connection ID (DCID for incoming packets).
+    /// Used for parsing Short header packets which don't include DCID length.
+    dcid_len: usize,
+    
+    /// Buffer for 1-RTT packets that arrive before OneRtt keys are available.
+    /// RFC 9001 Section 4.1.1: Implementations SHOULD buffer these packets.
+    /// Store original bytes so we can apply header protection removal later.
+    buffered_1rtt_packets: Vec<(Bytes, usize, Instant)>, // (packet_bytes, datagram_size, arrival_time)
 }
 
 impl ConnectionManager {
@@ -74,6 +89,7 @@ impl ConnectionManager {
         tokio_handle: TokioHandle,
         egress_tx: Sender<Command>,
         worker_id: u8,
+        app_registry: Arc<crate::apps::AppRegistry>,
     ) -> Self {
         let cid_generator = Arc::new(RoutingConnectionIdGenerator::new(
             worker_id,
@@ -88,6 +104,7 @@ impl ConnectionManager {
             egress_tx,
             cid_generator,
             worker_id,
+            app_registry,
             vn_rate_limiter: HashMap::new(),
         }
     }
@@ -108,7 +125,33 @@ impl ConnectionManager {
         
         // Parse packet from buffer
         let bytes = Bytes::copy_from_slice(&buffer);
-        let mut packet = match Packet::parse(bytes.clone()) {
+        
+        // Try to determine DCID length for Short packets
+        // Short packets don't encode DCID length, so we need to extract it from the first byte
+        let first_byte = bytes[0];
+        let is_long_header = (first_byte & 0x80) != 0;
+        
+        // For Short packets, we need to find the connection first to get DCID length
+        let mut parse_context = quicd_quic::packet::ParseContext::default();
+        
+        if !is_long_header {
+            // Short packet - need to find connection by trying different DCID lengths
+            // Start with common lengths: 20 bytes (our default), then 8 bytes
+            let possible_lens = [20, 8, 16, 12, 4];
+            for &len in &possible_lens {
+                if bytes.len() > 1 + len {
+                    let dcid = ConnectionId::from_slice(&bytes[1..1+len]);
+                    if let Some(scid) = self.dcid_to_conn.get(&dcid) {
+                        if let Some(state) = self.connections.get(scid) {
+                            parse_context = quicd_quic::packet::ParseContext::with_dcid_len(state.dcid_len);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        let mut packet = match quicd_quic::Packet::parse_with_context(bytes.clone(), parse_context) {
              Ok(p) => p,
              Err(e) => {
                  error!("Failed to parse packet: {}", e);
@@ -186,38 +229,79 @@ impl ConnectionManager {
             // We need to clone scid to use it for lookup to avoid borrow checker issues
             let scid = scid.clone();
             if let Some(state) = self.connections.get_mut(&scid) {
-                // RFC 9001 Section 5.4: Remove header protection BEFORE decryption
-                // Determine encryption level from packet type
-                let encryption_level = match packet.header.ty {
-                    PacketType::Initial => quicd_quic::crypto::EncryptionLevel::Initial,
-                    PacketType::Handshake => quicd_quic::crypto::EncryptionLevel::Handshake,
-                    PacketType::Short => quicd_quic::crypto::EncryptionLevel::OneRtt,
-                    _ => {
-                        error!("Unsupported packet type for existing connection: {:?}", packet.header.ty);
-                        return vec![];
-                    }
-                };
-                
-                // Get HP key from the connection's TLS session
-                if let Some(hp_key) = state.conn.get_hp_key(encryption_level) {
-                    if let Err(e) = packet.remove_header_protection(hp_key, bytes.as_ref()) {
+            // RFC 9001 Section 5.4: Remove header protection BEFORE decryption
+            // Determine encryption level from packet type
+            let encryption_level = match packet.header.ty {
+                PacketType::Initial => quicd_quic::crypto::EncryptionLevel::Initial,
+                PacketType::Handshake => quicd_quic::crypto::EncryptionLevel::Handshake,
+                PacketType::Short => quicd_quic::crypto::EncryptionLevel::OneRtt,
+                _ => {
+                    error!("Unsupported packet type for existing connection: {:?}", packet.header.ty);
+                    return vec![];
+                }
+            };
+            
+            // RFC 9001 Section 5.7: Server MUST NOT process 1-RTT packets before handshake complete
+            // Even if 1-RTT keys are available, buffer until handshake completes
+            if encryption_level == quicd_quic::crypto::EncryptionLevel::OneRtt && !state.conn.handshake_complete {
+                const MAX_BUFFERED_PACKETS: usize = 10;
+                if state.buffered_1rtt_packets.len() < MAX_BUFFERED_PACKETS {
+                    debug!("Buffering 1-RTT packet (handshake not complete): pn={:?}, buffer_size={}",
+                           packet.header.packet_number, state.buffered_1rtt_packets.len() + 1);
+                    state.buffered_1rtt_packets.push((bytes.clone(), datagram_size, now));
+                } else {
+                    warn!("Dropping 1-RTT packet - buffer full ({} packets)", MAX_BUFFERED_PACKETS);
+                }
+                return vec![];
+            }
+            
+            // Get HP key from the connection's TLS session
+            if let Some(hp_key) = state.conn.get_hp_key(encryption_level) {
+                if let Err(e) = packet.remove_header_protection(hp_key, bytes.as_ref()) {
+                    // RFC 9001 Section 5: If header protection removal fails for 1-RTT packets,
+                    // it likely means keys aren't ready yet (race condition during handshake).
+                    // Drop the packet silently - client will retransmit.
+                    if encryption_level == quicd_quic::crypto::EncryptionLevel::OneRtt {
+                        debug!("Dropping 1-RTT packet due to HP removal failure (keys may not be ready yet): {}", e);
+                    } else {
                         error!("Failed to remove header protection: {}", e);
-                        return vec![];
                     }
+                    return vec![];
+                }
+            } else {
+                // Keys not available yet
+                if encryption_level == quicd_quic::crypto::EncryptionLevel::OneRtt {
+                    // RFC 9001 Section 5.7: Server MUST NOT process 1-RTT packets before handshake complete
+                    // Buffer them to process after handshake completes
+                    const MAX_BUFFERED_PACKETS: usize = 10;
+                    if state.buffered_1rtt_packets.len() < MAX_BUFFERED_PACKETS {
+                        debug!("Buffering 1-RTT packet (keys not ready): pn={:?}, buffer_size={}",
+                               packet.header.packet_number, state.buffered_1rtt_packets.len() + 1);
+                        state.buffered_1rtt_packets.push((bytes.clone(), datagram_size, now));
+                    } else {
+                        warn!("Dropping 1-RTT packet - buffer full ({} packets)", MAX_BUFFERED_PACKETS);
+                    }
+                    return vec![];
                 } else {
                     error!("HP key not available for encryption level: {:?}", encryption_level);
                     return vec![];
                 }
-                
-                if let Err(e) = state.conn.process_packet(packet, datagram_size, now) {
-                    error!("Connection error: {}", e);
-                }
-                
-                self.flush_events_to_app(&scid);
-                self.check_handshake_complete(&scid);
-                
-                return self.generate_packets(&scid, now);
             }
+            
+            if let Err(e) = state.conn.process_packet(packet, datagram_size, now) {
+                error!("Connection error: {}", e);
+            }
+            
+            self.flush_events_to_app(&scid);
+            
+            let mut packets = self.generate_packets(&scid, now);
+            self.check_handshake_complete(&scid);
+            
+            // Process buffered 1-RTT packets if keys are now available
+            packets.extend(self.process_buffered_packets(&scid, now));
+            
+            return packets;
+        }
         }
         
         // New connection with supported version
@@ -285,14 +369,10 @@ impl ConnectionManager {
                 return vec![];
             }
             
-            let mut conn = Connection::new(self.config.clone(), scid.clone(), packet.header.scid.clone().unwrap(), tls);
-            
-            if let Err(e) = conn.process_packet(packet, datagram_size, now) {
-                error!("Failed to process initial packet: {}", e);
-                return vec![];
-            }
+            let conn = Connection::new(self.config.clone(), scid.clone(), packet.header.scid.clone().unwrap(), tls);
             
             let (ingress_tx, ingress_rx) = bounded(1024);
+            let dcid_len = scid.len();
             
             let state = ConnectionState {
                 conn,
@@ -300,36 +380,69 @@ impl ConnectionManager {
                 ingress_tx,
                 ingress_rx: Some(ingress_rx),
                 app_spawned: false,
+                notified_streams: HashSet::new(),
+                dcid_len,
+                buffered_1rtt_packets: Vec::new(),
             };
             
+            // INSERT INTO HASHMAP IMMEDIATELY - before processing packet
+            // This allows Short packets arriving during processing to find the connection
             self.connections.insert(scid.clone(), state);
-            self.dcid_to_conn.insert(dcid, scid.clone());
+            self.dcid_to_conn.insert(dcid.clone(), scid.clone());
             self.dcid_to_conn.insert(scid.clone(), scid.clone());
             
+            // Now process the Initial packet
+            if let Some(state) = self.connections.get_mut(&scid) {
+                if let Err(e) = state.conn.process_packet(packet, datagram_size, now) {
+                    error!("Failed to process initial packet: {}", e);
+                    // Remove the connection on failure
+                    self.connections.remove(&scid);
+                    self.dcid_to_conn.remove(&dcid);
+                    self.dcid_to_conn.remove(&scid);
+                    return vec![];
+                }
+            }
+            
+            let packets = self.generate_packets(&scid, now);
             self.check_handshake_complete(&scid);
             
-            return self.generate_packets(&scid, now);
+            return packets;
         }
         
+        // Unknown connection - log and drop
+        warn!("Dropping packet for unknown connection: dcid={:?}, packet_type={:?}, from {}", 
+              dcid, packet.header.ty, peer_addr);
         vec![]
     }
     
     fn check_handshake_complete(&mut self, scid: &ConnectionId) {
         // We need to extract fields to avoid borrow checker issues with self.spawn_app
         let mut should_spawn = false;
+        eprintln!("check_handshake_complete: Checking connection {:?}", scid);
         if let Some(state) = self.connections.get(scid) {
+            eprintln!("check_handshake_complete: handshake_complete={}, app_spawned={}", 
+                   state.conn.handshake_complete, state.app_spawned);
             if state.conn.handshake_complete && !state.app_spawned {
                 should_spawn = true;
             }
         }
         
         if should_spawn {
+            eprintln!("check_handshake_complete: Spawning app for connection {:?}", scid);
             self.spawn_app(scid.clone());
+        } else {
+            eprintln!("check_handshake_complete: NOT spawning (should_spawn=false)");
         }
     }
     
     fn spawn_app(&mut self, scid: ConnectionId) {
+        // Flush any pending events (including StreamOpened for existing streams) before spawning
+        self.flush_events_to_app(&scid);
+        
         if let Some(state) = self.connections.get_mut(&scid) {
+            // Debug: Log that we're attempting to spawn
+            eprintln!("spawn_app: Attempting to spawn application for connection {:?}", scid);
+            
             if let Some(rx) = state.ingress_rx.take() {
                 state.app_spawned = true;
                 
@@ -340,28 +453,46 @@ impl ConnectionManager {
                 bytes[..len].copy_from_slice(&scid_bytes[..len]);
                 let conn_id_u64 = u64::from_le_bytes(bytes);
                 
-                let _handle = ConnectionHandle::new(
+                let handle = ConnectionHandle::new(
                     XConnectionId(conn_id_u64),
                     rx,
                     self.egress_tx.clone(),
                 );
                 
-                // Spawn task
-                self.tokio_handle.spawn(async move {
-                    // In real impl, we'd look up the app factory based on ALPN
-                    // For now, we don't have the app registry here.
-                    // The prompt says "Applications implement the trait; worker spawns EXACTLY ONE tokio task".
-                    // But where does the worker get the application from?
-                    // "Worker looks up application factory by ALPN in AppRegistry"
-                    // I don't have AppRegistry passed in.
-                    // I'll assume a default app or placeholder.
-                    info!("Application task spawned for connection {}", conn_id_u64);
-                    
-                    // Placeholder:
-                    // let app = ...;
-                    // app.on_connection(handle).await;
-                });
+                // Get negotiated ALPN from TLS session
+                let alpn = state.conn.tls.negotiated_alpn();
+                eprintln!("spawn_app: ALPN negotiated = {:?}", alpn);
+                
+                match alpn {
+                    Some(alpn_str) => {
+                        // Look up application factory in registry
+                        eprintln!("spawn_app: Looking up application for ALPN: {}", alpn_str);
+                        match self.app_registry.get(&alpn_str) {
+                            Some(factory) => {
+                                let app = factory();
+                                info!("Application task spawned for connection {} with ALPN: {}", conn_id_u64, alpn_str);
+                                
+                                // Spawn exactly ONE tokio task per connection
+                                self.tokio_handle.spawn(async move {
+                                    app.on_connection(handle).await;
+                                    debug!("Application task completed for connection {}", conn_id_u64);
+                                });
+                            }
+                            None => {
+                                warn!("No application registered for ALPN: {} (connection {})", alpn_str, conn_id_u64);
+                                eprintln!("spawn_app: Available ALPNs in registry: {:?}", self.app_registry.alpns());
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("No ALPN negotiated for connection {}", conn_id_u64);
+                    }
+                }
+            } else {
+                eprintln!("spawn_app: ingress_rx already taken for connection {:?}", scid);
             }
+        } else {
+            eprintln!("spawn_app: Connection {:?} not found", scid);
         }
     }
     
@@ -370,6 +501,20 @@ impl ConnectionManager {
             // Check for pending datagrams
             while let Some(data) = state.conn.pending_datagrams.pop_front() {
                 let _ = state.ingress_tx.try_send(Event::DatagramReceived { data });
+            }
+            
+            // Check for new streams and send StreamOpened events
+            for (stream_id, _stream) in &state.conn.streams {
+                // Check if we've already notified the app about this stream
+                if !state.notified_streams.contains(stream_id) {
+                    eprintln!("flush_events_to_app: Sending StreamOpened for stream_id={}", stream_id.0);
+                    let is_bidirectional = stream_id.is_bidirectional();
+                    let _ = state.ingress_tx.try_send(Event::StreamOpened {
+                        stream_id: quicd_x::StreamId(stream_id.0),
+                        is_bidirectional,
+                    });
+                    state.notified_streams.insert(*stream_id);
+                }
             }
             
             // Check for stream data
@@ -742,5 +887,92 @@ impl ConnectionManager {
             return out;
         }
         vec![]
+    }
+    
+    /// Process buffered 1-RTT packets once keys become available.
+    ///
+    /// RFC 9001 Section 4.1.1: Implementations SHOULD buffer packets that might be
+    /// reordered on the wire, and SHOULD process them once the necessary keys are available.
+    fn process_buffered_packets(&mut self, scid: &ConnectionId, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+        // RFC 9001 Section 5.7: Process buffered 1-RTT packets only after handshake is COMPLETE
+        // First, check if we need to process buffered packets
+        let (should_process, dcid_len, buffered) = {
+            if let Some(state) = self.connections.get_mut(scid) {
+                // Check if handshake is complete (not just if keys are available)
+                if !state.conn.handshake_complete {
+                    return vec![];
+                }
+                
+                // Take buffered packets (move out of state)
+                let buffered = std::mem::take(&mut state.buffered_1rtt_packets);
+                
+                if buffered.is_empty() {
+                    return vec![];
+                }
+                
+                info!("Processing {} buffered 1-RTT packets for connection {:?}", buffered.len(), scid);
+                (true, state.dcid_len, buffered)
+            } else {
+                return vec![];
+            }
+        };
+        
+        if !should_process {
+            return vec![];
+        }
+        
+        // Now process each buffered packet (state borrow dropped)
+        use quicd_quic::packet::ParseContext;
+        let mut all_outgoing = Vec::new();
+        
+        for (packet_bytes, datagram_size, arrival_time) in buffered {
+            // Get state again for each packet (fresh borrow)
+            let state = match self.connections.get_mut(scid) {
+                Some(s) => s,
+                None => break,
+            };
+            
+            // Parse with known DCID length
+            let ctx = ParseContext::with_dcid_len(dcid_len);
+            let mut packet = match quicd_quic::packet::Packet::parse_with_context(packet_bytes.clone(), ctx) {
+                Ok(pkt) => pkt,
+                Err(e) => {
+                    warn!("Failed to parse buffered packet: {:?}", e);
+                    continue;
+                }
+            };
+            
+            // Remove header protection with now-available keys
+            let hp_key = match state.conn.get_hp_key(quicd_quic::crypto::EncryptionLevel::OneRtt) {
+                Some(key) => key,
+                None => {
+                    warn!("OneRtt HP key not available for buffered packet");
+                    continue;
+                }
+            };
+            
+            if let Err(e) = packet.remove_header_protection(hp_key, packet_bytes.as_ref()) {
+                warn!("Failed to remove header protection from buffered packet: {:?}", e);
+                continue;
+            }
+            
+            debug!("Processing buffered packet pn={:?}", packet.header.packet_number);
+            
+            // Process the packet
+            if let Err(e) = state.conn.process_packet(packet, datagram_size, arrival_time) {
+                error!("Error processing buffered packet: {}", e);
+                continue;
+            }
+            
+            // Drop state borrow before calling other self methods
+            drop(state);
+            
+            // Flush events and generate responses
+            self.flush_events_to_app(scid);
+            let outgoing = self.generate_packets(scid, now);
+            all_outgoing.extend(outgoing);
+        }
+        
+        all_outgoing
     }
 }

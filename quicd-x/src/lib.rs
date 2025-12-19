@@ -214,6 +214,7 @@ impl ConnectionHandle {
                         let mut state = state_clone.lock().unwrap();
                         match event {
                             Event::StreamOpened { stream_id, is_bidirectional } => {
+                                eprintln!("ConnectionHandle: Received StreamOpened event for stream_id={}, is_bidirectional={}", stream_id.0, is_bidirectional);
                                 if is_bidirectional {
                                     state.pending_bi_streams.push_back(stream_id);
                                     if let Some(waker) = state.accept_bi_waker.take() {

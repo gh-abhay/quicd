@@ -97,6 +97,7 @@ pub struct NetworkWorker {
     runtime_handle: tokio::runtime::Handle,
     cert_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
+    app_registry: Arc<crate::apps::AppRegistry>,
     // egress_tx: crossbeam_channel::Sender<quicd_x::EgressCommand>,
     // egress_rx: Option<crossbeam_channel::Receiver<quicd_x::EgressCommand>>,
 }
@@ -112,6 +113,7 @@ impl NetworkWorker {
         runtime_handle: tokio::runtime::Handle,
         cert_path: std::path::PathBuf,
         key_path: std::path::PathBuf,
+        app_registry: Arc<crate::apps::AppRegistry>,
     ) -> Result<Self> {
         // Create UDP socket with SO_REUSEPORT
         let socket = create_udp_socket(bind_addr, &config)?;
@@ -158,6 +160,7 @@ impl NetworkWorker {
             runtime_handle,
             cert_path,
             key_path,
+            app_registry,
             // egress_tx,
             // egress_rx: Some(egress_rx),
         })
@@ -306,6 +309,7 @@ impl NetworkWorker {
             self.runtime_handle.clone(),
             egress_tx,
             self.id as u8,
+            Arc::clone(&self.app_registry),
         );
 
         // Timeout tracking for QUIC - use adaptive timeout from manager
@@ -1233,6 +1237,7 @@ pub fn spawn(
     runtime_handle: tokio::runtime::Handle,
     cert_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
+    app_registry: Arc<crate::apps::AppRegistry>,
 ) -> Result<NetIoHandle> {
     use std::path::Path;
 
@@ -1263,6 +1268,7 @@ pub fn spawn(
         let runtime_handle = runtime_handle.clone();
         let cert_path = cert_path.clone();
         let key_path = key_path.clone();
+        let app_registry = Arc::clone(&app_registry);
 
         // Create worker (in main thread)
         let worker = NetworkWorker::new(
@@ -1274,6 +1280,7 @@ pub fn spawn(
             runtime_handle,
             cert_path,
             key_path,
+            app_registry,
         )?;
 
         // Spawn native thread and move worker into it
