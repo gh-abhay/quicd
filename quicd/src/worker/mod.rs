@@ -95,6 +95,8 @@ pub struct NetworkWorker {
     shutdown: Arc<AtomicBool>,
     routing_cookie: u16,
     runtime_handle: tokio::runtime::Handle,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
     // egress_tx: crossbeam_channel::Sender<quicd_x::EgressCommand>,
     // egress_rx: Option<crossbeam_channel::Receiver<quicd_x::EgressCommand>>,
 }
@@ -108,6 +110,8 @@ impl NetworkWorker {
         channel_config: crate::channel_config::ChannelConfig,
         shutdown: Arc<AtomicBool>,
         runtime_handle: tokio::runtime::Handle,
+        cert_path: std::path::PathBuf,
+        key_path: std::path::PathBuf,
     ) -> Result<Self> {
         // Create UDP socket with SO_REUSEPORT
         let socket = create_udp_socket(bind_addr, &config)?;
@@ -152,6 +156,8 @@ impl NetworkWorker {
             shutdown,
             routing_cookie,
             runtime_handle,
+            cert_path,
+            key_path,
             // egress_tx,
             // egress_rx: Some(egress_rx),
         })
@@ -289,9 +295,14 @@ impl NetworkWorker {
         // Create egress channel for receiving commands from app tasks
         let (egress_tx, egress_rx) = bounded(self.channel_config.worker_egress_capacity);
         
+        // Create connection config with TLS certificate paths
+        let mut conn_config = ConnectionConfig::default();
+        conn_config.cert_path = Some(self.cert_path.clone());
+        conn_config.key_path = Some(self.key_path.clone());
+        
         // Create connection manager for this worker (with routing-aware CID generator)
         let mut conn_manager = ConnectionManager::new(
-            ConnectionConfig::default(),
+            conn_config,
             self.runtime_handle.clone(),
             egress_tx,
             self.id as u8,
@@ -561,6 +572,7 @@ impl NetworkWorker {
             // Batch submit all outgoing packets
             let mut send_sq_full = false;
             for (dest, packets) in by_dest {
+                eprintln!("worker: Sending {} packets to {}", packets.len(), dest);
                 // Convert Vec<u8> to WorkerBuffer for sending
                 // We allocate new buffers and copy data since WorkerBuffer doesn't expose mutable API
                 let buffers: Vec<WorkerBuffer> = packets.into_iter().filter_map(|data| {
@@ -570,9 +582,13 @@ impl NetworkWorker {
                         return None;
                     }
                     
+                    eprintln!("worker: Packet size: {} bytes", data.len());
+                    
                     // Allocate buffer and write data
                     Some(WorkerBuffer::from_vec(data, &buffer_pool))
                 }).collect();
+                
+                eprintln!("worker: Converted {} packets to WorkerBuffer", buffers.len());
                 
                 if buffers.is_empty() {
                     continue;
@@ -587,7 +603,9 @@ impl NetworkWorker {
                     &mut next_send_id,
                     &mut send_op_pool,
                 ) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        eprintln!("worker: Successfully submitted send operation");
+                    }
                     Err(e)
                         if e.kind() == io::ErrorKind::Other
                             && e.to_string().contains("submission queue full") =>
@@ -1213,6 +1231,8 @@ pub fn spawn(
     config: NetIoConfig,
     channel_config: crate::channel_config::ChannelConfig,
     runtime_handle: tokio::runtime::Handle,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
 ) -> Result<NetIoHandle> {
     use std::path::Path;
 
@@ -1241,6 +1261,8 @@ pub fn spawn(
         let channel_config = channel_config.clone();
         let shutdown = Arc::clone(&shutdown);
         let runtime_handle = runtime_handle.clone();
+        let cert_path = cert_path.clone();
+        let key_path = key_path.clone();
 
         // Create worker (in main thread)
         let worker = NetworkWorker::new(
@@ -1250,6 +1272,8 @@ pub fn spawn(
             channel_config,
             shutdown,
             runtime_handle,
+            cert_path,
+            key_path,
         )?;
 
         // Spawn native thread and move worker into it

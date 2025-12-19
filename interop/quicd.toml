@@ -90,7 +90,7 @@ enable_thread_stats = false
 [global.logging]
 # Log level: "trace", "debug", "info", "warn", "error"
 # Default: "info"
-level = "info"
+level = "trace"
 
 # Enable structured JSON logging (for machine parsing)
 # Default: false

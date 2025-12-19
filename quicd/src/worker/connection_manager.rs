@@ -236,7 +236,24 @@ impl ConnectionManager {
             // RFC 9001 Section 5.2: Initial keys are derived from DCID from Initial packet
             // Use the DCID from the packet header to initialize TLS session
             let dcid_bytes = packet.header.dcid.as_bytes();
-            let tls = match TlsSession::new_server_with_config(dcid_bytes) {
+            
+            // Get cert and key paths from config
+            let cert_path = match &self.config.cert_path {
+                Some(path) => path,
+                None => {
+                    error!("No certificate path configured");
+                    return vec![];
+                }
+            };
+            let key_path = match &self.config.key_path {
+                Some(path) => path,
+                None => {
+                    error!("No key path configured");
+                    return vec![];
+                }
+            };
+            
+            let tls = match TlsSession::new_server_with_config(dcid_bytes, scid.as_bytes(), cert_path, key_path) {
                 Ok(tls) => tls,
                 Err(e) => {
                     error!("Failed to create TLS session: {:?}", e);
@@ -707,12 +724,21 @@ impl ConnectionManager {
     fn generate_packets(&mut self, scid: &ConnectionId, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
         if let Some(state) = self.connections.get_mut(scid) {
             let packets = state.conn.generate_packets(now);
+            eprintln!("connection_manager::generate_packets: Got {} packets from connection", packets.len());
             let mut out = Vec::new();
             for pkt in packets {
-                if let Ok(buf) = pkt.serialize() {
-                    out.push((state.peer_addr, buf.to_vec()));
+                // Serialize packet with header protection per RFC 9001 Section 5.4
+                match state.conn.serialize_with_header_protection(&pkt) {
+                    Ok(buf) => {
+                        eprintln!("connection_manager::generate_packets: Serialized and protected packet, size: {}", buf.len());
+                        out.push((state.peer_addr, buf));
+                    }
+                    Err(e) => {
+                        eprintln!("connection_manager::generate_packets: Failed to serialize/protect packet: {}", e);
+                    }
                 }
             }
+            eprintln!("connection_manager::generate_packets: Returning {} protected packets", out.len());
             return out;
         }
         vec![]

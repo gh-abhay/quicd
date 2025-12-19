@@ -2018,6 +2018,7 @@ dependencies = [
  "boring",
  "bytes",
  "criterion",
+ "foreign-types",
  "hex",
  "log",
  "rcgen",

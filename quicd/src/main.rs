@@ -91,6 +91,8 @@ fn main() -> anyhow::Result<()> {
         netio_cfg,
         config.global.channels.clone(),
         runtime_handle.clone(),
+        cert_path.clone(),
+        key_path.clone(),
     )
     .with_context(|| "failed to spawn network layer")?;
 
