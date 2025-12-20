@@ -22,8 +22,15 @@ esac
 if [ "$ROLE" == "client" ]; then
         exit 127
 elif [ "$ROLE" == "server" ]; then
-    echo "## Starting quiche server..."
+    echo "## Starting quicd server..."
     echo "## Server params: $SERVER_PARAMS"
     echo "## Test case: $TESTCASE"
+    
+    # Set file root to interop runner's WWW directory if provided
+    if [ -n "${WWW:-}" ]; then
+        echo "## Using WWW directory: $WWW"
+        export QUICD_APPLICATIONS__HTTP3__CONFIG__HANDLER__FILE_ROOT="$WWW"
+    fi
+    
     /quicd -c /quicd.toml $SERVER_PARAMS
 fi

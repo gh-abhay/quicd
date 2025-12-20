@@ -311,7 +311,8 @@ file_serving_enabled = true
 
 # File serving root directory
 # Default: "./www"
-file_root = "./www"
+# Interop test framework mounts files at /www
+file_root = "/www"
 
 # Enable directory listing (security consideration)
 # Default: false

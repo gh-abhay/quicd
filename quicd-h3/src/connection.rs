@@ -542,25 +542,27 @@ impl H3Connection {
         let state = self.request_streams.get_mut(&stream_id)
             .ok_or_else(|| Error::Internal("stream state not found".to_string()))?;
 
-        // Append new data to buffer
-        state.body_buffer.put_slice(data);
+        // Parse frames directly (parser has its own buffer for partial frames)
+        let frames = state.parser.parse(Bytes::copy_from_slice(data))?;
 
-        // Parse frames from buffer
-        let frames = state.parser.parse(state.body_buffer.split().freeze())?;
-
+        eprintln!("H3: process_request_stream_data: stream_id={}, parsed {} frames, fin={}", stream_id.0, frames.len(), fin);
         for frame in frames {
+            eprintln!("H3: Processing frame type: {:?}", frame.frame_type());
             match frame {
                 Frame::Headers(headers_frame) => {
+                    eprintln!("H3: Got HEADERS frame, headers_received={}", state.headers_received);
                     if state.headers_received {
                         // Trailers - not fully implemented yet
                         continue;
                     }
 
                     // Decode QPACK field section
+                    eprintln!("H3: Decoding QPACK field section, {} bytes", headers_frame.encoded_field_section.len());
                     let fields = self.qpack.decode_field_section(
                         stream_id.0,
                         &headers_frame.encoded_field_section,
                     )?;
+                    eprintln!("H3: Decoded {} fields", fields.len());
 
                     // Parse pseudo-headers
                     let (method, uri, headers) = parse_request_pseudo_headers(&fields)?;
@@ -597,9 +599,14 @@ impl H3Connection {
         }
 
         // If FIN received and we have a complete request, handle it
+        eprintln!("H3: End of process_request_stream_data, fin={}, headers_received={}", fin, state.headers_received);
         if fin && state.headers_received {
+            eprintln!("H3: FIN && headers_received, checking for request");
             if let Some(request) = state.request.clone() {
+                eprintln!("H3: Calling handle_http_request for {} {}", request.method, request.uri);
                 self.handle_http_request(stream_id, stream, request).await?;
+            } else {
+                eprintln!("H3: No request found in state!");
             }
         }
 
@@ -613,13 +620,18 @@ impl H3Connection {
         stream: &mut quicd_x::QuicStream,
         request: HttpRequest,
     ) -> Result<()> {
+        eprintln!("H3: handle_http_request: {} {}", request.method, request.uri);
         debug!("Handling HTTP request: {} {}", request.method, request.uri);
 
         // Invoke handler
+        eprintln!("H3: Calling handler.handle_request");
         let response = self.handler.handle_request(&request).await?;
+        eprintln!("H3: Got response: status={}, body_len={}", response.status, response.body.len());
 
         // Send response
+        eprintln!("H3: Sending HTTP response");
         self.send_http_response(stream, &response).await?;
+        eprintln!("H3: Response sent successfully");
 
         Ok(())
     }
@@ -630,12 +642,17 @@ impl H3Connection {
         stream: &mut quicd_x::QuicStream,
         response: &HttpResponse,
     ) -> Result<()> {
+        eprintln!("H3: send_http_response: status={}", response.status);
+        
         // Convert response to field lines
         let fields = response_to_field_lines(response);
+        eprintln!("H3: Converted to {} field lines", fields.len());
 
         // Encode with QPACK
         let stream_id = stream.stream_id();
+        eprintln!("H3: Encoding with QPACK for stream {}", stream_id.0);
         let encoded_fields = self.qpack.encode_field_section(stream_id.0, &fields)?;
+        eprintln!("H3: QPACK encoded: {} bytes", encoded_fields.len());
 
         // Build HEADERS frame
         let headers_frame = Frame::Headers(crate::frame::HeadersFrame {
@@ -644,21 +661,31 @@ impl H3Connection {
 
         let mut buf = BytesMut::new();
         write_frame(&headers_frame, &mut buf)?;
+        eprintln!("H3: HEADERS frame serialized: {} bytes", buf.len());
+        
+        eprintln!("H3: Writing HEADERS to stream");
         stream.write_all(&buf).await.map_err(|e| Error::Io(e))?;
+        eprintln!("H3: HEADERS written successfully");
 
         // Send body in DATA frame if non-empty
         if !response.body.is_empty() {
+            eprintln!("H3: Sending DATA frame with {} bytes", response.body.len());
             let data_frame = Frame::Data(crate::frame::DataFrame {
                 payload: response.body.clone(),
             });
 
             let mut buf = BytesMut::new();
             write_frame(&data_frame, &mut buf)?;
+            eprintln!("H3: DATA frame serialized: {} bytes", buf.len());
+            
             stream.write_all(&buf).await.map_err(|e| Error::Io(e))?;
+            eprintln!("H3: DATA written successfully");
         }
 
         // Close stream (FIN)
+        eprintln!("H3: Shutting down stream");
         stream.shutdown().await.map_err(|e| Error::Io(e))?;
+        eprintln!("H3: Stream shutdown complete");
 
         debug!("Sent HTTP response: {}", response.status);
         Ok(())

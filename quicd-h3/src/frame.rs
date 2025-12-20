@@ -291,6 +291,7 @@ impl FrameParser {
     ///
     /// Returns error if frame format is invalid.
     pub fn parse(&mut self, mut data: Bytes) -> Result<Vec<Frame>> {
+        eprintln!("FrameParser::parse: received {} bytes, current buffer: {} bytes", data.len(), self.buffer.len());
         self.buffer.extend_from_slice(&data);
         let mut frames = Vec::new();
 
@@ -300,6 +301,7 @@ impl FrameParser {
             match self.state {
                 ParserState::ReadingType => {
                     if let Some(frame_type) = try_read_varint(&mut self.buffer)? {
+                        eprintln!("FrameParser: Read frame type: 0x{:x}", frame_type);
                         self.state = ParserState::ReadingLength { frame_type };
                     } else {
                         break; // Need more data
@@ -308,6 +310,7 @@ impl FrameParser {
 
                 ParserState::ReadingLength { frame_type } => {
                     if let Some(length) = try_read_varint(&mut self.buffer)? {
+                        eprintln!("FrameParser: Read frame length: {} for type 0x{:x}", length, frame_type);
                         if length > u64::MAX as u64 {
                             return Err(Error::protocol(
                                 ErrorCode::FrameError,
@@ -324,11 +327,13 @@ impl FrameParser {
                 }
 
                 ParserState::ReadingPayload { frame_type, length } => {
+                    eprintln!("FrameParser: ReadingPayload, need {} bytes, have {}", length, self.buffer.len());
                     if self.buffer.len() < length {
                         break; // Need more data
                     }
 
                     let payload = self.buffer.split_to(length).freeze();
+                    eprintln!("FrameParser: Parsing frame type 0x{:x} with {} byte payload", frame_type, payload.len());
                     let frame = parse_frame_payload(frame_type, payload)?;
                     frames.push(frame);
 
@@ -342,6 +347,7 @@ impl FrameParser {
             }
         }
 
+        eprintln!("FrameParser::parse: returning {} frames, {} bytes buffered", frames.len(), self.buffer.len());
         Ok(frames)
     }
 

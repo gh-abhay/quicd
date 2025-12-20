@@ -228,6 +228,7 @@ impl ConnectionHandle {
                                 }
                             }
                             Event::StreamData { stream_id, data, fin } => {
+                                eprintln!("ConnectionHandle: Received StreamData event for stream_id={}, data_len={}, fin={}", stream_id.0, data.len(), fin);
                                 state.stream_buffers.entry(stream_id).or_default().push_back(data);
                                 if fin {
                                     state.stream_fin.insert(stream_id);
@@ -598,10 +599,13 @@ impl AsyncRead for QuicStream {
     ) -> Poll<io::Result<()>> {
         let mut state = self.state.lock().unwrap();
         
+        eprintln!("QuicStream::poll_read: stream_id={}, buf_remaining={}", self.stream_id.0, buf.remaining());
+        
         // Check for data
         if let Some(queue) = state.stream_buffers.get_mut(&self.stream_id) {
             if let Some(chunk) = queue.front_mut() {
                 let len = std::cmp::min(chunk.len(), buf.remaining());
+                eprintln!("QuicStream::poll_read: stream_id={}, reading {} bytes from queue", self.stream_id.0, len);
                 buf.put_slice(&chunk[..len]);
                 
                 // Consume from chunk
@@ -624,20 +628,24 @@ impl AsyncRead for QuicStream {
         
         // Check for FIN
         if state.stream_fin.contains(&self.stream_id) {
+            eprintln!("QuicStream::poll_read: stream_id={}, FIN detected, returning EOF", self.stream_id.0);
             return Poll::Ready(Ok(()));
         }
         
         // Check for Reset
         if let Some(err) = state.stream_reset.get(&self.stream_id) {
+            eprintln!("QuicStream::poll_read: stream_id={}, reset with error {}", self.stream_id.0, err);
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, format!("stream reset: {}", err))));
         }
         
         // Check for Connection Close
         if state.closed {
+            eprintln!("QuicStream::poll_read: stream_id={}, connection closed", self.stream_id.0);
              return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")));
         }
         
         // Register waker
+        eprintln!("QuicStream::poll_read: stream_id={}, no data available, registering waker", self.stream_id.0);
         state.stream_wakers.insert(self.stream_id, cx.waker().clone());
         
         Poll::Pending

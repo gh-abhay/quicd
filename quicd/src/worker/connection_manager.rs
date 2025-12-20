@@ -519,13 +519,18 @@ impl ConnectionManager {
             
             // Check for stream data
             for (stream_id, stream) in &mut state.conn.streams {
+                eprintln!("flush_events_to_app: Checking stream_id={}, has_data={}", stream_id.0, stream.has_data());
                 if stream.has_data() {
+                    eprintln!("flush_events_to_app: Reading data from stream_id={}", stream_id.0);
                     if let Ok((data, fin)) = stream.read() {
+                        eprintln!("flush_events_to_app: Sending StreamData for stream_id={}, data_len={}, fin={}", stream_id.0, data.len(), fin);
                         let _ = state.ingress_tx.try_send(Event::StreamData {
                             stream_id: quicd_x::StreamId(stream_id.0),
                             data,
                             fin,
                         });
+                    } else {
+                        eprintln!("flush_events_to_app: Failed to read from stream_id={}", stream_id.0);
                     }
                 }
             }

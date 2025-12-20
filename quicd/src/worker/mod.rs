@@ -412,35 +412,6 @@ impl NetworkWorker {
                 }
             }
 
-            // Process stream writes from all connections (egress path)
-            // Generate packets for any connections with pending frames
-            let now = std::time::Instant::now();
-            // Note: In a full implementation, we'd iterate through connections
-            // and call generate_packets() on those with pending data
-            // For now, this is handled implicitly when handle_command is called
-
-            // Group egress packets by destination
-            // let mut by_dest_egress: std::collections::HashMap<std::net::SocketAddr, Vec<WorkerBuffer>> = std::collections::HashMap::new();
-            // for packet in egress_packets {
-            //     by_dest_egress.entry(packet.to).or_default().push(packet.data);
-            // }
-
-            // Submit grouped egress packets
-            // for (dest, packets) in by_dest_egress {
-            //     if let Err(e) = submit_send_op(
-            //         &mut ring,
-            //         socket_fd,
-            //         dest,
-            //         packets,
-            //         &mut send_in_flight,
-            //         &mut next_send_id,
-            //         &mut send_op_pool,
-            //     ) {
-            //         error!(worker_id, peer = %dest, error = ?e, "Failed to submit egress packet");
-            //         record_metric(MetricsEvent::NetworkSendError);
-            //     }
-            // }
-
             // Wait for io_uring completions (non-blocking check)
             // This allows the loop to be responsive to egress commands and shutdown
             match ring.submit_and_wait(0) {
