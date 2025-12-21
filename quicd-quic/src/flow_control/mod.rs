@@ -6,7 +6,7 @@
 //!
 //! Flow control is bidirectional - both sender and receiver track limits.
 
-use crate::types::{VarInt, StreamId};
+use crate::frames::{VarInt, StreamId};
 use crate::error::{Error, Result, TransportError};
 
 /// Connection-level flow control state (RFC 9000 Section 4.1)
@@ -81,7 +81,7 @@ impl ConnectionFlowControl {
         
         if new_total > self.send_max_data {
             self.send_blocked = true;
-            return Err(Error::TransportError(TransportError::FlowControlError));
+            return Err(Error::Transport(TransportError::FlowControlError));
         }
         
         self.send_data = new_total;
@@ -98,7 +98,7 @@ impl ConnectionFlowControl {
     
     /// Check if we're blocked and should send DATA_BLOCKED frame
     pub fn is_send_blocked(&self) -> bool {
-        self.send_blocked && self.send_data >= self.send_max_data
+        self.send_blocked
     }
     
     /// Get current send limit
@@ -118,7 +118,7 @@ impl ConnectionFlowControl {
         let new_total = self.recv_data + bytes as u64;
         
         if new_total > self.recv_max_data {
-            return Err(Error::TransportError(TransportError::FlowControlError));
+            return Err(Error::Transport(TransportError::FlowControlError));
         }
         
         self.recv_data = new_total;
@@ -234,7 +234,7 @@ impl StreamFlowControl {
         
         if end_offset > self.send_max_offset {
             self.send_blocked = true;
-            return Err(Error::TransportError(TransportError::FlowControlError));
+            return Err(Error::Transport(TransportError::FlowControlError));
         }
         
         // Update highest offset sent
@@ -273,7 +273,7 @@ impl StreamFlowControl {
         let end_offset = offset + length as u64;
         
         if end_offset > self.recv_max_offset {
-            return Err(Error::TransportError(TransportError::FlowControlError));
+            return Err(Error::Transport(TransportError::FlowControlError));
         }
         
         Ok(())
@@ -360,7 +360,9 @@ impl FlowControlManager {
         stream_id: StreamId,
         is_local: bool,
     ) -> StreamFlowControl {
-        let (send_max, recv_max) = if stream_id.is_bidirectional() {
+        use crate::frames::StreamType;
+        let stream_type = StreamType::from_stream_id(stream_id);
+        let (send_max, recv_max) = if stream_type.is_bidirectional() {
             if is_local {
                 (
                     self.initial_send_max_stream_data_bidi_remote,
@@ -406,7 +408,7 @@ impl FlowControlManager {
         
         // Check connection-level limit
         if !self.connection.can_send(length) {
-            return Err(Error::TransportError(TransportError::FlowControlError));
+            return Err(Error::Transport(TransportError::FlowControlError));
         }
         
         Ok(())
@@ -485,7 +487,7 @@ mod tests {
     
     #[test]
     fn test_stream_flow_control() {
-        let stream_id = StreamId(0);  // Client-initiated bidirectional
+        let stream_id = 0;  // Client-initiated bidirectional
         let mut fc = StreamFlowControl::new(stream_id, 1000, 1000);
         
         // Send data at offset 0

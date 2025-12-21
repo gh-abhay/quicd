@@ -94,12 +94,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "std")]
-extern crate std;
-
 extern crate alloc;
-
-use core::fmt;
 
 // ============================================================================
 // RFC 8999: Version-Independent Properties
@@ -200,23 +195,34 @@ pub mod transport;
 /// Server connection management
 pub mod server;
 
+/// Connection state machine and lifecycle management (RFC 9000 Section 5)
+pub mod connection;
+
+/// Version negotiation and invariants (RFC 8999)
+pub mod version;
+
+/// Connection-level flow control (distinct from stream flow control)
+pub mod flow_control;
+
 // ============================================================================
 // Re-export Core Types for Convenience
 // ============================================================================
 
 pub use error::{Error, Result, TransportError, ApplicationError, CryptoError};
 pub use frames::{Frame, StreamId, VarInt};
-pub use packet::{PacketNumber, PacketNumberSpace};
+pub use packet::{PacketNumber, PacketNumberSpace, PacketType, PacketHeader, PacketParser};
 pub use recovery::{
     RttEstimator, LossDetector, CongestionController,
-    CongestionWindow, BytesInFlight,
+    CongestionWindow, BytesInFlight, PacketSent, AckReceived,
 };
 pub use crypto::{EncryptionLevel, CryptoContext, PacketProtector, HeaderProtector};
-pub use stream::{StreamMeta, SendState, RecvState};
+pub use stream::{StreamMeta, SendState, RecvState, StreamManager};
 pub use transport::{
     parameters::TransportParameters,
     flow::ConnectionFlowControl,
 };
+pub use connection::{QuicConnection, ConnectionState, ConnectionConfig, ConnectionEvent};
+pub use version::{QuicVersion, VersionNegotiator, PacketInvariants, VERSION_1};
 
 // ============================================================================
 // RFC 8999: Version-Independent Properties

@@ -42,7 +42,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use core::time::Duration;
 
 /// Type alias for time tracking (no_std compatible)

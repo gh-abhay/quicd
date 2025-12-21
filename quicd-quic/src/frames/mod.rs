@@ -55,7 +55,6 @@
 
 #![forbid(unsafe_code)]
 
-use crate::error::{Error, Result, TransportError};
 use core::fmt;
 
 // Re-export parsing logic

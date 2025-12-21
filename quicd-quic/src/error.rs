@@ -119,6 +119,12 @@ pub enum Error {
     
     /// Unsupported QUIC version
     UnsupportedVersion,
+    
+    /// Invalid packet (RFC 8999 invariants violated)
+    InvalidPacket,
+    
+    /// Invalid transport parameter
+    InvalidTransportParameter,
 }
 
 impl fmt::Display for Error {
@@ -134,6 +140,8 @@ impl fmt::Display for Error {
             Error::StreamNotFound => write!(f, "Stream not found"),
             Error::MalformedPacket => write!(f, "Malformed packet"),
             Error::UnsupportedVersion => write!(f, "Unsupported version"),
+            Error::InvalidPacket => write!(f, "Invalid packet"),
+            Error::InvalidTransportParameter => write!(f, "Invalid transport parameter"),
         }
     }
 }
