@@ -9,7 +9,7 @@ use quicd_x::{ConnectionHandle, QuicdApplication, StreamId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::config::H3Config;
@@ -692,7 +692,7 @@ impl H3Connection {
     }
 
     /// Handle peer's control stream.
-    async fn handle_control_stream(&mut self, mut stream: quicd_x::QuicStream) -> Result<()> {
+    async fn handle_control_stream(&mut self, _stream: quicd_x::QuicStream) -> Result<()> {
         // This method is no longer used - replaced by incremental processing in run()
         Ok(())
     }
@@ -758,13 +758,13 @@ impl H3Connection {
     }
 
     /// Handle QPACK encoder stream (from peer).
-    async fn handle_qpack_encoder_stream(&mut self, mut stream: quicd_x::QuicStream) -> Result<()> {
+    async fn handle_qpack_encoder_stream(&mut self, _stream: quicd_x::QuicStream) -> Result<()> {
         // This method is no longer used - replaced by incremental processing in run()
         Ok(())
     }
 
     /// Handle QPACK decoder stream (from peer).
-    async fn handle_qpack_decoder_stream(&mut self, mut stream: quicd_x::QuicStream) -> Result<()> {
+    async fn handle_qpack_decoder_stream(&mut self, _stream: quicd_x::QuicStream) -> Result<()> {
         // This method is no longer used - replaced by incremental processing in run()
         Ok(())
     }

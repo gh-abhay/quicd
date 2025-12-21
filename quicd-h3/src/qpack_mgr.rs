@@ -105,7 +105,7 @@ impl QpackManager {
     /// Process data received on the peer's encoder stream.
     ///
     /// The decoder processes these instructions to update its dynamic table.
-    pub fn process_encoder_stream_data(&mut self, data: &[u8]) -> Result<()> {
+    pub fn process_encoder_stream_data(&mut self, _data: &[u8]) -> Result<()> {
         // Feed encoder stream data to decoder
         // Note: quicd-qpack API may need method for this
         // For now, this is a placeholder
@@ -115,7 +115,7 @@ impl QpackManager {
     /// Process data received on the peer's decoder stream.
     ///
     /// The encoder processes these instructions (acknowledgments, etc.).
-    pub fn process_decoder_stream_data(&mut self, data: &[u8]) -> Result<()> {
+    pub fn process_decoder_stream_data(&mut self, _data: &[u8]) -> Result<()> {
         // Feed decoder stream data to encoder
         // Note: quicd-qpack API may need method for this
         // For now, this is a placeholder
@@ -168,7 +168,6 @@ impl QpackManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::BytesMut;
 
     #[test]
     fn test_qpack_manager_creation() {

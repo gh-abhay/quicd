@@ -4,16 +4,3 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bytes = { workspace = true }
-boring = { workspace = true }
-thiserror = { workspace = true }
-smallvec = { workspace = true }
-ahash = { workspace = true }
-log = { workspace = true }
-foreign-types = "0.5"
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
-rcgen = { workspace = true }
-criterion = { version = "0.5", features = ["html_reports"] }
-hex = "0.4"

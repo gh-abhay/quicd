@@ -290,7 +290,7 @@ impl FrameParser {
     /// # Errors
     ///
     /// Returns error if frame format is invalid.
-    pub fn parse(&mut self, mut data: Bytes) -> Result<Vec<Frame>> {
+    pub fn parse(&mut self, data: Bytes) -> Result<Vec<Frame>> {
         eprintln!("FrameParser::parse: received {} bytes, current buffer: {} bytes", data.len(), self.buffer.len());
         self.buffer.extend_from_slice(&data);
         let mut frames = Vec::new();
