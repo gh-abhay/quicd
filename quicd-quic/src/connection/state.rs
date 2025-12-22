@@ -8,7 +8,7 @@ use crate::crypto::{CryptoBackend, CryptoLevel, TlsSession};
 use crate::error::{Error, Result};
 use crate::flow_control::ConnectionFlowControl;
 use crate::frames::Frame;
-use crate::packet::{Header, PacketParser};
+use crate::packet::{Header, PacketParserTrait};
 use crate::packet::space::PacketNumberSpaceManager;
 use crate::recovery::{CongestionController, LossDetector, RttEstimator};
 use crate::stream::{StreamController, StreamManager};

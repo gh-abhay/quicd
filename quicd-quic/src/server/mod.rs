@@ -8,7 +8,7 @@ use crate::connection::{Connection, ConnectionConfig};
 use crate::connection::state::QuicConnection;
 use crate::crypto::CryptoBackend;
 use crate::error::{Error, Result, TransportError};
-use crate::packet::{Header, PacketParser, PacketType};
+use crate::packet::{Header, PacketParserTrait, PacketType};
 use crate::transport::TransportParameters;
 use crate::types::{ConnectionId, Instant, Side, Token};
 use crate::version::{VERSION_1, VERSION_NEGOTIATION};
@@ -130,7 +130,7 @@ pub struct DefaultQuicServer {
     connections: HashMap<ConnectionId, Box<dyn Connection>>,
 
     /// Packet parser
-    packet_parser: Box<dyn PacketParser>,
+    packet_parser: Box<dyn PacketParserTrait>,
 
     /// Crypto backend factory
     crypto_backend: Box<dyn CryptoBackend>,
@@ -142,7 +142,7 @@ impl DefaultQuicServer {
         Self {
             config,
             connections: HashMap::new(),
-            packet_parser: Box::new(crate::packet::header::DefaultPacketParser),
+            packet_parser: Box::new(crate::packet::parser::DefaultPacketParser::new(65535)),
             crypto_backend,
         }
     }

@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use crate::error::{Error, Result, TransportError};
-use crate::types::{Side, StreamDirection, StreamId, StreamInitiator, StreamOffset};
+use crate::types::{stream_id_helpers, Side, StreamDirection, StreamId, StreamInitiator, StreamOffset};
 use bytes::Bytes;
 
 /// Stream State (RFC 9000 Section 3)
@@ -237,13 +237,14 @@ impl StreamManager {
             }
         };
 
-        Ok(StreamId(next_id))
+        Ok(stream_id_helpers::from_raw(next_id))
     }
 
     /// Validate stream ID (check against limits)
     pub fn validate_stream_id(&self, stream_id: StreamId) -> Result<()> {
-        let initiator = stream_id.initiator();
-        let direction = stream_id.direction();
+        let raw_id = stream_id;
+        let initiator = stream_id_helpers::initiator(stream_id);
+        let direction = stream_id_helpers::direction(stream_id);
         let is_remote = (self.side == Side::Client && initiator == StreamInitiator::Server)
             || (self.side == Side::Server && initiator == StreamInitiator::Client);
 
@@ -254,7 +255,7 @@ impl StreamManager {
             (false, StreamDirection::Unidirectional) => self.max_streams_uni_local,
         };
 
-        let stream_count = stream_id.0 / 4;
+        let stream_count = raw_id / 4;
         if stream_count >= max_streams {
             return Err(Error::Transport(TransportError::StreamLimitError));
         }

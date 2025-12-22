@@ -227,23 +227,22 @@ pub mod server;
 
 // Re-export commonly used types
 pub use types::{
-    ConnectionId, Instant, PacketNumber, PacketNumberSpace, Side, StreamDirection, StreamId,
-    StreamInitiator, StreamOffset, VarInt, VarIntCodec, VARINT_MAX,
+    ConnectionId, Instant, PacketNumber, PacketNumberSpace, Side, StreamId,
+    StreamOffset, VarInt, VarIntCodec, VARINT_MAX, StatelessResetToken,
 };
 
 pub use error::{ApplicationError, CryptoError, Error, Result, TransportError};
 
-pub use version::{QuicVersion, VERSION_1, VERSION_2, VERSION_NEGOTIATION};
+pub use version::{QuicVersion, VERSION_1, VERSION_NEGOTIATION};
 
 // Re-export primary traits for library consumers
-pub use connection::{Connection, ConnectionConfig, ConnectionEvent, ConnectionState};
-pub use connection::state::QuicConnection;
-pub use crypto::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, KeySchedule, TlsSession};
+pub use connection::state::{ConnectionState, ConnectionConfig};
+pub use crypto::backend::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, TlsSession};
 pub use frames::{Frame, FrameParser};
 pub use frames::parse::FrameSerializer;
-pub use packet::{Header, HeaderForm, PacketParser, PacketType};
-pub use recovery::{CongestionController, CongestionControllerFactory, LossDetector, RttEstimator};
-pub use server::{QuicServer, ServerConfig};
-pub use stream::{StreamController, StreamManager, StreamState};
+pub use packet::header::{Header, HeaderForm, PacketType};
+pub use packet::parser::PacketParser as PacketParserTrait;
+pub use recovery::{CongestionController, LossDetector, RttEstimator};
+pub use stream::{StreamController, StreamManager};
 pub use transport::TransportParameters;
 

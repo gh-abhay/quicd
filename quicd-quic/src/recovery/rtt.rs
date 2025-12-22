@@ -105,6 +105,6 @@ pub struct RttSample {
 impl RttSample {
     /// Calculate RTT from sample
     pub fn rtt(&self) -> Duration {
-        self.ack_time.duration_since(self.sent_time)
+        self.ack_time.duration_since(self.sent_time).unwrap_or(Duration::from_secs(0))
     }
 }

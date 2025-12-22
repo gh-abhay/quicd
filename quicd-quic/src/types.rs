@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 use bytes::Bytes;
 use core::time::Duration;
 
@@ -148,50 +150,67 @@ impl VarIntCodec {
 // Connection ID (RFC 9000 Section 5.1, RFC 8999 Section 5.3)
 // ============================================================================
 
-/// Connection ID (RFC 9000 Section 5.1, RFC 8999 Section 5.3)
+/// Maximum length of a Connection ID (20 bytes per RFC 9000)
+pub const MAX_CID_LENGTH: usize = 20;
+
+/// Connection ID - Version-independent identifier (RFC 8999 Section 5.3)
 ///
-/// Opaque identifier for a connection. Length: 0-20 bytes.
-/// Used for routing packets to the correct connection context.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Connection IDs are opaque byte sequences chosen by endpoints.
+/// Zero-length CIDs are permitted.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConnectionId {
-    bytes: tinyvec::TinyVec<[u8; 20]>,
+    bytes: Bytes,
 }
 
 impl ConnectionId {
-    /// Maximum Connection ID length in bytes (RFC 9000 Section 17.2)
-    pub const MAX_LENGTH: usize = 20;
-
-    /// Create a new Connection ID from a byte slice.
-    /// Returns None if length > 20 bytes.
-    pub fn new(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() > Self::MAX_LENGTH {
+    /// Create a new ConnectionId from bytes
+    ///
+    /// Returns None if length exceeds MAX_CID_LENGTH
+    pub fn new(bytes: Bytes) -> Option<Self> {
+        if bytes.len() > MAX_CID_LENGTH {
             return None;
         }
-        let mut vec = tinyvec::TinyVec::new();
-        vec.extend_from_slice(bytes);
-        Some(Self { bytes: vec })
+        Some(Self { bytes })
     }
 
-    /// Create an empty (zero-length) Connection ID
-    pub fn empty() -> Self {
-        Self {
-            bytes: tinyvec::TinyVec::new(),
+    /// Create from a borrowed slice (copies data)
+    pub fn from_slice(slice: &[u8]) -> Option<Self> {
+        if slice.len() > MAX_CID_LENGTH {
+            return None;
         }
+        Some(Self {
+            bytes: Bytes::copy_from_slice(slice),
+        })
     }
 
-    /// Returns the byte slice of this Connection ID
+    /// Access the underlying bytes
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    /// Returns the length in bytes
+    /// Length of the connection ID
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
 
-    /// Returns true if the Connection ID is zero-length
+    /// Check if this is a zero-length connection ID
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+}
+
+impl core::fmt::Debug for ConnectionId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "ConnectionId({:02x?})", &self.bytes[..])
+    }
+}
+
+impl core::fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in &self.bytes[..] {
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
     }
 }
 
@@ -199,124 +218,132 @@ impl ConnectionId {
 // Packet Number (RFC 9000 Section 12.3)
 // ============================================================================
 
-/// Packet Number (RFC 9000 Section 12.3)
+/// Packet Number - Monotonically increasing per packet number space
 ///
-/// 62-bit packet number. Encoded in 1-4 bytes in packet headers.
-/// Monotonically increasing per packet number space.
+/// Packet numbers are 62-bit integers (0 to 2^62-1) that increase
+/// monotonically within each packet number space.
 pub type PacketNumber = u64;
 
-/// Maximum Packet Number value (2^62 - 1)
-pub const PACKET_NUMBER_MAX: u64 = VARINT_MAX;
+/// Maximum packet number value (2^62 - 1)
+pub const MAX_PACKET_NUMBER: u64 = (1u64 << 62) - 1;
 
-/// Packet Number Space (RFC 9000 Section 12.1)
+/// Packet Number Space (RFC 9000 Section 12.3)
 ///
-/// QUIC has three distinct packet number spaces, each with independent
-/// packet number sequences:
-/// - Initial: Used for initial handshake packets
-/// - Handshake: Used after Initial keys are available
-/// - ApplicationData: Used for 0-RTT and 1-RTT packets
+/// QUIC uses three separate packet number spaces to avoid ambiguity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PacketNumberSpace {
-    /// Initial packet number space
-    Initial,
-    /// Handshake packet number space
-    Handshake,
-    /// Application data packet number space (0-RTT and 1-RTT)
-    ApplicationData,
+    /// Initial packet space (Initial packets)
+    Initial = 0,
+    /// Handshake packet space (Handshake packets)
+    Handshake = 1,
+    /// Application data packet space (0-RTT and 1-RTT packets)
+    ApplicationData = 2,
 }
 
 // ============================================================================
-// Stream ID and Offsets (RFC 9000 Section 2)
+// Stream ID (RFC 9000 Section 2.1)
 // ============================================================================
 
-/// Stream ID (RFC 9000 Section 2.1)
+/// Stream ID - Identifies a bidirectional or unidirectional stream
 ///
-/// 62-bit identifier for streams. Lower 2 bits encode:
-/// - Bit 0: Client-initiated (0) or Server-initiated (1)
-/// - Bit 1: Bidirectional (0) or Unidirectional (1)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct StreamId(pub u64);
+/// The two least significant bits encode stream type and initiator:
+/// - Bit 0: Direction (0=bidirectional, 1=unidirectional)
+/// - Bit 1: Initiator (0=client, 1=server)
+pub type StreamId = u64;
 
-impl StreamId {
-    /// Extract the initiator from a stream ID
-    pub fn initiator(self) -> StreamInitiator {
-        if self.0 & 0x01 == 0 {
-            StreamInitiator::Client
-        } else {
-            StreamInitiator::Server
+/// Maximum Stream ID value (2^62 - 1)
+pub const MAX_STREAM_ID: u64 = VARINT_MAX;
+
+/// Stream Type - Encodes directionality and initiator
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamType {
+    /// Client-initiated bidirectional stream
+    ClientBidirectional = 0x00,
+    /// Server-initiated bidirectional stream
+    ServerBidirectional = 0x01,
+    /// Client-initiated unidirectional stream
+    ClientUnidirectional = 0x02,
+    /// Server-initiated unidirectional stream
+    ServerUnidirectional = 0x03,
+}
+
+impl StreamType {
+    /// Extract stream type from stream ID
+    pub fn from_stream_id(id: StreamId) -> Self {
+        match id & 0x03 {
+            0x00 => StreamType::ClientBidirectional,
+            0x01 => StreamType::ServerBidirectional,
+            0x02 => StreamType::ClientUnidirectional,
+            0x03 => StreamType::ServerUnidirectional,
+            _ => unreachable!(),
         }
     }
 
-    /// Extract the direction from a stream ID
-    pub fn direction(self) -> StreamDirection {
-        if self.0 & 0x02 == 0 {
-            StreamDirection::Bidirectional
-        } else {
-            StreamDirection::Unidirectional
-        }
-    }
-
-    /// Check if this stream ID is for a bidirectional stream
+    /// Check if this stream type is bidirectional
     pub fn is_bidirectional(self) -> bool {
-        matches!(self.direction(), StreamDirection::Bidirectional)
+        matches!(self, StreamType::ClientBidirectional | StreamType::ServerBidirectional)
     }
 
-    /// Check if this stream ID is for a unidirectional stream
+    /// Check if this stream type is unidirectional
     pub fn is_unidirectional(self) -> bool {
-        matches!(self.direction(), StreamDirection::Unidirectional)
+        !self.is_bidirectional()
     }
 
-    /// Check if this stream was initiated by the client
+    /// Check if client initiated this stream type
     pub fn is_client_initiated(self) -> bool {
-        matches!(self.initiator(), StreamInitiator::Client)
+        matches!(self, StreamType::ClientBidirectional | StreamType::ClientUnidirectional)
     }
 
-    /// Check if this stream was initiated by the server
+    /// Check if server initiated this stream type
     pub fn is_server_initiated(self) -> bool {
-        matches!(self.initiator(), StreamInitiator::Server)
-    }
-
-    /// Get the inner u64 value
-    pub fn into_inner(self) -> u64 {
-        self.0
+        !self.is_client_initiated()
     }
 }
 
-/// Stream Offset (RFC 9000 Section 2.2)
-///
-/// Byte offset within a stream. Used in STREAM frames.
+/// Stream Offset - Byte offset within a stream
 pub type StreamOffset = u64;
 
-/// Stream Direction (RFC 9000 Section 2.1)
-///
-/// Indicates whether a stream is bidirectional or unidirectional.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamDirection {
-    /// Bidirectional stream - both endpoints can send data
-    Bidirectional,
-    /// Unidirectional stream - only initiator can send data
-    Unidirectional,
-}
+// ============================================================================
+// Side (Client vs Server)
+// ============================================================================
 
-/// Stream Initiator (RFC 9000 Section 2.1)
-///
-/// Indicates which side initiated the stream.
+/// Connection endpoint side
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamInitiator {
-    /// Client-initiated stream
+pub enum Side {
+    /// Client endpoint
     Client,
-    /// Server-initiated stream
+    /// Server endpoint
     Server,
 }
 
+impl Side {
+    /// Check if this side is the client
+    pub fn is_client(self) -> bool {
+        matches!(self, Side::Client)
+    }
+
+    /// Check if this side is the server
+    pub fn is_server(self) -> bool {
+        matches!(self, Side::Server)
+    }
+
+    /// Get the opposite side
+    pub fn opposite(self) -> Side {
+        match self {
+            Side::Client => Side::Server,
+            Side::Server => Side::Client,
+        }
+    }
+}
+
 // ============================================================================
-// Time and Duration (Monotonic Clock Abstraction)
+// Time Abstraction (no_std compatible)
 // ============================================================================
 
-/// Instant in time (monotonic clock)
+/// Monotonic timestamp for QUIC timing operations
 ///
-/// Used for tracking packet send/receive times, timeouts, etc.
-/// Intentionally opaque - implementation provides this via poll().
+/// This abstraction allows no_std usage. The caller must provide
+/// a monotonic clock source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant {
     /// Nanoseconds since an arbitrary epoch
@@ -324,7 +351,7 @@ pub struct Instant {
 }
 
 impl Instant {
-    /// Create a new instant from nanoseconds
+    /// Create an Instant from nanoseconds since epoch
     pub fn from_nanos(nanos: u64) -> Self {
         Self { nanos }
     }
@@ -335,91 +362,192 @@ impl Instant {
     }
 
     /// Calculate duration since another instant
-    pub fn duration_since(&self, earlier: Instant) -> Duration {
-        Duration::from_nanos(self.nanos.saturating_sub(earlier.nanos))
+    ///
+    /// Returns None if other is later than self
+    pub fn duration_since(&self, other: Instant) -> Option<Duration> {
+        if self.nanos >= other.nanos {
+            Some(Duration::from_nanos(self.nanos - other.nanos))
+        } else {
+            None
+        }
+    }
+
+    /// Calculate duration until another instant
+    pub fn duration_until(&self, other: Instant) -> Option<Duration> {
+        other.duration_since(*self)
     }
 
     /// Add a duration to this instant
-    pub fn checked_add(&self, duration: Duration) -> Option<Self> {
-        self.nanos
-            .checked_add(duration.as_nanos() as u64)
-            .map(|nanos| Self { nanos })
+    pub fn checked_add(&self, duration: Duration) -> Option<Instant> {
+        let nanos = duration.as_nanos();
+        if nanos > u64::MAX as u128 {
+            return None;
+        }
+        self.nanos.checked_add(nanos as u64).map(|n| Instant { nanos: n })
     }
 
-    /// Saturating subtraction of duration
-    pub fn saturating_sub(&self, duration: Duration) -> Self {
-        Self {
-            nanos: self.nanos.saturating_sub(duration.as_nanos() as u64),
+    /// Subtract a duration from this instant
+    pub fn checked_sub(&self, duration: Duration) -> Option<Instant> {
+        let nanos = duration.as_nanos();
+        if nanos > u64::MAX as u128 {
+            return None;
         }
+        self.nanos.checked_sub(nanos as u64).map(|n| Instant { nanos: n })
     }
 }
 
 // ============================================================================
-// Connection Side and Roles
+// Token (RFC 9000 Section 8.1)
 // ============================================================================
 
-/// Side of the connection (RFC 9000 Section 3)
+/// Address Validation Token
 ///
-/// Distinguishes between client and server roles.
+/// Opaque blob issued by servers for address validation.
+/// Clients echo these in subsequent Initial packets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Token {
+    bytes: Bytes,
+}
+
+impl Token {
+    /// Create a new token from bytes
+    pub fn new(bytes: Bytes) -> Self {
+        Self { bytes }
+    }
+
+    /// Create token from slice (copies data)
+    pub fn from_slice(slice: &[u8]) -> Self {
+        Self {
+            bytes: Bytes::copy_from_slice(slice),
+        }
+    }
+
+    /// Access the underlying bytes
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Length of the token
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Check if token is empty
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+// ============================================================================
+// Constants from RFC 9000
+// ============================================================================
+
+/// Default UDP payload size (1200 bytes per RFC 9000 Section 14.1)
+pub const DEFAULT_MAX_UDP_PAYLOAD_SIZE: usize = 1200;
+
+/// Minimum Initial packet size (1200 bytes per RFC 9000 Section 14.1)
+pub const MIN_INITIAL_PACKET_SIZE: usize = 1200;
+
+/// Maximum UDP payload size for IPv4 (65527 bytes)
+pub const MAX_UDP_PAYLOAD_SIZE_IPV4: usize = 65527;
+
+/// Maximum UDP payload size for IPv6 (65535 bytes)
+pub const MAX_UDP_PAYLOAD_SIZE_IPV6: usize = 65535;
+
+/// Default idle timeout (30 seconds)
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum idle timeout (600 seconds per RFC 9000)
+pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Default maximum number of bidirectional streams
+pub const DEFAULT_MAX_STREAMS_BIDI: u64 = 100;
+
+/// Default maximum number of unidirectional streams
+pub const DEFAULT_MAX_STREAMS_UNI: u64 = 100;
+
+/// Default initial maximum data (15 MB)
+pub const DEFAULT_INITIAL_MAX_DATA: u64 = 15 * 1024 * 1024;
+
+
+// Additional types needed by the crate
+pub type StatelessResetToken = [u8; 16];
+
+/// Stream Direction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    /// Client initiated the connection
+pub enum StreamDirection {
+    Bidirectional,
+    Unidirectional,
+}
+
+/// Stream Initiator
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamInitiator {
     Client,
-    /// Server accepted the connection
     Server,
 }
 
-impl Side {
-    /// Returns true if this side initiates streams with even IDs
-    pub fn initiates_even_streams(&self) -> bool {
-        matches!(self, Side::Client)
+// ============================================================================
+// StreamId Helper Functions
+// ============================================================================
+
+/// Helper functions for StreamId operations
+pub mod stream_id_helpers {
+    use super::*;
+
+    /// Create a StreamId from raw u64 value
+    #[inline]
+    pub fn from_raw(id: u64) -> StreamId {
+        id
     }
 
-    /// Returns true if this is the client side
-    pub fn is_client(&self) -> bool {
-        matches!(self, Side::Client)
+    /// Get the raw u64 value from StreamId
+    #[inline]
+    pub fn into_inner(id: StreamId) -> u64 {
+        id
     }
 
-    /// Returns true if this is the server side
-    pub fn is_server(&self) -> bool {
-        matches!(self, Side::Server)
+    /// Get the initiator of a stream
+    #[inline]
+    pub fn initiator(id: StreamId) -> StreamInitiator {
+        if (id & 0x01) == 0 {
+            StreamInitiator::Client
+        } else {
+            StreamInitiator::Server
+        }
+    }
+
+    /// Get the direction of a stream
+    #[inline]
+    pub fn direction(id: StreamId) -> StreamDirection {
+        if (id & 0x02) == 0 {
+            StreamDirection::Bidirectional
+        } else {
+            StreamDirection::Unidirectional
+        }
+    }
+
+    /// Check if stream is client-initiated
+    #[inline]
+    pub fn is_client_initiated(id: StreamId) -> bool {
+        (id & 0x01) == 0
+    }
+
+    /// Check if stream is server-initiated
+    #[inline]
+    pub fn is_server_initiated(id: StreamId) -> bool {
+        (id & 0x01) == 1
+    }
+
+    /// Check if stream is bidirectional
+    #[inline]
+    pub fn is_bidirectional(id: StreamId) -> bool {
+        (id & 0x02) == 0
+    }
+
+    /// Check if stream is unidirectional
+    #[inline]
+    pub fn is_unidirectional(id: StreamId) -> bool {
+        (id & 0x02) != 0
     }
 }
-
-// ============================================================================
-// Tokens and Reset (RFC 9000 Section 8, Section 10)
-// ============================================================================
-
-/// Token (RFC 9000 Section 8.1)
-///
-/// Opaque blob used for address validation and stateless retry.
-/// - Retry Token: Sent in Retry packets
-/// - NEW_TOKEN: Sent in NEW_TOKEN frames for future connections
-pub type Token = Bytes;
-
-/// Stateless Reset Token (RFC 9000 Section 10.3)
-///
-/// 16-byte token used to reset a connection without per-connection state.
-pub type StatelessResetToken = [u8; 16];
-
-// ============================================================================
-// Protocol Constants (RFC 9000)
-// ============================================================================
-
-/// Maximum UDP payload size (bytes)
-///
-/// RFC 9000 Section 14: Initial packets must be at least 1200 bytes.
-/// IPv6 minimum MTU is 1280 bytes, leaving room for UDP/IP headers.
-pub const MIN_INITIAL_PACKET_SIZE: usize = 1200;
-
-/// Maximum QUIC packet size (without considering MTU)
-pub const MAX_PACKET_SIZE: usize = 65527; // Max UDP payload for IPv6
-
-/// Default maximum datagram size
-pub const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1200;
-
-/// Default idle timeout (milliseconds)
-pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 30_000;
-
-/// Maximum connection ID sequence number
-pub const MAX_CID_SEQUENCE: u64 = VARINT_MAX;

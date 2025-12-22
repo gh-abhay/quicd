@@ -245,10 +245,10 @@ pub enum HeaderForm {
 // Default Parser Implementation Skeleton
 // ============================================================================
 
-/// Default zero-copy packet parser
-pub struct DefaultPacketParser;
+/// Default zero-copy packet header parser
+pub struct DefaultHeaderParser;
 
-impl PacketParser for DefaultPacketParser {
+impl PacketParser for DefaultHeaderParser {
     fn parse_header<'a>(&self, packet: &'a [u8]) -> Result<(Header<'a>, usize)> {
         unimplemented!("Skeleton - no implementation required")
     }
