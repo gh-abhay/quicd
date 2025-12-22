@@ -4,12 +4,10 @@
 
 #![forbid(unsafe_code)]
 
-use crate::error::{ApplicationError, Error, Result, TransportError};
+use crate::error::{ApplicationError, TransportError};
 use crate::types::{
-    ConnectionId, PacketNumber, StatelessResetToken, StreamId, StreamOffset, VarInt,
+    PacketNumber, StatelessResetToken, StreamId, StreamOffset, VarInt,
 };
-use bytes::Bytes;
-use core::time::Duration;
 
 // ============================================================================
 // Frame Type Constants (RFC 9000 Section 19)

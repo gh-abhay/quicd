@@ -49,7 +49,7 @@ impl VarIntCodec {
                 if buf.len() < 2 {
                     return None;
                 }
-                let value = (((first as u64 & 0x3f) << 8) | buf[1] as u64);
+                let value = ((first as u64 & 0x3f) << 8) | buf[1] as u64;
                 Some((value, 2))
             }
             0b10 => {
@@ -57,10 +57,10 @@ impl VarIntCodec {
                 if buf.len() < 4 {
                     return None;
                 }
-                let value = (((first as u64 & 0x3f) << 24)
+                let value = ((first as u64 & 0x3f) << 24)
                     | ((buf[1] as u64) << 16)
                     | ((buf[2] as u64) << 8)
-                    | (buf[3] as u64));
+                    | (buf[3] as u64);
                 Some((value, 4))
             }
             0b11 => {
@@ -68,14 +68,14 @@ impl VarIntCodec {
                 if buf.len() < 8 {
                     return None;
                 }
-                let value = (((first as u64 & 0x3f) << 56)
+                let value = ((first as u64 & 0x3f) << 56)
                     | ((buf[1] as u64) << 48)
                     | ((buf[2] as u64) << 40)
                     | ((buf[3] as u64) << 32)
                     | ((buf[4] as u64) << 24)
                     | ((buf[5] as u64) << 16)
                     | ((buf[6] as u64) << 8)
-                    | (buf[7] as u64));
+                    | (buf[7] as u64);
                 Some((value, 8))
             }
             _ => unreachable!(),

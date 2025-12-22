@@ -6,9 +6,7 @@
 #![forbid(unsafe_code)]
 
 use crate::error::{Error, Result, TransportError};
-use crate::types::{ConnectionId, PacketNumber, VarInt};
-use bytes::Bytes;
-use core::fmt;
+use crate::types::VarInt;
 
 // ============================================================================
 // Header Form Constants (RFC 8999 Section 5.1, RFC 9000 Section 17)

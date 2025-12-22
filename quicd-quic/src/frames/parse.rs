@@ -5,11 +5,10 @@
 #![forbid(unsafe_code)]
 
 extern crate alloc;
-use alloc::vec::Vec;
 
 use super::types::*;
 use crate::error::{Error, Result, TransportError};
-use crate::types::{VarIntCodec, VARINT_MAX};
+use crate::types::VarIntCodec;
 use bytes::BytesMut;
 
 /// Frame Parser Trait
