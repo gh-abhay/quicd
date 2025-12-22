@@ -18,64 +18,17 @@
 //! ### Packet Protection (Section 5)
 //! QUIC packets are encrypted using AEAD (Authenticated Encryption with Associated Data).
 //! The payload is encrypted, and the header is authenticated as additional data.
-//!
-//! ### Header Protection (Section 5.4)
-//! After packet protection, the packet number and certain header bits are obfuscated
-//! using a sample of the encrypted payload. This prevents passive observers from
-//! tracking packet numbers.
-//!
-//! ### Key Phases (Section 6)
-//! QUIC uses different keys for different packet types and connection phases:
-//! - **Initial Keys**: Derived from the destination connection ID (publicly known)
-//! - **Handshake Keys**: Derived from the TLS handshake
-//! - **0-RTT Keys**: For early data (client only)
-//! - **1-RTT Keys**: For application data after handshake completes
-//!
-//! ## Zero-Copy Design
-//!
-//! All cryptographic operations work **in-place** on mutable buffers to avoid copying:
-//! - `encrypt_in_place(&mut [u8])` - Encrypts buffer contents without allocation
-//! - `decrypt_in_place(&mut [u8])` - Decrypts buffer contents without allocation
-//! - `apply_header_protection(&mut [u8])` - Obfuscates header bits in-place
-//!
-//! The caller provides the buffer, and the crypto provider modifies it directly.
 
-#![forbid(unsafe_code)]
+pub mod backend;
+
+pub use backend::{
+    Aead, AeadAlgorithm, CryptoBackend, CryptoKeys, EncryptionLevel, HandshakeStatus,
+    HeaderProtection, HeaderProtectionAlgorithm, InitialSecretDerivation, KeyPhase,
+    INITIAL_SALT_V1,
+};
 
 use crate::error::Result;
-use core::time::Duration;
-
-/// Type alias for time tracking (no_std compatible)
-/// In no_std environments, callers provide monotonic time as Duration since epoch
-pub type Instant = Duration;
-
-// ============================================================================
-// Core Types
-// ============================================================================
-
-/// Encryption Level (RFC 9001 Section 4.1.4)
-///
-/// QUIC uses four encryption levels corresponding to TLS record types:
-/// - Initial: Publicly derivable keys (RFC 9001 Section 5.2)
-/// - Handshake: Keys from TLS handshake messages
-/// - EarlyData: 0-RTT keys for early data (client to server)
-/// - ApplicationData: 1-RTT keys for normal application data
-///
-/// Each level has independent packet number spaces and keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EncryptionLevel {
-    Initial,
-    Handshake,
-    EarlyData,      // 0-RTT
-    ApplicationData, // 1-RTT
-}
-
-/// Key Phase Bit (RFC 9001 Section 6)
-///
-/// The Key Phase bit in 1-RTT packet headers indicates which key generation
-/// is in use. This allows for in-flight key updates without coordination.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeyPhase(pub bool);
+use crate::types::Instant;
 
 /// AEAD Nonce for packet encryption
 ///
@@ -326,38 +279,6 @@ pub trait HeaderProtector {
 }
 
 // ============================================================================
-// Trait: Initial Secret Derivation (RFC 9001 Section 5.2)
-// ============================================================================
-
-/// Initial Secrets Derivation
-///
-/// Initial packets use keys derived from the Destination Connection ID and
-/// a version-specific salt. This allows the client's first packet to be
-/// encrypted without a prior TLS handshake.
-///
-/// **RFC 9001 Section 5.2**: Initial keys are derived using HKDF-Expand-Label
-/// with the salt `0x38762cf7f55934b34d179ae6a4c80cadccbb7f0a`.
-///
-/// **Security Note**: Initial keys are publicly derivable, so Initial packets
-/// provide only obfuscation, not strong confidentiality. They protect against
-/// off-path attackers but not on-path observers.
-pub trait InitialSecretDerivation {
-    /// Derive initial secrets from a connection ID
-    ///
-    /// # Arguments
-    /// * `connection_id` - The destination connection ID from the client's Initial packet
-    /// * `version` - The QUIC version (affects the salt used)
-    ///
-    /// # Returns
-    /// A tuple of (client_secret, server_secret) for deriving keys.
-    fn derive_initial_secrets(
-        &self,
-        connection_id: &[u8],
-        version: u32,
-    ) -> Result<([u8; 32], [u8; 32])>;
-}
-
-// ============================================================================
 // Zero-Copy Helpers
 // ============================================================================
 
@@ -385,19 +306,7 @@ pub fn construct_nonce(iv: &[u8; 12], packet_number: u64) -> Nonce {
     nonce
 }
 
-// ============================================================================
-// Constants
-// ============================================================================
-
-/// Initial salt for QUIC v1 (RFC 9001 Section 5.2)
-pub const INITIAL_SALT_V1: [u8; 20] = [
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3,
-    0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
-    0xcc, 0xbb, 0x7f, 0x0a,
-];
-
-/// AEAD tag length for AES-128-GCM and ChaCha20-Poly1305 (16 bytes)
-pub const AEAD_TAG_LEN: usize = 16;
-
-/// Header protection sample length (always 16 bytes)
-pub const HP_SAMPLE_LEN: usize = 16;
+// Constants re-exported from backend module:
+// - INITIAL_SALT_V1
+// - AEAD_TAG_LEN (if needed)
+// - HP_SAMPLE_LEN (if needed)

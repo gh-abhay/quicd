@@ -39,7 +39,18 @@
 
 #![forbid(unsafe_code)]
 
-use crate::error::{Error, Result};
+pub mod traits;
+
+pub use traits::{
+    AckedPacketInfo, CongestionEvent, CongestionState,
+    LossDetectionTimer, LostPacketInfo, NewRenoConfig,
+    RecoveryManager, RttMicros, RttStats, SentPacketInfo,
+};
+
+pub mod constants {
+    pub use super::traits::constants::*;
+}
+
 use crate::packet::{PacketNumber, PacketNumberSpace};
 use core::time::Duration;
 

@@ -6,7 +6,14 @@
 //!
 //! Flow control is bidirectional - both sender and receiver track limits.
 
-use crate::frames::{VarInt, StreamId};
+pub mod controller;
+
+pub use controller::{
+    ConnectionFlowController, FlowControlConfig, FlowControlLimit, FlowControlManager,
+    StreamFlowController,
+};
+
+use crate::frames::StreamId;
 use crate::error::{Error, Result, TransportError};
 
 /// Connection-level flow control state (RFC 9000 Section 4.1)
@@ -311,12 +318,12 @@ impl StreamFlowControl {
     }
 }
 
-/// Flow control manager for all streams on a connection
+/// Flow control manager implementation for all streams on a connection
 ///
 /// **Design**: Maintains both connection-level and per-stream flow control.
 /// Validates that stream-level limits don't exceed connection-level limits.
 #[derive(Debug)]
-pub struct FlowControlManager {
+pub struct FlowControlManagerImpl {
     /// Connection-level flow control
     connection: ConnectionFlowControl,
     
@@ -329,7 +336,7 @@ pub struct FlowControlManager {
     initial_recv_max_stream_data_uni: u64,
 }
 
-impl FlowControlManager {
+impl FlowControlManagerImpl {
     /// Create new flow control manager from transport parameters
     pub fn new(
         conn_send_max: u64,

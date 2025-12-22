@@ -34,31 +34,11 @@
 //!
 //! All frame parsing operates on borrowed slices (`&'a [u8]`), returning structures
 //! that reference the original packet data. This avoids copying payload data.
-//!
-//! **Example**:
-//! ```rust,ignore
-//! let packet: &[u8] = /* received packet */;
-//! let mut cursor = packet;
-//! 
-//! while !cursor.is_empty() {
-//!     let (frame, remaining) = Frame::parse(cursor)?;
-//!     match frame {
-//!         Frame::Stream { data, .. } => {
-//!             // `data` is a zero-copy reference to `packet`
-//!             process_stream_data(data);
-//!         }
-//!         _ => { /* handle other frames */ }
-//!     }
-//!     cursor = remaining;
-//! }
-//! ```
-
-#![forbid(unsafe_code)]
 
 use core::fmt;
 
-// Re-export parsing logic
 pub mod parse;
+pub mod types;
 
 // ============================================================================
 // Core Types

@@ -18,24 +18,16 @@
 //! Receiving Side:
 //!   Recv → Size Known → Data Recvd → Reset Recvd
 //! ```
-//!
-//! ### Unidirectional Stream States (RFC 9000 Section 3.3)
-//!
-//! Unidirectional streams have only one direction (send or receive), so they
-//! follow a simplified version of the bidirectional state machine.
-//!
-//! ## Flow Control (RFC 9000 Section 4)
-//!
-//! Each stream has independent flow control managed by MAX_STREAM_DATA frames:
-//! - **Send-side limit**: How much data we can send (peer's advertised limit)
-//! - **Receive-side limit**: How much data we allow the peer to send
-//!
-//! ## Zero-Copy Data Management
-//!
-//! Stream data is managed using references to packet buffers. The reassembly
-//! buffer handles out-of-order data delivery without copying.
 
 #![forbid(unsafe_code)]
+
+pub mod manager;
+
+pub use manager::{
+    BidiStreamState, StreamChunk, StreamController, StreamPriority,
+    StreamReadResult, StreamReassembler, StreamRecvState, StreamSendState, StreamState,
+    StreamWriteResult, UniStreamState,
+};
 
 use crate::error::{Error, Result, TransportError};
 use crate::frames::StreamId;

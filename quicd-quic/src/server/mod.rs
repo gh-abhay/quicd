@@ -1,9 +1,13 @@
 //! # QUIC Server State Machine
 //!
-//! **Note**: Placeholder - full implementation to follow
+//! RFC 9000 Section 7
 
 #![forbid(unsafe_code)]
 
-use crate::{ConnectionId, Version};
-
 pub mod session;
+pub mod accept;
+
+pub use accept::{
+    AcceptResult, ConnectionIdGenerator, InitialPacketInfo, Server, ServerBuilder, ServerConfig,
+    TokenGenerator,
+};
