@@ -44,3 +44,10 @@ pub use parser::{
 };
 pub use protection::{HeaderProtectionProvider, InPlaceHeaderProtectionRemover};
 
+// Stub types for main binary compatibility
+#[derive(Debug)]
+pub struct Packet;
+
+#[derive(Debug)]
+pub struct ParseContext;
+

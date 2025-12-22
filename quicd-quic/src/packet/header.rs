@@ -250,11 +250,37 @@ pub struct DefaultHeaderParser;
 
 impl PacketParser for DefaultHeaderParser {
     fn parse_header<'a>(&self, packet: &'a [u8]) -> Result<(Header<'a>, usize)> {
-        unimplemented!("Skeleton - no implementation required")
+        if packet.is_empty() {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+
+        let first_byte = packet[0];
+
+        // Validate Fixed Bit (RFC 9000 Section 17.2)
+        if (first_byte & FIXED_BIT) == 0 {
+            return Err(Error::Transport(TransportError::ProtocolViolation));
+        }
+
+        // Check header form
+        if (first_byte & HEADER_FORM_BIT) != 0 {
+            // Long Header
+            self.parse_long_header(packet)
+        } else {
+            // Short Header
+            self.parse_short_header(packet)
+        }
     }
 
     fn peek_header_form(&self, packet: &[u8]) -> Result<HeaderForm> {
-        unimplemented!("Skeleton - no implementation required")
+        if packet.is_empty() {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+
+        if (packet[0] & HEADER_FORM_BIT) != 0 {
+            Ok(HeaderForm::Long)
+        } else {
+            Ok(HeaderForm::Short)
+        }
     }
 
     fn extract_dcid<'a>(
@@ -262,7 +288,217 @@ impl PacketParser for DefaultHeaderParser {
         packet: &'a [u8],
         dcid_len: Option<usize>,
     ) -> Result<&'a [u8]> {
-        unimplemented!("Skeleton - no implementation required")
+        if packet.is_empty() {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+
+        let first_byte = packet[0];
+
+        if (first_byte & HEADER_FORM_BIT) != 0 {
+            // Long Header: DCID starts at byte 6
+            if packet.len() < 6 {
+                return Err(Error::Transport(TransportError::FrameEncodingError));
+            }
+
+            let dcid_len = packet[5] as usize;
+            if packet.len() < 6 + dcid_len {
+                return Err(Error::Transport(TransportError::FrameEncodingError));
+            }
+
+            Ok(&packet[6..6 + dcid_len])
+        } else {
+            // Short Header: DCID starts at byte 1
+            let dcid_len = dcid_len.ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+            if packet.len() < 1 + dcid_len {
+                return Err(Error::Transport(TransportError::FrameEncodingError));
+            }
+
+            Ok(&packet[1..1 + dcid_len])
+        }
+    }
+}
+
+impl DefaultHeaderParser {
+    /// Parse Long Header (RFC 9000 Section 17.2)
+    fn parse_long_header<'a>(&self, packet: &'a [u8]) -> Result<(Header<'a>, usize)> {
+        use crate::types::VarIntCodec;
+
+        if packet.len() < 5 {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+
+        let first_byte = packet[0];
+        let mut offset = 1;
+
+        // Parse Version (4 bytes)
+        let version = u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]);
+        offset += 4;
+
+        // Parse DCID Length + DCID
+        let dcid_len = packet[offset] as usize;
+        offset += 1;
+
+        if dcid_len > 20 {
+            return Err(Error::Transport(TransportError::ProtocolViolation));
+        }
+
+        if packet.len() < offset + dcid_len {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+
+        let dcid = &packet[offset..offset + dcid_len];
+        offset += dcid_len;
+
+        // Parse SCID Length + SCID
+        if packet.len() < offset + 1 {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+
+        let scid_len = packet[offset] as usize;
+        offset += 1;
+
+        if scid_len > 20 {
+            return Err(Error::Transport(TransportError::ProtocolViolation));
+        }
+
+        if packet.len() < offset + scid_len {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+
+        let scid = &packet[offset..offset + scid_len];
+        offset += scid_len;
+
+        // Version Negotiation packet check
+        if version == 0x00000000 {
+            return Ok((
+                Header::Long(LongHeader {
+                    packet_type: PacketType::VersionNegotiation,
+                    version,
+                    dcid,
+                    scid,
+                    token: None,
+                    length: None,
+                    packet_number: None,
+                }),
+                offset,
+            ));
+        }
+
+        // Determine packet type
+        let packet_type_bits = first_byte & LONG_PACKET_TYPE_MASK;
+        let packet_type = match packet_type_bits {
+            LONG_PACKET_TYPE_INITIAL => PacketType::Initial,
+            LONG_PACKET_TYPE_0RTT => PacketType::ZeroRtt,
+            LONG_PACKET_TYPE_HANDSHAKE => PacketType::Handshake,
+            LONG_PACKET_TYPE_RETRY => PacketType::Retry,
+            _ => return Err(Error::Transport(TransportError::ProtocolViolation)),
+        };
+
+        // Parse token (Initial and Retry packets)
+        let token = if matches!(packet_type, PacketType::Initial) {
+            let (token_length, consumed) = VarIntCodec::decode(&packet[offset..])
+                .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+            offset += consumed;
+
+            if token_length > (packet.len() - offset) as u64 {
+                return Err(Error::Transport(TransportError::FrameEncodingError));
+            }
+
+            let token_data = &packet[offset..offset + token_length as usize];
+            offset += token_length as usize;
+            Some(token_data)
+        } else if matches!(packet_type, PacketType::Retry) {
+            // Retry has token at end (all remaining bytes except 16-byte integrity tag)
+            if packet.len() < offset + 16 {
+                return Err(Error::Transport(TransportError::FrameEncodingError));
+            }
+            let token_data = &packet[offset..packet.len() - 16];
+            return Ok((
+                Header::Long(LongHeader {
+                    packet_type,
+                    version,
+                    dcid,
+                    scid,
+                    token: Some(token_data),
+                    length: None,
+                    packet_number: None,
+                }),
+                packet.len(),
+            ));
+        } else {
+            None
+        };
+
+        // Parse Length + Packet Number (not in Retry packets)
+        let (length, consumed) = VarIntCodec::decode(&packet[offset..])
+            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        offset += consumed;
+
+        // Packet Number Length from first byte (bottom 2 bits)
+        let pn_len = ((first_byte & PACKET_NUMBER_LENGTH_MASK) as usize) + 1;
+
+        if packet.len() < offset + pn_len {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+
+        let packet_number = &packet[offset..offset + pn_len];
+        offset += pn_len;
+
+        Ok((
+            Header::Long(LongHeader {
+                packet_type,
+                version,
+                dcid,
+                scid,
+                token,
+                length: Some(length),
+                packet_number: Some(packet_number),
+            }),
+            offset,
+        ))
+    }
+
+    /// Parse Short Header (RFC 9000 Section 17.3)
+    fn parse_short_header<'a>(&self, packet: &'a [u8]) -> Result<(Header<'a>, usize)> {
+        if packet.is_empty() {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+
+        let first_byte = packet[0];
+        let mut offset = 1;
+
+        // Extract flags
+        let spin = (first_byte & SPIN_BIT) != 0;
+        let key_phase = (first_byte & KEY_PHASE_BIT) != 0;
+
+        // Packet Number Length from first byte (bottom 2 bits)
+        let pn_len = ((first_byte & PACKET_NUMBER_LENGTH_MASK) as usize) + 1;
+
+        // DCID: Variable length, must be known from connection state
+        // For parsing, we'll read until we have enough for packet number
+        // In real implementation, DCID length is tracked per connection
+
+        // Simplified: Assume zero-length DCID for now
+        // Real implementation needs connection context
+        let dcid = &packet[offset..offset]; // Empty slice
+
+        // Packet Number
+        if packet.len() < offset + pn_len {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+
+        let packet_number = &packet[offset..offset + pn_len];
+        offset += pn_len;
+
+        Ok((
+            Header::Short(ShortHeader {
+                spin,
+                key_phase,
+                dcid,
+                packet_number,
+            }),
+            offset,
+        ))
     }
 }
 
@@ -306,4 +542,291 @@ pub trait HeaderProtectionRemover {
         header_len: usize,
         sample: &[u8; 16],
     ) -> Result<()>;
+}
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_peek_header_form_long() {
+        let parser = DefaultHeaderParser;
+        let packet = [0xc0, 0x00, 0x00, 0x00, 0x01]; // Long header (Initial)
+        
+        let form = parser.peek_header_form(&packet).unwrap();
+        assert_eq!(form, HeaderForm::Long);
+    }
+
+    #[test]
+    fn test_peek_header_form_short() {
+        let parser = DefaultHeaderParser;
+        let packet = [0x40, 0x01]; // Short header
+        
+        let form = parser.peek_header_form(&packet).unwrap();
+        assert_eq!(form, HeaderForm::Short);
+    }
+
+    #[test]
+    fn test_peek_header_form_empty() {
+        let parser = DefaultHeaderParser;
+        assert!(parser.peek_header_form(&[]).is_err());
+    }
+
+    #[test]
+    fn test_parse_long_header_initial() {
+        let parser = DefaultHeaderParser;
+        
+        // Construct Initial packet header
+        let mut packet = vec![
+            0xc0, // Long header, Initial, pn_len=1
+            0x00, 0x00, 0x00, 0x01, // Version 1
+            0x04, // DCID length = 4
+            0x01, 0x02, 0x03, 0x04, // DCID
+            0x04, // SCID length = 4
+            0x05, 0x06, 0x07, 0x08, // SCID
+            0x00, // Token length = 0
+            0x03, // Length = 3
+            0xaa, // Packet number (1 byte)
+        ];
+        
+        let (header, offset) = parser.parse_header(&packet).unwrap();
+        
+        match header {
+            Header::Long(h) => {
+                assert_eq!(h.packet_type, PacketType::Initial);
+                assert_eq!(h.version, 1);
+                assert_eq!(h.dcid, &[0x01, 0x02, 0x03, 0x04]);
+                assert_eq!(h.scid, &[0x05, 0x06, 0x07, 0x08]);
+                assert_eq!(h.token, Some(&[][..]));
+                assert_eq!(h.length, Some(3));
+                assert_eq!(h.packet_number, Some(&[0xaa][..]));
+            }
+            _ => panic!("Expected Long header"),
+        }
+        
+        assert_eq!(offset, packet.len());
+    }
+
+    #[test]
+    fn test_parse_long_header_with_token() {
+        let parser = DefaultHeaderParser;
+        
+        let mut packet = vec![
+            0xc0, // Long header, Initial
+            0x00, 0x00, 0x00, 0x01, // Version 1
+            0x02, 0xaa, 0xbb, // DCID length + DCID
+            0x02, 0xcc, 0xdd, // SCID length + SCID
+            0x03, 0x11, 0x22, 0x33, // Token length + token
+            0x02, // Length = 2
+            0xff, // Packet number
+        ];
+        
+        let (header, _) = parser.parse_header(&packet).unwrap();
+        
+        match header {
+            Header::Long(h) => {
+                assert_eq!(h.token, Some(&[0x11, 0x22, 0x33][..]));
+            }
+            _ => panic!("Expected Long header"),
+        }
+    }
+
+    #[test]
+    fn test_parse_long_header_handshake() {
+        let parser = DefaultHeaderParser;
+        
+        let packet = vec![
+            0xe0, // Long header, Handshake
+            0x00, 0x00, 0x00, 0x01, // Version 1
+            0x00, // DCID length = 0
+            0x00, // SCID length = 0
+            0x02, // Length = 2
+            0xab, // Packet number
+        ];
+        
+        let (header, _) = parser.parse_header(&packet).unwrap();
+        
+        match header {
+            Header::Long(h) => {
+                assert_eq!(h.packet_type, PacketType::Handshake);
+                assert_eq!(h.dcid.len(), 0);
+                assert_eq!(h.scid.len(), 0);
+                assert_eq!(h.token, None);
+            }
+            _ => panic!("Expected Long header"),
+        }
+    }
+
+    #[test]
+    fn test_parse_version_negotiation() {
+        let parser = DefaultHeaderParser;
+        
+        let packet = vec![
+            0xc0, // Long header
+            0x00, 0x00, 0x00, 0x00, // Version = 0 (Version Negotiation)
+            0x02, 0xaa, 0xbb, // DCID
+            0x02, 0xcc, 0xdd, // SCID
+            // Supported versions follow
+            0x00, 0x00, 0x00, 0x01,
+        ];
+        
+        let (header, offset) = parser.parse_header(&packet).unwrap();
+        
+        match header {
+            Header::Long(h) => {
+                assert_eq!(h.packet_type, PacketType::VersionNegotiation);
+                assert_eq!(h.version, 0);
+                assert_eq!(h.length, None);
+                assert_eq!(h.packet_number, None);
+            }
+            _ => panic!("Expected Long header"),
+        }
+    }
+
+    #[test]
+    fn test_parse_header_invalid_fixed_bit() {
+        let parser = DefaultHeaderParser;
+        
+        // Header with Fixed Bit = 0 (invalid)
+        let packet = [0x80, 0x00, 0x00, 0x00, 0x01];
+        
+        assert!(parser.parse_header(&packet).is_err());
+    }
+
+    #[test]
+    fn test_parse_header_buffer_too_short() {
+        let parser = DefaultHeaderParser;
+        
+        // Incomplete header
+        let packet = [0xc0, 0x00];
+        
+        assert!(parser.parse_header(&packet).is_err());
+    }
+
+    #[test]
+    fn test_parse_header_dcid_too_long() {
+        let parser = DefaultHeaderParser;
+        
+        let mut packet = vec![
+            0xc0, // Long header
+            0x00, 0x00, 0x00, 0x01, // Version
+            21, // DCID length = 21 (exceeds max of 20)
+        ];
+        
+        assert!(parser.parse_header(&packet).is_err());
+    }
+
+    #[test]
+    fn test_extract_dcid_long_header() {
+        let parser = DefaultHeaderParser;
+        
+        let packet = vec![
+            0xc0, // Long header
+            0x00, 0x00, 0x00, 0x01, // Version
+            0x04, // DCID length = 4
+            0xaa, 0xbb, 0xcc, 0xdd, // DCID
+        ];
+        
+        let dcid = parser.extract_dcid(&packet, None).unwrap();
+        assert_eq!(dcid, &[0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn test_extract_dcid_short_header() {
+        let parser = DefaultHeaderParser;
+        
+        let packet = vec![
+            0x40, // Short header
+            0xaa, 0xbb, 0xcc, 0xdd, // DCID (4 bytes)
+        ];
+        
+        let dcid = parser.extract_dcid(&packet, Some(4)).unwrap();
+        assert_eq!(dcid, &[0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn test_packet_type_properties() {
+        assert!(PacketType::Initial.is_long_header());
+        assert!(PacketType::Handshake.is_long_header());
+        assert!(!PacketType::OneRtt.is_long_header());
+        
+        assert!(PacketType::Initial.is_ack_eliciting_type());
+        assert!(!PacketType::Retry.is_ack_eliciting_type());
+        assert!(!PacketType::VersionNegotiation.is_ack_eliciting_type());
+    }
+
+    #[test]
+    fn test_packet_type_packet_number_space() {
+        use crate::types::PacketNumberSpace;
+        
+        assert_eq!(
+            PacketType::Initial.packet_number_space(),
+            Some(PacketNumberSpace::Initial)
+        );
+        assert_eq!(
+            PacketType::Handshake.packet_number_space(),
+            Some(PacketNumberSpace::Handshake)
+        );
+        assert_eq!(
+            PacketType::OneRtt.packet_number_space(),
+            Some(PacketNumberSpace::ApplicationData)
+        );
+        assert_eq!(PacketType::Retry.packet_number_space(), None);
+    }
+
+    #[test]
+    fn test_header_getters() {
+        let long_header = LongHeader {
+            packet_type: PacketType::Initial,
+            version: 1,
+            dcid: &[0x01, 0x02],
+            scid: &[0x03, 0x04],
+            token: None,
+            length: Some(10),
+            packet_number: Some(&[0xaa]),
+        };
+        
+        let header = Header::Long(long_header);
+        
+        assert_eq!(header.packet_type(), PacketType::Initial);
+        assert_eq!(header.dcid(), &[0x01, 0x02]);
+        assert_eq!(header.scid(), Some(&[0x03, 0x04][..]));
+        assert_eq!(header.version(), Some(1));
+        assert_eq!(header.protected_packet_number(), Some(&[0xaa][..]));
+    }
+
+    #[test]
+    fn test_parse_retry_packet() {
+        let parser = DefaultHeaderParser;
+        
+        let mut packet = vec![
+            0xf0, // Long header, Retry
+            0x00, 0x00, 0x00, 0x01, // Version 1
+            0x02, 0xaa, 0xbb, // DCID
+            0x02, 0xcc, 0xdd, // SCID
+        ];
+        
+        // Retry token (variable length)
+        packet.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        
+        // Integrity tag (16 bytes)
+        packet.extend_from_slice(&[0u8; 16]);
+        
+        let (header, offset) = parser.parse_header(&packet).unwrap();
+        
+        match header {
+            Header::Long(h) => {
+                assert_eq!(h.packet_type, PacketType::Retry);
+                assert_eq!(h.token, Some(&[0x11, 0x22, 0x33, 0x44][..]));
+                assert_eq!(h.length, None);
+                assert_eq!(h.packet_number, None);
+            }
+            _ => panic!("Expected Long header"),
+        }
+        
+        assert_eq!(offset, packet.len());
+    }
 }

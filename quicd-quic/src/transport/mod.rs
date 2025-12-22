@@ -190,3 +190,149 @@ impl TransportParametersCodec for DefaultTransportParametersCodec {
         unimplemented!("Skeleton - no implementation required")
     }
 }
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_client_parameters() {
+        let params = TransportParameters::default_client();
+        
+        assert_eq!(params.max_idle_timeout, Duration::from_secs(30));
+        assert_eq!(params.max_udp_payload_size, 65527);
+        assert_eq!(params.ack_delay_exponent, 3);
+        assert_eq!(params.max_ack_delay, Duration::from_millis(25));
+        assert_eq!(params.active_connection_id_limit, 2);
+        assert!(!params.disable_active_migration);
+    }
+
+    #[test]
+    fn test_default_server_parameters() {
+        let params = TransportParameters::default_server();
+        
+        assert_eq!(params.max_idle_timeout, Duration::from_secs(30));
+        assert_eq!(params.max_udp_payload_size, 65527);
+    }
+
+    #[test]
+    fn test_validate_valid_parameters() {
+        let params = TransportParameters::default_client();
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_max_udp_payload_too_small() {
+        let mut params = TransportParameters::default_client();
+        params.max_udp_payload_size = 1199; // Less than minimum 1200
+        
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_max_udp_payload_exactly_minimum() {
+        let mut params = TransportParameters::default_client();
+        params.max_udp_payload_size = 1200; // Exactly minimum
+        
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_ack_delay_exponent_too_large() {
+        let mut params = TransportParameters::default_client();
+        params.ack_delay_exponent = 21; // Exceeds maximum of 20
+        
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_ack_delay_exponent_at_limit() {
+        let mut params = TransportParameters::default_client();
+        params.ack_delay_exponent = 20; // Exactly at limit
+        
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_max_ack_delay_too_large() {
+        let mut params = TransportParameters::default_client();
+        params.max_ack_delay = Duration::from_millis(1 << 14); // Exceeds limit
+        
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_max_ack_delay_at_limit() {
+        let mut params = TransportParameters::default_client();
+        params.max_ack_delay = Duration::from_millis((1 << 14) - 1); // Just under limit
+        
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_active_connection_id_limit_too_small() {
+        let mut params = TransportParameters::default_client();
+        params.active_connection_id_limit = 1; // Less than minimum 2
+        
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_active_connection_id_limit_at_minimum() {
+        let mut params = TransportParameters::default_client();
+        params.active_connection_id_limit = 2; // Exactly minimum
+        
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn test_transport_parameter_ids() {
+        // Verify constants match RFC 9000 Section 18.2
+        assert_eq!(PARAM_ORIGINAL_DESTINATION_CONNECTION_ID, 0x00);
+        assert_eq!(PARAM_MAX_IDLE_TIMEOUT, 0x01);
+        assert_eq!(PARAM_STATELESS_RESET_TOKEN, 0x02);
+        assert_eq!(PARAM_MAX_UDP_PAYLOAD_SIZE, 0x03);
+        assert_eq!(PARAM_INITIAL_MAX_DATA, 0x04);
+        assert_eq!(PARAM_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, 0x05);
+        assert_eq!(PARAM_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, 0x06);
+        assert_eq!(PARAM_INITIAL_MAX_STREAM_DATA_UNI, 0x07);
+        assert_eq!(PARAM_INITIAL_MAX_STREAMS_BIDI, 0x08);
+        assert_eq!(PARAM_INITIAL_MAX_STREAMS_UNI, 0x09);
+        assert_eq!(PARAM_ACK_DELAY_EXPONENT, 0x0a);
+        assert_eq!(PARAM_MAX_ACK_DELAY, 0x0b);
+        assert_eq!(PARAM_DISABLE_ACTIVE_MIGRATION, 0x0c);
+        assert_eq!(PARAM_PREFERRED_ADDRESS, 0x0d);
+        assert_eq!(PARAM_ACTIVE_CONNECTION_ID_LIMIT, 0x0e);
+        assert_eq!(PARAM_INITIAL_SOURCE_CONNECTION_ID, 0x0f);
+        assert_eq!(PARAM_RETRY_SOURCE_CONNECTION_ID, 0x10);
+    }
+
+    #[test]
+    fn test_flow_control_parameters() {
+        let params = TransportParameters::default_client();
+        
+        // Verify default flow control settings are reasonable
+        assert!(params.initial_max_data > 0);
+        assert!(params.initial_max_stream_data_bidi_local > 0);
+        assert!(params.initial_max_stream_data_bidi_remote > 0);
+        assert!(params.initial_max_stream_data_uni > 0);
+        assert!(params.initial_max_streams_bidi > 0);
+        assert!(params.initial_max_streams_uni > 0);
+    }
+
+    #[test]
+    fn test_multiple_validation_failures() {
+        let mut params = TransportParameters::default_client();
+        
+        // Set multiple invalid values
+        params.max_udp_payload_size = 500;
+        params.ack_delay_exponent = 25;
+        params.active_connection_id_limit = 0;
+        
+        // Should fail validation (first error is returned)
+        assert!(params.validate().is_err());
+    }
+}

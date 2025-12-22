@@ -237,7 +237,7 @@ pub use version::{QuicVersion, VERSION_1, VERSION_NEGOTIATION};
 
 // Re-export primary traits for library consumers
 pub use connection::state::{ConnectionState, ConnectionConfig};
-pub use crypto::backend::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, TlsSession};
+pub use crypto::backend::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, TlsSession, KeySchedule};
 pub use frames::{Frame, FrameParser};
 pub use frames::parse::FrameSerializer;
 pub use packet::header::{Header, HeaderForm, PacketType};
@@ -245,4 +245,40 @@ pub use packet::parser::PacketParser as PacketParserTrait;
 pub use recovery::{CongestionController, LossDetector, RttEstimator};
 pub use stream::{StreamController, StreamManager};
 pub use transport::TransportParameters;
+
+// Stub types for main binary compatibility - TODO: implement full Connection API
+/// Stub Connection type - to be replaced with full state machine
+#[derive(Debug)]
+pub struct Connection;
+
+/// Stub Packet type - packet module has primitives but no unified Packet struct yet  
+#[derive(Debug)]
+pub struct Packet;
+
+/// Stub Stream type - stream module defines StreamController trait
+#[derive(Debug)]
+pub struct Stream;
+
+/// Stub ParseContext - used for packet parsing
+#[derive(Debug)]
+pub struct ParseContext;
+
+/// ConnectionIdGenerator trait - for CID routing logic
+pub trait ConnectionIdGenerator: Send + Sync {
+    fn generate(&mut self) -> ConnectionId;
+}
+
+// Type alias for EncryptionLevel (renamed to CryptoLevel in backend)
+pub use crypto::backend::CryptoLevel as EncryptionLevel;
+
+// Re-export sub-modules for convenience
+pub mod cid {
+    pub use crate::types::ConnectionId;
+    pub use crate::ConnectionIdGenerator;
+    pub const MAX_CID_LENGTH: usize = 20;
+}
+
+pub mod frame {
+    pub use crate::frames::Frame;
+}
 

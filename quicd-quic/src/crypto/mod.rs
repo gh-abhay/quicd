@@ -7,5 +7,8 @@ pub mod backend;
 
 pub use backend::{
     AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, KeySchedule,
-    PacketProtection, TlsSession,
+    PacketProtection, TlsEvent, TlsSession,
 };
+
+// Type alias for main binary compatibility
+pub use backend::CryptoLevel as EncryptionLevel;
