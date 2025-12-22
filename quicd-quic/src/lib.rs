@@ -30,19 +30,175 @@
 //!
 //! ## Design Principles
 //!
-//! 1. **Pure State Machine**: No I/O, sockets, or event loops. The library processes input
-//!    bytes/events and produces output bytes/events.
+//! ### 1. Pure State Machine
 //!
-//! 2. **Zero-Copy Parsing**: All frame and packet parsing operates on borrowed slices (`&[u8]`).
-//!    Return types use lifetime parameters to reference original packet data.
+//! No I/O, sockets, or event loops. The library processes input bytes/events
+//! and produces output bytes/events:
 //!
-//! 3. **Zero-Allocation (Runtime)**: No heap allocations in hot paths. Callers provide
-//!    pre-allocated buffers via `bytes::BytesMut` for output operations.
+//! ```rust,ignore
+//! // Process incoming UDP datagram
+//! connection.process_datagram(DatagramInput {
+//!     data: received_bytes,
+//!     recv_time: Instant::now(),
+//! })?;
 //!
-//! 4. **Deterministic**: State transitions are purely deterministic based on inputs and time.
+//! // Poll for outgoing datagrams
+//! while let Some(dgram) = connection.poll_send(&mut send_buf, now) {
+//!     udp_socket.send(&dgram.data)?;
+//! }
+//! ```
 //!
-//! 5. **Pluggable Backends**: Crypto providers and congestion control algorithms are
-//!    abstracted via traits, enabling testability and algorithm swapping.
+//! ### 2. Zero-Copy Parsing
+//!
+//! All frame and packet parsing operates on borrowed slices (`&[u8]`).
+//! Return types use lifetime parameters to reference original packet data:
+//!
+//! ```rust,ignore
+//! // Frame references borrow from original packet
+//! pub struct StreamFrame<'a> {
+//!     pub stream_id: StreamId,
+//!     pub offset: StreamOffset,
+//!     pub data: &'a [u8],  // Zero-copy reference
+//!     pub fin: bool,
+//! }
+//! ```
+//!
+//! ### 3. Buffer Injection Pattern
+//!
+//! Output methods accept caller-provided `bytes::BytesMut` to avoid internal
+//! allocations:
+//!
+//! ```rust,ignore
+//! let mut send_buf = BytesMut::with_capacity(1500);
+//! if let Some(datagram) = connection.poll_send(&mut send_buf, now) {
+//!     // send_buf contains serialized packet
+//! }
+//! ```
+//!
+//! ### 4. Pluggable Cryptography
+//!
+//! Crypto providers and congestion control algorithms are abstracted via traits:
+//!
+//! ```rust,ignore
+//! pub trait CryptoBackend: Send + Sync {
+//!     fn create_aead(&self, cipher_suite: u16) -> Result<Box<dyn AeadProvider>>;
+//!     fn create_header_protection(&self, cipher_suite: u16) -> Result<Box<dyn HeaderProtectionProvider>>;
+//!     fn create_tls_session(&self, side: Side) -> Result<Box<dyn TlsSession>>;
+//! }
+//! ```
+//!
+//! ### 5. Deterministic Behavior
+//!
+//! State transitions are purely deterministic based on inputs and time.
+//! No randomness except in cryptographic operations.
+//!
+//! ## Usage Example
+//!
+//! ```rust,ignore
+//! use quicd_quic::*;
+//!
+//! // Create connection
+//! let config = ConnectionConfig {
+//!     local_params: TransportParameters::default_client(),
+//!     idle_timeout: Duration::from_secs(30),
+//!     max_packet_size: 1200,
+//! };
+//!
+//! let mut conn = QuicConnection::new(
+//!     Side::Client,
+//!     source_cid,
+//!     dest_cid,
+//!     config,
+//! );
+//!
+//! // Process received datagram
+//! conn.process_datagram(DatagramInput {
+//!     data: udp_payload,
+//!     recv_time: Instant::from_nanos(monotonic_time),
+//! })?;
+//!
+//! // Open stream and send data
+//! let stream_id = conn.open_stream(StreamDirection::Bidirectional)?;
+//! conn.write_stream(stream_id, Bytes::from("Hello QUIC"), true)?;
+//!
+//! // Poll for output
+//! let mut buf = BytesMut::with_capacity(1500);
+//! while let Some(dgram) = conn.poll_send(&mut buf, now) {
+//!     udp_socket.send(&dgram.data)?;
+//!     buf.clear();
+//! }
+//!
+//! // Poll for events
+//! while let Some(event) = conn.poll_event() {
+//!     match event {
+//!         ConnectionEvent::StreamData { stream_id, data, fin } => {
+//!             println!("Received data on stream {}: {:?}", stream_id.0, data);
+//!         }
+//!         ConnectionEvent::HandshakeComplete => {
+//!             println!("Handshake complete!");
+//!         }
+//!         _ => {}
+//!     }
+//! }
+//! ```
+//!
+//! ## Module Organization
+//!
+//! ### Core Types (`types`)
+//! - `VarInt`, `ConnectionId`, `StreamId`, `PacketNumber`
+//! - `Instant` (monotonic time abstraction)
+//! - `Side`, `StreamDirection`, `PacketNumberSpace`
+//!
+//! ### Packet Layer (`packet`)
+//! - Zero-copy packet header parsing (`PacketParser` trait)
+//! - Packet number encoding/decoding (RFC 9000 Appendix A)
+//! - Packet number space management
+//!
+//! ### Frame Layer (`frames`)
+//! - All 22+ QUIC frame types with zero-copy parsing
+//! - `FrameParser` and `FrameSerializer` traits
+//! - Iterator-based frame processing
+//!
+//! ### Cryptography (`crypto`)
+//! - `CryptoBackend` trait for pluggable TLS providers
+//! - `AeadProvider`, `HeaderProtectionProvider` traits
+//! - `TlsSession` trait for handshake state machine
+//!
+//! ### Loss Recovery (`recovery`)
+//! - `LossDetector` trait (RFC 9002 Section 6)
+//! - `CongestionController` trait (pluggable algorithms)
+//! - `RttEstimator` for RTT calculation
+//!
+//! ### Streams (`stream`)
+//! - Stream state machine (RFC 9000 Section 3)
+//! - `ReceiveBuffer` and `SendBuffer` for reassembly
+//! - `StreamController` trait for zero-copy I/O
+//!
+//! ### Flow Control (`flow_control`)
+//! - Connection and stream-level flow control
+//! - Credit tracking and window updates
+//!
+//! ### Transport Parameters (`transport`)
+//! - Encoding/decoding of transport parameters (RFC 9000 Section 18)
+//! - Parameter validation and negotiation
+//!
+//! ### Connection (`connection`)
+//! - `Connection` trait (top-level state machine)
+//! - Event-driven interface with `poll_send()` and `poll_event()`
+//! - Connection statistics and lifecycle management
+//!
+//! ### Server (`server`)
+//! - `QuicServer` trait for connection acceptance
+//! - Version negotiation (RFC 9000 Section 6)
+//! - Retry logic for address validation (RFC 9000 Section 8)
+//!
+//! ## Testing Strategy
+//!
+//! The trait-based architecture enables comprehensive testing:
+//!
+//! - **Unit Tests**: Mock crypto backends, predictable packet parsing
+//! - **Interop Tests**: RFC compliance validation against other implementations
+//! - **Fuzzing**: Zero-copy parsing is fuzz-safe (no panics on invalid input)
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
@@ -72,10 +228,22 @@ pub mod server;
 // Re-export commonly used types
 pub use types::{
     ConnectionId, Instant, PacketNumber, PacketNumberSpace, Side, StreamDirection, StreamId,
-    StreamInitiator, StreamOffset, VarInt, VARINT_MAX,
+    StreamInitiator, StreamOffset, VarInt, VarIntCodec, VARINT_MAX,
 };
 
 pub use error::{ApplicationError, CryptoError, Error, Result, TransportError};
 
-pub use version::{VERSION_1, VERSION_2, VERSION_NEGOTIATION};
+pub use version::{QuicVersion, VERSION_1, VERSION_2, VERSION_NEGOTIATION};
+
+// Re-export primary traits for library consumers
+pub use connection::{Connection, ConnectionConfig, ConnectionEvent, ConnectionState};
+pub use connection::state::QuicConnection;
+pub use crypto::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, KeySchedule, TlsSession};
+pub use frames::{Frame, FrameParser};
+pub use frames::parse::FrameSerializer;
+pub use packet::{Header, HeaderForm, PacketParser, PacketType};
+pub use recovery::{CongestionController, CongestionControllerFactory, LossDetector, RttEstimator};
+pub use server::{QuicServer, ServerConfig};
+pub use stream::{StreamController, StreamManager, StreamState};
+pub use transport::TransportParameters;
 

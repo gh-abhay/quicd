@@ -1,355 +1,276 @@
-//! # Stream Management (RFC 9000 Sections 2, 3, 4)
+//! # Stream State Machine and Manager (RFC 9000 Section 3)
 //!
-//! This module defines the stream state machine and management interfaces.
-//! QUIC streams provide reliable, in-order delivery of data.
-//!
-//! ## Stream Types:
-//! - **Bidirectional**: Both endpoints can send data
-//! - **Unidirectional**: Only initiator can send data
-//!
-//! ## Stream States (RFC 9000 Section 3):
-//! Sending side: Idle → Open → Send → Data Sent → Reset Sent → Reset Recvd
-//! Receiving side: Idle → Recv → Size Known → Data Recvd → Data Read → Reset Recvd
+//! Manages stream lifecycles and state transitions.
 
 #![forbid(unsafe_code)]
 
-use crate::error::{Error, Result};
-use crate::types::{ErrorCode, Side, StreamDirection, StreamId, StreamInitiator, StreamOffset, VarInt};
-use bytes::{Bytes, BytesMut};
+use crate::error::{Error, Result, TransportError};
+use crate::types::{Side, StreamDirection, StreamId, StreamInitiator, StreamOffset};
+use bytes::Bytes;
 
-/// Maximum Stream Data (Flow Control Limit)
+/// Stream State (RFC 9000 Section 3)
 ///
-/// Used to advertise flow control windows to the peer.
-pub type MaxStreamData = u64;
-
-/// Stream Send State (RFC 9000 Section 3.1)
-///
-/// State machine for the sending side of a stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamSendState {
-    /// No frames sent yet (initial state for sender-initiated streams)
-    Idle,
-
-    /// Stream is open, ready to send data
-    Ready,
-
-    /// All data sent, waiting for acknowledgment
-    Send,
-
-    /// All data acknowledged by peer
-    DataSent,
-
-    /// RESET_STREAM sent
-    ResetSent,
-
-    /// RESET_STREAM acknowledged
-    ResetRecvd,
-}
-
-/// Stream Receive State (RFC 9000 Section 3.2)
-///
-/// State machine for the receiving side of a stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamRecvState {
-    /// No frames received yet (initial state for peer-initiated streams)
-    Idle,
-
-    /// Stream is open, receiving data
-    Recv,
-
-    /// Received FIN, know final size, may have gaps
-    SizeKnown,
-
-    /// All data received, no gaps
-    DataRecvd,
-
-    /// All data read by application
-    DataRead,
-
-    /// RESET_STREAM received
-    ResetRecvd,
-}
-
-/// Bidirectional Stream State (RFC 9000 Section 3.3)
-///
-/// Combines send and receive states for bidirectional streams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BidiStreamState {
-    /// Sending side state
-    pub send: StreamSendState,
-
-    /// Receiving side state
-    pub recv: StreamRecvState,
-}
-
-/// Unidirectional Stream State (RFC 9000 Section 3.4)
-///
-/// For unidirectional streams, only one side exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UniStreamState {
-    /// Sending-only (for locally-initiated unidirectional streams)
-    Send(StreamSendState),
-
-    /// Receiving-only (for peer-initiated unidirectional streams)
-    Recv(StreamRecvState),
-}
-
-/// Stream State (unified)
-///
-/// Discriminated union for bidirectional and unidirectional streams.
+/// Bidirectional and unidirectional streams have different state machines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
-    /// Bidirectional stream
-    Bidi(BidiStreamState),
+    // === Bidirectional Stream States ===
+    /// Idle (not yet opened)
+    Idle,
 
-    /// Unidirectional stream
-    Uni(UniStreamState),
+    /// Open (can send and receive)
+    Open,
+
+    /// Half-closed (local) - sent FIN, can still receive
+    HalfClosedLocal,
+
+    /// Half-closed (remote) - received FIN, can still send
+    HalfClosedRemote,
+
+    /// Closed - both sides finished
+    Closed,
+
+    // === Send-Only Stream States (Unidirectional, local initiated) ===
+    /// Ready to send data
+    Ready,
+
+    /// Sending data
+    Send,
+
+    /// Data sent (waiting for ACK)
+    DataSent,
+
+    /// Reset sent
+    ResetSent,
+
+    /// Reset received ACK
+    ResetRecvd,
+
+    // === Receive-Only Stream States (Unidirectional, remote initiated) ===
+    /// Receiving data
+    Recv,
+
+    /// Size known (FIN received)
+    SizeKnown,
+
+    /// Data ready to be read
+    DataRecvd,
+
+    /// Data read completely
+    DataRead,
 }
 
-/// Stream Priority (RFC 9218 - Extensible Priorities)
-///
-/// Note: RFC 9218 defines HTTP/3-specific priorities.
-/// This is a placeholder for generic stream prioritization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamPriority {
-    /// Urgency level (0-7, lower = higher priority)
-    pub urgency: u8,
+impl StreamState {
+    /// Check if stream can send data
+    pub fn can_send(&self) -> bool {
+        matches!(
+            self,
+            StreamState::Open | StreamState::HalfClosedRemote | StreamState::Ready | StreamState::Send
+        )
+    }
 
-    /// Incremental flag
-    pub incremental: bool,
-}
+    /// Check if stream can receive data
+    pub fn can_receive(&self) -> bool {
+        matches!(
+            self,
+            StreamState::Open
+                | StreamState::HalfClosedLocal
+                | StreamState::Recv
+                | StreamState::SizeKnown
+        )
+    }
 
-impl Default for StreamPriority {
-    fn default() -> Self {
-        Self {
-            urgency: 3, // Default urgency per RFC 9218
-            incremental: false,
-        }
+    /// Check if stream is finished
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self,
+            StreamState::Closed | StreamState::ResetRecvd | StreamState::DataRead
+        )
     }
 }
 
-/// Stream Data Chunk (Zero-Copy)
-///
-/// Represents a contiguous chunk of stream data with offset.
+/// Stream Event (for application notification)
 #[derive(Debug, Clone)]
-pub struct StreamChunk {
-    /// Byte offset in stream
-    pub offset: StreamOffset,
+pub enum StreamEvent {
+    /// Stream opened (new stream ID)
+    Opened { stream_id: StreamId },
 
-    /// Data bytes (reference-counted, zero-copy)
-    pub data: Bytes,
+    /// Data available to read
+    DataAvailable { stream_id: StreamId, offset: StreamOffset, length: usize },
 
-    /// True if this is the final chunk (FIN flag)
-    pub fin: bool,
-}
+    /// Stream finished (FIN received)
+    Finished { stream_id: StreamId },
 
-/// Stream Read Result
-///
-/// Result of reading data from a stream.
-#[derive(Debug)]
-pub enum StreamReadResult {
-    /// Data available (offset, bytes, fin)
-    Data {
-        offset: StreamOffset,
-        data: Bytes,
-        fin: bool,
+    /// Stream reset by peer
+    Reset {
+        stream_id: StreamId,
+        error_code: u64,
+        final_size: u64,
     },
 
-    /// Stream was reset by peer
-    Reset { error_code: ErrorCode },
+    /// Stream stopped by peer (STOP_SENDING)
+    Stopped { stream_id: StreamId, error_code: u64 },
 
-    /// No data available (would block)
-    WouldBlock,
-
-    /// Stream closed gracefully
-    Finished,
-}
-
-/// Stream Write Result
-///
-/// Result of writing data to a stream.
-#[derive(Debug, Clone, Copy)]
-pub enum StreamWriteResult {
-    /// Bytes accepted (may be less than requested due to flow control)
-    Written { bytes: usize },
-
-    /// Blocked by flow control (buffer full)
-    Blocked,
-
-    /// Stream closed, cannot write
-    Closed,
+    /// Send side finished (all data ACKed)
+    SendFinished { stream_id: StreamId },
 }
 
 /// Stream Controller Trait
 ///
-/// Manages the lifecycle and data flow of a single stream.
+/// Interface for reading/writing stream data with zero-copy.
 ///
-/// ## Design Notes:
-/// - Zero-copy: Uses `Bytes` for all data operations
-/// - Visitor pattern: Allows reading without copying into intermediate buffer
-/// - Flow control: Enforces stream and connection-level limits
-pub trait StreamController {
-    /// Get the stream ID
-    fn stream_id(&self) -> StreamId;
-
-    /// Get the current stream state
-    fn state(&self) -> StreamState;
-
-    /// Write data to the stream's send buffer.
+/// **Design Rationale**: Cursor pattern - application reads/writes
+/// via slices without intermediate buffering.
+pub trait StreamController: Send {
+    /// Open a new stream
     ///
-    /// # Flow Control
-    /// May accept fewer bytes than provided if flow control limit reached.
-    ///
-    /// # Errors
-    /// Returns Error::StreamStateError if stream is not in a sendable state.
-    fn write(&mut self, data: Bytes, fin: bool) -> Result<StreamWriteResult>;
-
-    /// Read data from the stream's receive buffer.
-    ///
-    /// Returns the next available contiguous chunk of data.
-    /// Application must call this repeatedly until WouldBlock or Finished.
-    fn read(&mut self) -> Result<StreamReadResult>;
-
-    /// Peek at available data without consuming it.
-    ///
-    /// Useful for parsers that need to look ahead.
-    fn peek(&self) -> Result<StreamReadResult>;
-
-    /// Reset the sending side of the stream.
-    ///
-    /// # RFC 9000 Section 3.1
-    /// Sends RESET_STREAM frame to peer, discarding unsent data.
-    fn reset_send(&mut self, error_code: ErrorCode) -> Result<()>;
-
-    /// Stop the receiving side of the stream.
-    ///
-    /// # RFC 9000 Section 3.5
-    /// Sends STOP_SENDING frame to peer, discarding unreceived data.
-    fn stop_recv(&mut self, error_code: ErrorCode) -> Result<()>;
-
-    /// Get the current send offset (next byte to send)
-    fn send_offset(&self) -> StreamOffset;
-
-    /// Get the current receive offset (next byte expected)
-    fn recv_offset(&self) -> StreamOffset;
-
-    /// Get the flow control limit for this stream
-    fn max_stream_data(&self) -> MaxStreamData;
-
-    /// Update the flow control limit (from MAX_STREAM_DATA frame)
-    fn update_max_stream_data(&mut self, limit: MaxStreamData);
-
-    /// Check if stream has data ready to send
-    fn has_data_to_send(&self) -> bool;
-
-    /// Check if stream can accept more data to write
-    fn can_write(&self) -> bool;
-}
-
-/// Stream Manager Trait
-///
-/// Manages the collection of all streams on a connection.
-///
-/// ## Design Notes:
-/// - Enforces stream limits (MAX_STREAMS)
-/// - Tracks stream state across all streams
-/// - Provides iterator/visitor access to avoid copying stream metadata
-pub trait StreamManager {
-    /// Open a new stream (bidirectional or unidirectional).
-    ///
-    /// # Errors
-    /// Returns Error::StreamLimitError if stream limit exceeded.
+    /// Returns new stream ID or error if limit reached.
     fn open_stream(&mut self, direction: StreamDirection) -> Result<StreamId>;
 
-    /// Get a stream controller for an existing stream.
+    /// Write data to stream
     ///
-    /// Returns None if stream doesn't exist.
-    fn get_stream(&mut self, stream_id: StreamId) -> Option<&mut dyn StreamController>;
-
-    /// Accept a new peer-initiated stream.
-    ///
-    /// Returns None if no streams are ready to accept.
-    fn accept_stream(&mut self, direction: StreamDirection) -> Option<StreamId>;
-
-    /// Handle incoming STREAM frame.
-    ///
-    /// Creates stream if it doesn't exist (peer-initiated).
-    fn handle_stream_frame(
+    /// **Zero-copy**: Accepts Bytes (reference-counted buffer).
+    fn write_stream(
         &mut self,
         stream_id: StreamId,
-        offset: StreamOffset,
         data: Bytes,
         fin: bool,
-    ) -> Result<()>;
+    ) -> Result<usize>;
 
-    /// Handle incoming MAX_STREAM_DATA frame.
-    fn handle_max_stream_data(&mut self, stream_id: StreamId, limit: MaxStreamData) -> Result<()>;
-
-    /// Handle incoming RESET_STREAM frame.
-    fn handle_reset_stream(
-        &mut self,
-        stream_id: StreamId,
-        error_code: ErrorCode,
-        final_size: VarInt,
-    ) -> Result<()>;
-
-    /// Handle incoming STOP_SENDING frame.
-    fn handle_stop_sending(&mut self, stream_id: StreamId, error_code: ErrorCode) -> Result<()>;
-
-    /// Update stream limits (from MAX_STREAMS frame).
-    fn update_max_streams(&mut self, limit: VarInt, bidirectional: bool);
-
-    /// Get current stream count.
-    fn stream_count(&self, direction: StreamDirection) -> usize;
-
-    /// Visit all streams with pending data.
+    /// Read data from stream
     ///
-    /// Visitor pattern avoids allocating a Vec of stream IDs.
-    fn visit_writable_streams<F>(&mut self, visitor: F)
-    where
-        F: FnMut(StreamId, &mut dyn StreamController);
+    /// Returns zero-copy slice of available data.
+    /// Advances read cursor by returned length.
+    fn read_stream(&mut self, stream_id: StreamId, max_len: usize) -> Result<Option<Bytes>>;
 
-    /// Visit all streams with received data ready to read.
-    fn visit_readable_streams<F>(&mut self, visitor: F)
-    where
-        F: FnMut(StreamId, &mut dyn StreamController);
+    /// Reset stream (send RESET_STREAM)
+    fn reset_stream(&mut self, stream_id: StreamId, error_code: u64) -> Result<()>;
 
-    /// Check if any streams are writable
-    fn has_writable_streams(&self) -> bool;
+    /// Stop receiving on stream (send STOP_SENDING)
+    fn stop_sending(&mut self, stream_id: StreamId, error_code: u64) -> Result<()>;
 
-    /// Check if any streams are readable
-    fn has_readable_streams(&self) -> bool;
+    /// Get stream state
+    fn stream_state(&self, stream_id: StreamId) -> Option<StreamState>;
+
+    /// Check if stream exists
+    fn has_stream(&self, stream_id: StreamId) -> bool;
+
+    /// Get list of open streams
+    fn open_streams(&self) -> Vec<StreamId>;
 }
 
-/// Stream Reassembly Buffer
+/// Stream Manager (Connection-Level)
 ///
-/// Handles out-of-order stream data reception.
-///
-/// ## RFC 9000 Section 2.2:
-/// Stream data may arrive out of order. The receiver must buffer
-/// data until all prior data has been received.
-pub trait StreamReassembler {
-    /// Insert a chunk of data at a specific offset.
-    ///
-    /// May create gaps if data arrives out of order.
-    fn insert(&mut self, offset: StreamOffset, data: Bytes) -> Result<()>;
+/// Manages all streams for a connection. Enforces stream limits.
+pub struct StreamManager {
+    /// Local side (Client or Server)
+    side: Side,
 
-    /// Read the next contiguous chunk of data.
-    ///
-    /// Returns None if there's a gap at the current offset.
-    fn read_next(&mut self) -> Option<Bytes>;
+    /// Maximum bidirectional streams (local limit)
+    max_streams_bidi_local: u64,
 
-    /// Check if data is available at the current offset
-    fn has_contiguous_data(&self) -> bool;
+    /// Maximum unidirectional streams (local limit)
+    max_streams_uni_local: u64,
 
-    /// Get the current read offset
-    fn read_offset(&self) -> StreamOffset;
+    /// Maximum bidirectional streams (peer limit)
+    max_streams_bidi_remote: u64,
 
-    /// Set the final size (from FIN flag).
-    ///
-    /// Returns Error::FinalSizeError if conflicts with previously received data.
-    fn set_final_size(&mut self, size: StreamOffset) -> Result<()>;
+    /// Maximum unidirectional streams (peer limit)
+    max_streams_uni_remote: u64,
 
-    /// Check if all data up to final size has been received
-    fn is_complete(&self) -> bool;
+    /// Next client-initiated bidirectional stream ID
+    next_bidi_client: u64,
+
+    /// Next server-initiated bidirectional stream ID
+    next_bidi_server: u64,
+
+    /// Next client-initiated unidirectional stream ID
+    next_uni_client: u64,
+
+    /// Next server-initiated unidirectional stream ID
+    next_uni_server: u64,
+}
+
+impl StreamManager {
+    /// Create new stream manager
+    pub fn new(side: Side) -> Self {
+        Self {
+            side,
+            max_streams_bidi_local: 0,
+            max_streams_uni_local: 0,
+            max_streams_bidi_remote: 0,
+            max_streams_uni_remote: 0,
+            next_bidi_client: 0,
+            next_bidi_server: 1,
+            next_uni_client: 2,
+            next_uni_server: 3,
+        }
+    }
+
+    /// Allocate next stream ID
+    pub fn allocate_stream_id(&mut self, direction: StreamDirection) -> Result<StreamId> {
+        let initiator = if self.side == Side::Client {
+            StreamInitiator::Client
+        } else {
+            StreamInitiator::Server
+        };
+
+        let next_id = match (initiator, direction) {
+            (StreamInitiator::Client, StreamDirection::Bidirectional) => {
+                let id = self.next_bidi_client;
+                self.next_bidi_client += 4;
+                id
+            }
+            (StreamInitiator::Server, StreamDirection::Bidirectional) => {
+                let id = self.next_bidi_server;
+                self.next_bidi_server += 4;
+                id
+            }
+            (StreamInitiator::Client, StreamDirection::Unidirectional) => {
+                let id = self.next_uni_client;
+                self.next_uni_client += 4;
+                id
+            }
+            (StreamInitiator::Server, StreamDirection::Unidirectional) => {
+                let id = self.next_uni_server;
+                self.next_uni_server += 4;
+                id
+            }
+        };
+
+        Ok(StreamId(next_id))
+    }
+
+    /// Validate stream ID (check against limits)
+    pub fn validate_stream_id(&self, stream_id: StreamId) -> Result<()> {
+        let initiator = stream_id.initiator();
+        let direction = stream_id.direction();
+        let is_remote = (self.side == Side::Client && initiator == StreamInitiator::Server)
+            || (self.side == Side::Server && initiator == StreamInitiator::Client);
+
+        let max_streams = match (is_remote, direction) {
+            (true, StreamDirection::Bidirectional) => self.max_streams_bidi_remote,
+            (true, StreamDirection::Unidirectional) => self.max_streams_uni_remote,
+            (false, StreamDirection::Bidirectional) => self.max_streams_bidi_local,
+            (false, StreamDirection::Unidirectional) => self.max_streams_uni_local,
+        };
+
+        let stream_count = stream_id.0 / 4;
+        if stream_count >= max_streams {
+            return Err(Error::Transport(TransportError::StreamLimitError));
+        }
+
+        Ok(())
+    }
+
+    /// Update peer's stream limits (from MAX_STREAMS frames)
+    pub fn update_peer_max_streams(&mut self, direction: StreamDirection, max_streams: u64) {
+        match direction {
+            StreamDirection::Bidirectional => {
+                self.max_streams_bidi_remote = max_streams;
+            }
+            StreamDirection::Unidirectional => {
+                self.max_streams_uni_remote = max_streams;
+            }
+        }
+    }
 }

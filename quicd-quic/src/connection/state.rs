@@ -1,342 +1,342 @@
-//! # Connection State Machine (RFC 9000 Section 4)
+//! # Connection State Machine (RFC 9000 Section 5, 10)
 //!
-//! This module defines the connection state machine and the top-level
-//! QUIC connection interface (the "Driver").
-//!
-//! ## RFC 9000 Section 4: Connection Lifecycle
-//!
-//! States: Idle → Initial → Handshake → Active → Draining → Closed
-//!
-//! ## Design:
-//! The Connection is the top-level state machine that coordinates:
-//! - Packet parsing and encryption
-//! - Stream management
-//! - Flow control
-//! - Loss recovery
-//! - Crypto handshake
+//! Pure state machine - accepts datagrams and time, produces datagrams and events.
 
 #![forbid(unsafe_code)]
 
-use crate::crypto::backend::{CryptoBackend, EncryptionLevel};
+use crate::crypto::{CryptoBackend, CryptoLevel, TlsSession};
 use crate::error::{Error, Result};
-use crate::frames::types::Frame;
-use crate::packet::header::{PacketHeader, PacketParser, PacketBuilder};
-use crate::recovery::traits::{RecoveryManager};
-use crate::stream::manager::{StreamManager};
-use crate::transport::params::TransportParameters;
-use crate::types::{ConnectionId, Instant, PacketNumber, PacketNumberSpace, Side};
+use crate::flow_control::ConnectionFlowControl;
+use crate::frames::Frame;
+use crate::packet::{Header, PacketParser};
+use crate::packet::space::PacketNumberSpaceManager;
+use crate::recovery::{CongestionController, LossDetector, RttEstimator};
+use crate::stream::{StreamController, StreamManager};
+use crate::transport::TransportParameters;
+use crate::types::{ConnectionId, Instant, PacketNumber, Side, StreamId};
 use bytes::{Bytes, BytesMut};
+use core::time::Duration;
 
-/// Connection State (RFC 9000 Section 4)
-///
-/// Tracks the lifecycle state of a QUIC connection.
+/// Connection State (RFC 9000 Section 5)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
-    /// Initial state before any packets sent/received
-    Idle,
-
-    /// Initial packet exchange in progress
-    Initial,
-
     /// Handshake in progress
-    Handshake,
+    Handshaking,
 
-    /// Handshake complete, active data transfer
+    /// Handshake complete, connection active
     Active,
 
-    /// Closing: CONNECTION_CLOSE sent, waiting for ACK or timeout
-    Closing,
-
-    /// Draining: CONNECTION_CLOSE received, waiting for timeout
+    /// Draining - waiting after sending CONNECTION_CLOSE
     Draining,
+
+    /// Closing - sending CONNECTION_CLOSE
+    Closing,
 
     /// Connection closed
     Closed,
 }
 
-/// Connection Event
+/// Connection Configuration
+#[derive(Debug, Clone)]
+pub struct ConnectionConfig {
+    /// Local transport parameters
+    pub local_params: TransportParameters,
+
+    /// Idle timeout
+    pub idle_timeout: Duration,
+
+    /// Maximum packet size to send
+    pub max_packet_size: usize,
+}
+
+/// Connection Input (Datagram)
 ///
-/// Events produced by the connection that must be handled by the application.
+/// **Zero-Copy**: Bytes references the received UDP datagram.
+#[derive(Debug, Clone)]
+pub struct DatagramInput {
+    /// Datagram payload (entire UDP payload)
+    pub data: Bytes,
+
+    /// Time received
+    pub recv_time: Instant,
+}
+
+/// Connection Output (Datagram)
+///
+/// **Buffer Injection**: Connection writes into provided BytesMut.
 #[derive(Debug)]
+pub struct DatagramOutput {
+    /// Datagram payload to send
+    pub data: BytesMut,
+
+    /// When to send (for pacing, or immediate if None)
+    pub send_time: Option<Instant>,
+}
+
+/// Connection Event (Application Notifications)
+#[derive(Debug, Clone)]
 pub enum ConnectionEvent {
-    /// Handshake completed successfully
+    /// Handshake completed
     HandshakeComplete,
 
-    /// New stream created by peer
-    StreamOpened {
-        stream_id: u64,
+    /// Stream data available
+    StreamData {
+        stream_id: StreamId,
+        data: Bytes,
+        fin: bool,
     },
 
-    /// Stream data available to read
-    StreamReadable {
-        stream_id: u64,
-    },
+    /// Stream opened by peer
+    StreamOpened { stream_id: StreamId },
 
-    /// Stream writable (flow control window increased)
-    StreamWritable {
-        stream_id: u64,
-    },
+    /// Stream finished (FIN received)
+    StreamFinished { stream_id: StreamId },
 
-    /// Stream closed by peer
-    StreamClosed {
-        stream_id: u64,
+    /// Stream reset by peer
+    StreamReset {
+        stream_id: StreamId,
         error_code: u64,
     },
 
+    /// Datagram received (DATAGRAM frame)
+    DatagramReceived { data: Bytes },
+
     /// Connection closing
-    Closing {
+    ConnectionClosing {
         error_code: u64,
         reason: Bytes,
     },
 
     /// Connection closed
-    Closed,
-
-    /// Datagram received (RFC 9221 - DATAGRAM extension)
-    DatagramReceived {
-        data: Bytes,
-    },
+    ConnectionClosed,
 }
 
-/// Datagram to Send
+/// QUIC Connection (Top-Level State Machine)
 ///
-/// Represents a UDP datagram ready to be sent.
-#[derive(Debug)]
-pub struct Datagram {
-    /// Destination Connection ID
-    pub dcid: ConnectionId,
-
-    /// Source Connection ID
-    pub scid: Option<ConnectionId>,
-
-    /// Serialized packet bytes
-    pub data: Bytes,
-}
-
-/// Connection Configuration
+/// **Pure State Machine Design**:
+/// - No I/O - accepts bytes via `process_datagram()`
+/// - No timers - accepts time via `process_timeout()`
+/// - Returns bytes via `poll_send()`
+/// - Returns events via `poll_event()`
 ///
-/// Configuration options for a QUIC connection.
-#[derive(Debug, Clone)]
-pub struct ConnectionConfig {
-    /// Local transport parameters
-    pub local_transport_params: TransportParameters,
-
-    /// Connection role (Client or Server)
-    pub side: Side,
-
-    /// Initial destination Connection ID
-    pub initial_dcid: ConnectionId,
-
-    /// Initial source Connection ID
-    pub initial_scid: ConnectionId,
-
-    /// ALPN protocols to negotiate
-    pub alpn_protocols: tinyvec::TinyVec<[Bytes; 4]>,
-
-    /// Maximum UDP payload size
-    pub max_udp_payload_size: usize,
-
-    /// Enable DATAGRAM extension (RFC 9221)
-    pub enable_datagram: bool,
-}
-
-/// QUIC Connection Trait (Main State Machine)
+/// **Zero-Copy + Buffer Injection**:
+/// - Input: `Bytes` (zero-copy reference to received datagram)
+/// - Output: Writes into caller-provided `BytesMut`
 ///
-/// This is the top-level interface for a QUIC connection.
-/// It's a pure state machine: accepts bytes/events, returns bytes/events.
-///
-/// ## Zero-Copy Design:
-/// - Input: References to UDP datagram buffers (&[u8])
-/// - Output: Caller-provided buffers (BytesMut) or Bytes
-///
-/// ## No I/O:
-/// The connection doesn't perform any I/O. The caller is responsible for:
-/// - Receiving UDP datagrams and passing them to `handle_datagram()`
-/// - Calling `poll()` to get outgoing datagrams
-/// - Managing timers and calling `handle_timeout()`
-pub trait Connection {
-    /// Process an incoming UDP datagram.
+/// **Deterministic**: Same inputs produce same outputs (no randomness except crypto).
+pub trait Connection: Send {
+    /// Process incoming datagram
     ///
-    /// Parses packets, decrypts, processes frames, updates state.
+    /// Parses packets, processes frames, updates state.
     ///
-    /// # Arguments
-    /// - `datagram`: Raw UDP payload bytes
-    /// - `now`: Current time
-    ///
-    /// # Returns
-    /// List of connection events produced by processing this datagram
-    fn handle_datagram(&mut self, datagram: &[u8], now: Instant) -> Result<Vec<ConnectionEvent>>;
+    /// **Zero-Copy**: Input borrows from datagram buffer.
+    fn process_datagram(&mut self, datagram: DatagramInput) -> Result<()>;
 
-    /// Poll the connection for outgoing datagrams and events.
+    /// Process timeout (called at or after deadline from `next_timeout()`)
     ///
-    /// Caller should call this repeatedly until it returns None or buffer is full.
-    ///
-    /// # Arguments
-    /// - `buf`: Buffer to write outgoing datagram into
-    /// - `now`: Current time
-    ///
-    /// # Returns
-    /// Number of bytes written, or None if no data to send
-    fn poll(&mut self, buf: &mut BytesMut, now: Instant) -> Result<Option<usize>>;
+    /// Handles PTO, idle timeout, draining timeout, etc.
+    fn process_timeout(&mut self, now: Instant) -> Result<()>;
 
-    /// Handle a timeout event.
+    /// Poll for outgoing datagram
     ///
-    /// Should be called when the timer returned by `get_timeout()` expires.
+    /// **Buffer Injection**: Writes into provided `buf`.
     ///
-    /// # Arguments
-    /// - `now`: Current time
-    fn handle_timeout(&mut self, now: Instant) -> Result<Vec<ConnectionEvent>>;
+    /// Returns None if nothing to send.
+    fn poll_send(&mut self, buf: &mut BytesMut, now: Instant) -> Option<DatagramOutput>;
 
-    /// Get the next timeout deadline.
+    /// Poll for application events
     ///
-    /// Caller must implement timer management and call `handle_timeout()`
-    /// when this deadline is reached.
-    ///
-    /// # Returns
-    /// Next timeout instant, or None if no timers active
-    fn get_timeout(&self) -> Option<Instant>;
+    /// Returns None if no events pending.
+    fn poll_event(&mut self) -> Option<ConnectionEvent>;
 
-    /// Get the current connection state
+    /// Get next timeout deadline
+    ///
+    /// Returns None if no timeout pending (connection idle).
+    fn next_timeout(&self) -> Option<Instant>;
+
+    /// Get connection state
     fn state(&self) -> ConnectionState;
 
-    /// Check if the connection is established (handshake complete)
-    fn is_established(&self) -> bool;
-
-    /// Check if the connection is closed
-    fn is_closed(&self) -> bool;
-
-    /// Close the connection gracefully.
-    ///
-    /// Sends CONNECTION_CLOSE frame and transitions to Closing state.
-    ///
-    /// # Arguments
-    /// - `error_code`: Application error code
-    /// - `reason`: Human-readable reason (UTF-8)
-    fn close(&mut self, error_code: u64, reason: &[u8]) -> Result<()>;
-
-    // Note: streams() method removed - implementations should provide their own typed access
-
-    /// Get peer's transport parameters
-    fn peer_transport_params(&self) -> Option<&TransportParameters>;
-
-    /// Get negotiated ALPN protocol
-    fn alpn(&self) -> Option<&[u8]>;
-
-    /// Send a datagram (RFC 9221 - DATAGRAM extension)
-    ///
-    /// # Errors
-    /// Returns Error if DATAGRAM extension not negotiated or datagram too large
+    /// Send datagram (DATAGRAM frame)
     fn send_datagram(&mut self, data: Bytes) -> Result<()>;
+
+    /// Open new stream
+    fn open_stream(
+        &mut self,
+        direction: crate::types::StreamDirection,
+    ) -> Result<StreamId>;
+
+    /// Write data to stream
+    fn write_stream(&mut self, stream_id: StreamId, data: Bytes, fin: bool) -> Result<()>;
+
+    /// Read data from stream
+    fn read_stream(&mut self, stream_id: StreamId) -> Result<Option<Bytes>>;
+
+    /// Reset stream (send RESET_STREAM)
+    fn reset_stream(&mut self, stream_id: StreamId, error_code: u64) -> Result<()>;
+
+    /// Close connection gracefully
+    fn close(&mut self, error_code: u64, reason: &[u8]);
 
     /// Get connection statistics
     fn stats(&self) -> ConnectionStats;
+
+    /// Get source connection ID
+    fn source_cid(&self) -> &ConnectionId;
+
+    /// Get destination connection ID
+    fn destination_cid(&self) -> &ConnectionId;
 }
 
 /// Connection Statistics
-///
-/// Metrics for monitoring connection health and performance.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ConnectionStats {
-    /// Total packets sent
+    /// Packets sent
     pub packets_sent: u64,
 
-    /// Total packets received
+    /// Packets received
     pub packets_received: u64,
 
-    /// Total bytes sent
+    /// Bytes sent
     pub bytes_sent: u64,
 
-    /// Total bytes received
+    /// Bytes received
     pub bytes_received: u64,
 
     /// Packets lost
     pub packets_lost: u64,
 
-    /// Current congestion window (bytes)
-    pub cwnd: u64,
+    /// Smoothed RTT
+    pub smoothed_rtt: Duration,
 
-    /// Current bytes in flight
-    pub bytes_in_flight: u64,
+    /// Congestion window
+    pub congestion_window: usize,
 
-    /// Smoothed RTT (microseconds)
-    pub smoothed_rtt_us: u64,
-
-    /// Minimum RTT (microseconds)
-    pub min_rtt_us: u64,
-
-    /// Latest RTT (microseconds)
-    pub latest_rtt_us: u64,
+    /// Bytes in flight
+    pub bytes_in_flight: usize,
 }
 
-/// Connection ID Manager Trait
+/// Connection Implementation Skeleton
 ///
-/// Manages Connection IDs for a connection (RFC 9000 Section 5.1).
-/// QUIC connections can have multiple Connection IDs for migration.
-pub trait ConnectionIdManager {
-    /// Get the current destination Connection ID
-    fn current_dcid(&self) -> &ConnectionId;
+/// Real implementation would contain:
+/// - Packet parser
+/// - Frame parser
+/// - Crypto backend
+/// - Stream manager
+/// - Flow control
+/// - Loss detector
+/// - Congestion controller
+/// - Packet number space manager
+pub struct QuicConnection {
+    /// Connection side (Client or Server)
+    side: Side,
 
-    /// Get the current source Connection ID
-    fn current_scid(&self) -> &ConnectionId;
+    /// Connection state
+    state: ConnectionState,
 
-    /// Add a new Connection ID (from NEW_CONNECTION_ID frame)
-    fn add_connection_id(&mut self, cid: ConnectionId, sequence: u64, token: [u8; 16]) -> Result<()>;
+    /// Source Connection ID
+    scid: ConnectionId,
 
-    /// Retire a Connection ID (from RETIRE_CONNECTION_ID frame)
-    fn retire_connection_id(&mut self, sequence: u64) -> Result<()>;
+    /// Destination Connection ID
+    dcid: ConnectionId,
 
-    /// Generate a new Connection ID for the peer to use
-    fn generate_new_cid(&mut self) -> Result<(ConnectionId, [u8; 16])>;
+    /// Configuration
+    config: ConnectionConfig,
 
-    /// Get the number of active Connection IDs
-    fn active_cid_count(&self) -> usize;
+    /// Statistics
+    stats: ConnectionStats,
+
+    // Internal components (would be fully implemented):
+    // packet_parser: Box<dyn PacketParser>,
+    // crypto: Box<dyn CryptoBackend>,
+    // tls_session: Box<dyn TlsSession>,
+    // streams: StreamManager,
+    // flow_control: ConnectionFlowControl,
+    // loss_detector: Box<dyn LossDetector>,
+    // congestion_controller: Box<dyn CongestionController>,
+    // pn_spaces: PacketNumberSpaceManager,
 }
 
-/// Packet Space Manager
-///
-/// Manages per-packet-number-space state (Initial, Handshake, ApplicationData).
-///
-/// ## RFC 9000 Section 12.1:
-/// QUIC has three packet number spaces with independent packet numbers and ACKs.
-pub trait PacketSpaceManager {
-    /// Get the next packet number for a packet number space
-    fn next_packet_number(&mut self, space: PacketNumberSpace) -> PacketNumber;
-
-    /// Get the largest acknowledged packet number
-    fn largest_acked(&self, space: PacketNumberSpace) -> Option<PacketNumber>;
-
-    /// Update largest acknowledged packet number
-    fn update_largest_acked(&mut self, space: PacketNumberSpace, pn: PacketNumber);
-
-    /// Check if a packet number has been acknowledged
-    fn is_acked(&self, space: PacketNumberSpace, pn: PacketNumber) -> bool;
-
-    /// Get the largest sent packet number
-    fn largest_sent(&self, space: PacketNumberSpace) -> Option<PacketNumber>;
+impl QuicConnection {
+    /// Create new connection
+    pub fn new(
+        side: Side,
+        scid: ConnectionId,
+        dcid: ConnectionId,
+        config: ConnectionConfig,
+    ) -> Self {
+        Self {
+            side,
+            state: ConnectionState::Handshaking,
+            scid,
+            dcid,
+            config,
+            stats: ConnectionStats::default(),
+        }
+    }
 }
 
-/// Connection Context Builder
-///
-/// Builder pattern for creating connection contexts.
-pub trait ConnectionBuilder {
-    /// Set the connection role (client or server)
-    fn with_side(self, side: Side) -> Self;
+impl Connection for QuicConnection {
+    fn process_datagram(&mut self, datagram: DatagramInput) -> Result<()> {
+        unimplemented!("Skeleton - no implementation required")
+    }
 
-    /// Set initial destination Connection ID
-    fn with_initial_dcid(self, dcid: ConnectionId) -> Self;
+    fn process_timeout(&mut self, now: Instant) -> Result<()> {
+        unimplemented!("Skeleton")
+    }
 
-    /// Set initial source Connection ID
-    fn with_initial_scid(self, scid: ConnectionId) -> Self;
+    fn poll_send(&mut self, buf: &mut BytesMut, now: Instant) -> Option<DatagramOutput> {
+        unimplemented!("Skeleton")
+    }
 
-    /// Set transport parameters
-    fn with_transport_params(self, params: TransportParameters) -> Self;
+    fn poll_event(&mut self) -> Option<ConnectionEvent> {
+        unimplemented!("Skeleton")
+    }
 
-    /// Set ALPN protocols
-    fn with_alpn(self, alpn: Vec<Bytes>) -> Self;
+    fn next_timeout(&self) -> Option<Instant> {
+        unimplemented!("Skeleton")
+    }
 
-    /// Set crypto backend
-    fn with_crypto_backend(self, backend: Box<dyn CryptoBackend>) -> Self;
+    fn state(&self) -> ConnectionState {
+        self.state
+    }
 
-    /// Build the connection
-    fn build(self) -> Result<Box<dyn Connection>>;
+    fn send_datagram(&mut self, data: Bytes) -> Result<()> {
+        unimplemented!("Skeleton")
+    }
+
+    fn open_stream(
+        &mut self,
+        direction: crate::types::StreamDirection,
+    ) -> Result<StreamId> {
+        unimplemented!("Skeleton")
+    }
+
+    fn write_stream(&mut self, stream_id: StreamId, data: Bytes, fin: bool) -> Result<()> {
+        unimplemented!("Skeleton")
+    }
+
+    fn read_stream(&mut self, stream_id: StreamId) -> Result<Option<Bytes>> {
+        unimplemented!("Skeleton")
+    }
+
+    fn reset_stream(&mut self, stream_id: StreamId, error_code: u64) -> Result<()> {
+        unimplemented!("Skeleton")
+    }
+
+    fn close(&mut self, error_code: u64, reason: &[u8]) {
+        unimplemented!("Skeleton")
+    }
+
+    fn stats(&self) -> ConnectionStats {
+        self.stats.clone()
+    }
+
+    fn source_cid(&self) -> &ConnectionId {
+        &self.scid
+    }
+
+    fn destination_cid(&self) -> &ConnectionId {
+        &self.dcid
+    }
 }

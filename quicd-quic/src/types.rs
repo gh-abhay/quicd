@@ -5,9 +5,12 @@
 
 #![forbid(unsafe_code)]
 
-use bytes::{Bytes, BytesMut};
-use core::fmt;
+use bytes::Bytes;
 use core::time::Duration;
+
+// ============================================================================
+// Variable-Length Integer Encoding (RFC 9000 Section 16)
+// ============================================================================
 
 /// Variable-Length Integer (RFC 9000 Section 16)
 ///
@@ -19,11 +22,137 @@ pub type VarInt = u64;
 /// Maximum value for VarInt (2^62 - 1)
 pub const VARINT_MAX: u64 = (1u64 << 62) - 1;
 
+/// VarInt encoding and decoding utilities
+pub struct VarIntCodec;
+
+impl VarIntCodec {
+    /// Decode a VarInt from a byte slice, returning (value, bytes_consumed)
+    ///
+    /// Returns None if buffer is too short or value exceeds VARINT_MAX
+    pub fn decode(buf: &[u8]) -> Option<(VarInt, usize)> {
+        if buf.is_empty() {
+            return None;
+        }
+
+        let first = buf[0];
+        let tag = first >> 6;
+
+        match tag {
+            0b00 => {
+                // 1-byte encoding
+                Some((first as u64 & 0x3f, 1))
+            }
+            0b01 => {
+                // 2-byte encoding
+                if buf.len() < 2 {
+                    return None;
+                }
+                let value = (((first as u64 & 0x3f) << 8) | buf[1] as u64);
+                Some((value, 2))
+            }
+            0b10 => {
+                // 4-byte encoding
+                if buf.len() < 4 {
+                    return None;
+                }
+                let value = (((first as u64 & 0x3f) << 24)
+                    | ((buf[1] as u64) << 16)
+                    | ((buf[2] as u64) << 8)
+                    | (buf[3] as u64));
+                Some((value, 4))
+            }
+            0b11 => {
+                // 8-byte encoding
+                if buf.len() < 8 {
+                    return None;
+                }
+                let value = (((first as u64 & 0x3f) << 56)
+                    | ((buf[1] as u64) << 48)
+                    | ((buf[2] as u64) << 40)
+                    | ((buf[3] as u64) << 32)
+                    | ((buf[4] as u64) << 24)
+                    | ((buf[5] as u64) << 16)
+                    | ((buf[6] as u64) << 8)
+                    | (buf[7] as u64));
+                Some((value, 8))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Encode a VarInt into a buffer, returning bytes written
+    ///
+    /// Returns None if value exceeds VARINT_MAX or buffer is too small
+    pub fn encode(value: VarInt, buf: &mut [u8]) -> Option<usize> {
+        if value > VARINT_MAX {
+            return None;
+        }
+
+        if value < 0x40 {
+            // 1-byte encoding
+            if buf.is_empty() {
+                return None;
+            }
+            buf[0] = value as u8;
+            Some(1)
+        } else if value < 0x4000 {
+            // 2-byte encoding
+            if buf.len() < 2 {
+                return None;
+            }
+            buf[0] = 0x40 | ((value >> 8) as u8);
+            buf[1] = value as u8;
+            Some(2)
+        } else if value < 0x40000000 {
+            // 4-byte encoding
+            if buf.len() < 4 {
+                return None;
+            }
+            buf[0] = 0x80 | ((value >> 24) as u8);
+            buf[1] = (value >> 16) as u8;
+            buf[2] = (value >> 8) as u8;
+            buf[3] = value as u8;
+            Some(4)
+        } else {
+            // 8-byte encoding
+            if buf.len() < 8 {
+                return None;
+            }
+            buf[0] = 0xc0 | ((value >> 56) as u8);
+            buf[1] = (value >> 48) as u8;
+            buf[2] = (value >> 40) as u8;
+            buf[3] = (value >> 32) as u8;
+            buf[4] = (value >> 24) as u8;
+            buf[5] = (value >> 16) as u8;
+            buf[6] = (value >> 8) as u8;
+            buf[7] = value as u8;
+            Some(8)
+        }
+    }
+
+    /// Calculate the encoded size for a given value
+    pub fn size(value: VarInt) -> usize {
+        if value < 0x40 {
+            1
+        } else if value < 0x4000 {
+            2
+        } else if value < 0x40000000 {
+            4
+        } else {
+            8
+        }
+    }
+}
+
+// ============================================================================
+// Connection ID (RFC 9000 Section 5.1, RFC 8999 Section 5.3)
+// ============================================================================
+
 /// Connection ID (RFC 9000 Section 5.1, RFC 8999 Section 5.3)
 ///
 /// Opaque identifier for a connection. Length: 0-20 bytes.
 /// Used for routing packets to the correct connection context.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConnectionId {
     bytes: tinyvec::TinyVec<[u8; 20]>,
 }
@@ -43,6 +172,13 @@ impl ConnectionId {
         Some(Self { bytes: vec })
     }
 
+    /// Create an empty (zero-length) Connection ID
+    pub fn empty() -> Self {
+        Self {
+            bytes: tinyvec::TinyVec::new(),
+        }
+    }
+
     /// Returns the byte slice of this Connection ID
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
@@ -59,6 +195,10 @@ impl ConnectionId {
     }
 }
 
+// ============================================================================
+// Packet Number (RFC 9000 Section 12.3)
+// ============================================================================
+
 /// Packet Number (RFC 9000 Section 12.3)
 ///
 /// 62-bit packet number. Encoded in 1-4 bytes in packet headers.
@@ -67,6 +207,27 @@ pub type PacketNumber = u64;
 
 /// Maximum Packet Number value (2^62 - 1)
 pub const PACKET_NUMBER_MAX: u64 = VARINT_MAX;
+
+/// Packet Number Space (RFC 9000 Section 12.1)
+///
+/// QUIC has three distinct packet number spaces, each with independent
+/// packet number sequences:
+/// - Initial: Used for initial handshake packets
+/// - Handshake: Used after Initial keys are available
+/// - ApplicationData: Used for 0-RTT and 1-RTT packets
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PacketNumberSpace {
+    /// Initial packet number space
+    Initial,
+    /// Handshake packet number space
+    Handshake,
+    /// Application data packet number space (0-RTT and 1-RTT)
+    ApplicationData,
+}
+
+// ============================================================================
+// Stream ID and Offsets (RFC 9000 Section 2)
+// ============================================================================
 
 /// Stream ID (RFC 9000 Section 2.1)
 ///
@@ -126,22 +287,31 @@ impl StreamId {
 /// Byte offset within a stream. Used in STREAM frames.
 pub type StreamOffset = u64;
 
-/// Packet Number Space (RFC 9000 Section 12.1)
+/// Stream Direction (RFC 9000 Section 2.1)
 ///
-/// QUIC has three distinct packet number spaces, each with independent
-/// packet number sequences:
-/// - Initial: Used for initial handshake packets
-/// - Handshake: Used after Initial keys are available
-/// - ApplicationData: Used for 0-RTT and 1-RTT packets
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PacketNumberSpace {
-    /// Initial packet number space
-    Initial,
-    /// Handshake packet number space
-    Handshake,
-    /// Application data packet number space (0-RTT and 1-RTT)
-    ApplicationData,
+/// Indicates whether a stream is bidirectional or unidirectional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDirection {
+    /// Bidirectional stream - both endpoints can send data
+    Bidirectional,
+    /// Unidirectional stream - only initiator can send data
+    Unidirectional,
 }
+
+/// Stream Initiator (RFC 9000 Section 2.1)
+///
+/// Indicates which side initiated the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamInitiator {
+    /// Client-initiated stream
+    Client,
+    /// Server-initiated stream
+    Server,
+}
+
+// ============================================================================
+// Time and Duration (Monotonic Clock Abstraction)
+// ============================================================================
 
 /// Instant in time (monotonic clock)
 ///
@@ -175,7 +345,18 @@ impl Instant {
             .checked_add(duration.as_nanos() as u64)
             .map(|nanos| Self { nanos })
     }
+
+    /// Saturating subtraction of duration
+    pub fn saturating_sub(&self, duration: Duration) -> Self {
+        Self {
+            nanos: self.nanos.saturating_sub(duration.as_nanos() as u64),
+        }
+    }
 }
+
+// ============================================================================
+// Connection Side and Roles
+// ============================================================================
 
 /// Side of the connection (RFC 9000 Section 3)
 ///
@@ -205,29 +386,9 @@ impl Side {
     }
 }
 
-/// Stream Direction (RFC 9000 Section 2.1)
-///
-/// Indicates whether a stream is bidirectional or unidirectional.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamDirection {
-    /// Bidirectional stream - both endpoints can send data
-    Bidirectional,
-    /// Unidirectional stream - only initiator can send data
-    Unidirectional,
-}
-
-/// Stream Initiator (RFC 9000 Section 2.1)
-///
-/// Indicates which side initiated the stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamInitiator {
-    /// Client-initiated stream
-    Client,
-    /// Server-initiated stream
-    Server,
-}
-
-
+// ============================================================================
+// Tokens and Reset (RFC 9000 Section 8, Section 10)
+// ============================================================================
 
 /// Token (RFC 9000 Section 8.1)
 ///
@@ -241,6 +402,10 @@ pub type Token = Bytes;
 /// 16-byte token used to reset a connection without per-connection state.
 pub type StatelessResetToken = [u8; 16];
 
+// ============================================================================
+// Protocol Constants (RFC 9000)
+// ============================================================================
+
 /// Maximum UDP payload size (bytes)
 ///
 /// RFC 9000 Section 14: Initial packets must be at least 1200 bytes.
@@ -253,7 +418,8 @@ pub const MAX_PACKET_SIZE: usize = 65527; // Max UDP payload for IPv6
 /// Default maximum datagram size
 pub const DEFAULT_MAX_DATAGRAM_SIZE: usize = 1200;
 
-/// Error Code (generic)
-///
-/// Used in RESET_STREAM and STOP_SENDING frames.
-pub type ErrorCode = u64;
+/// Default idle timeout (milliseconds)
+pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 30_000;
+
+/// Maximum connection ID sequence number
+pub const MAX_CID_SEQUENCE: u64 = VARINT_MAX;

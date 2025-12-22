@@ -1,345 +1,354 @@
-//! # Cryptographic Backend Trait (RFC 9001)
+//! # Cryptography Backend Traits (RFC 9001)
 //!
-//! This module defines the trait interface for cryptographic operations.
-//! The QUIC state machine uses this trait to encrypt/decrypt packets
-//! and protect/unprotect headers without depending on a specific TLS library.
-//!
-//! ## RFC 9001: Using TLS to Secure QUIC
-//!
-//! QUIC uses TLS 1.3 for:
-//! - Handshake authentication
-//! - Key derivation
-//! - AEAD encryption (ChaCha20-Poly1305, AES-GCM)
-//! - Header protection (AES-ECB or ChaCha20)
-//!
-//! ## Design:
-//! This trait abstracts the crypto provider (rustls, boring, ring, etc.)
-//! allowing unit testing with mock crypto and algorithm swapping.
+//! Pluggable interfaces for TLS/crypto providers.
+//! Enables swapping implementations (rustls, BoringSSL, mock for testing).
 
 #![forbid(unsafe_code)]
 
-use crate::error::{Error, Result};
-use crate::types::{PacketNumber, PacketNumberSpace};
+use crate::error::{CryptoError, Error, Result};
+use crate::types::{ConnectionId, PacketNumber, PacketNumberSpace, Side};
 use bytes::{Bytes, BytesMut};
 
-/// AEAD Algorithm Identifier (RFC 9001 Section 5.3)
-///
-/// QUIC supports multiple AEAD algorithms for packet protection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AeadAlgorithm {
-    /// AES-128-GCM
-    Aes128Gcm,
-
-    /// AES-256-GCM
-    Aes256Gcm,
-
-    /// ChaCha20-Poly1305
-    ChaCha20Poly1305,
-}
-
-impl AeadAlgorithm {
-    /// Returns the key length in bytes for this algorithm
-    pub fn key_len(&self) -> usize {
-        match self {
-            AeadAlgorithm::Aes128Gcm => 16,
-            AeadAlgorithm::Aes256Gcm => 32,
-            AeadAlgorithm::ChaCha20Poly1305 => 32,
-        }
-    }
-
-    /// Returns the IV length in bytes for this algorithm
-    pub fn iv_len(&self) -> usize {
-        match self {
-            AeadAlgorithm::Aes128Gcm => 12,
-            AeadAlgorithm::Aes256Gcm => 12,
-            AeadAlgorithm::ChaCha20Poly1305 => 12,
-        }
-    }
-
-    /// Returns the authentication tag length in bytes
-    pub fn tag_len(&self) -> usize {
-        16 // All supported algorithms use 16-byte tags
-    }
-}
-
-/// Header Protection Algorithm (RFC 9001 Section 5.4)
-///
-/// Used to protect packet header fields (packet number, etc.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeaderProtectionAlgorithm {
-    /// AES-128-ECB (for AES-GCM)
-    Aes128,
-
-    /// AES-256-ECB (for AES-256-GCM)
-    Aes256,
-
-    /// ChaCha20 (for ChaCha20-Poly1305)
-    ChaCha20,
-}
-
-/// Key Phase (RFC 9001 Section 6)
-///
-/// QUIC supports in-protocol key updates. Each key phase has distinct keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyPhase {
-    /// Initial phase (phase 0)
-    Zero,
-
-    /// Updated phase (phase 1)
-    One,
-}
+// ============================================================================
+// Crypto Level (RFC 9001 Section 4)
+// ============================================================================
 
 /// Encryption Level (RFC 9001 Section 4)
 ///
-/// Corresponds to TLS encryption levels and packet number spaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncryptionLevel {
-    /// Initial packets (uses Initial Secret derived from DCID)
+/// QUIC uses four encryption levels during connection establishment:
+/// - Initial: Client's first packets (uses Initial secret derived from DCID)
+/// - Early Data (0-RTT): Early application data
+/// - Handshake: TLS handshake messages
+/// - Application (1-RTT): Protected application data
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CryptoLevel {
+    /// Initial packets (derived from Destination CID)
     Initial,
 
-    /// Handshake packets (uses Handshake Secret from TLS)
+    /// 0-RTT early data packets
+    EarlyData,
+
+    /// Handshake packets (TLS handshake)
     Handshake,
 
-    /// 0-RTT packets (uses Early Data Secret from TLS)
-    ZeroRtt,
-
-    /// 1-RTT packets (uses Application Secret from TLS)
-    OneRtt,
+    /// 1-RTT application data packets
+    Application,
 }
 
-impl EncryptionLevel {
-    /// Map encryption level to packet number space
+impl CryptoLevel {
+    /// Get corresponding packet number space
     pub fn packet_number_space(&self) -> PacketNumberSpace {
         match self {
-            EncryptionLevel::Initial => PacketNumberSpace::Initial,
-            EncryptionLevel::Handshake => PacketNumberSpace::Handshake,
-            EncryptionLevel::ZeroRtt | EncryptionLevel::OneRtt => {
+            CryptoLevel::Initial => PacketNumberSpace::Initial,
+            CryptoLevel::Handshake => PacketNumberSpace::Handshake,
+            CryptoLevel::EarlyData | CryptoLevel::Application => {
                 PacketNumberSpace::ApplicationData
             }
         }
     }
 }
 
-/// Cryptographic Keys (RFC 9001 Section 5)
+// ============================================================================
+// AEAD Provider (RFC 9001 Section 5)
+// ============================================================================
+
+/// AEAD (Authenticated Encryption with Associated Data) Provider
 ///
-/// Contains keys derived from TLS for a specific encryption level.
-#[derive(Clone)]
-pub struct CryptoKeys {
-    /// Encryption level these keys are for
-    pub level: EncryptionLevel,
-
-    /// AEAD algorithm
-    pub aead: AeadAlgorithm,
-
-    /// Header protection algorithm
-    pub hp_algo: HeaderProtectionAlgorithm,
-
-    /// Packet protection key
-    pub key: Bytes,
-
-    /// Packet protection IV
-    pub iv: Bytes,
-
-    /// Header protection key
-    pub hp_key: Bytes,
-}
-
-/// AEAD Trait (RFC 9001 Section 5.3)
+/// RFC 9001 Section 5: QUIC packets are protected using AEAD algorithms.
+/// Provides encryption/decryption of packet payloads.
 ///
-/// Interface for Authenticated Encryption with Associated Data.
-/// Used to encrypt/decrypt QUIC packet payloads.
-pub trait Aead {
-    /// Encrypt a packet payload.
+/// **Design**: Stateless trait - keys are passed as parameters.
+/// Implementation handles algorithm-specific operations (AES-GCM, ChaCha20-Poly1305).
+pub trait AeadProvider: Send + Sync {
+    /// Encrypt packet payload
     ///
-    /// # Arguments
-    /// - `packet_number`: Packet number (used in nonce construction)
-    /// - `header`: Packet header bytes (associated data)
-    /// - `plaintext`: Payload to encrypt
-    /// - `output`: Buffer to write ciphertext + tag
+    /// **Parameters**:
+    /// - `key`: Packet protection key
+    /// - `iv`: Packet-specific IV (XOR of base IV and packet number)
+    /// - `packet_number`: Full packet number (for IV derivation)
+    /// - `header`: Packet header (used as AAD - Additional Authenticated Data)
+    /// - `payload`: Plaintext payload to encrypt
+    /// - `output`: Buffer to write ciphertext + auth tag
     ///
-    /// # Returns
-    /// Number of bytes written (plaintext.len() + tag_len())
-    ///
-    /// # RFC 9001 Section 5.3
-    /// The nonce is constructed by XORing the packet number with the IV.
+    /// **Returns**: Length of ciphertext (includes auth tag)
     fn seal(
         &self,
+        key: &[u8],
+        iv: &[u8],
         packet_number: PacketNumber,
         header: &[u8],
-        plaintext: &[u8],
+        payload: &[u8],
         output: &mut [u8],
     ) -> Result<usize>;
 
-    /// Decrypt a packet payload.
+    /// Decrypt packet payload
     ///
-    /// # Arguments
-    /// - `packet_number`: Packet number (used in nonce construction)
-    /// - `header`: Packet header bytes (associated data)
-    /// - `ciphertext`: Encrypted payload + tag
-    /// - `output`: Buffer to write plaintext
+    /// **Parameters**:
+    /// - `key`: Packet protection key
+    /// - `iv`: Packet-specific IV
+    /// - `packet_number`: Full packet number
+    /// - `header`: Packet header (AAD)
+    /// - `ciphertext`: Encrypted payload + auth tag
+    /// - `output`: Buffer to write decrypted plaintext
     ///
-    /// # Returns
-    /// Number of bytes written (ciphertext.len() - tag_len())
-    ///
-    /// # Errors
-    /// Returns Error::Crypto if authentication fails
+    /// **Returns**: Length of plaintext (excludes auth tag)
     fn open(
         &self,
+        key: &[u8],
+        iv: &[u8],
         packet_number: PacketNumber,
         header: &[u8],
         ciphertext: &[u8],
         output: &mut [u8],
     ) -> Result<usize>;
 
-    /// Get the authentication tag length
+    /// Get AEAD algorithm tag length (typically 16 bytes)
     fn tag_len(&self) -> usize;
+
+    /// Get key length for this AEAD algorithm
+    fn key_len(&self) -> usize;
+
+    /// Get IV length for this AEAD algorithm
+    fn iv_len(&self) -> usize;
 }
 
-/// Header Protection Trait (RFC 9001 Section 5.4)
-///
-/// Interface for protecting/unprotecting packet header fields.
-/// This prevents intermediaries from observing packet numbers.
-pub trait HeaderProtection {
-    /// Protect packet header fields.
-    ///
-    /// # RFC 9001 Section 5.4.1
-    /// Applies header protection to:
-    /// - First byte (flags, packet number length)
-    /// - Packet number bytes
-    ///
-    /// The sample is taken from the encrypted payload.
-    ///
-    /// # Arguments
-    /// - `sample`: 16-byte sample from encrypted payload
-    /// - `first_byte`: Mutable reference to first header byte
-    /// - `packet_number_bytes`: Mutable packet number bytes (1-4 bytes)
-    fn protect(&self, sample: &[u8], first_byte: &mut u8, packet_number_bytes: &mut [u8])
-        -> Result<()>;
+// ============================================================================
+// Header Protection Provider (RFC 9001 Section 5.4)
+// ============================================================================
 
-    /// Unprotect packet header fields.
+/// Header Protection Provider
+///
+/// RFC 9001 Section 5.4: Packet numbers and certain header bits are protected
+/// using a sample from the packet payload to prevent ossification.
+///
+/// **Algorithm**: Uses first 16 bytes of ciphertext as sample, generates
+/// 5-byte mask, XORs with header bits and packet number.
+pub trait HeaderProtectionProvider: Send + Sync {
+    /// Generate header protection mask from sample
     ///
-    /// # RFC 9001 Section 5.4.2
-    /// Removes header protection to reveal:
-    /// - Original first byte flags
-    /// - Original packet number bytes
-    ///
-    /// # Arguments
+    /// **Parameters**:
+    /// - `hp_key`: Header protection key (separate from packet key)
     /// - `sample`: 16-byte sample from encrypted payload
-    /// - `first_byte`: Mutable reference to first header byte
-    /// - `packet_number_bytes`: Mutable packet number bytes (1-4 bytes)
-    fn unprotect(
+    ///
+    /// **Returns**: 5-byte mask (byte 0 for header, bytes 1-4 for packet number)
+    fn generate_mask(&self, hp_key: &[u8], sample: &[u8; 16]) -> Result<[u8; 5]>;
+
+    /// Get header protection key length
+    fn key_len(&self) -> usize;
+}
+
+// ============================================================================
+// Key Schedule (RFC 9001 Section 5.1, 5.2)
+// ============================================================================
+
+/// Key Schedule (Derives keys from TLS secrets)
+///
+/// RFC 9001 Section 5.1: QUIC derives packet protection keys from TLS secrets.
+/// Each encryption level has its own set of keys.
+///
+/// **Keys Derived**:
+/// - Packet protection key (for AEAD)
+/// - Packet protection IV (base IV, XORed with packet number)
+/// - Header protection key (for header masking)
+pub trait KeySchedule: Send + Sync {
+    /// Derive Initial secrets (RFC 9001 Section 5.2)
+    ///
+    /// Initial packets use secrets derived from the Destination Connection ID
+    /// using a version-specific salt.
+    ///
+    /// **Parameters**:
+    /// - `version`: QUIC version (determines salt)
+    /// - `dcid`: Destination Connection ID
+    /// - `side`: Client or Server
+    ///
+    /// **Returns**: (client_secret, server_secret)
+    fn derive_initial_secrets(
         &self,
-        sample: &[u8],
-        first_byte: &mut u8,
-        packet_number_bytes: &mut [u8],
+        version: u32,
+        dcid: &ConnectionId,
+        side: Side,
+    ) -> Result<(Bytes, Bytes)>;
+
+    /// Derive packet protection keys from TLS secret
+    ///
+    /// **Parameters**:
+    /// - `secret`: TLS traffic secret
+    /// - `cipher_suite`: TLS cipher suite ID
+    ///
+    /// **Returns**: (packet_key, packet_iv, hp_key)
+    fn derive_packet_keys(
+        &self,
+        secret: &[u8],
+        cipher_suite: u16,
+    ) -> Result<(Bytes, Bytes, Bytes)>;
+
+    /// Derive next generation of keys (key update, RFC 9001 Section 6)
+    ///
+    /// Used for 1-RTT key updates after handshake completes.
+    fn update_keys(&self, secret: &[u8]) -> Result<Bytes>;
+}
+
+// ============================================================================
+// Packet Protection (Unified Interface)
+// ============================================================================
+
+/// Packet Protection (Combines AEAD + Header Protection)
+///
+/// High-level interface for protecting/unprotecting entire packets.
+/// Delegates to AEAD and HeaderProtection providers.
+pub trait PacketProtection: Send + Sync {
+    /// Protect an outgoing packet (encrypt + apply header protection)
+    ///
+    /// **In-place operation**: Modifies `packet` buffer.
+    ///
+    /// **Parameters**:
+    /// - `level`: Encryption level (determines keys)
+    /// - `packet_number`: Full packet number
+    /// - `packet`: Mutable buffer containing unprotected packet
+    /// - `header_len`: Length of packet header (before payload)
+    ///
+    /// **Returns**: Final packet length (may be longer due to auth tag)
+    fn protect_packet(
+        &self,
+        level: CryptoLevel,
+        packet_number: PacketNumber,
+        packet: &mut [u8],
+        header_len: usize,
+    ) -> Result<usize>;
+
+    /// Unprotect an incoming packet (remove header protection + decrypt)
+    ///
+    /// **In-place operation**: Modifies `packet` buffer.
+    ///
+    /// **Parameters**:
+    /// - `level`: Encryption level
+    /// - `packet`: Mutable buffer containing protected packet
+    ///
+    /// **Returns**: (packet_number, header_len, payload_len)
+    fn unprotect_packet(
+        &self,
+        level: CryptoLevel,
+        packet: &mut [u8],
+    ) -> Result<(PacketNumber, usize, usize)>;
+
+    /// Check if keys are available for a given level
+    fn has_keys(&self, level: CryptoLevel) -> bool;
+
+    /// Install keys for a specific encryption level
+    ///
+    /// Called when TLS handshake provides new secrets.
+    fn install_keys(
+        &mut self,
+        level: CryptoLevel,
+        packet_key: Bytes,
+        packet_iv: Bytes,
+        hp_key: Bytes,
     ) -> Result<()>;
+
+    /// Discard keys for a specific level (RFC 9001 Section 4.9)
+    ///
+    /// Called when transitioning to next encryption level.
+    fn discard_keys(&mut self, level: CryptoLevel);
 }
 
-/// TLS Handshake Status (RFC 9001 Section 4)
+// ============================================================================
+// TLS Session Interface
+// ============================================================================
+
+/// TLS Session (Handshake State Machine)
 ///
-/// Tracks the state of the TLS handshake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandshakeStatus {
-    /// Handshake in progress
-    InProgress,
-
-    /// Handshake completed successfully
-    Complete,
-
-    /// Handshake failed
-    Failed,
-}
-
-/// Crypto Backend Trait (RFC 9001)
+/// RFC 9001 Section 4: QUIC uses TLS 1.3 for key exchange and authentication.
+/// This trait wraps a TLS library (rustls, BoringSSL, etc.) and provides
+/// QUIC-specific handshake operations.
 ///
-/// Main interface between QUIC state machine and TLS provider.
-/// Handles handshake processing and key derivation.
-///
-/// ## Implementation Notes:
-/// - Typically wraps rustls, boring, or ring
-/// - Maintains TLS handshake state
-/// - Provides keys at appropriate encryption levels
-pub trait CryptoBackend {
-    /// Process incoming CRYPTO data.
+/// **Critical Design**: QUIC controls crypto frame transmission, not TLS.
+/// TLS provides crypto data to send, QUIC decides when/how to send it.
+pub trait TlsSession: Send {
+    /// Process incoming CRYPTO frame data
     ///
-    /// # Arguments
-    /// - `level`: Encryption level of the CRYPTO frame
-    /// - `data`: CRYPTO frame data
+    /// Feeds TLS handshake messages to the TLS engine.
     ///
-    /// # Returns
-    /// Handshake status after processing
+    /// **Parameters**:
+    /// - `level`: Encryption level of CRYPTO frame
+    /// - `data`: Handshake data from CRYPTO frame
     ///
-    /// # RFC 9001 Section 4.1
-    /// CRYPTO frames are processed by TLS in order.
-    fn process_crypto_data(&mut self, level: EncryptionLevel, data: &[u8]) -> Result<HandshakeStatus>;
+    /// **Returns**: State change (keys ready, handshake complete, etc.)
+    fn process_crypto_data(&mut self, level: CryptoLevel, data: &[u8]) -> Result<TlsEvent>;
 
-    /// Get outgoing CRYPTO data to send.
+    /// Get outgoing CRYPTO data to send
     ///
-    /// # Arguments
-    /// - `level`: Encryption level to get data for
-    /// - `output`: Buffer to write CRYPTO data
+    /// Returns data that should be sent in CRYPTO frames.
     ///
-    /// # Returns
-    /// Number of bytes written
-    fn get_crypto_data(&mut self, level: EncryptionLevel, output: &mut BytesMut) -> Result<usize>;
+    /// **Returns**: (level, data) - May be empty if nothing to send
+    fn crypto_data_to_send(&mut self) -> Option<(CryptoLevel, Bytes)>;
 
-    /// Get keys for a specific encryption level.
-    ///
-    /// Returns None if keys not yet available.
-    ///
-    /// # RFC 9001 Section 5
-    /// Keys become available after TLS derives secrets.
-    fn get_keys(&self, level: EncryptionLevel) -> Option<&CryptoKeys>;
-
-    /// Get AEAD for encryption at a level.
-    fn get_aead(&self, level: EncryptionLevel) -> Result<&dyn Aead>;
-
-    /// Get header protection for a level.
-    fn get_header_protection(&self, level: EncryptionLevel) -> Result<&dyn HeaderProtection>;
-
-    /// Check if handshake is complete.
+    /// Check if handshake is complete
     fn is_handshake_complete(&self) -> bool;
 
-    /// Update 1-RTT keys (RFC 9001 Section 6)
-    ///
-    /// Performs in-protocol key update for 1-RTT packets.
-    fn update_keys(&mut self) -> Result<()>;
+    /// Get negotiated ALPN protocol
+    fn alpn_protocol(&self) -> Option<&[u8]>;
 
-    /// Get peer's TLS certificate chain (for validation)
+    /// Get peer's certificate chain (for validation)
     fn peer_certificates(&self) -> Option<&[Bytes]>;
 
-    /// Get negotiated ALPN protocol
-    fn alpn(&self) -> Option<&[u8]>;
-
-    /// Get negotiated QUIC transport parameters
-    fn transport_parameters(&self) -> Option<&[u8]>;
+    /// Trigger key update (RFC 9001 Section 6)
+    fn initiate_key_update(&mut self) -> Result<()>;
 }
 
-/// Initial Secret Derivation (RFC 9001 Section 5.2)
-///
-/// QUIC derives Initial Secrets from the client's DCID.
-/// This allows stateless servers to decrypt Initial packets.
-///
-/// # Salt for QUIC Version 1
-/// ```text
-/// 38762cf7f55934b34d179ae6a4c80cadccbb7f0a
-/// ```
-pub const INITIAL_SALT_V1: &[u8] = &[
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c,
-    0xad, 0xcc, 0xbb, 0x7f, 0x0a,
-];
+/// TLS Event (Handshake State Changes)
+#[derive(Debug, Clone)]
+pub enum TlsEvent {
+    /// New encryption keys available
+    KeysReady {
+        level: CryptoLevel,
+        /// TLS traffic secret (use with KeySchedule to derive packet keys)
+        secret: Bytes,
+    },
 
-/// Trait for deriving Initial Secrets
-pub trait InitialSecretDerivation {
-    /// Derive client Initial Secret from DCID.
+    /// Handshake has completed successfully
+    HandshakeComplete,
+
+    /// TLS alert received (error)
+    Alert { code: u8, message: Bytes },
+
+    /// No state change
+    None,
+}
+
+// ============================================================================
+// Crypto Backend (Top-Level Interface)
+// ============================================================================
+
+/// Crypto Backend (Unified Cryptography Provider)
+///
+/// Factory trait for creating crypto components. Implementations provide
+/// all crypto primitives needed for QUIC.
+///
+/// **Design Rationale**: Single trait for DI (dependency injection).
+/// Test implementations can mock all crypto at once.
+pub trait CryptoBackend: Send + Sync {
+    /// Create AEAD provider for cipher suite
+    fn create_aead(&self, cipher_suite: u16) -> Result<Box<dyn AeadProvider>>;
+
+    /// Create header protection provider for cipher suite
+    fn create_header_protection(
+        &self,
+        cipher_suite: u16,
+    ) -> Result<Box<dyn HeaderProtectionProvider>>;
+
+    /// Create key schedule
+    fn create_key_schedule(&self) -> Box<dyn KeySchedule>;
+
+    /// Create TLS session for handshake
     ///
-    /// # RFC 9001 Section 5.2
-    /// Uses HKDF-Extract with INITIAL_SALT and DCID.
-    fn derive_client_initial_secret(&self, dcid: &[u8]) -> Result<Bytes>;
-
-    /// Derive server Initial Secret from DCID.
-    fn derive_server_initial_secret(&self, dcid: &[u8]) -> Result<Bytes>;
-
-    /// Derive keys from a secret.
-    fn derive_keys(&self, secret: &[u8], aead: AeadAlgorithm) -> Result<CryptoKeys>;
+    /// **Parameters**:
+    /// - `side`: Client or Server
+    /// - `server_name`: SNI for client, ignored for server
+    /// - `alpn_protocols`: Offered/accepted ALPN protocols
+    fn create_tls_session(
+        &self,
+        side: Side,
+        server_name: Option<&str>,
+        alpn_protocols: &[&[u8]],
+    ) -> Result<Box<dyn TlsSession>>;
 }

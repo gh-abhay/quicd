@@ -1,94 +1,64 @@
-//! # Packet Header Types (RFC 9000 Section 17, RFC 8999)
+//! # QUIC Packet Header Parsing and Types (RFC 9000 Section 17, RFC 8999)
 //!
-//! This module defines the packet header format and parsing traits.
-//! QUIC has two header forms: Long Header and Short Header.
-//!
-//! ## Long Header (RFC 9000 Section 17.2)
-//! Used during handshake (Initial, 0-RTT, Handshake, Retry).
-//! Contains version field and full connection IDs.
-//!
-//! ## Short Header (RFC 9000 Section 17.3)
-//! Used for 1-RTT packets after handshake completes.
-//! Omits version and SCID for efficiency.
+//! Zero-copy packet header parsing with lifetime-bound return types.
+//! Supports both Long Header (handshake) and Short Header (1-RTT) formats.
 
 #![forbid(unsafe_code)]
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, TransportError};
 use crate::types::{ConnectionId, PacketNumber, VarInt};
 use bytes::Bytes;
+use core::fmt;
 
-/// Header Form Bit (RFC 8999 Section 5.1)
-///
-/// The most significant bit of the first byte indicates header form:
-/// - 1: Long Header
-/// - 0: Short Header
+// ============================================================================
+// Header Form Constants (RFC 8999 Section 5.1, RFC 9000 Section 17)
+// ============================================================================
+
+/// Header Form Bit (most significant bit)
+/// 1 = Long Header, 0 = Short Header
 pub const HEADER_FORM_BIT: u8 = 0x80;
 
-/// Fixed Bit (RFC 9000 Section 17.2)
-///
-/// The second most significant bit MUST be set to 1.
-/// Packets with this bit cleared are not valid QUIC packets.
+/// Fixed Bit (second most significant bit)
+/// MUST be set to 1 in all QUIC packets
 pub const FIXED_BIT: u8 = 0x40;
 
-/// Long Packet Type Mask (RFC 9000 Section 17.2)
-///
-/// Bits 4-5 of the first byte encode the long packet type.
+/// Long Packet Type Mask (bits 4-5)
 pub const LONG_PACKET_TYPE_MASK: u8 = 0x30;
 
-/// Long Packet Type: Initial (0x00)
+/// Long Packet Type Values
 pub const LONG_PACKET_TYPE_INITIAL: u8 = 0x00;
-
-/// Long Packet Type: 0-RTT (0x10)
 pub const LONG_PACKET_TYPE_0RTT: u8 = 0x10;
-
-/// Long Packet Type: Handshake (0x20)
 pub const LONG_PACKET_TYPE_HANDSHAKE: u8 = 0x20;
-
-/// Long Packet Type: Retry (0x30)
 pub const LONG_PACKET_TYPE_RETRY: u8 = 0x30;
 
-/// Spin Bit (RFC 9000 Section 17.3.1)
-///
-/// Used for latency measurement. Third most significant bit in short header.
+/// Spin Bit (Short Header, bit 5)
 pub const SPIN_BIT: u8 = 0x20;
 
-/// Key Phase Bit (RFC 9000 Section 17.3.1)
-///
-/// Indicates which key phase is in use. Fourth most significant bit.
+/// Key Phase Bit (Short Header, bit 2)
 pub const KEY_PHASE_BIT: u8 = 0x04;
 
-/// Packet Number Length Mask (RFC 9000 Section 17.2)
-///
-/// Bottom 2 bits encode packet number length - 1 (0=1 byte, 1=2 bytes, etc.)
+/// Packet Number Length Mask (bottom 2 bits)
+/// Encodes (packet_number_length - 1)
 pub const PACKET_NUMBER_LENGTH_MASK: u8 = 0x03;
 
+// ============================================================================
+// Packet Type Enumeration
+// ============================================================================
+
 /// Packet Type (RFC 9000 Section 17)
-///
-/// Distinguishes between different packet types in the QUIC protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketType {
     /// Initial packet (Long Header, type 0x0)
-    /// Used for client's first flight and crypto handshake
     Initial,
-
     /// 0-RTT packet (Long Header, type 0x1)
-    /// Contains early application data before handshake completes
     ZeroRtt,
-
     /// Handshake packet (Long Header, type 0x2)
-    /// Used for crypto handshake after Initial keys derived
     Handshake,
-
     /// Retry packet (Long Header, type 0x3)
-    /// Sent by server to perform stateless retry
     Retry,
-
     /// 1-RTT packet (Short Header)
-    /// Used for application data after handshake completes
     OneRtt,
-
-    /// Version Negotiation packet (Long Header with version 0x00000000)
-    /// Sent when server doesn't support client's version
+    /// Version Negotiation packet (special Long Header)
     VersionNegotiation,
 }
 
@@ -98,215 +68,242 @@ impl PacketType {
         !matches!(self, PacketType::OneRtt)
     }
 
-    /// Returns true if this is a short header packet type
-    pub fn is_short_header(&self) -> bool {
-        matches!(self, PacketType::OneRtt)
+    /// Returns true if this packet type carries an ACK-eliciting payload
+    pub fn is_ack_eliciting_type(&self) -> bool {
+        !matches!(
+            self,
+            PacketType::Retry | PacketType::VersionNegotiation
+        )
     }
 
-    /// Returns true if this packet type carries an ACK-eliciting payload
-    pub fn is_ack_eliciting(&self) -> bool {
-        // Version Negotiation and Retry are not ACK-eliciting
-        !matches!(self, PacketType::VersionNegotiation | PacketType::Retry)
+    /// Get the packet number space for this packet type
+    pub fn packet_number_space(&self) -> Option<crate::types::PacketNumberSpace> {
+        use crate::types::PacketNumberSpace;
+        match self {
+            PacketType::Initial => Some(PacketNumberSpace::Initial),
+            PacketType::Handshake => Some(PacketNumberSpace::Handshake),
+            PacketType::ZeroRtt | PacketType::OneRtt => {
+                Some(PacketNumberSpace::ApplicationData)
+            }
+            PacketType::Retry | PacketType::VersionNegotiation => None,
+        }
     }
 }
 
-/// Long Packet Header (RFC 9000 Section 17.2)
+// ============================================================================
+// Header Structures (Zero-Copy, Lifetime-Bound)
+// ============================================================================
+
+/// Long Header (RFC 9000 Section 17.2)
 ///
-/// Used for Initial, 0-RTT, Handshake, and Retry packets.
-/// Contains full version and connection ID information.
+/// Used during connection establishment. Contains version field and
+/// both source and destination connection IDs.
 #[derive(Debug, Clone)]
-pub struct LongHeader {
-    /// Packet type (Initial, 0-RTT, Handshake, Retry)
+pub struct LongHeader<'a> {
+    /// Packet type (Initial, 0-RTT, Handshake, Retry, VersionNegotiation)
     pub packet_type: PacketType,
 
-    /// QUIC version (4 bytes)
+    /// QUIC version (or 0x00000000 for Version Negotiation)
     pub version: u32,
 
     /// Destination Connection ID
-    pub dcid: ConnectionId,
+    pub dcid: &'a [u8],
 
     /// Source Connection ID
-    pub scid: ConnectionId,
+    pub scid: &'a [u8],
 
-    /// Token (only for Initial and Retry packets)
-    pub token: Option<Bytes>,
+    /// Token (only present in Initial and Retry packets)
+    pub token: Option<&'a [u8]>,
 
-    /// Packet Number (not present in Retry packets)
-    /// Encoded length varies (1-4 bytes)
-    pub packet_number: Option<PacketNumber>,
+    /// Length of payload + packet number (only in Initial, 0-RTT, Handshake)
+    pub length: Option<VarInt>,
 
-    /// Packet Number Length in bytes (1-4)
-    /// Derived from the 2 least significant bits of first byte
-    pub packet_number_length: u8,
-
-    /// Length of the payload (variable-length integer)
-    /// Includes packet number and encrypted payload
-    pub length: VarInt,
+    /// Encoded packet number (1-4 bytes, still protected)
+    /// Not present in Retry or Version Negotiation packets
+    pub packet_number: Option<&'a [u8]>,
 }
 
-/// Short Packet Header (RFC 9000 Section 17.3)
+/// Short Header (RFC 9000 Section 17.3)
 ///
-/// Used for 1-RTT packets after handshake completion.
-/// More compact than long header, omits version and SCID.
+/// Used for 1-RTT packets after handshake completes. Omits version
+/// and source connection ID for efficiency.
 #[derive(Debug, Clone)]
-pub struct ShortHeader {
-    /// Destination Connection ID
-    /// Length determined by initial handshake
-    pub dcid: ConnectionId,
+pub struct ShortHeader<'a> {
+    /// Spin bit (for latency measurement)
+    pub spin: bool,
 
-    /// Packet Number (1-4 bytes)
-    pub packet_number: PacketNumber,
-
-    /// Packet Number Length in bytes (1-4)
-    pub packet_number_length: u8,
-
-    /// Spin bit value (for latency measurement)
-    pub spin_bit: bool,
-
-    /// Key phase bit (indicates current key phase)
+    /// Key phase bit (for key updates)
     pub key_phase: bool,
+
+    /// Destination Connection ID
+    pub dcid: &'a [u8],
+
+    /// Encoded packet number (1-4 bytes, still protected)
+    pub packet_number: &'a [u8],
 }
 
-/// Unified Packet Header (RFC 9000 Section 17)
-///
-/// Discriminated union of Long and Short headers.
+/// Parsed Packet Header (unifies Long and Short headers)
 #[derive(Debug, Clone)]
-pub enum PacketHeader {
+pub enum Header<'a> {
     /// Long header packet
-    Long(LongHeader),
+    Long(LongHeader<'a>),
 
     /// Short header packet
-    Short(ShortHeader),
+    Short(ShortHeader<'a>),
 }
 
-impl PacketHeader {
+impl<'a> Header<'a> {
     /// Get the packet type
     pub fn packet_type(&self) -> PacketType {
         match self {
-            PacketHeader::Long(h) => h.packet_type,
-            PacketHeader::Short(_) => PacketType::OneRtt,
+            Header::Long(h) => h.packet_type,
+            Header::Short(_) => PacketType::OneRtt,
         }
     }
 
-    /// Get the destination connection ID
-    pub fn dcid(&self) -> &ConnectionId {
+    /// Get destination connection ID
+    pub fn dcid(&self) -> &'a [u8] {
         match self {
-            PacketHeader::Long(h) => &h.dcid,
-            PacketHeader::Short(h) => &h.dcid,
+            Header::Long(h) => h.dcid,
+            Header::Short(h) => h.dcid,
         }
     }
 
-    /// Get the packet number (if present)
-    pub fn packet_number(&self) -> Option<PacketNumber> {
+    /// Get source connection ID (only available in Long Header)
+    pub fn scid(&self) -> Option<&'a [u8]> {
         match self {
-            PacketHeader::Long(h) => h.packet_number,
-            PacketHeader::Short(h) => Some(h.packet_number),
+            Header::Long(h) => Some(h.scid),
+            Header::Short(_) => None,
+        }
+    }
+
+    /// Get the version (only available in Long Header)
+    pub fn version(&self) -> Option<u32> {
+        match self {
+            Header::Long(h) => Some(h.version),
+            Header::Short(_) => None,
+        }
+    }
+
+    /// Get the encoded (protected) packet number bytes
+    pub fn protected_packet_number(&self) -> Option<&'a [u8]> {
+        match self {
+            Header::Long(h) => h.packet_number,
+            Header::Short(h) => Some(h.packet_number),
         }
     }
 }
 
-/// Parsed Packet (Zero-Copy)
+// ============================================================================
+// Packet Parser Trait (Zero-Copy, Lifetime-Bound)
+// ============================================================================
+
+/// Zero-Copy Packet Parser (RFC 9000 Section 17)
 ///
-/// Represents a parsed QUIC packet with lifetime-bound payload reference.
-/// The payload slice points into the original datagram buffer.
-#[derive(Debug)]
-pub struct ParsedPacket<'a> {
-    /// Parsed header
-    pub header: PacketHeader,
+/// Parses QUIC packet headers without copying data. All returned
+/// references borrow from the input buffer.
+///
+/// **Design Rationale**:
+/// - Lifetime parameter 'a binds all returned data to input buffer
+/// - No heap allocations during parsing
+/// - Returns slices into original packet for zero-copy processing
+pub trait PacketParser: Send + Sync {
+    /// Parse packet header from bytes
+    ///
+    /// Returns parsed header and offset to payload.
+    /// Header references borrow from input buffer 'a.
+    ///
+    /// **Note**: Packet number is still protected at this stage.
+    /// Call `remove_header_protection()` before decoding.
+    fn parse_header<'a>(&self, packet: &'a [u8]) -> Result<(Header<'a>, usize)>;
 
-    /// Encrypted payload (references original buffer)
-    /// Does NOT include packet number - that's in the header
-    pub payload: &'a [u8],
+    /// Parse only the first byte to determine header form
+    ///
+    /// Fast path for routing decisions without full parsing.
+    fn peek_header_form(&self, packet: &[u8]) -> Result<HeaderForm>;
 
-    /// Header bytes (for header protection removal)
-    /// References the exact header bytes from original buffer
-    pub header_bytes: &'a [u8],
+    /// Extract destination CID without full parsing
+    ///
+    /// Used for connection demultiplexing. Faster than full parse.
+    fn extract_dcid<'a>(
+        &self,
+        packet: &'a [u8],
+        dcid_len: Option<usize>,
+    ) -> Result<&'a [u8]>;
 }
 
-/// Packet Parser Trait (Zero-Copy)
-///
-/// Defines the interface for parsing QUIC packets from UDP datagrams.
-/// All parsing is done in-place without allocations.
-///
-/// ## Implementation Note:
-/// The parser must handle:
-/// 1. Version-independent header parsing (RFC 8999)
-/// 2. Variable-length integer decoding
-/// 3. Connection ID extraction
-/// 4. Packet number recovery (RFC 9000 Section A.3)
-pub trait PacketParser {
-    /// Parse a QUIC packet from a datagram buffer.
-    ///
-    /// Returns a ParsedPacket with lifetime-bound references to the input buffer.
-    /// The payload is still encrypted at this stage.
-    ///
-    /// # Errors
-    /// Returns Error::ProtocolViolation if the packet is malformed.
-    fn parse<'a>(&self, datagram: &'a [u8]) -> Result<ParsedPacket<'a>>;
-
-    /// Decode a variable-length integer from a buffer.
-    ///
-    /// Returns (value, bytes_consumed) on success.
-    ///
-    /// # RFC 9000 Section 16
-    /// Variable-length integers use the first 2 bits to encode length:
-    /// - 00: 1 byte (6-bit value)
-    /// - 01: 2 bytes (14-bit value)
-    /// - 10: 4 bytes (30-bit value)
-    /// - 11: 8 bytes (62-bit value)
-    fn decode_varint(&self, buf: &[u8]) -> Result<(VarInt, usize)>;
-
-    /// Recover the full packet number from a truncated packet number.
-    ///
-    /// # RFC 9000 Section A.3
-    /// Packet numbers are transmitted in truncated form (1-4 bytes).
-    /// The receiver reconstructs the full value using the largest
-    /// acknowledged packet number.
-    fn recover_packet_number(
-        &self,
-        truncated_pn: u64,
-        pn_nbits: usize,
-        expected_pn: PacketNumber,
-    ) -> PacketNumber;
+/// Header Form (Long vs Short)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderForm {
+    /// Long Header (handshake packets)
+    Long,
+    /// Short Header (1-RTT packets)
+    Short,
 }
 
-/// Packet Builder Trait (Zero-Allocation)
-///
-/// Defines the interface for constructing QUIC packets.
-/// The caller provides a pre-allocated buffer.
-///
-/// ## Implementation Note:
-/// The builder writes directly into the provided buffer.
-/// Encryption is handled separately by the CryptoBackend.
-pub trait PacketBuilder {
-    /// Build a long header packet into the provided buffer.
-    ///
-    /// Returns the number of bytes written on success.
-    ///
-    /// # Errors
-    /// Returns Error::InternalError if buffer is too small.
-    fn build_long_header(
+// ============================================================================
+// Default Parser Implementation Skeleton
+// ============================================================================
+
+/// Default zero-copy packet parser
+pub struct DefaultPacketParser;
+
+impl PacketParser for DefaultPacketParser {
+    fn parse_header<'a>(&self, packet: &'a [u8]) -> Result<(Header<'a>, usize)> {
+        unimplemented!("Skeleton - no implementation required")
+    }
+
+    fn peek_header_form(&self, packet: &[u8]) -> Result<HeaderForm> {
+        unimplemented!("Skeleton - no implementation required")
+    }
+
+    fn extract_dcid<'a>(
         &self,
-        buf: &mut [u8],
-        header: &LongHeader,
-        payload: &[u8],
+        packet: &'a [u8],
+        dcid_len: Option<usize>,
+    ) -> Result<&'a [u8]> {
+        unimplemented!("Skeleton - no implementation required")
+    }
+}
+
+// ============================================================================
+// Header Protection Removal (RFC 9001 Section 5.4)
+// ============================================================================
+
+/// Header Protection Operations
+///
+/// RFC 9001 Section 5.4: Packet number and certain header bits are
+/// protected using a sample from the packet payload.
+///
+/// **Critical Design**: This trait enables in-place modification of
+/// packet buffers for header protection removal without allocation.
+pub trait HeaderProtectionRemover {
+    /// Remove header protection from a packet
+    ///
+    /// Modifies the packet buffer in-place to reveal:
+    /// - Actual packet number length (bottom 2 bits of first byte)
+    /// - Packet number bytes
+    ///
+    /// **Parameters**:
+    /// - `packet`: Mutable buffer containing protected packet
+    /// - `header_len`: Length of fixed header before packet number
+    /// - `sample`: 16-byte sample from packet payload
+    ///
+    /// **Returns**: Length of packet number (1-4 bytes)
+    fn remove_protection(
+        &self,
+        packet: &mut [u8],
+        header_len: usize,
+        sample: &[u8; 16],
     ) -> Result<usize>;
 
-    /// Build a short header packet into the provided buffer.
+    /// Apply header protection to a packet
     ///
-    /// Returns the number of bytes written on success.
-    fn build_short_header(
+    /// Inverse operation for outgoing packets.
+    fn apply_protection(
         &self,
-        buf: &mut [u8],
-        header: &ShortHeader,
-        payload: &[u8],
-    ) -> Result<usize>;
-
-    /// Encode a variable-length integer into the buffer.
-    ///
-    /// Returns the number of bytes written.
-    fn encode_varint(&self, buf: &mut [u8], value: VarInt) -> Result<usize>;
-
-    /// Calculate the required size for encoding a VarInt
-    fn varint_size(&self, value: VarInt) -> usize;
+        packet: &mut [u8],
+        header_len: usize,
+        sample: &[u8; 16],
+    ) -> Result<()>;
 }
