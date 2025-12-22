@@ -383,15 +383,16 @@ impl QuicConnection {
             Frame::Ack(ack_frame) => {
                 // Process ACK: mark packets as acknowledged, detect losses
                 let space = crate::types::PacketNumberSpace::ApplicationData;
-                let lost_packets = self.loss_detector.on_ack_received(
+                let result = self.loss_detector.on_ack_received(
                     space,
                     ack_frame.largest_acked,
                     Duration::from_micros(ack_frame.ack_delay as u64),
+                    &[], // ACK ranges - simplified
                     now,
-                );
+                )?;
                 
                 // Handle lost packets - mark for retransmission
-                for _pn in lost_packets {
+                for _pn in result.1 {
                     self.stats.packets_lost += 1;
                 }
                 
@@ -516,16 +517,24 @@ impl CryptoBackend for StubCryptoBackend {
 struct StubLossDetector;
 
 impl LossDetector for StubLossDetector {
-    fn on_packet_sent(&mut self, _info: crate::recovery::PacketSentInfo) {}
+    fn on_packet_sent(
+        &mut self,
+        _space: crate::types::PacketNumberSpace,
+        _packet_number: PacketNumber,
+        _size: usize,
+        _is_retransmittable: bool,
+        _send_time: Instant,
+    ) {}
     
     fn on_ack_received(
         &mut self,
         _space: crate::types::PacketNumberSpace,
         _largest_acked: PacketNumber,
         _ack_delay: Duration,
-        _now: Instant,
-    ) -> alloc::vec::Vec<PacketNumber> {
-        alloc::vec::Vec::new()
+        _ack_ranges: &[(PacketNumber, PacketNumber)],
+        _recv_time: Instant,
+    ) -> crate::error::Result<(alloc::vec::Vec<PacketNumber>, alloc::vec::Vec<PacketNumber>)> {
+        Ok((alloc::vec::Vec::new(), alloc::vec::Vec::new()))
     }
     
     fn detect_lost_packets(
@@ -536,15 +545,19 @@ impl LossDetector for StubLossDetector {
         alloc::vec::Vec::new()
     }
     
-    fn loss_detection_timer(&self) -> Option<Instant> {
+    fn get_loss_detection_timer(&self) -> Option<Instant> {
         None
     }
     
-    fn pto_count(&self, _space: crate::types::PacketNumberSpace) -> u32 {
+    fn on_loss_detection_timeout(&mut self, _now: Instant) -> crate::recovery::LossDetectionAction {
+        crate::recovery::LossDetectionAction::None
+    }
+    
+    fn pto_count(&self) -> u32 {
         0
     }
     
-    fn reset_pto_count(&mut self, _space: crate::types::PacketNumberSpace) {}
+    fn discard_pn_space(&mut self, _space: crate::types::PacketNumberSpace) {}
 }
 
 impl Connection for QuicConnection {
@@ -706,7 +719,7 @@ impl Connection for QuicConnection {
         }
 
         // Loss detection timer
-        if let Some(loss_timer) = self.loss_detector.loss_detection_timer() {
+        if let Some(loss_timer) = self.loss_detector.get_loss_detection_timer() {
             earliest = Some(match earliest {
                 None => loss_timer,
                 Some(e) => if loss_timer.as_nanos() < e.as_nanos() {
