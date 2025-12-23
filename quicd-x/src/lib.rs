@@ -7,21 +7,29 @@
 //! ## Ingress (Worker → App): Bounded tokio::mpsc
 //! - **Per-connection** bounded channel (capacity 32-64)
 //! - Provides automatic backpressure to worker when app is slow
-//! - Worker detects full channel and applies QUIC flow control
+//! - Worker detects full channel via try_send() and applies QUIC flow control
 //!
 //! ## Egress (App → Worker): Unbounded crossbeam
 //! - **Shared per-worker** unbounded channel
 //! - All app tasks send to same worker channel
 //! - High-throughput signaling without blocking
+//! - Worker processes commands in batches between I/O operations
 //!
 //! ## Zero-Copy Design
 //! - All data transferred as `bytes::Bytes` (reference-counted)
 //! - No memory copies in hot path
+//! - Worker slices and transfers ownership to Task
 //!
 //! ## No Poller Thread
 //! - ConnectionHandle directly holds the ingress receiver
 //! - Applications poll events directly via async methods
 //! - Zero-allocation event delivery
+//!
+//! ## Scalability Model
+//! - Exactly ONE Tokio task per connection
+//! - Applications MUST NOT spawn additional tasks
+//! - Event-driven patterns exclusively within single task
+//! - Supports millions of concurrent connections per worker
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};

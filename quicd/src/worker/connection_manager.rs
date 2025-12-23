@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn, debug};
+use tracing::{error, info, warn, debug, trace};
 
 /// Default maximum concurrent connections per worker.
 /// This provides predictable memory usage: ~100MB per worker for 100k connections.
@@ -170,15 +170,13 @@ impl ConnectionManager {
     fn remove_connection(&mut self, slab_idx: SlabIndex) {
         if let Some(state) = self.connections.get(slab_idx) {
             // Get the SCID before removing
-            let scid = state.conn.scid();
+            let scid = state.conn.source_cid().clone();
             
             // Remove all DCID mappings for this connection
             self.dcid_to_slab.retain(|_, &mut idx| idx != slab_idx);
             
             // Remove SCID mapping
-            if let Some(scid) = scid {
-                self.scid_to_slab.remove(&scid);
-            }
+            self.scid_to_slab.remove(&scid);
         }
         
         // Remove from Slab (slot will be reused)
@@ -444,14 +442,18 @@ impl ConnectionManager {
                 ingress_backpressure: false,
             };
             
-            // INSERT INTO HASHMAP IMMEDIATELY - before processing packet
+            // INSERT INTO SLAB IMMEDIATELY - before processing packet
             // This allows Short packets arriving during processing to find the connection
-            self.connections.insert(scid.clone(), state);
-            self.dcid_to_conn.insert(dcid.clone(), scid.clone());
-            self.dcid_to_conn.insert(scid.clone(), scid.clone());
+            let slab_idx = match self.insert_connection(dcid.clone(), scid.clone(), state) {
+                Some(idx) => idx,
+                None => {
+                    error!("Failed to insert connection - Slab at capacity");
+                    return vec![];
+                }
+            };
             
             // Now process the Initial packet
-            if let Some(state) = self.connections.get_mut(&scid) {
+            if let Some(state) = self.get_connection_mut(slab_idx) {
                 let datagram_input = DatagramInput {
                     data: bytes,
                     recv_time: Self::to_quic_instant(now),
@@ -459,15 +461,13 @@ impl ConnectionManager {
                 if let Err(e) = state.conn.process_datagram(datagram_input) {
                     error!("Failed to process initial packet: {}", e);
                     // Remove the connection on failure
-                    self.connections.remove(&scid);
-                    self.dcid_to_conn.remove(&dcid);
-                    self.dcid_to_conn.remove(&scid);
+                    self.remove_connection(slab_idx);
                     return vec![];
                 }
             }
             
-            let packets = self.generate_packets(&scid, now);
-            self.check_handshake_complete(&scid);
+            let packets = self.generate_packets(slab_idx, now);
+            self.check_handshake_complete(slab_idx);
             
             return packets;
         }
@@ -500,8 +500,13 @@ impl ConnectionManager {
         // Flush any pending events before spawning
         self.flush_events_to_app(slab_idx);
         
+        // Clone shared resources before borrowing state
+        let egress_tx = self.egress_tx.clone();
+        let app_registry = self.app_registry.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        
         if let Some(state) = self.get_connection_mut(slab_idx) {
-            let scid = state.conn.scid().expect("Connection must have SCID");
+            let scid = state.conn.source_cid().clone();
             if let Some(rx) = state.ingress_rx.take() {
                 state.app_spawned = true;
                 
@@ -515,7 +520,7 @@ impl ConnectionManager {
                 let handle = ConnectionHandle::new(
                     XConnectionId(conn_id_u64),
                     rx,
-                    self.egress_tx.clone(),
+                    egress_tx,
                 );
                 
                 // Get negotiated ALPN from connection wrapper
@@ -528,13 +533,13 @@ impl ConnectionManager {
                         let alpn_str = std::str::from_utf8(alpn_bytes).unwrap_or("<invalid-utf8>");
                         
                         // Look up application factory in registry
-                        match self.app_registry.get(alpn_str) {
+                        match app_registry.get(alpn_str) {
                             Some(factory) => {
                                 let app = factory();
                                 info!("Application task spawned for connection {} with ALPN: {}", conn_id_u64, alpn_str);
                                 
                                 // Spawn exactly ONE tokio task per connection
-                                self.tokio_handle.spawn(async move {
+                                tokio_handle.spawn(async move {
                                     app.on_connection(handle).await;
                                     debug!("Application task completed for connection {}", conn_id_u64);
                                 });
@@ -559,15 +564,21 @@ impl ConnectionManager {
     /// 
     /// # Backpressure Handling
     /// Uses try_send on bounded tokio::mpsc channel. If channel is full:
-    /// - Event is dropped (logged as warning)
-    /// - Worker should detect this and apply QUIC flow control
+    /// - Sets ingress_backpressure flag for this connection
+    /// - Worker stops reading stream data (via flush_events_to_app_with_backpressure)
     /// - Application task must process events faster to keep up
-    fn bridge_event_to_app(&self, event: ConnectionEvent, ingress_tx: &mpsc::Sender<Event>) {
+    /// - Returns true if backpressure was applied
+    fn bridge_event_to_app(&mut self, event: ConnectionEvent, slab_idx: SlabIndex) -> bool {
+        let ingress_tx = if let Some(state) = self.get_connection(slab_idx) {
+            state.ingress_tx.clone()
+        } else {
+            return false;
+        };
         let x_event = match event {
             ConnectionEvent::HandshakeComplete => {
                 debug!("Handshake complete event received");
                 // Handshake complete is handled separately by spawning application
-                return;
+                return false;
             }
             
             ConnectionEvent::StreamData { stream_id, data, fin } => {
@@ -620,7 +631,16 @@ impl ConnectionManager {
         // Send event to application task via bounded tokio::mpsc channel
         // try_send returns immediately, providing backpressure if channel is full
         match ingress_tx.try_send(x_event) {
-            Ok(_) => {},
+            Ok(_) => {
+                // Successfully sent - clear backpressure flag if set
+                if let Some(state) = self.get_connection_mut(slab_idx) {
+                    if state.ingress_backpressure {
+                        debug!("Clearing ingress backpressure for slab_idx={}", slab_idx);
+                        state.ingress_backpressure = false;
+                    }
+                }
+                false
+            },
             Err(mpsc::error::TrySendError::Full(_)) => {
                 // ═══════════════════════════════════════════════════════════════════
                 // BACKPRESSURE HANDLING (Asymmetric Channel Strategy)
@@ -630,10 +650,10 @@ impl ConnectionManager {
                 //
                 // Strategy:
                 // 1. Set ingress_backpressure flag for this connection
-                // 2. QUIC state machine will respect flow control
-                // 3. Connection will stop reading stream data
-                // 4. Peer will stop sending data (flow control window = 0)
-                // 5. When channel drains, clear flag and resume reading
+                // 2. Stop polling events from QUIC state machine (skip StreamData)
+                // 3. Connection buffer fills up naturally
+                // 4. QUIC flow control signals peer to stop sending
+                // 5. When channel drains, clear flag and resume polling
                 //
                 // Benefits:
                 // - Prevents unbounded memory growth
@@ -643,19 +663,43 @@ impl ConnectionManager {
                 //
                 // This is the "bounded ingress for memory safety" principle.
                 // ═══════════════════════════════════════════════════════════════════
-                warn!("Ingress channel full - applying QUIC flow control backpressure");
+                if let Some(state) = self.get_connection_mut(slab_idx) {
+                    if !state.ingress_backpressure {
+                        warn!(
+                            "Ingress channel full for slab_idx={} - applying backpressure (will stop polling events)",
+                            slab_idx
+                        );
+                        state.ingress_backpressure = true;
+                    }
+                }
+                true // Backpressure applied
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Application task has terminated
-                debug!("Ingress channel closed - application task ended");
+                // Application task has terminated - close connection
+                debug!("Ingress channel closed for slab_idx={} - application task ended", slab_idx);
+                if let Some(state) = self.get_connection_mut(slab_idx) {
+                    state.conn.close(0x00, b"application terminated");
+                }
+                false
             }
         }
     }
     
     fn flush_events_to_app(&mut self, slab_idx: SlabIndex) {
+        // Check backpressure flag first
+        let under_backpressure = self.get_connection(slab_idx)
+            .map(|s| s.ingress_backpressure)
+            .unwrap_or(false);
+        
+        if under_backpressure {
+            // Don't poll events when under backpressure
+            // This allows QUIC flow control to naturally throttle the sender
+            trace!("Skipping event flush for slab_idx={} (backpressure active)", slab_idx);
+            return;
+        }
+        
         if let Some(state) = self.get_connection_mut(slab_idx) {
-            // Clone the channel sender and collect events to avoid borrow checker issues
-            let ingress_tx = state.ingress_tx.clone();
+            // Collect events to avoid borrow checker issues
             let mut events = Vec::new();
             
             // Poll all pending events from the connection
@@ -666,9 +710,16 @@ impl ConnectionManager {
             // Drop the mutable borrow before calling bridge_event_to_app
             drop(state);
             
-            // Now send events (no borrow of self.connections)
+            // Now send events (bridge_event_to_app takes &mut self)
             for event in events {
-                self.bridge_event_to_app(event, &ingress_tx);
+                let backpressure_applied = self.bridge_event_to_app(event, slab_idx);
+                
+                // If backpressure was applied, stop flushing events
+                // This prevents filling the channel and wasting CPU
+                if backpressure_applied {
+                    debug!("Backpressure applied for slab_idx={} - stopping event flush", slab_idx);
+                    break;
+                }
             }
         }
     }
@@ -797,80 +848,29 @@ impl ConnectionManager {
                 }
             }
             Command::StopSending { conn_id, stream_id, error_code } => {
-                // Stop sending on stream via Connection trait
+                // Stop sending on stream - for now just generate packets
+                // TODO: Implement proper STOP_SENDING frame handling in quicd-quic
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
-                    if let Some(state) = self.get_connection_mut(slab_idx) {
-                        let quic_stream_id = QuicStreamId(stream_id.0);
-                        if let Err(e) = state.conn.stop_sending(quic_stream_id, error_code) {
-                            error!("Failed to stop sending on stream {:?}: {}", stream_id, e);
-                        }
-                    }
+                    debug!("STOP_SENDING requested for stream {:?} with error {}", stream_id, error_code);
                     return self.generate_packets(slab_idx, now);
                 }
             }
             Command::AbortConnection { conn_id, error_code } => {
-                // Immediate connection abort (less graceful than close)
+                // Immediate connection abort using close()
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
                     if let Some(state) = self.get_connection_mut(slab_idx) {
-                        state.conn.abort(error_code);
+                        state.conn.close(error_code, b"connection aborted");
                     }
                     return self.generate_packets(slab_idx, now);
                 }
             }
             Command::StreamDataRead { conn_id, stream_id, len } => {
                 // Flow control update - application has consumed data
+                // For now, just generate packets to send any pending MAX_STREAM_DATA frames
+                // TODO: Implement explicit flow control update in quicd-quic
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
-                    if let Some(state) = self.get_connection_mut(slab_idx) {
-                        let quic_stream_id = QuicStreamId(stream_id.0);
-                        // Notify QUIC stack that data has been read
-                        // This allows it to send MAX_STREAM_DATA frames
-                        if let Err(e) = state.conn.stream_data_consumed(quic_stream_id, len) {
-                            error!("Failed to update flow control for stream {:?}: {}", stream_id, e);
-                        }
-                    }
+                    trace!("Application consumed {} bytes from stream {:?}", len, stream_id);
                     return self.generate_packets(slab_idx, now);
-                }
-            }
-        }
-        vec![]
-    }
-                    }
-                    let now = Instant::now();
-                    return self.generate_packets(&scid, now);
-                }
-            }
-            Command::StopSending { conn_id, stream_id, error_code: _error_code } => {
-                // Send STOP_SENDING via Connection trait
-                if let Some((scid, _state)) = self.find_connection_by_id(conn_id) {
-                    let quic_stream_id = QuicStreamId(stream_id.0);
-                    // STOP_SENDING is sent via the stop_sending method
-                    // For now, log and generate packets (assuming Connection handles internally)
-                    debug!("Sending STOP_SENDING for stream {:?}", stream_id);
-                    // TODO: Add stop_sending() method to Connection trait if not present
-                    let now = Instant::now();
-                    return self.generate_packets(&scid, now);
-                }
-            }
-            Command::AbortConnection { conn_id, error_code } => {
-                // Immediate connection termination
-                if let Some((scid, state)) = self.find_connection_by_id(conn_id) {
-                    state.conn.close(error_code, b"connection aborted");
-                    let now = Instant::now();
-                    let packets = self.generate_packets(&scid, now);
-                    // Remove connection immediately after sending abort
-                    self.connections.remove(&scid);
-                    self.dcid_to_conn.retain(|_, v| v != &scid);
-                    return packets;
-                }
-            }
-            Command::StreamDataRead { conn_id, stream_id, len } => {
-                // Application has consumed data, update flow control
-                if let Some((scid, state)) = self.find_connection_by_id(conn_id) {
-                    let quic_stream_id = QuicStreamId(stream_id.0);
-                    // Connection trait handles flow control internally via read_stream
-                    // Just generate packets to send any pending MAX_STREAM_DATA frames
-                    let now = Instant::now();
-                    return self.generate_packets(&scid, now);
                 }
             }
         }
@@ -881,17 +881,16 @@ impl ConnectionManager {
     fn find_slab_by_app_conn_id(&self, conn_id: XConnectionId) -> Option<SlabIndex> {
         // Search through all connections in the Slab
         for (slab_idx, state) in &self.connections {
-            if let Some(scid) = state.conn.scid() {
-                // Convert scid to u64 for comparison
-                let mut bytes = [0u8; 8];
-                let scid_bytes = scid.as_bytes();
-                let len = std::cmp::min(scid_bytes.len(), 8);
-                bytes[..len].copy_from_slice(&scid_bytes[..len]);
-                let conn_id_u64 = u64::from_le_bytes(bytes);
-                
-                if conn_id_u64 == conn_id.0 {
-                    return Some(slab_idx);
-                }
+            let scid = state.conn.source_cid();
+            // Convert scid to u64 for comparison
+            let mut bytes = [0u8; 8];
+            let scid_bytes = scid.as_bytes();
+            let len = std::cmp::min(scid_bytes.len(), 8);
+            bytes[..len].copy_from_slice(&scid_bytes[..len]);
+            let conn_id_u64 = u64::from_le_bytes(bytes);
+            
+            if conn_id_u64 == conn_id.0 {
+                return Some(slab_idx);
             }
         }
         None
