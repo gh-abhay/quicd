@@ -263,7 +263,7 @@ pub trait PacketProtection: Send + Sync {
 ///
 /// **Critical Design**: QUIC controls crypto frame transmission, not TLS.
 /// TLS provides crypto data to send, QUIC decides when/how to send it.
-pub trait TlsSession: Send {
+pub trait TlsSession: Send + core::fmt::Debug {
     /// Process incoming CRYPTO frame data
     ///
     /// Feeds TLS handshake messages to the TLS engine.

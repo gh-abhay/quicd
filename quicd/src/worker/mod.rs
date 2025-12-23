@@ -18,6 +18,7 @@
 
 pub mod io_state;
 pub mod connection_manager;
+pub mod connection_wrapper;
 
 use crate::netio::{
     buffer::{create_worker_pool, WorkerBufPool, WorkerBuffer},
@@ -95,8 +96,8 @@ pub struct NetworkWorker {
     shutdown: Arc<AtomicBool>,
     routing_cookie: u16,
     runtime_handle: tokio::runtime::Handle,
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
+    cert_data: bytes::Bytes,
+    key_data: bytes::Bytes,
     app_registry: Arc<crate::apps::AppRegistry>,
     // egress_tx: crossbeam_channel::Sender<quicd_x::EgressCommand>,
     // egress_rx: Option<crossbeam_channel::Receiver<quicd_x::EgressCommand>>,
@@ -111,8 +112,8 @@ impl NetworkWorker {
         channel_config: crate::channel_config::ChannelConfig,
         shutdown: Arc<AtomicBool>,
         runtime_handle: tokio::runtime::Handle,
-        cert_path: std::path::PathBuf,
-        key_path: std::path::PathBuf,
+        cert_data: bytes::Bytes,
+        key_data: bytes::Bytes,
         app_registry: Arc<crate::apps::AppRegistry>,
     ) -> Result<Self> {
         // Create UDP socket with SO_REUSEPORT
@@ -158,8 +159,8 @@ impl NetworkWorker {
             shutdown,
             routing_cookie,
             runtime_handle,
-            cert_path,
-            key_path,
+            cert_data,
+            key_data,
             app_registry,
             // egress_tx,
             // egress_rx: Some(egress_rx),
@@ -298,10 +299,10 @@ impl NetworkWorker {
         // Create egress channel for receiving commands from app tasks
         let (egress_tx, egress_rx) = bounded(self.channel_config.worker_egress_capacity);
         
-        // Create connection config with TLS certificate paths
+        // Create connection config with TLS certificate data (already in memory, no disk I/O)
         let mut conn_config = ConnectionConfig::default();
-        conn_config.cert_path = Some(self.cert_path.clone());
-        conn_config.key_path = Some(self.key_path.clone());
+        conn_config.cert_data = Some(self.cert_data.clone());
+        conn_config.key_data = Some(self.key_data.clone());
         
         // Create connection manager for this worker (with routing-aware CID generator)
         let mut conn_manager = ConnectionManager::new(
@@ -1206,8 +1207,8 @@ pub fn spawn(
     config: NetIoConfig,
     channel_config: crate::channel_config::ChannelConfig,
     runtime_handle: tokio::runtime::Handle,
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
+    cert_data: bytes::Bytes,
+    key_data: bytes::Bytes,
     app_registry: Arc<crate::apps::AppRegistry>,
 ) -> Result<NetIoHandle> {
     use std::path::Path;
@@ -1237,8 +1238,8 @@ pub fn spawn(
         let channel_config = channel_config.clone();
         let shutdown = Arc::clone(&shutdown);
         let runtime_handle = runtime_handle.clone();
-        let cert_path = cert_path.clone();
-        let key_path = key_path.clone();
+        let cert_data = cert_data.clone();
+        let key_data = key_data.clone();
         let app_registry = Arc::clone(&app_registry);
 
         // Create worker (in main thread)
@@ -1249,8 +1250,8 @@ pub fn spawn(
             channel_config,
             shutdown,
             runtime_handle,
-            cert_path,
-            key_path,
+            cert_data,
+            key_data,
             app_registry,
         )?;
 

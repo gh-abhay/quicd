@@ -254,6 +254,8 @@ impl QuicServer for DefaultQuicServer {
             local_params: self.config.transport_params.clone(),
             idle_timeout: self.config.idle_timeout,
             max_packet_size: 1200,
+            cert_data: None,
+            key_data: None,
         };
 
         let conn = QuicConnection::new(Side::Server, scid, dcid, conn_config);

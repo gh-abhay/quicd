@@ -6,7 +6,10 @@ edition = "2021"
 [dependencies]
 bytes = { version = "1.11", default-features = false }
 tinyvec = { version = "1.8", features = ["alloc"] }
+boring = { workspace = true, optional = true }
+boring-sys = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
 std = []
+boring-crypto = ["boring", "boring-sys", "std"]

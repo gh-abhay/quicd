@@ -8,7 +8,7 @@ extern crate alloc;
 
 use super::types::*;
 use crate::error::{Error, Result, TransportError};
-use crate::types::VarIntCodec;
+use crate::types::{VarIntCodec, StreamId};
 use bytes::BytesMut;
 
 /// Frame Parser Trait
@@ -262,7 +262,7 @@ impl DefaultFrameParser {
 
         Ok((
             StreamFrame {
-                stream_id,
+                stream_id: StreamId::new(stream_id),
                 offset: stream_offset,
                 fin,
                 data,
@@ -414,7 +414,7 @@ impl DefaultFrameParser {
 
         Ok((
             ResetStreamFrame {
-                stream_id,
+                stream_id: StreamId::new(stream_id),
                 application_error_code: error_code,
                 final_size,
             },
@@ -436,7 +436,7 @@ impl DefaultFrameParser {
 
         Ok((
             StopSendingFrame {
-                stream_id,
+                stream_id: StreamId::new(stream_id),
                 application_error_code: error_code,
             },
             offset,
@@ -483,7 +483,7 @@ impl DefaultFrameParser {
 
         Ok((
             MaxStreamDataFrame {
-                stream_id,
+                stream_id: StreamId::new(stream_id),
                 maximum_stream_data,
             },
             offset,
@@ -520,7 +520,7 @@ impl DefaultFrameParser {
 
         Ok((
             StreamDataBlockedFrame {
-                stream_id,
+                stream_id: StreamId::new(stream_id),
                 maximum_stream_data,
             },
             offset,
@@ -770,7 +770,7 @@ impl FrameSerializer for DefaultFrameSerializer {
                 let len = VarIntCodec::encode(FRAME_TYPE_RESET_STREAM, &mut tmp)
                     .ok_or(Error::Transport(TransportError::InternalError))?;
                 buf.extend_from_slice(&tmp[..len]);
-                let len = VarIntCodec::encode(reset.stream_id, &mut tmp)
+                let len = VarIntCodec::encode(reset.stream_id.value(), &mut tmp)
                     .ok_or(Error::Transport(TransportError::InternalError))?;
                 buf.extend_from_slice(&tmp[..len]);
                 let len = VarIntCodec::encode(reset.application_error_code, &mut tmp)
@@ -786,7 +786,7 @@ impl FrameSerializer for DefaultFrameSerializer {
                 let len = VarIntCodec::encode(FRAME_TYPE_STOP_SENDING, &mut tmp)
                     .ok_or(Error::Transport(TransportError::InternalError))?;
                 buf.extend_from_slice(&tmp[..len]);
-                let len = VarIntCodec::encode(stop.stream_id, &mut tmp)
+                let len = VarIntCodec::encode(stop.stream_id.value(), &mut tmp)
                     .ok_or(Error::Transport(TransportError::InternalError))?;
                 buf.extend_from_slice(&tmp[..len]);
                 let len = VarIntCodec::encode(stop.application_error_code, &mut tmp)
@@ -838,7 +838,7 @@ impl FrameSerializer for DefaultFrameSerializer {
                 let len = VarIntCodec::encode(FRAME_TYPE_MAX_STREAM_DATA, &mut tmp)
                     .ok_or(Error::Transport(TransportError::InternalError))?;
                 buf.extend_from_slice(&tmp[..len]);
-                let len = VarIntCodec::encode(max_stream_data.stream_id, &mut tmp)
+                let len = VarIntCodec::encode(max_stream_data.stream_id.value(), &mut tmp)
                     .ok_or(Error::Transport(TransportError::InternalError))?;
                 buf.extend_from_slice(&tmp[..len]);
                 let len = VarIntCodec::encode(max_stream_data.maximum_stream_data, &mut tmp)
@@ -900,7 +900,7 @@ impl FrameSerializer for DefaultFrameSerializer {
                     | STREAM_FRAME_BIT_LEN;
                 
                 VarIntCodec::size(frame_type)
-                    + VarIntCodec::size(stream.stream_id)
+                    + VarIntCodec::size(stream.stream_id.value())
                     + if stream.offset > 0 { VarIntCodec::size(stream.offset) } else { 0 }
                     + VarIntCodec::size(stream.data.len() as u64)
                     + stream.data.len()
@@ -955,7 +955,7 @@ impl DefaultFrameSerializer {
             .ok_or(Error::Transport(TransportError::InternalError))?;
         buf.extend_from_slice(&tmp[..len]);
         
-        let len = VarIntCodec::encode(stream.stream_id, &mut tmp)
+        let len = VarIntCodec::encode(stream.stream_id.value(), &mut tmp)
             .ok_or(Error::Transport(TransportError::InternalError))?;
         buf.extend_from_slice(&tmp[..len]);
         
@@ -1019,7 +1019,7 @@ mod tests {
         let (frame, consumed) = parser.parse_frame(&buf).unwrap();
         match frame {
             Frame::Stream(s) => {
-                assert_eq!(s.stream_id, 4);
+                assert_eq!(s.stream_id, StreamId::new(4));
                 assert_eq!(s.offset, 100);
                 assert_eq!(s.fin, true);
                 assert_eq!(s.data, b"hello");
@@ -1127,7 +1127,7 @@ mod tests {
         let mut buf = BytesMut::new();
         
         let stream = StreamFrame {
-            stream_id: 4,
+            stream_id: StreamId::new(4),
             offset: 0,
             fin: false,
             data: b"test",
@@ -1142,7 +1142,7 @@ mod tests {
         
         match parsed_frame {
             Frame::Stream(s) => {
-                assert_eq!(s.stream_id, 4);
+                assert_eq!(s.stream_id, StreamId::new(4));
                 assert_eq!(s.offset, 0);
                 assert_eq!(s.fin, false);
                 assert_eq!(s.data, b"test");

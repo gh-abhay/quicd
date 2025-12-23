@@ -307,9 +307,9 @@ mod tests {
 
     #[test]
     fn test_stream_flow_control() {
-        let stream_fc = StreamFlowControl::new(4, 5000, 6000, 7000);
+        let stream_fc = StreamFlowControl::new(StreamId::new(4), 5000, 6000, 7000);
         
-        assert_eq!(stream_fc.stream_id, 4);
+        assert_eq!(stream_fc.stream_id, StreamId::new(4));
         assert_eq!(stream_fc.send.max_data, 5000);
         assert_eq!(stream_fc.recv.max_data, 6000);
         assert_eq!(stream_fc.recv.local_max_data, 7000);

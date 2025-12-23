@@ -85,6 +85,12 @@ pub struct TransportParameters {
     pub retry_source_connection_id: Option<ConnectionId>,
 }
 
+impl Default for TransportParameters {
+    fn default() -> Self {
+        Self::default_client()
+    }
+}
+
 impl TransportParameters {
     /// Create default client parameters
     pub fn default_client() -> Self {
@@ -116,7 +122,7 @@ impl TransportParameters {
         params.stateless_reset_token = None; // Set by implementation
         params
     }
-
+    
     /// Validate parameters (RFC 9000 Section 18.2)
     pub fn validate(&self) -> Result<()> {
         // Max UDP payload size must be >= 1200

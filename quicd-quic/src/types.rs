@@ -197,6 +197,11 @@ impl ConnectionId {
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
+    
+    /// Create an empty (zero-length) connection ID
+    pub fn empty() -> Self {
+        Self { bytes: Bytes::new() }
+    }
 }
 
 impl core::fmt::Debug for ConnectionId {
@@ -249,7 +254,56 @@ pub enum PacketNumberSpace {
 /// The two least significant bits encode stream type and initiator:
 /// - Bit 0: Direction (0=bidirectional, 1=unidirectional)
 /// - Bit 1: Initiator (0=client, 1=server)
-pub type StreamId = u64;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StreamId(pub u64);
+
+impl StreamId {
+    /// Create a new StreamId
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+    
+    /// Get the raw value
+    pub fn value(&self) -> u64 {
+        self.0
+    }
+
+    /// Construct StreamId from raw u64 (alias for new())
+    pub fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// Convert StreamId into raw u64
+    pub fn into_inner(self) -> u64 {
+        self.0
+    }
+    
+    /// Check if this stream is bidirectional
+    pub fn is_bidirectional(&self) -> bool {
+        (self.0 & 0x02) == 0
+    }
+    
+    /// Check if this stream is unidirectional
+    pub fn is_unidirectional(&self) -> bool {
+        (self.0 & 0x02) != 0
+    }
+}
+
+// Implement BitAnd for StreamId to support bitwise operations
+impl core::ops::BitAnd<u64> for StreamId {
+    type Output = u64;
+
+    fn bitand(self, rhs: u64) -> u64 {
+        self.0 & rhs
+    }
+}
+
+// Implement PartialEq<u64> for StreamId comparisons
+impl PartialEq<u64> for StreamId {
+    fn eq(&self, other: &u64) -> bool {
+        self.0 == *other
+    }
+}
 
 /// Maximum Stream ID value (2^62 - 1)
 pub const MAX_STREAM_ID: u64 = VARINT_MAX;
@@ -270,7 +324,7 @@ pub enum StreamType {
 impl StreamType {
     /// Extract stream type from stream ID
     pub fn from_stream_id(id: StreamId) -> Self {
-        match id & 0x03 {
+        match id.0 & 0x03 {
             0x00 => StreamType::ClientBidirectional,
             0x01 => StreamType::ServerBidirectional,
             0x02 => StreamType::ClientUnidirectional,
@@ -498,13 +552,13 @@ pub mod stream_id_helpers {
     /// Create a StreamId from raw u64 value
     #[inline]
     pub fn from_raw(id: u64) -> StreamId {
-        id
+        StreamId::from_raw(id)
     }
 
     /// Get the raw u64 value from StreamId
     #[inline]
     pub fn into_inner(id: StreamId) -> u64 {
-        id
+        id.into_inner()
     }
 
     /// Get the initiator of a stream
@@ -791,12 +845,12 @@ mod tests {
     // StreamType Tests
     #[test]
     fn test_stream_type_from_id() {
-        assert_eq!(StreamType::from_stream_id(0), StreamType::ClientBidirectional);
-        assert_eq!(StreamType::from_stream_id(1), StreamType::ServerBidirectional);
-        assert_eq!(StreamType::from_stream_id(2), StreamType::ClientUnidirectional);
-        assert_eq!(StreamType::from_stream_id(3), StreamType::ServerUnidirectional);
-        assert_eq!(StreamType::from_stream_id(4), StreamType::ClientBidirectional);
-        assert_eq!(StreamType::from_stream_id(7), StreamType::ServerUnidirectional);
+        assert_eq!(StreamType::from_stream_id(StreamId::new(0)), StreamType::ClientBidirectional);
+        assert_eq!(StreamType::from_stream_id(StreamId::new(1)), StreamType::ServerBidirectional);
+        assert_eq!(StreamType::from_stream_id(StreamId::new(2)), StreamType::ClientUnidirectional);
+        assert_eq!(StreamType::from_stream_id(StreamId::new(3)), StreamType::ServerUnidirectional);
+        assert_eq!(StreamType::from_stream_id(StreamId::new(4)), StreamType::ClientBidirectional);
+        assert_eq!(StreamType::from_stream_id(StreamId::new(7)), StreamType::ServerUnidirectional);
     }
 
     #[test]

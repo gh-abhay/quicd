@@ -17,6 +17,11 @@ pub const VERSION_1: Version = 0x00000001;
 /// Version used for Version Negotiation packets
 pub const VERSION_NEGOTIATION: Version = 0x00000000;
 
+/// Token (RFC 9000 Section 8)
+///
+/// Opaque blob used for address validation.
+pub type Token = Bytes;
+
 /// Header Form (RFC 9000 Section 17.2)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderForm {

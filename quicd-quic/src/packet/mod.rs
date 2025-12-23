@@ -26,12 +26,17 @@ pub mod space;
 pub mod types;
 pub mod parser;
 pub mod protection;
+pub mod api;
 
 // Re-export specific types to avoid ambiguity
-pub use header::{Header, HeaderForm, PacketType};
+pub use header::{Header, HeaderForm, PacketType, LongHeader as LongHeaderDetail, ShortHeader as ShortHeaderDetail};
 pub use number::PacketNumberLen;
 pub use space::PacketNumberSpaceState;
-pub use types::{LongHeader, ShortHeader, LongPacketType, ParsedPacket, DatagramInput, DatagramOutput};
+pub use types::{
+    LongHeader, ShortHeader, LongPacketType, ParsedPacket, DatagramInput, DatagramOutput,
+    Token, VERSION_1, VERSION_NEGOTIATION, PacketHeader,
+};
+pub use api::{Packet, ParseContext, PacketHeaderWrapper, PacketTypeWrapper};
 
 // Parser traits - use qualified names to avoid conflict
 pub use parser::{
@@ -43,11 +48,3 @@ pub use parser::{
     HeaderProtectionRemover as HpRemover,
 };
 pub use protection::{HeaderProtectionProvider, InPlaceHeaderProtectionRemover};
-
-// Stub types for main binary compatibility
-#[derive(Debug)]
-pub struct Packet;
-
-#[derive(Debug)]
-pub struct ParseContext;
-

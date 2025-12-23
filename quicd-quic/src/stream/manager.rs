@@ -255,7 +255,7 @@ impl StreamManager {
             (false, StreamDirection::Unidirectional) => self.max_streams_uni_local,
         };
 
-        let stream_count = raw_id / 4;
+        let stream_count = raw_id.value() / 4;
         if stream_count >= max_streams {
             return Err(Error::Transport(TransportError::StreamLimitError));
         }

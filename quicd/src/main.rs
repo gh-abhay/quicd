@@ -66,23 +66,22 @@ fn main() -> anyhow::Result<()> {
 
     info!("eBPF routing initialized successfully");
 
-    // TLS configuration is now handled at the QUIC connection level using BoringSSL
-    // Certificate paths are validated but loading is deferred to connection establishment
-    info!("Validating TLS configuration");
+    // TLS configuration: Read certificate and key files ONCE at startup
+    // This avoids disk I/O contention when multiple worker threads initialize connections
+    info!("Loading TLS configuration");
     let cert_path = config.global.tls.cert_path.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Missing certificate path"))?;
     let key_path = config.global.tls.key_path.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Missing private key path"))?;
 
-    // Verify files exist
-    if !std::path::Path::new(cert_path).exists() {
-        anyhow::bail!("Certificate file not found: {}", cert_path.display());
-    }
-    if !std::path::Path::new(key_path).exists() {
-        anyhow::bail!("Private key file not found: {}", key_path.display());
-    }
+    // Read certificate and key data into memory
+    let cert_data = std::fs::read(cert_path)
+        .with_context(|| format!("Failed to read certificate file: {}", cert_path.display()))?;
+    let key_data = std::fs::read(key_path)
+        .with_context(|| format!("Failed to read private key file: {}", key_path.display()))?;
     
-    info!("TLS certificate and key files validated");
+    info!("TLS certificate ({} bytes) and key ({} bytes) loaded into memory", 
+          cert_data.len(), key_data.len());
 
     // Spawn network workers as native threads (NOT on tokio runtime)
     info!("Spawning network worker threads");
@@ -91,8 +90,8 @@ fn main() -> anyhow::Result<()> {
         netio_cfg,
         config.global.channels.clone(),
         runtime_handle.clone(),
-        cert_path.clone(),
-        key_path.clone(),
+        bytes::Bytes::from(cert_data),
+        bytes::Bytes::from(key_data),
         Arc::new(app_registry),
     )
     .with_context(|| "failed to spawn network layer")?;

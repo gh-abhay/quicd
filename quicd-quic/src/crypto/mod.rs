@@ -5,10 +5,16 @@
 
 pub mod backend;
 
+#[cfg(feature = "boring-crypto")]
+pub mod boring_backend;
+
 pub use backend::{
     AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, KeySchedule,
     PacketProtection, TlsEvent, TlsSession,
 };
+
+#[cfg(feature = "boring-crypto")]
+pub use boring_backend::BoringCryptoBackend;
 
 // Type alias for main binary compatibility
 pub use backend::CryptoLevel as EncryptionLevel;

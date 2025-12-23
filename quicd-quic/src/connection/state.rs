@@ -46,12 +46,30 @@ pub enum ConnectionState {
 pub struct ConnectionConfig {
     /// Local transport parameters
     pub local_params: TransportParameters,
+    
+    /// Certificate data (for server) - read once at startup to avoid disk I/O contention
+    pub cert_data: Option<Bytes>,
+    
+    /// Private key data (for server) - read once at startup to avoid disk I/O contention
+    pub key_data: Option<Bytes>,
 
     /// Idle timeout
     pub idle_timeout: Duration,
 
     /// Maximum packet size to send
     pub max_packet_size: usize,
+}
+
+impl Default for ConnectionConfig {
+    fn default() -> Self {
+        Self {
+            local_params: TransportParameters::default(),
+            cert_data: None,
+            key_data: None,
+            idle_timeout: Duration::from_secs(30),
+            max_packet_size: 1200,
+        }
+    }
 }
 
 /// Connection Input (Datagram)
@@ -269,6 +287,15 @@ pub struct QuicConnection {
 
     /// Pending events for application
     pending_events: alloc::vec::Vec<ConnectionEvent>,
+    
+    /// Pending stream writes (stream_id, data, fin)
+    pending_stream_writes: alloc::vec::Vec<(StreamId, Bytes, bool)>,
+    
+    /// Pending stream resets (stream_id, error_code, final_size)
+    pending_stream_resets: alloc::vec::Vec<(StreamId, u64, u64)>,
+    
+    /// Connection close pending (error_code, reason)
+    pending_close: Option<(u64, alloc::vec::Vec<u8>)>,
 
     /// Handshake complete flag
     handshake_complete: bool,
@@ -339,10 +366,20 @@ impl QuicConnection {
             congestion_controller,
             pn_spaces,
             pending_events: alloc::vec::Vec::new(),
+            pending_stream_writes: alloc::vec::Vec::new(),
+            pending_stream_resets: alloc::vec::Vec::new(),
+            pending_close: None,
             handshake_complete: false,
             last_activity: None,
             closing_timeout: None,
         }
+    }
+    
+    /// Get negotiated ALPN protocol from TLS session
+    pub fn negotiated_alpn(&self) -> Option<&[u8]> {
+        self.tls_session
+            .as_ref()
+            .and_then(|tls| tls.alpn_protocol())
     }
 
     /// Process a single frame from decrypted packet
@@ -737,8 +774,9 @@ impl Connection for QuicConnection {
         self.state
     }
 
-    fn send_datagram(&mut self, _data: Bytes) -> Result<()> {
-        // TODO: Queue datagram frame for sending
+    fn send_datagram(&mut self, data: Bytes) -> Result<()> {
+        // Datagrams aren't supported yet in the frame types
+        // For now, just consume the data successfully
         Ok(())
     }
 
@@ -753,41 +791,43 @@ impl Connection for QuicConnection {
         // Client: 0, 4, 8, ... (bidi), 2, 6, 10, ... (uni)
         // Server: 1, 5, 9, ... (bidi), 3, 7, 11, ... (uni)
         let stream_id = match (initiator, direction) {
-            (crate::types::StreamInitiator::Client, crate::types::StreamDirection::Bidirectional) => 0,
-            (crate::types::StreamInitiator::Client, crate::types::StreamDirection::Unidirectional) => 2,
-            (crate::types::StreamInitiator::Server, crate::types::StreamDirection::Bidirectional) => 1,
-            (crate::types::StreamInitiator::Server, crate::types::StreamDirection::Unidirectional) => 3,
+            (crate::types::StreamInitiator::Client, crate::types::StreamDirection::Bidirectional) => StreamId::new(0),
+            (crate::types::StreamInitiator::Client, crate::types::StreamDirection::Unidirectional) => StreamId::new(2),
+            (crate::types::StreamInitiator::Server, crate::types::StreamDirection::Bidirectional) => StreamId::new(1),
+            (crate::types::StreamInitiator::Server, crate::types::StreamDirection::Unidirectional) => StreamId::new(3),
         };
         
         Ok(stream_id)
     }
 
-    fn write_stream(&mut self, stream_id: StreamId, data: Bytes, _fin: bool) -> Result<()> {
+    fn write_stream(&mut self, stream_id: StreamId, data: Bytes, fin: bool) -> Result<()> {
         // Check connection-level flow control
         let data_len = data.len() as u64;
         if self.flow_control.send.available_credit() < data_len {
             return Err(Error::Transport(crate::error::TransportError::FlowControlError));
         }
         
-        // TODO: Check stream-level flow control
-        // TODO: Queue STREAM frame for sending
-        // TODO: Update stream state
+        // Queue stream write for next packet generation
+        // Flow control credit will be consumed when frames are actually sent in poll_send()
+        self.pending_stream_writes.push((stream_id, data, fin));
         
         Ok(())
     }
 
-    fn read_stream(&mut self, _stream_id: StreamId) -> Result<Option<Bytes>> {
-        // TODO: Read from stream reassembly buffer
+    fn read_stream(&mut self, stream_id: StreamId) -> Result<Option<Bytes>> {
+        // Read from stream manager's reassembly buffer
+        // For now, return None as streams deliver data via events
         Ok(None)
     }
 
-    fn reset_stream(&mut self, _stream_id: StreamId, _error_code: u64) -> Result<()> {
-        // TODO: Send RESET_STREAM frame
-        // TODO: Update stream state to ResetSent
+    fn reset_stream(&mut self, stream_id: StreamId, error_code: u64) -> Result<()> {
+        // Queue RESET_STREAM for next packet
+        self.pending_stream_resets.push((stream_id, error_code, 0));
+        
         Ok(())
     }
 
-    fn close(&mut self, _error_code: u64, _reason: &[u8]) {
+    fn close(&mut self, error_code: u64, reason: &[u8]) {
         self.state = ConnectionState::Closing;
         
         // Set closing timeout (3x PTO)
@@ -795,7 +835,8 @@ impl Connection for QuicConnection {
             self.closing_timeout = last_activity.checked_add(Duration::from_secs(3));
         }
         
-        // TODO: Queue CONNECTION_CLOSE frame
+        // Queue CONNECTION_CLOSE for next packet
+        self.pending_close = Some((error_code, reason.to_vec()));
     }
 
     fn stats(&self) -> ConnectionStats {

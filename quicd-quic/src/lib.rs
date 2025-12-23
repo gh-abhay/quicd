@@ -236,36 +236,22 @@ pub use error::{ApplicationError, CryptoError, Error, Result, TransportError};
 pub use version::{QuicVersion, VERSION_1, VERSION_NEGOTIATION};
 
 // Re-export primary traits for library consumers
-pub use connection::state::{ConnectionState, ConnectionConfig};
-pub use crypto::backend::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, TlsSession, KeySchedule};
+pub use connection::state::{Connection, ConnectionConfig, ConnectionEvent, ConnectionState, ConnectionStats, DatagramInput, DatagramOutput, QuicConnection};
+pub use crypto::backend::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, TlsSession, TlsEvent, KeySchedule};
 pub use frames::{Frame, FrameParser};
-pub use frames::parse::FrameSerializer;
-pub use packet::header::{Header, HeaderForm, PacketType};
+pub use frames::parse::{FrameSerializer, DefaultFrameParser, DefaultFrameSerializer};
+pub use packet::header::{Header, HeaderForm, PacketType, LongHeader, ShortHeader, DefaultHeaderParser};
+pub use packet::types::{LongPacketType, Token, ParsedPacket};
+pub use packet::api::{Packet, ParseContext, PacketHeaderWrapper, PacketTypeWrapper};
 pub use packet::parser::PacketParser as PacketParserTrait;
+pub use packet::number::{PacketNumberLen, PacketNumberEncoder, PacketNumberDecoder, DefaultPacketNumberEncoder, DefaultPacketNumberDecoder};
 pub use recovery::{CongestionController, LossDetector, RttEstimator};
 pub use stream::{StreamController, StreamManager};
 pub use transport::TransportParameters;
 
-// Stub types for main binary compatibility - TODO: implement full Connection API
-/// Stub Connection type - to be replaced with full state machine
-#[derive(Debug)]
-pub struct Connection;
-
-/// Stub Packet type - packet module has primitives but no unified Packet struct yet  
-#[derive(Debug)]
-pub struct Packet;
-
-/// Stub Stream type - stream module defines StreamController trait
-#[derive(Debug)]
-pub struct Stream;
-
-/// Stub ParseContext - used for packet parsing
-#[derive(Debug)]
-pub struct ParseContext;
-
-/// ConnectionIdGenerator trait - for CID routing logic
+// ConnectionIdGenerator trait - for CID routing logic
 pub trait ConnectionIdGenerator: Send + Sync {
-    fn generate(&mut self) -> ConnectionId;
+    fn generate(&self, len: usize) -> ConnectionId;
 }
 
 // Type alias for EncryptionLevel (renamed to CryptoLevel in backend)
@@ -281,4 +267,3 @@ pub mod cid {
 pub mod frame {
     pub use crate::frames::Frame;
 }
-
