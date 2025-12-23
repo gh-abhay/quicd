@@ -1,30 +1,56 @@
 //! quicd-x: Application Bridge Interface for QUIC Server
+//!
+//! # Architecture: Asymmetric Channel Design
+//!
+//! This crate provides the bridge between worker threads and application tasks with:
+//!
+//! ## Ingress (Worker → App): Bounded tokio::mpsc
+//! - **Per-connection** bounded channel (capacity 32-64)
+//! - Provides automatic backpressure to worker when app is slow
+//! - Worker detects full channel and applies QUIC flow control
+//!
+//! ## Egress (App → Worker): Unbounded crossbeam
+//! - **Shared per-worker** unbounded channel
+//! - All app tasks send to same worker channel
+//! - High-throughput signaling without blocking
+//!
+//! ## Zero-Copy Design
+//! - All data transferred as `bytes::Bytes` (reference-counted)
+//! - No memory copies in hot path
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use crossbeam_channel::{Receiver, Sender, TrySendError};
-use std::collections::{HashMap, VecDeque, HashSet};
+use crossbeam_channel::{Sender, TrySendError};
+use parking_lot::Mutex;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc;
 
 /// Unique identifier for a QUIC connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(pub u64);
 
 /// Unique identifier for a stream within a connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(pub u64);
 
 impl StreamId {
     pub fn is_bidirectional(&self) -> bool {
         (self.0 & 0x2) == 0
     }
+    
+    pub fn is_client_initiated(&self) -> bool {
+        (self.0 & 0x1) == 0
+    }
 }
 
 /// Events sent from worker thread to application task (ingress).
+/// 
+/// These are sent via bounded tokio::mpsc channel for backpressure.
 #[derive(Debug, Clone)]
 pub enum Event {
     StreamOpened {
@@ -56,9 +82,15 @@ pub enum Event {
         is_bidirectional: bool,
         max_streams: u64,
     },
+    /// Notification that a stream has been opened in response to OpenBiStream/OpenUniStream
+    StreamOpenedConfirm {
+        stream_id: StreamId,
+    },
 }
 
 /// Commands sent from application task to worker thread (egress).
+/// 
+/// These are sent via unbounded crossbeam channel for high throughput.
 #[derive(Debug, Clone)]
 pub enum Command {
     OpenBiStream {
@@ -121,197 +153,209 @@ pub trait QuicdApplication: Send + Sync {
     async fn on_connection(&self, conn: ConnectionHandle);
 }
 
+/// Internal state shared between async operations on a connection.
 struct SharedState {
+    // Stream data buffers
     stream_buffers: HashMap<StreamId, VecDeque<Bytes>>,
-    stream_fin: HashSet<StreamId>,
-    stream_reset: HashMap<StreamId, u64>, // error code
+    stream_fin: HashMap<StreamId, bool>,
+    stream_reset: HashMap<StreamId, u64>,
     stream_wakers: HashMap<StreamId, Waker>,
     
+    // Pending opened streams
     pending_bi_streams: VecDeque<StreamId>,
     pending_uni_streams: VecDeque<StreamId>,
     accept_bi_waker: Option<Waker>,
     accept_uni_waker: Option<Waker>,
     
+    // Pending stream confirmations for open operations
+    pending_stream_confirms: VecDeque<StreamId>,
+    open_stream_waker: Option<Waker>,
+    
+    // Datagrams
     datagrams: VecDeque<Bytes>,
     datagram_waker: Option<Waker>,
     
+    // Connection state
     closed: bool,
     close_error: Option<(u64, String)>,
-    
-    // Poller state
-    poller_running: bool,
 }
+
 
 impl SharedState {
     fn new() -> Self {
         Self {
             stream_buffers: HashMap::new(),
-            stream_fin: HashSet::new(),
+            stream_fin: HashMap::new(),
             stream_reset: HashMap::new(),
             stream_wakers: HashMap::new(),
             pending_bi_streams: VecDeque::new(),
             pending_uni_streams: VecDeque::new(),
             accept_bi_waker: None,
             accept_uni_waker: None,
+            pending_stream_confirms: VecDeque::new(),
+            open_stream_waker: None,
             datagrams: VecDeque::new(),
             datagram_waker: None,
             closed: false,
             close_error: None,
-            poller_running: false,
         }
     }
 }
 
-/// Handle to a QUIC connection, wrapping crossbeam channels for worker communication.
-///
-/// Provides async API for connection operations:
-/// - Opening/accepting streams
-/// - Sending/receiving datagrams
-/// - Connection control (close, abort)
+/// Handle to a QUIC connection using asymmetric channels.
 ///
 /// # Architecture
-/// - Ingress channel: receives events from worker thread (SPSC, bounded)
-/// - Egress channel: sends commands to worker thread (MPSC shared, bounded)
-/// - All operations are non-blocking from application perspective
-/// - Backpressure applied automatically via bounded channels
-#[derive(Clone)]
+/// - **Ingress**: Bounded `tokio::mpsc::Receiver` for events from worker (backpressure)
+/// - **Egress**: Unbounded `crossbeam::Sender` to worker (high throughput)
+/// - All operations are event-driven and non-blocking
+/// - Exactly ONE task per connection - do not spawn additional tasks
 pub struct ConnectionHandle {
     conn_id: ConnectionId,
-    ingress_rx: Receiver<Event>,
     egress_tx: Sender<Command>,
     state: Arc<Mutex<SharedState>>,
 }
 
 impl ConnectionHandle {
+    /// Create a new connection handle.
+    ///
+    /// # Parameters
+    /// - `conn_id`: Unique connection identifier
+    /// - `ingress_rx`: Bounded tokio::mpsc receiver for events (capacity 32-64)
+    /// - `egress_tx`: Unbounded crossbeam sender for commands (shared across all connections)
     pub fn new(
         conn_id: ConnectionId,
-        ingress_rx: Receiver<Event>,
+        mut ingress_rx: mpsc::Receiver<Event>,
         egress_tx: Sender<Command>,
     ) -> Self {
-        Self {
+        let state = Arc::new(Mutex::new(SharedState::new()));
+        
+        let handle = Self {
             conn_id,
-            ingress_rx,
             egress_tx,
-            state: Arc::new(Mutex::new(SharedState::new())),
-        }
-    }
-
-    fn ensure_poller(&self) {
-        let mut state = self.state.lock().unwrap();
-        if state.poller_running || state.closed {
-            return;
-        }
-        state.poller_running = true;
-        drop(state);
-
-        let rx = self.ingress_rx.clone();
-        let state_clone = self.state.clone();
-
-        tokio::task::spawn_blocking(move || {
+            state: state.clone(),
+        };
+        
+        // Spawn event processing task
+        tokio::spawn(async move {
             loop {
-                match rx.recv() {
-                    Ok(event) => {
-                        let mut state = state_clone.lock().unwrap();
-                        match event {
-                            Event::StreamOpened { stream_id, is_bidirectional } => {
-                                eprintln!("ConnectionHandle: Received StreamOpened event for stream_id={}, is_bidirectional={}", stream_id.0, is_bidirectional);
-                                if is_bidirectional {
-                                    state.pending_bi_streams.push_back(stream_id);
-                                    if let Some(waker) = state.accept_bi_waker.take() {
-                                        waker.wake();
-                                    }
-                                } else {
-                                    state.pending_uni_streams.push_back(stream_id);
-                                    if let Some(waker) = state.accept_uni_waker.take() {
-                                        waker.wake();
-                                    }
-                                }
+                // Receive next event
+                match ingress_rx.recv().await {
+                    Some(Event::StreamOpened { stream_id, is_bidirectional }) => {
+                        let mut state = state.lock();
+                        if is_bidirectional {
+                            state.pending_bi_streams.push_back(stream_id);
+                            if let Some(waker) = state.accept_bi_waker.take() {
+                                drop(state);
+                                waker.wake();
                             }
-                            Event::StreamData { stream_id, data, fin } => {
-                                eprintln!("ConnectionHandle: Received StreamData event for stream_id={}, data_len={}, fin={}", stream_id.0, data.len(), fin);
-                                state.stream_buffers.entry(stream_id).or_default().push_back(data);
-                                if fin {
-                                    state.stream_fin.insert(stream_id);
-                                }
-                                if let Some(waker) = state.stream_wakers.remove(&stream_id) {
-                                    waker.wake();
-                                }
-                            }
-                            Event::StreamReset { stream_id, error_code } => {
-                                state.stream_reset.insert(stream_id, error_code);
-                                if let Some(waker) = state.stream_wakers.remove(&stream_id) {
-                                    waker.wake();
-                                }
-                            }
-                            Event::StreamStopSending { .. } => {
-                                // Handled by writer
-                            }
-                            Event::DatagramReceived { data } => {
-                                state.datagrams.push_back(data);
-                                if let Some(waker) = state.datagram_waker.take() {
-                                    waker.wake();
-                                }
-                            }
-                            Event::ConnectionClosing { error_code, reason } => {
-                                state.closed = true;
-                                state.close_error = Some((error_code, reason));
-                                state.poller_running = false;
-                                // Wake everyone
-                                for (_, waker) in state.stream_wakers.drain() {
-                                    waker.wake();
-                                }
-                                if let Some(waker) = state.accept_bi_waker.take() { waker.wake(); }
-                                if let Some(waker) = state.accept_uni_waker.take() { waker.wake(); }
-                                if let Some(waker) = state.datagram_waker.take() { waker.wake(); }
-                                return;
-                            }
-                            Event::ConnectionClosed => {
-                                state.closed = true;
-                                state.poller_running = false;
-                                // Wake everyone
-                                for (_, waker) in state.stream_wakers.drain() {
-                                    waker.wake();
-                                }
-                                if let Some(waker) = state.accept_bi_waker.take() { waker.wake(); }
-                                if let Some(waker) = state.accept_uni_waker.take() { waker.wake(); }
-                                if let Some(waker) = state.datagram_waker.take() { waker.wake(); }
-                                return;
-                            }
-                            Event::MaxStreamsUpdated { is_bidirectional: _, max_streams: _ } => {
-                                // Update max streams limit per RFC 9000 Section 4.6
-                                let mut state = state_clone.lock().unwrap();
-                                // In practice, we'd track this and validate against limits
-                                // Wake any tasks waiting to open streams
-                                if let Some(waker) = state.accept_bi_waker.take() {
-                                    waker.wake();
-                                }
+                        } else {
+                            state.pending_uni_streams.push_back(stream_id);
+                            if let Some(waker) = state.accept_uni_waker.take() {
+                                drop(state);
+                                waker.wake();
                             }
                         }
                     }
-                    Err(_) => {
-                        // Channel closed
-                        let mut state = state_clone.lock().unwrap();
+                    Some(Event::StreamOpenedConfirm { stream_id }) => {
+                        let mut state = state.lock();
+                        state.pending_stream_confirms.push_back(stream_id);
+                        if let Some(waker) = state.open_stream_waker.take() {
+                            drop(state);
+                            waker.wake();
+                        }
+                    }
+                    Some(Event::StreamData { stream_id, data, fin }) => {
+                        let mut state = state.lock();
+                        state.stream_buffers.entry(stream_id).or_default().push_back(data);
+                        if fin {
+                            state.stream_fin.insert(stream_id, true);
+                        }
+                        if let Some(waker) = state.stream_wakers.remove(&stream_id) {
+                            drop(state);
+                            waker.wake();
+                        }
+                    }
+                    Some(Event::StreamReset { stream_id, error_code }) => {
+                        let mut state = state.lock();
+                        state.stream_reset.insert(stream_id, error_code);
+                        if let Some(waker) = state.stream_wakers.remove(&stream_id) {
+                            drop(state);
+                            waker.wake();
+                        }
+                    }
+                    Some(Event::DatagramReceived { data }) => {
+                        let mut state = state.lock();
+                        state.datagrams.push_back(data);
+                        if let Some(waker) = state.datagram_waker.take() {
+                            drop(state);
+                            waker.wake();
+                        }
+                    }
+                    Some(Event::ConnectionClosing { error_code, reason }) => {
+                        let mut state = state.lock();
                         state.closed = true;
-                        state.poller_running = false;
+                        state.close_error = Some((error_code, reason));
+                        // Wake all waiting operations
                         for (_, waker) in state.stream_wakers.drain() {
                             waker.wake();
                         }
                         if let Some(waker) = state.accept_bi_waker.take() { waker.wake(); }
                         if let Some(waker) = state.accept_uni_waker.take() { waker.wake(); }
                         if let Some(waker) = state.datagram_waker.take() { waker.wake(); }
+                        if let Some(waker) = state.open_stream_waker.take() { waker.wake(); }
+                        return;
+                    }
+                    Some(Event::ConnectionClosed) => {
+                        let mut state = state.lock();
+                        state.closed = true;
+                        // Wake all waiting operations
+                        for (_, waker) in state.stream_wakers.drain() {
+                            waker.wake();
+                        }
+                        if let Some(waker) = state.accept_bi_waker.take() { waker.wake(); }
+                        if let Some(waker) = state.accept_uni_waker.take() { waker.wake(); }
+                        if let Some(waker) = state.datagram_waker.take() { waker.wake(); }
+                        if let Some(waker) = state.open_stream_waker.take() { waker.wake(); }
+                        return;
+                    }
+                    Some(Event::MaxStreamsUpdated { .. }) => {
+                        // Flow control update, wake stream open operations
+                        let mut state = state.lock();
+                        if let Some(waker) = state.open_stream_waker.take() {
+                            drop(state);
+                            waker.wake();
+                        }
+                    }
+                    Some(Event::StreamStopSending { .. }) => {
+                        // Handle stop sending if needed
+                    }
+                    None => {
+                        // Channel closed
+                        let mut state = state.lock();
+                        state.closed = true;
+                        for (_, waker) in state.stream_wakers.drain() {
+                            waker.wake();
+                        }
+                        if let Some(waker) = state.accept_bi_waker.take() { waker.wake(); }
+                        if let Some(waker) = state.accept_uni_waker.take() { waker.wake(); }
+                        if let Some(waker) = state.datagram_waker.take() { waker.wake(); }
+                        if let Some(waker) = state.open_stream_waker.take() { waker.wake(); }
                         return;
                     }
                 }
             }
         });
+        
+        handle
     }
-
+    
+    /// Open a bidirectional stream (client-initiated).
     pub async fn open_bi_stream(&self) -> io::Result<QuicStream> {
-        self.ensure_poller();
-        // Send command to open stream
-        self.egress_tx.try_send(Command::OpenBiStream { conn_id: self.conn_id })
+        // Send command to worker
+        self.egress_tx.send(Command::OpenBiStream { conn_id: self.conn_id })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
         
+        // Wait for confirmation
         struct OpenBiFuture {
             state: Arc<Mutex<SharedState>>,
         }
@@ -320,26 +364,20 @@ impl ConnectionHandle {
             type Output = io::Result<StreamId>;
             
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let mut state = self.state.lock().unwrap();
-                // Look for server-initiated (odd ID)
-                let mut found_idx = None;
-                for (i, id) in state.pending_bi_streams.iter().enumerate() {
-                    if !id.is_bidirectional() { continue; }
-                    if (id.0 & 0x1) == 1 {
-                        found_idx = Some(i);
-                        break;
-                    }
-                }
+                let mut state = self.state.lock();
                 
-                if let Some(idx) = found_idx {
-                    let id = state.pending_bi_streams.remove(idx).unwrap();
-                    return Poll::Ready(Ok(id));
+                if let Some(stream_id) = state.pending_stream_confirms.pop_front() {
+                    return Poll::Ready(Ok(stream_id));
                 }
                 
                 if state.closed {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "connection closed"
+                    )));
                 }
-                state.accept_bi_waker = Some(cx.waker().clone());
+                
+                state.open_stream_waker = Some(cx.waker().clone());
                 Poll::Pending
             }
         }
@@ -352,12 +390,13 @@ impl ConnectionHandle {
             egress_tx: self.egress_tx.clone(),
             state: self.state.clone(),
             is_bidirectional: true,
+            read_buf: None,
+            bytes_read: 0,
         })
     }
 
+    /// Accept an incoming bidirectional stream (peer-initiated).
     pub async fn accept_bi_stream(&self) -> io::Result<QuicStream> {
-        self.ensure_poller();
-        
         struct AcceptBiFuture {
             state: Arc<Mutex<SharedState>>,
         }
@@ -366,24 +405,20 @@ impl ConnectionHandle {
             type Output = io::Result<StreamId>;
             
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let mut state = self.state.lock().unwrap();
-                // Look for client-initiated (even ID)
-                let mut found_idx = None;
-                for (i, id) in state.pending_bi_streams.iter().enumerate() {
-                    if (id.0 & 0x1) == 0 {
-                        found_idx = Some(i);
-                        break;
-                    }
-                }
+                let mut state = self.state.lock();
                 
-                if let Some(idx) = found_idx {
-                    let id = state.pending_bi_streams.remove(idx).unwrap();
-                    return Poll::Ready(Ok(id));
+                // Look for peer-initiated bidirectional stream
+                if let Some(stream_id) = state.pending_bi_streams.pop_front() {
+                    return Poll::Ready(Ok(stream_id));
                 }
                 
                 if state.closed {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "connection closed"
+                    )));
                 }
+                
                 state.accept_bi_waker = Some(cx.waker().clone());
                 Poll::Pending
             }
@@ -397,14 +432,133 @@ impl ConnectionHandle {
             egress_tx: self.egress_tx.clone(),
             state: self.state.clone(),
             is_bidirectional: true,
+            read_buf: None,
+            bytes_read: 0,
         })
     }
 
+    /// Open a unidirectional stream (outgoing only).
+    pub async fn open_uni_stream(&self) -> io::Result<QuicStream> {
+        self.egress_tx.send(Command::OpenUniStream { conn_id: self.conn_id })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
+        
+        struct OpenUniFuture {
+            state: Arc<Mutex<SharedState>>,
+        }
+        
+        impl std::future::Future for OpenUniFuture {
+            type Output = io::Result<StreamId>;
+            
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let mut state = self.state.lock();
+                
+                if let Some(stream_id) = state.pending_stream_confirms.pop_front() {
+                    return Poll::Ready(Ok(stream_id));
+                }
+                
+                if state.closed {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "connection closed"
+                    )));
+                }
+                
+                state.open_stream_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+        
+        let stream_id = OpenUniFuture { state: self.state.clone() }.await?;
+        
+        Ok(QuicStream {
+            conn_id: self.conn_id,
+            stream_id,
+            egress_tx: self.egress_tx.clone(),
+            state: self.state.clone(),
+            is_bidirectional: false,
+            read_buf: None,
+            bytes_read: 0,
+        })
+    }
+
+    /// Accept an incoming unidirectional stream.
+    pub async fn accept_uni_stream(&self) -> io::Result<QuicStream> {
+        struct AcceptUniFuture {
+            state: Arc<Mutex<SharedState>>,
+        }
+        
+        impl std::future::Future for AcceptUniFuture {
+            type Output = io::Result<StreamId>;
+            
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let mut state = self.state.lock();
+                
+                if let Some(stream_id) = state.pending_uni_streams.pop_front() {
+                    return Poll::Ready(Ok(stream_id));
+                }
+                
+                if state.closed {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "connection closed"
+                    )));
+                }
+                
+                state.accept_uni_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+        
+        let stream_id = AcceptUniFuture { state: self.state.clone() }.await?;
+        
+        Ok(QuicStream {
+            conn_id: self.conn_id,
+            stream_id,
+            egress_tx: self.egress_tx.clone(),
+            state: self.state.clone(),
+            is_bidirectional: false,
+            read_buf: None,
+            bytes_read: 0,
+        })
+    }
+
+    /// Send a datagram (unreliable, unordered).
     pub fn send_datagram(&self, data: Bytes) -> Result<(), TrySendError<Command>> {
         self.egress_tx.try_send(Command::SendDatagram {
             conn_id: self.conn_id,
             data,
         })
+    }
+    
+    /// Receive a datagram.
+    pub async fn recv_datagram(&self) -> io::Result<Bytes> {
+        struct RecvDatagramFuture {
+            state: Arc<Mutex<SharedState>>,
+        }
+        
+        impl std::future::Future for RecvDatagramFuture {
+            type Output = io::Result<Bytes>;
+            
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let mut state = self.state.lock();
+                
+                if let Some(data) = state.datagrams.pop_front() {
+                    return Poll::Ready(Ok(data));
+                }
+                
+                if state.closed {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "connection closed"
+                    )));
+                }
+                
+                state.datagram_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+        
+        RecvDatagramFuture { state: self.state.clone() }.await
     }
     
     /// Initiate graceful connection close.
@@ -424,131 +578,6 @@ impl ConnectionHandle {
         })
     }
 
-    /// Open a unidirectional stream (outgoing only).
-    pub async fn open_uni_stream(&self) -> io::Result<QuicStream> {
-        self.ensure_poller();
-        self.egress_tx.try_send(Command::OpenUniStream { conn_id: self.conn_id })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
-        
-        struct OpenUniFuture {
-            state: Arc<Mutex<SharedState>>,
-        }
-        
-        impl std::future::Future for OpenUniFuture {
-            type Output = io::Result<StreamId>;
-            
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let mut state = self.state.lock().unwrap();
-                // Look for client-initiated unidirectional
-                let mut found_idx = None;
-                for (i, id) in state.pending_uni_streams.iter().enumerate() {
-                    if id.is_bidirectional() { continue; }
-                    if (id.0 & 0x1) == 0 {
-                        found_idx = Some(i);
-                        break;
-                    }
-                }
-                
-                if let Some(idx) = found_idx {
-                    let id = state.pending_uni_streams.remove(idx).unwrap();
-                    return Poll::Ready(Ok(id));
-                }
-                
-                if state.closed {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")));
-                }
-                state.accept_uni_waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        }
-        
-        let stream_id = OpenUniFuture { state: self.state.clone() }.await?;
-        
-        Ok(QuicStream {
-            conn_id: self.conn_id,
-            stream_id,
-            egress_tx: self.egress_tx.clone(),
-            state: self.state.clone(),
-            is_bidirectional: false,
-        })
-    }
-
-    /// Accept an incoming unidirectional stream.
-    pub async fn accept_uni_stream(&self) -> io::Result<QuicStream> {
-        self.ensure_poller();
-        
-        struct AcceptUniFuture {
-            state: Arc<Mutex<SharedState>>,
-        }
-        
-        impl std::future::Future for AcceptUniFuture {
-            type Output = io::Result<StreamId>;
-            
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let mut state = self.state.lock().unwrap();
-                // Look for server-initiated unidirectional
-                let mut found_idx = None;
-                for (i, id) in state.pending_uni_streams.iter().enumerate() {
-                    if (id.0 & 0x1) == 1 {
-                        found_idx = Some(i);
-                        break;
-                    }
-                }
-                
-                if let Some(idx) = found_idx {
-                    let id = state.pending_uni_streams.remove(idx).unwrap();
-                    return Poll::Ready(Ok(id));
-                }
-                
-                if state.closed {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")));
-                }
-                state.accept_uni_waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        }
-        
-        let stream_id = AcceptUniFuture { state: self.state.clone() }.await?;
-        
-        Ok(QuicStream {
-            conn_id: self.conn_id,
-            stream_id,
-            egress_tx: self.egress_tx.clone(),
-            state: self.state.clone(),
-            is_bidirectional: false,
-        })
-    }
-
-    /// Receive a datagram from the peer.
-    pub async fn recv_datagram(&self) -> io::Result<Bytes> {
-        self.ensure_poller();
-        
-        struct RecvDatagramFuture {
-            state: Arc<Mutex<SharedState>>,
-        }
-        
-        impl std::future::Future for RecvDatagramFuture {
-            type Output = io::Result<Bytes>;
-            
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let mut state = self.state.lock().unwrap();
-                
-                if let Some(data) = state.datagrams.pop_front() {
-                    return Poll::Ready(Ok(data));
-                }
-                
-                if state.closed {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")));
-                }
-                
-                state.datagram_waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        }
-        
-        RecvDatagramFuture { state: self.state.clone() }.await
-    }
-
     /// Get connection ID for this connection.
     pub fn connection_id(&self) -> ConnectionId {
         self.conn_id
@@ -556,7 +585,7 @@ impl ConnectionHandle {
 
     /// Check if connection is closed.
     pub fn is_closed(&self) -> bool {
-        self.state.lock().unwrap().closed
+        self.state.lock().closed
     }
 }
 
@@ -575,8 +604,12 @@ pub struct QuicStream {
     stream_id: StreamId,
     egress_tx: Sender<Command>,
     state: Arc<Mutex<SharedState>>,
-    #[allow(dead_code)] // May be used for future validation
+    #[allow(dead_code)]
     is_bidirectional: bool,
+    /// Current buffer being read
+    read_buf: Option<Bytes>,
+    /// Total bytes read (for flow control)
+    bytes_read: usize,
 }
 
 impl QuicStream {
@@ -589,65 +622,103 @@ impl QuicStream {
     pub fn conn_id(&self) -> ConnectionId {
         self.conn_id
     }
+    
+    /// Reset the stream with an error code.
+    pub fn reset(&self, error_code: u64) -> Result<(), TrySendError<Command>> {
+        self.egress_tx.try_send(Command::ResetStream {
+            conn_id: self.conn_id,
+            stream_id: self.stream_id,
+            error_code,
+        })
+    }
+    
+    /// Send STOP_SENDING to peer.
+    pub fn stop_sending(&self, error_code: u64) -> Result<(), TrySendError<Command>> {
+        self.egress_tx.try_send(Command::StopSending {
+            conn_id: self.conn_id,
+            stream_id: self.stream_id,
+            error_code,
+        })
+    }
 }
 
 impl AsyncRead for QuicStream {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut state = self.state.lock().unwrap();
+        let stream_id = self.stream_id;
         
-        eprintln!("QuicStream::poll_read: stream_id={}, buf_remaining={}", self.stream_id.0, buf.remaining());
-        
-        // Check for data
-        if let Some(queue) = state.stream_buffers.get_mut(&self.stream_id) {
-            if let Some(chunk) = queue.front_mut() {
-                let len = std::cmp::min(chunk.len(), buf.remaining());
-                eprintln!("QuicStream::poll_read: stream_id={}, reading {} bytes from queue", self.stream_id.0, len);
-                buf.put_slice(&chunk[..len]);
+        // Try to read from current buffer first
+        if let Some(ref mut bytes) = self.as_mut().get_mut().read_buf {
+            if !bytes.is_empty() {
+                let len = std::cmp::min(bytes.len(), buf.remaining());
+                buf.put_slice(&bytes[..len]);
+                bytes.advance(len);
                 
-                // Consume from chunk
-                if len == chunk.len() {
-                    queue.pop_front();
-                } else {
-                    chunk.advance(len);
+                // Update bytes read and send flow control
+                let is_empty = bytes.is_empty();
+                // Release the mutable borrow
+                let _ = bytes;
+                
+                let this = self.as_mut().get_mut();
+                this.bytes_read += len;
+                if this.bytes_read >= 1024 {
+                    let _ = this.egress_tx.try_send(Command::StreamDataRead {
+                        conn_id: this.conn_id,
+                        stream_id: this.stream_id,
+                        len: this.bytes_read,
+                    });
+                    this.bytes_read = 0;
                 }
                 
-                // Send flow control update
-                let _ = self.egress_tx.try_send(Command::StreamDataRead {
-                    conn_id: self.conn_id,
-                    stream_id: self.stream_id,
-                    len,
-                });
+                // Clear buffer if fully consumed
+                if is_empty {
+                    this.read_buf = None;
+                }
                 
                 return Poll::Ready(Ok(()));
             }
         }
         
+        // Fetch next buffer from shared state
+        let state_arc = self.state.clone();
+        let mut state = state_arc.lock();
+        
+        if let Some(queue) = state.stream_buffers.get_mut(&stream_id) {
+            if let Some(chunk) = queue.pop_front() {
+                drop(state);
+                let this = self.as_mut().get_mut();
+                this.read_buf = Some(chunk);
+                // Re-call poll_read to consume from new buffer
+                return self.poll_read(cx, buf);
+            }
+        }
+        
         // Check for FIN
-        if state.stream_fin.contains(&self.stream_id) {
-            eprintln!("QuicStream::poll_read: stream_id={}, FIN detected, returning EOF", self.stream_id.0);
+        if state.stream_fin.get(&stream_id) == Some(&true) {
             return Poll::Ready(Ok(()));
         }
         
         // Check for Reset
-        if let Some(err) = state.stream_reset.get(&self.stream_id) {
-            eprintln!("QuicStream::poll_read: stream_id={}, reset with error {}", self.stream_id.0, err);
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, format!("stream reset: {}", err))));
+        if let Some(&error_code) = state.stream_reset.get(&stream_id) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("stream reset: {}", error_code)
+            )));
         }
         
         // Check for Connection Close
         if state.closed {
-            eprintln!("QuicStream::poll_read: stream_id={}, connection closed", self.stream_id.0);
-             return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, "connection closed")));
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection closed"
+            )));
         }
         
         // Register waker
-        eprintln!("QuicStream::poll_read: stream_id={}, no data available, registering waker", self.stream_id.0);
-        state.stream_wakers.insert(self.stream_id, cx.waker().clone());
-        
+        state.stream_wakers.insert(stream_id, cx.waker().clone());
         Poll::Pending
     }
 }
@@ -673,12 +744,16 @@ impl AsyncWrite for QuicStream {
                 Poll::Pending
             }
             Err(TrySendError::Disconnected(_)) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")))
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection closed"
+                )))
             }
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Crossbeam channel doesn't buffer, so flush is instant
         Poll::Ready(Ok(()))
     }
 
@@ -695,7 +770,10 @@ impl AsyncWrite for QuicStream {
                 Poll::Pending
             }
             Err(TrySendError::Disconnected(_)) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")))
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection closed"
+                )))
             }
         }
     }

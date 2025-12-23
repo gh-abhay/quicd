@@ -1954,6 +1954,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "parking_lot",
  "quicd-h3",
  "quicd-quic",
  "quicd-x",
@@ -1962,6 +1963,7 @@ dependencies = [
  "serde",
  "serde_json",
  "siphasher",
+ "slab",
  "smallvec",
  "socket2",
  "sys-info",
@@ -2021,6 +2023,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "crossbeam-channel",
+ "parking_lot",
  "thiserror",
  "tokio",
 ]

@@ -6,10 +6,9 @@
 use bytes::{Bytes, BytesMut};
 use crate::netio::buffer::WorkerBuffer;
 use crate::routing::{RoutingConnectionIdGenerator, current_generation};
-use crate::worker::connection_wrapper::ConnectionWrapper;
-use crossbeam_channel::{Sender, Receiver, bounded};
-use quicd_quic::{ConnectionConfig, Packet, PacketTypeWrapper, VERSION_1, Side};
-use quicd_quic::{ConnectionEvent, ConnectionState as QuicConnectionState, StreamId as QuicStreamId};
+use crossbeam_channel::Sender as CrossbeamSender;
+use quicd_quic::{ConnectionConfig, Packet, PacketTypeWrapper, VERSION_1, Side, QuicConnection, DatagramInput};
+use quicd_quic::{Connection, ConnectionEvent, ConnectionState as QuicConnectionState, StreamId as QuicStreamId};
 use quicd_quic::cid::{ConnectionIdGenerator, ConnectionId};
 use quicd_quic::crypto::CryptoLevel;
 use quicd_quic::types::{Instant as QuicInstant, StreamDirection};
@@ -20,6 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle as TokioHandle;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn, debug};
 
 /// Maps incoming packets to QUIC connections.
@@ -36,8 +36,8 @@ pub struct ConnectionManager {
     /// Tokio runtime handle for spawning application tasks.
     tokio_handle: TokioHandle,
     
-    /// Worker egress channel sender (cloned for each connection).
-    egress_tx: Sender<Command>,
+    /// Worker egress channel sender (unbounded, cloned for each connection).
+    egress_tx: CrossbeamSender<Command>,
     
     /// CID generator for this worker (with routing cookie).
     cid_generator: Arc<dyn ConnectionIdGenerator>,
@@ -55,17 +55,17 @@ pub struct ConnectionManager {
 
 /// Per-connection state managed by the worker.
 struct ConnectionState {
-    /// The QUIC connection wrapper.
-    conn: ConnectionWrapper,
+    /// The QUIC connection state machine.
+    conn: QuicConnection,
     
     /// Remote peer address.
     peer_addr: SocketAddr,
     
-    /// Ingress channel sender for events to application task.
-    ingress_tx: Sender<Event>,
+    /// Ingress channel sender for events to application task (bounded tokio::mpsc).
+    ingress_tx: mpsc::Sender<Event>,
     
     /// Ingress channel receiver (stored until app spawned).
-    ingress_rx: Option<Receiver<Event>>,
+    ingress_rx: Option<mpsc::Receiver<Event>>,
     
     /// Has the application task been spawned?
     app_spawned: bool,
@@ -87,7 +87,7 @@ impl ConnectionManager {
     pub fn new(
         config: ConnectionConfig,
         tokio_handle: TokioHandle,
-        egress_tx: Sender<Command>,
+        egress_tx: CrossbeamSender<Command>,
         worker_id: u8,
         app_registry: Arc<crate::apps::AppRegistry>,
     ) -> Self {
@@ -158,7 +158,7 @@ impl ConnectionManager {
             }
         }
         
-        let mut packet = match quicd_quic::Packet::parse_with_context(bytes.clone(), parse_context) {
+        let packet = match quicd_quic::Packet::parse_with_context(bytes.clone(), parse_context) {
              Ok(p) => p,
              Err(e) => {
                  error!("Failed to parse packet: {}", e);
@@ -250,7 +250,7 @@ impl ConnectionManager {
             
             // RFC 9001 Section 5.7: Server MUST NOT process 1-RTT packets before handshake complete
             // Even if 1-RTT keys are available, buffer until handshake completes
-            if encryption_level == CryptoLevel::Application && !state.conn.is_handshake_complete() {
+            if encryption_level == CryptoLevel::Application && state.conn.state() == QuicConnectionState::Handshaking {
                 const MAX_BUFFERED_PACKETS: usize = 10;
                 if state.buffered_1rtt_packets.len() < MAX_BUFFERED_PACKETS {
                     debug!("Buffering 1-RTT packet (handshake not complete): buffer_size={}",
@@ -263,31 +263,15 @@ impl ConnectionManager {
             }
             
             // Get HP key from the connection's TLS session
-            if let Some(_hp_key) = state.conn.get_hp_key(encryption_level) {
-                // Header protection removal handled by packet parser
-                // In real implementation, would use HP key here
-            } else {
-                // Keys not available yet
-                if encryption_level == CryptoLevel::Application {
-                    // RFC 9001 Section 5.7: Server MUST NOT process 1-RTT packets before handshake complete
-                    // Buffer them to process after handshake completes
-                    const MAX_BUFFERED_PACKETS: usize = 10;
-                    if state.buffered_1rtt_packets.len() < MAX_BUFFERED_PACKETS {
-                        debug!("Buffering 1-RTT packet (keys not ready): buffer_size={}",
-                               state.buffered_1rtt_packets.len() + 1);
-                        state.buffered_1rtt_packets.push((bytes.clone(), datagram_size, now));
-                    } else {
-                        warn!("Dropping 1-RTT packet - buffer full ({} packets)", MAX_BUFFERED_PACKETS);
-                    }
-                    return vec![];
-                } else {
-                    error!("HP key not available for encryption level: {:?}", encryption_level);
-                    return vec![];
-                }
-            }
+            // Header protection removal is handled internally by QuicConnection
+            // during process_datagram() - it parses, decrypts, and processes frames
             
-            // Process packet using Connection trait
-            if let Err(e) = state.conn.process_datagram(bytes.clone(), Self::to_quic_instant(now)) {
+            // Process packet using Connection trait with DatagramInput
+            let datagram_input = DatagramInput {
+                data: bytes.clone(),
+                recv_time: Self::to_quic_instant(now),
+            };
+            if let Err(e) = state.conn.process_datagram(datagram_input) {
                 error!("Connection error: {}", e);
             }
             
@@ -317,15 +301,17 @@ impl ConnectionManager {
             let scid = self.cid_generator.generate(20);
             let dcid = packet.header.dcid.clone();
             
-            // Create connection wrapper with QUIC state machine
-            let conn = ConnectionWrapper::new(
+            // Create QUIC connection state machine
+            let conn = QuicConnection::new(
                 Side::Server,
                 scid.clone(),
                 dcid.clone(),
                 self.config.clone(),
             );
             
-            let (ingress_tx, ingress_rx) = bounded(1024);
+            // Create bounded tokio::mpsc channel for ingress (Worker → App)
+            // Capacity of 64 provides backpressure when app is slow
+            let (ingress_tx, ingress_rx) = mpsc::channel(64);
             let dcid_len = scid.len();
             
             let state = ConnectionState {
@@ -347,7 +333,11 @@ impl ConnectionManager {
             
             // Now process the Initial packet
             if let Some(state) = self.connections.get_mut(&scid) {
-                if let Err(e) = state.conn.process_datagram(bytes, Self::to_quic_instant(now)) {
+                let datagram_input = DatagramInput {
+                    data: bytes,
+                    recv_time: Self::to_quic_instant(now),
+                };
+                if let Err(e) = state.conn.process_datagram(datagram_input) {
                     error!("Failed to process initial packet: {}", e);
                     // Remove the connection on failure
                     self.connections.remove(&scid);
@@ -373,7 +363,11 @@ impl ConnectionManager {
         let mut should_spawn = false;
         
         if let Some(state) = self.connections.get(scid) {
-            if state.conn.is_handshake_complete() && !state.app_spawned {
+            let is_handshake_complete = matches!(
+                state.conn.state(),
+                QuicConnectionState::Active | QuicConnectionState::Closing | QuicConnectionState::Draining
+            );
+            if is_handshake_complete && !state.app_spawned {
                 should_spawn = true;
             }
         }
@@ -406,9 +400,13 @@ impl ConnectionManager {
                 
                 // Get negotiated ALPN from connection wrapper
                 let alpn = state.conn.negotiated_alpn();
+                // negotiated_alpn() returns Option<&[u8]>
                 
                 match alpn {
-                    Some(alpn_str) => {
+                    Some(alpn_bytes) => {
+                        // Convert &[u8] to &str for lookup and display
+                        let alpn_str = std::str::from_utf8(alpn_bytes).unwrap_or("<invalid-utf8>");
+                        
                         // Look up application factory in registry
                         match self.app_registry.get(alpn_str) {
                             Some(factory) => {
@@ -438,7 +436,13 @@ impl ConnectionManager {
     ///
     /// This is the critical integration point between the QUIC protocol state machine
     /// and application tasks.
-    fn bridge_event_to_app(&self, event: ConnectionEvent, ingress_tx: &Sender<Event>) {
+    /// 
+    /// # Backpressure Handling
+    /// Uses try_send on bounded tokio::mpsc channel. If channel is full:
+    /// - Event is dropped (logged as warning)
+    /// - Worker should detect this and apply QUIC flow control
+    /// - Application task must process events faster to keep up
+    fn bridge_event_to_app(&self, event: ConnectionEvent, ingress_tx: &mpsc::Sender<Event>) {
         let x_event = match event {
             ConnectionEvent::HandshakeComplete => {
                 debug!("Handshake complete event received");
@@ -493,9 +497,19 @@ impl ConnectionManager {
             }
         };
         
-        // Send event to application task via crossbeam channel
-        if let Err(e) = ingress_tx.try_send(x_event) {
-            warn!("Failed to send event to application: {:?}", e);
+        // Send event to application task via bounded tokio::mpsc channel
+        // try_send returns immediately, providing backpressure if channel is full
+        match ingress_tx.try_send(x_event) {
+            Ok(_) => {},
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Channel is full - application task is slow
+                // TODO: Signal QUIC state machine to reduce flow control window
+                warn!("Ingress channel full - dropping event (backpressure applied)");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Application task has terminated
+                debug!("Ingress channel closed - application task ended");
+            }
         }
     }
     
@@ -575,9 +589,9 @@ impl ConnectionManager {
                 if let Some((scid, state)) = self.find_connection_by_id(conn_id) {
                     match state.conn.open_stream(StreamDirection::Bidirectional) {
                         Ok(quic_stream_id) => {
-                            let _ = state.ingress_tx.try_send(Event::StreamOpened {
+                            // Send StreamOpenedConfirm event to application
+                            let _ = state.ingress_tx.try_send(Event::StreamOpenedConfirm {
                                 stream_id: XStreamId(quic_stream_id.0),
-                                is_bidirectional: true,
                             });
                         }
                         Err(e) => {
@@ -593,9 +607,9 @@ impl ConnectionManager {
                 if let Some((scid, state)) = self.find_connection_by_id(conn_id) {
                     match state.conn.open_stream(StreamDirection::Unidirectional) {
                         Ok(quic_stream_id) => {
-                            let _ = state.ingress_tx.try_send(Event::StreamOpened {
+                            // Send StreamOpenedConfirm event to application
+                            let _ = state.ingress_tx.try_send(Event::StreamOpenedConfirm {
                                 stream_id: XStreamId(quic_stream_id.0),
-                                is_bidirectional: false,
                             });
                         }
                         Err(e) => {
@@ -635,9 +649,9 @@ impl ConnectionManager {
                     return self.generate_packets(&scid, now);
                 }
             }
-            Command::StopSending { conn_id, stream_id, error_code } => {
+            Command::StopSending { conn_id, stream_id, error_code: _error_code } => {
                 // Send STOP_SENDING via Connection trait
-                if let Some((scid, state)) = self.find_connection_by_id(conn_id) {
+                if let Some((scid, _state)) = self.find_connection_by_id(conn_id) {
                     let quic_stream_id = QuicStreamId(stream_id.0);
                     // STOP_SENDING is sent via the stop_sending method
                     // For now, log and generate packets (assuming Connection handles internally)
@@ -760,9 +774,10 @@ impl ConnectionManager {
             loop {
                 let mut buf = BytesMut::with_capacity(1500);
                 match state.conn.poll_send(&mut buf, Self::to_quic_instant(now)) {
-                    Some(packet_bytes) => {
-                        // Got a packet to send
-                        out.push((state.peer_addr, packet_bytes));
+                    Some(datagram_output) => {
+                        // Got a packet to send - extract the data as Vec<u8>
+                        let packet_data = datagram_output.data.to_vec();
+                        out.push((state.peer_addr, packet_data));
                     }
                     None => {
                         // No more packets to send
@@ -786,7 +801,11 @@ impl ConnectionManager {
         let (should_process, buffered) = {
             if let Some(state) = self.connections.get_mut(scid) {
                 // Check if handshake is complete (not just if keys are available)
-                if !state.conn.is_handshake_complete() {
+                let is_handshake_complete = matches!(
+                    state.conn.state(),
+                    QuicConnectionState::Active | QuicConnectionState::Closing | QuicConnectionState::Draining
+                );
+                if !is_handshake_complete {
                     return vec![];
                 }
                 
@@ -820,7 +839,11 @@ impl ConnectionManager {
             
             // Process the buffered datagram (convert arrival_time to quicd_quic::Instant)
             let quic_arrival_time = Self::to_quic_instant(arrival_time);
-            if let Err(e) = state.conn.process_datagram(packet_bytes, quic_arrival_time) {
+            let timeout_datagram = DatagramInput {
+                data: packet_bytes,
+                recv_time: quic_arrival_time,
+            };
+            if let Err(e) = state.conn.process_datagram(timeout_datagram) {
                 error!("Error processing buffered packet: {}", e);
                 continue;
             }

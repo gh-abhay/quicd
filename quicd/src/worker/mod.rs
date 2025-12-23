@@ -18,7 +18,7 @@
 
 pub mod io_state;
 pub mod connection_manager;
-pub mod connection_wrapper;
+pub mod context;
 
 use crate::netio::{
     buffer::{create_worker_pool, WorkerBufPool, WorkerBuffer},
@@ -29,10 +29,8 @@ use crate::telemetry::{record_metric, MetricsEvent};
 use crate::worker::io_state::{RecvOpState, SendOpState};
 use crate::worker::connection_manager::ConnectionManager;
 use anyhow::{Context, Result};
-use crossbeam_channel::bounded;
 use io_uring::{opcode, types, IoUring};
 use quicd_quic::ConnectionConfig;
-use quicd_x::Command;
 use std::collections::HashMap;
 use std::io;
 use std::mem::ManuallyDrop;
@@ -168,7 +166,7 @@ impl NetworkWorker {
     }
 
     /// Run the worker's io_uring event loop (runs in dedicated native thread).
-    pub fn run(mut self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         // Pin thread to CPU core if enabled
         if self.config.pin_to_cpu {
             if let Some(core_id) =
@@ -295,9 +293,10 @@ impl NetworkWorker {
         let socket_fd = self.socket_fd;
         let shutdown = &self.shutdown;
 
-        // Extract egress_rx for the event loop
-        // Create egress channel for receiving commands from app tasks
-        let (egress_tx, egress_rx) = bounded(self.channel_config.worker_egress_capacity);
+        // Create UNBOUNDED egress channel for receiving commands from app tasks
+        // Unbounded allows high-throughput signaling without blocking application tasks
+        // All app tasks for this worker share the same sender
+        let (egress_tx, egress_rx) = crossbeam_channel::unbounded();
         
         // Create connection config with TLS certificate data (already in memory, no disk I/O)
         let mut conn_config = ConnectionConfig::default();
@@ -384,11 +383,11 @@ impl NetworkWorker {
                 // Send timeout-generated packets
                 for (dest, packet_data) in timeout_packets {
                     // Convert to WorkerBuffer (data is already copied by from_slice)
-                    let buf = WorkerBuffer::from_slice(&packet_data, &buffer_pool);
+                    let _buf = WorkerBuffer::from_slice(&packet_data, &buffer_pool);
                     
                     // Submit send operation to io_uring
-                    // Note: submit_send would need to be implemented in io_state
-                    // For now, this is a placeholder showing the pattern
+                    // TODO: Complete send operation submission
+                    debug!(worker_id, dest_addr = %dest, packet_len = packet_data.len(), "Generated timeout packet");
                 }
                 
                 last_timeout_check = now;
@@ -744,7 +743,7 @@ impl NetworkWorker {
         // Step 1: Stop accepting new connections (already done - loop exited)
 
         // Step 2: Gracefully close all active QUIC connections per RFC 9000 Section 10
-        let mut shutdown_packets: Vec<(std::net::SocketAddr, Vec<u8>)> = Vec::new();
+        let shutdown_packets: Vec<(std::net::SocketAddr, Vec<u8>)> = Vec::new();
         
         // Generate CONNECTION_CLOSE frames for all connections
         // This is handled via connection_manager - it would iterate through all

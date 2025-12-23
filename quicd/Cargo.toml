@@ -29,6 +29,8 @@ once_cell = { workspace = true }
 crossbeam-channel = { workspace = true }
 core_affinity = { workspace = true }
 rcgen = { workspace = true }
+slab = { workspace = true }
+parking_lot = { workspace = true }
 
 # OpenTelemetry for metrics and tracing
 opentelemetry = { workspace = true, features = ["metrics", "trace"] }

@@ -9,6 +9,7 @@ bytes = { workspace = true }
 crossbeam-channel = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "sync", "time", "rt"] }
 thiserror = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
