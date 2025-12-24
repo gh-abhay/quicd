@@ -8,6 +8,7 @@ bytes = { version = "1.11", default-features = false }
 tinyvec = { version = "1.8", features = ["alloc"] }
 boring = { workspace = true, optional = true }
 boring-sys = { workspace = true, optional = true }
+foreign-types = "0.5.0"
 
 [features]
 default = ["std"]

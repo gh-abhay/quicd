@@ -382,7 +382,7 @@ impl QuicConnection {
     }
     
     /// Get negotiated ALPN protocol from TLS session
-    pub fn negotiated_alpn(&self) -> Option<&[u8]> {
+    pub fn negotiated_alpn(&self) -> Option<Vec<u8>> {
         self.tls_session
             .as_ref()
             .and_then(|tls| tls.alpn_protocol())
@@ -408,16 +408,22 @@ impl QuicConnection {
                 // Feed crypto data to TLS session
                 if let Some(ref mut tls) = self.tls_session {
                     let level = CryptoLevel::Handshake; // TODO: determine from packet type
-                    match tls.process_crypto_data(level, crypto_frame.data)? {
-                        crate::crypto::TlsEvent::HandshakeComplete => {
-                            self.handshake_complete = true;
-                            self.state = ConnectionState::Active;
-                            self.pending_events.push(ConnectionEvent::HandshakeComplete);
+                    tls.process_input(crypto_frame.data, level)?;
+                    while let Some(event) = tls.get_output() {
+                        match event {
+                            crate::crypto::TlsEvent::HandshakeComplete => {
+                                self.handshake_complete = true;
+                                self.state = ConnectionState::Active;
+                                self.pending_events.push(ConnectionEvent::HandshakeComplete);
+                            }
+                            crate::crypto::TlsEvent::ReadSecret(_level, _secret) => {
+                                // Keys installed, can start encrypting at new level
+                            }
+                            crate::crypto::TlsEvent::WriteSecret(_level, _secret) => {
+                                // Keys installed, can start encrypting at new level
+                            }
+                            _ => {}
                         }
-                        crate::crypto::TlsEvent::KeysReady { .. } => {
-                            // Keys installed, can start encrypting at new level
-                        }
-                        _ => {}
                     }
                 }
                 Ok(())

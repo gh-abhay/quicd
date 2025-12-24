@@ -1,0 +1,329 @@
+use crate::crypto::backend::{CryptoLevel, TlsEvent, TlsSession};
+use crate::error::{CryptoError, Error, Result};
+use crate::types::Side;
+use boring::ssl::{Ssl, SslContext, SslMethod, SslVersion};
+use boring_sys as ffi;
+use std::ffi::c_void;
+use std::ptr;
+use std::sync::Arc;
+use std::collections::VecDeque;
+use foreign_types::ForeignType;
+
+static mut EX_DATA_INDEX: i32 = -1;
+static EX_DATA_INDEX_INIT: std::sync::Once = std::sync::Once::new();
+
+fn get_ex_data_index() -> i32 {
+    unsafe {
+        EX_DATA_INDEX_INIT.call_once(|| {
+            EX_DATA_INDEX = ffi::SSL_get_ex_new_index(0, ptr::null_mut(), ptr::null_mut(), None, None);
+        });
+        EX_DATA_INDEX
+    }
+}
+
+struct ExData<'a> {
+    events: &'a mut VecDeque<TlsEvent>,
+}
+
+pub struct BoringTlsSession {
+    ssl: Ssl,
+    events: VecDeque<TlsEvent>,
+    is_server: bool,
+}
+
+impl BoringTlsSession {
+    pub fn new_client(server_name: Option<&str>, alpn_protocols: &[&[u8]]) -> Result<Box<dyn TlsSession>> {
+        let mut ctx = SslContext::builder(SslMethod::tls_client())
+            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+        
+        ctx.set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+        
+        ctx.set_max_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+
+        // Set ALPN
+        if !alpn_protocols.is_empty() {
+            let mut protos = Vec::new();
+            for proto in alpn_protocols {
+                protos.push(proto.len() as u8);
+                protos.extend_from_slice(proto);
+            }
+            ctx.set_alpn_protos(&protos)
+                .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+        }
+
+        let ctx = ctx.build();
+        let mut ssl = Ssl::new(&ctx)
+            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+
+        if let Some(name) = server_name {
+            ssl.set_hostname(name)
+                .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+        }
+
+        unsafe {
+            ffi::SSL_set_connect_state(ssl.as_ptr());
+            ffi::SSL_set_quic_method(ssl.as_ptr(), &QUIC_METHOD);
+        }
+
+        Ok(Box::new(Self {
+            ssl,
+            events: VecDeque::new(),
+            is_server: false,
+        }))
+    }
+
+    pub fn new_server(alpn_protocols: &[&[u8]]) -> Result<Box<dyn TlsSession>> {
+        let mut ctx = SslContext::builder(SslMethod::tls_server())
+            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+        
+        ctx.set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+        
+        ctx.set_max_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+
+        // Set ALPN callback
+        if !alpn_protocols.is_empty() {
+            let mut protos_flat = Vec::new();
+            for p in alpn_protocols {
+                protos_flat.push(p.len() as u8);
+                protos_flat.extend_from_slice(p);
+            }
+            
+            ctx.set_alpn_select_callback(move |_, client_protos| {
+                let mut client_idx = 0;
+                while client_idx < client_protos.len() {
+                    let len = client_protos[client_idx] as usize;
+                    client_idx += 1;
+                    if client_idx + len > client_protos.len() {
+                        break;
+                    }
+                    let proto = &client_protos[client_idx..client_idx + len];
+                    
+                    let mut server_idx = 0;
+                    while server_idx < protos_flat.len() {
+                        let slen = protos_flat[server_idx] as usize;
+                        server_idx += 1;
+                        if server_idx + slen > protos_flat.len() {
+                            break;
+                        }
+                        let sproto = &protos_flat[server_idx..server_idx + slen];
+                        if proto == sproto {
+                            return Ok(proto);
+                        }
+                        server_idx += slen;
+                    }
+                    
+                    client_idx += len;
+                }
+                Err(boring::ssl::AlpnError::NOACK)
+            });
+        }
+
+        let ctx = ctx.build();
+        let mut ssl = Ssl::new(&ctx)
+            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+
+        unsafe {
+            ffi::SSL_set_accept_state(ssl.as_ptr());
+            ffi::SSL_set_quic_method(ssl.as_ptr(), &QUIC_METHOD);
+        }
+
+        Ok(Box::new(Self {
+            ssl,
+            events: VecDeque::new(),
+            is_server: true,
+        }))
+    }
+}
+
+impl TlsSession for BoringTlsSession {
+    fn process_input(&mut self, data: &[u8], level: CryptoLevel) -> Result<()> {
+        let level_int = match level {
+            CryptoLevel::Initial => ffi::ssl_encryption_level_t::ssl_encryption_initial,
+            CryptoLevel::ZeroRTT => ffi::ssl_encryption_level_t::ssl_encryption_early_data,
+            CryptoLevel::Handshake => ffi::ssl_encryption_level_t::ssl_encryption_handshake,
+            CryptoLevel::OneRTT => ffi::ssl_encryption_level_t::ssl_encryption_application,
+        };
+
+        let mut ex_data = ExData {
+            events: &mut self.events,
+        };
+
+        unsafe {
+            ffi::SSL_set_ex_data(self.ssl.as_ptr(), get_ex_data_index(), &mut ex_data as *mut ExData as *mut c_void);
+
+            if ffi::SSL_provide_quic_data(
+                self.ssl.as_ptr(),
+                level_int,
+                data.as_ptr(),
+                data.len(),
+            ) != 1 {
+                ffi::SSL_set_ex_data(self.ssl.as_ptr(), get_ex_data_index(), ptr::null_mut());
+                return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+            }
+
+            if ffi::SSL_do_handshake(self.ssl.as_ptr()) <= 0 {
+                let err = ffi::SSL_get_error(self.ssl.as_ptr(), 0);
+                ffi::SSL_set_ex_data(self.ssl.as_ptr(), get_ex_data_index(), ptr::null_mut());
+                
+                if err == ffi::SSL_ERROR_WANT_READ || err == ffi::SSL_ERROR_WANT_WRITE {
+                    return Ok(());
+                }
+                // return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+            }
+            
+            ffi::SSL_set_ex_data(self.ssl.as_ptr(), get_ex_data_index(), ptr::null_mut());
+        }
+        
+        Ok(())
+    }
+
+    fn get_output(&mut self) -> Option<TlsEvent> {
+        self.events.pop_front()
+    }
+
+    fn is_handshake_complete(&self) -> bool {
+        unsafe { ffi::SSL_in_init(self.ssl.as_ptr()) == 0 }
+    }
+
+    fn alpn_protocol(&self) -> Option<Vec<u8>> {
+        if let Some(proto) = self.ssl.selected_alpn_protocol() {
+            Some(proto.to_vec())
+        } else {
+            None
+        }
+    }
+
+    fn peer_transport_params(&self) -> Option<Vec<u8>> {
+        unsafe {
+            let mut ptr: *const u8 = ptr::null();
+            let mut len: usize = 0;
+            ffi::SSL_get_peer_quic_transport_params(self.ssl.as_ptr(), &mut ptr, &mut len);
+            if ptr.is_null() || len == 0 {
+                return None;
+            }
+            let slice = std::slice::from_raw_parts(ptr, len);
+            Some(slice.to_vec())
+        }
+    }
+
+    fn set_transport_params(&mut self, params: &[u8]) -> Result<()> {
+        unsafe {
+            if ffi::SSL_set_quic_transport_params(
+                self.ssl.as_ptr(),
+                params.as_ptr(),
+                params.len(),
+            ) != 1 {
+                return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+            }
+        }
+        Ok(())
+    }
+}
+
+// QUIC Method Callbacks
+static QUIC_METHOD: ffi::SSL_QUIC_METHOD = ffi::SSL_QUIC_METHOD {
+    set_read_secret: Some(set_read_secret),
+    set_write_secret: Some(set_write_secret),
+    add_handshake_data: Some(add_handshake_data),
+    flush_flight: Some(flush_flight),
+    send_alert: Some(send_alert),
+};
+
+unsafe extern "C" fn set_read_secret(
+    ssl: *mut ffi::SSL,
+    level: ffi::ssl_encryption_level_t,
+    _cipher: *const ffi::SSL_CIPHER,
+    secret: *const u8,
+    secret_len: usize,
+) -> i32 {
+    let ex_data_ptr = ffi::SSL_get_ex_data(ssl, get_ex_data_index()) as *mut ExData;
+    if ex_data_ptr.is_null() {
+        return 0;
+    }
+    let ex_data = &mut *ex_data_ptr;
+
+    let slice = std::slice::from_raw_parts(secret, secret_len);
+    let vec = slice.to_vec();
+
+    let crypto_level = match level {
+        ffi::ssl_encryption_level_t::ssl_encryption_initial => CryptoLevel::Initial,
+        ffi::ssl_encryption_level_t::ssl_encryption_early_data => CryptoLevel::ZeroRTT,
+        ffi::ssl_encryption_level_t::ssl_encryption_handshake => CryptoLevel::Handshake,
+        ffi::ssl_encryption_level_t::ssl_encryption_application => CryptoLevel::OneRTT,
+        _ => return 0,
+    };
+
+    ex_data.events.push_back(TlsEvent::ReadSecret(crypto_level, vec));
+    1
+}
+
+unsafe extern "C" fn set_write_secret(
+    ssl: *mut ffi::SSL,
+    level: ffi::ssl_encryption_level_t,
+    _cipher: *const ffi::SSL_CIPHER,
+    secret: *const u8,
+    secret_len: usize,
+) -> i32 {
+    let ex_data_ptr = ffi::SSL_get_ex_data(ssl, get_ex_data_index()) as *mut ExData;
+    if ex_data_ptr.is_null() {
+        return 0;
+    }
+    let ex_data = &mut *ex_data_ptr;
+
+    let slice = std::slice::from_raw_parts(secret, secret_len);
+    let vec = slice.to_vec();
+
+    let crypto_level = match level {
+        ffi::ssl_encryption_level_t::ssl_encryption_initial => CryptoLevel::Initial,
+        ffi::ssl_encryption_level_t::ssl_encryption_early_data => CryptoLevel::ZeroRTT,
+        ffi::ssl_encryption_level_t::ssl_encryption_handshake => CryptoLevel::Handshake,
+        ffi::ssl_encryption_level_t::ssl_encryption_application => CryptoLevel::OneRTT,
+        _ => return 0,
+    };
+
+    ex_data.events.push_back(TlsEvent::WriteSecret(crypto_level, vec));
+    1
+}
+
+unsafe extern "C" fn add_handshake_data(
+    ssl: *mut ffi::SSL,
+    level: ffi::ssl_encryption_level_t,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    let ex_data_ptr = ffi::SSL_get_ex_data(ssl, get_ex_data_index()) as *mut ExData;
+    if ex_data_ptr.is_null() {
+        return 0;
+    }
+    let ex_data = &mut *ex_data_ptr;
+    
+    let slice = std::slice::from_raw_parts(data, len);
+    let vec = slice.to_vec();
+    
+    let crypto_level = match level {
+        ffi::ssl_encryption_level_t::ssl_encryption_initial => CryptoLevel::Initial,
+        ffi::ssl_encryption_level_t::ssl_encryption_early_data => CryptoLevel::ZeroRTT,
+        ffi::ssl_encryption_level_t::ssl_encryption_handshake => CryptoLevel::Handshake,
+        ffi::ssl_encryption_level_t::ssl_encryption_application => CryptoLevel::OneRTT,
+        _ => return 0,
+    };
+    
+    ex_data.events.push_back(TlsEvent::WriteData(crypto_level, vec));
+    1
+}
+
+unsafe extern "C" fn flush_flight(_ssl: *mut ffi::SSL) -> i32 {
+    1
+}
+
+unsafe extern "C" fn send_alert(
+    _ssl: *mut ffi::SSL,
+    _level: ffi::ssl_encryption_level_t,
+    _alert: u8,
+) -> i32 {
+    1
+}

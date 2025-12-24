@@ -201,7 +201,7 @@
 //! - **Fuzzing**: Zero-copy parsing is fuzz-safe (no panics on invalid input)
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![forbid(unsafe_code)]
+// #![forbid(unsafe_code)]
 
 extern crate alloc;
 
@@ -214,6 +214,7 @@ pub mod version;
 pub mod frames;
 pub mod packet;
 pub mod crypto;
+pub mod tls;
 
 // Transport subsystems
 pub mod stream;

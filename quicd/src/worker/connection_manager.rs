@@ -355,9 +355,9 @@ impl ConnectionManager {
                 // RFC 9001 Section 5.4: Remove header protection BEFORE decryption
                 // Determine encryption level from packet type
                 let encryption_level = match packet.header.ty {
-                    PacketTypeWrapper::Initial => quicd_quic::crypto::EncryptionLevel::Initial,
-                    PacketTypeWrapper::Handshake => quicd_quic::crypto::EncryptionLevel::Handshake,
-                    PacketTypeWrapper::Short => quicd_quic::crypto::EncryptionLevel::Application,
+                    PacketTypeWrapper::Initial => quicd_quic::crypto::CryptoLevel::Initial,
+                    PacketTypeWrapper::Handshake => quicd_quic::crypto::CryptoLevel::Handshake,
+                    PacketTypeWrapper::Short => quicd_quic::crypto::CryptoLevel::OneRTT,
                     _ => {
                         error!("Unsupported packet type for existing connection: {:?}", packet.header.ty);
                         return vec![];
@@ -366,7 +366,7 @@ impl ConnectionManager {
                 
                 // RFC 9001 Section 5.7: Server MUST NOT process 1-RTT packets before handshake complete
                 // Even if 1-RTT keys are available, buffer until handshake completes
-                if encryption_level == CryptoLevel::Application && state.conn.state() == QuicConnectionState::Handshaking {
+                if encryption_level == quicd_quic::crypto::CryptoLevel::OneRTT && state.conn.state() == QuicConnectionState::Handshaking {
                     const MAX_BUFFERED_PACKETS: usize = 10;
                     if state.buffered_1rtt_packets.len() < MAX_BUFFERED_PACKETS {
                         debug!("Buffering 1-RTT packet (handshake not complete): buffer_size={}",
@@ -530,7 +530,7 @@ impl ConnectionManager {
                 match alpn {
                     Some(alpn_bytes) => {
                         // Convert &[u8] to &str for lookup and display
-                        let alpn_str = std::str::from_utf8(alpn_bytes).unwrap_or("<invalid-utf8>");
+                        let alpn_str = std::str::from_utf8(&alpn_bytes).unwrap_or("<invalid-utf8>");
                         
                         // Look up application factory in registry
                         match app_registry.get(alpn_str) {
