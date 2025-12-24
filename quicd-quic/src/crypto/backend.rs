@@ -19,6 +19,8 @@ pub trait CryptoBackend: Send + Sync {
         side: Side,
         server_name: Option<&str>,
         alpn_protocols: &[&[u8]],
+        cert_data: Option<&[u8]>,
+        key_data: Option<&[u8]>,
     ) -> Result<Box<dyn TlsSession>>;
 }
 

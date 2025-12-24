@@ -1,11 +1,9 @@
 use crate::crypto::backend::{CryptoLevel, TlsEvent, TlsSession};
 use crate::error::{CryptoError, Error, Result};
-use crate::types::Side;
 use boring::ssl::{Ssl, SslContext, SslMethod, SslVersion};
 use boring_sys as ffi;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::Arc;
 use std::collections::VecDeque;
 use foreign_types::ForeignType;
 
@@ -74,7 +72,11 @@ impl BoringTlsSession {
         }))
     }
 
-    pub fn new_server(alpn_protocols: &[&[u8]]) -> Result<Box<dyn TlsSession>> {
+    pub fn new_server(
+        alpn_protocols: &[&[u8]],
+        cert_data: Option<&[u8]>,
+        key_data: Option<&[u8]>,
+    ) -> Result<Box<dyn TlsSession>> {
         let mut ctx = SslContext::builder(SslMethod::tls_server())
             .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
         
@@ -83,6 +85,27 @@ impl BoringTlsSession {
         
         ctx.set_max_proto_version(Some(SslVersion::TLS1_3))
             .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+
+        // Load certificate and private key from memory
+        if let (Some(cert_bytes), Some(key_bytes)) = (cert_data, key_data) {
+            // Parse certificate chain from PEM
+            use boring::x509::X509;
+            let cert = X509::from_pem(cert_bytes)
+                .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+            
+            // Set certificate
+            ctx.set_certificate(&cert)
+                .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+            
+            // Parse private key from PEM
+            use boring::pkey::PKey;
+            let key = PKey::private_key_from_pem(key_bytes)
+                .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+            
+            // Set private key
+            ctx.set_private_key(&key)
+                .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+        }
 
         // Set ALPN callback
         if !alpn_protocols.is_empty() {
@@ -123,7 +146,7 @@ impl BoringTlsSession {
         }
 
         let ctx = ctx.build();
-        let mut ssl = Ssl::new(&ctx)
+        let ssl = Ssl::new(&ctx)
             .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
 
         unsafe {
@@ -165,17 +188,29 @@ impl TlsSession for BoringTlsSession {
                 return Err(Error::Crypto(CryptoError { code: 0x0150 }));
             }
 
-            if ffi::SSL_do_handshake(self.ssl.as_ptr()) <= 0 {
-                let err = ffi::SSL_get_error(self.ssl.as_ptr(), 0);
-                ffi::SSL_set_ex_data(self.ssl.as_ptr(), get_ex_data_index(), ptr::null_mut());
-                
-                if err == ffi::SSL_ERROR_WANT_READ || err == ffi::SSL_ERROR_WANT_WRITE {
-                    return Ok(());
-                }
-                // return Err(Error::Crypto(CryptoError { code: 0x0150 }));
-            }
-            
+            let handshake_result = ffi::SSL_do_handshake(self.ssl.as_ptr());
+            let err = ffi::SSL_get_error(self.ssl.as_ptr(), handshake_result);
             ffi::SSL_set_ex_data(self.ssl.as_ptr(), get_ex_data_index(), ptr::null_mut());
+            
+            // Check if handshake completed
+            if handshake_result == 1 {
+                // Handshake completed successfully
+                if !self.events.iter().any(|e| matches!(e, TlsEvent::HandshakeComplete)) {
+                    self.events.push_back(TlsEvent::HandshakeComplete);
+                }
+            } else {
+                // Handshake not complete yet
+                match err {
+                    ffi::SSL_ERROR_WANT_READ | ffi::SSL_ERROR_WANT_WRITE => {
+                        // Normal - need more data
+                        return Ok(());
+                    }
+                    _ => {
+                        // Error occurred
+                        return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+                    }
+                }
+            }
         }
         
         Ok(())

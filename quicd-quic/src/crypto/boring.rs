@@ -47,10 +47,12 @@ impl CryptoBackend for BoringCryptoBackend {
         side: Side,
         server_name: Option<&str>,
         alpn_protocols: &[&[u8]],
+        cert_data: Option<&[u8]>,
+        key_data: Option<&[u8]>,
     ) -> Result<Box<dyn TlsSession>> {
         match side {
             Side::Client => crate::tls::boringssl::BoringTlsSession::new_client(server_name, alpn_protocols),
-            Side::Server => crate::tls::boringssl::BoringTlsSession::new_server(alpn_protocols),
+            Side::Server => crate::tls::boringssl::BoringTlsSession::new_server(alpn_protocols, cert_data, key_data),
         }
     }
 }
@@ -81,12 +83,26 @@ impl AeadProvider for BoringAead {
         &self,
         key: &[u8],
         iv: &[u8],
-        _packet_number: PacketNumber,
+        packet_number: PacketNumber,
         header: &[u8],
         payload: &[u8],
         output: &mut [u8],
     ) -> Result<usize> {
         unsafe {
+            // RFC 9001 Section 5.3: Construct nonce by XORing IV with left-padded packet number
+            let iv_len = iv.len();
+            let mut nonce = vec![0u8; iv_len];
+            nonce.copy_from_slice(iv);
+            
+            // Packet number in network byte order (big-endian), left-padded with zeros
+            let pn_bytes = packet_number.to_be_bytes();
+            // XOR the last bytes of nonce with packet number bytes
+            // Nonce is typically 12 bytes, packet number is 8 bytes max
+            let pn_start = iv_len.saturating_sub(8);
+            for i in 0..8.min(iv_len - pn_start) {
+                nonce[pn_start + i] ^= pn_bytes[i];
+            }
+            
             let mut ctx: ffi::EVP_AEAD_CTX = std::mem::zeroed();
             if ffi::EVP_AEAD_CTX_init(
                 &mut ctx,
@@ -113,8 +129,8 @@ impl AeadProvider for BoringAead {
                 output.as_mut_ptr(),
                 &mut out_len,
                 output.len(),
-                iv.as_ptr(),
-                iv.len(),
+                nonce.as_ptr(),
+                nonce.len(),
                 payload.as_ptr(),
                 payload.len(),
                 header.as_ptr(),
@@ -130,12 +146,25 @@ impl AeadProvider for BoringAead {
         &self,
         key: &[u8],
         iv: &[u8],
-        _packet_number: PacketNumber,
+        packet_number: PacketNumber,
         header: &[u8],
         payload: &[u8],
         output: &mut [u8],
     ) -> Result<usize> {
         unsafe {
+            // RFC 9001 Section 5.3: Construct nonce by XORing IV with left-padded packet number
+            let iv_len = iv.len();
+            let mut nonce = vec![0u8; iv_len];
+            nonce.copy_from_slice(iv);
+            
+            // Packet number in network byte order (big-endian), left-padded with zeros
+            let pn_bytes = packet_number.to_be_bytes();
+            // XOR the last bytes of nonce with packet number bytes
+            let pn_start = iv_len.saturating_sub(8);
+            for i in 0..8.min(iv_len - pn_start) {
+                nonce[pn_start + i] ^= pn_bytes[i];
+            }
+            
             let mut ctx: ffi::EVP_AEAD_CTX = std::mem::zeroed();
             if ffi::EVP_AEAD_CTX_init(
                 &mut ctx,
@@ -162,8 +191,8 @@ impl AeadProvider for BoringAead {
                 output.as_mut_ptr(),
                 &mut out_len,
                 output.len(),
-                iv.as_ptr(),
-                iv.len(),
+                nonce.as_ptr(),
+                nonce.len(),
                 payload.as_ptr(),
                 payload.len(),
                 header.as_ptr(),

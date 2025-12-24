@@ -6,7 +6,7 @@
 
 extern crate alloc;
 
-use crate::crypto::{CryptoBackend, CryptoLevel, TlsSession};
+use crate::crypto::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, KeySchedule, TlsSession};
 use crate::error::{Error, Result};
 use crate::flow_control::ConnectionFlowControl;
 use crate::frames::Frame;
@@ -15,7 +15,8 @@ use crate::recovery::{CongestionController, LossDetector};
 use crate::stream::StreamManager;
 use crate::transport::TransportParameters;
 use crate::types::{ConnectionId, Instant, PacketNumber, Side, StreamId};
-use bytes::{Bytes, BytesMut};
+use crate::version::VERSION_1;
+use bytes::{BufMut, Bytes, BytesMut};
 use core::time::Duration;
 
 // ============================================================================
@@ -39,6 +40,78 @@ pub enum ConnectionState {
 
     /// Connection closed
     Closed,
+}
+
+/// Encryption keys for a specific crypto level
+struct EncryptionKeys {
+    /// AEAD key for encryption/decryption
+    key: Vec<u8>,
+    /// IV for encryption/decryption
+    iv: Vec<u8>,
+    /// Header protection key
+    hp_key: Vec<u8>,
+    /// AEAD provider (cipher suite specific)
+    aead: Option<Box<dyn AeadProvider>>,
+    /// Header protection provider
+    hp: Option<Box<dyn HeaderProtectionProvider>>,
+    /// Packet number for this level
+    packet_number: PacketNumber,
+}
+
+impl EncryptionKeys {
+    fn new(key: Vec<u8>, iv: Vec<u8>, hp_key: Vec<u8>, aead: Box<dyn AeadProvider>, hp: Box<dyn HeaderProtectionProvider>) -> Self {
+        Self {
+            key,
+            iv,
+            hp_key,
+            aead: Some(aead),
+            hp: Some(hp),
+            packet_number: 0,
+        }
+    }
+    
+    fn empty() -> Self {
+        Self {
+            key: Vec::new(),
+            iv: Vec::new(),
+            hp_key: Vec::new(),
+            aead: None,
+            hp: None,
+            packet_number: 0,
+        }
+    }
+    
+    /// Install keys from a TLS secret
+    /// Derives packet key, IV, and HP key, then creates AEAD and HP providers
+    fn install_from_secret(
+        &mut self,
+        secret: &[u8],
+        key_schedule: &dyn KeySchedule,
+        crypto_backend: &dyn CryptoBackend,
+        cipher_suite: u16, // TLS cipher suite (e.g., 0x1301 for AES_128_GCM_SHA256)
+    ) -> Result<()> {
+        // Derive keys using HKDF (RFC 9001 Section 5.1)
+        let key_len = 16; // AES-128-GCM uses 16-byte keys (adjust for other ciphers)
+        let iv_len = 12;  // Standard nonce length for QUIC
+        let hp_key_len = 16; // Header protection key length
+        
+        let packet_key = key_schedule.derive_packet_key(secret, key_len)?;
+        let packet_iv = key_schedule.derive_packet_iv(secret, iv_len)?;
+        let hp_key = key_schedule.derive_header_protection_key(secret, hp_key_len)?;
+        
+        // Create AEAD and HP providers
+        let aead = crypto_backend.create_aead(cipher_suite)?;
+        let hp = crypto_backend.create_header_protection(cipher_suite)?;
+        
+        // Install keys
+        self.key = packet_key;
+        self.iv = packet_iv;
+        self.hp_key = hp_key;
+        self.aead = Some(aead);
+        self.hp = Some(hp);
+        
+        Ok(())
+    }
 }
 
 /// Connection Configuration
@@ -311,6 +384,21 @@ pub struct QuicConnection {
 
     /// Draining/closing timeout
     closing_timeout: Option<Instant>,
+    
+    /// Initial encryption keys (read: decrypt client Initial, write: encrypt server Initial)
+    initial_read_keys: EncryptionKeys,
+    initial_write_keys: EncryptionKeys,
+    
+    /// Handshake encryption keys (read: decrypt client Handshake, write: encrypt server Handshake)
+    handshake_read_keys: EncryptionKeys,
+    handshake_write_keys: EncryptionKeys,
+    
+    /// 1-RTT encryption keys (read: decrypt client 1-RTT, write: encrypt server 1-RTT)
+    one_rtt_read_keys: EncryptionKeys,
+    one_rtt_write_keys: EncryptionKeys,
+    
+    /// Pending CRYPTO data to send (level, data)
+    pending_crypto: alloc::vec::Vec<(CryptoLevel, Bytes)>,
 }
 
 impl QuicConnection {
@@ -326,8 +414,8 @@ impl QuicConnection {
             crate::packet::parser::DefaultPacketParser::new(1500)
         );
         
-        // Create crypto backend (stub for now - needs real implementation)
-        let crypto_backend: Box<dyn CryptoBackend> = Box::new(StubCryptoBackend);
+        // Create crypto backend using BoringSSL
+        let crypto_backend: Box<dyn CryptoBackend> = Box::new(crate::crypto::boring::BoringCryptoBackend);
         
         // Create stream manager
         let streams = StreamManager::new(side);
@@ -356,6 +444,567 @@ impl QuicConnection {
         // Create packet number space manager
         let pn_spaces = crate::packet::space::PacketNumberSpaceManager::new();
         
+        // Derive Initial encryption keys (RFC 9001 Section 5.2)
+        // Initial keys are derived from DCID, not from TLS
+        let key_schedule = crypto_backend.create_key_schedule();
+        let initial_secret = match key_schedule.derive_initial_secret(&dcid, VERSION_1) {
+            Ok(secret) => secret,
+            Err(e) => {
+                eprintln!("Failed to derive initial secret: {:?}", e);
+                return Self {
+                    side,
+                    state: ConnectionState::Closed,
+                    scid,
+                    dcid,
+                    config,
+                    stats: ConnectionStats::default(),
+                    packet_parser,
+                    crypto_backend,
+                    tls_session: None,
+                    streams,
+                    flow_control,
+                    loss_detector,
+                    congestion_controller,
+                    pn_spaces,
+                    pending_events: alloc::vec::Vec::new(),
+                    pending_stream_writes: alloc::vec::Vec::new(),
+                    pending_stream_resets: alloc::vec::Vec::new(),
+                    pending_close: None,
+                    handshake_complete: false,
+                    last_activity: None,
+                    closing_timeout: None,
+                    initial_read_keys: EncryptionKeys::empty(),
+                    initial_write_keys: EncryptionKeys::empty(),
+                    handshake_read_keys: EncryptionKeys::empty(),
+                    handshake_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_keys: EncryptionKeys::empty(),
+                    one_rtt_write_keys: EncryptionKeys::empty(),
+                    pending_crypto: alloc::vec::Vec::new(),
+                };
+            }
+        };
+        
+        // Derive client and server Initial secrets
+        let client_initial_secret = match key_schedule.derive_client_initial_secret(&initial_secret) {
+            Ok(secret) => secret,
+            Err(e) => {
+                eprintln!("Failed to derive client initial secret: {:?}", e);
+                return Self {
+                    side,
+                    state: ConnectionState::Closed,
+                    scid,
+                    dcid,
+                    config,
+                    stats: ConnectionStats::default(),
+                    packet_parser,
+                    crypto_backend,
+                    tls_session: None,
+                    streams,
+                    flow_control,
+                    loss_detector,
+                    congestion_controller,
+                    pn_spaces,
+                    pending_events: alloc::vec::Vec::new(),
+                    pending_stream_writes: alloc::vec::Vec::new(),
+                    pending_stream_resets: alloc::vec::Vec::new(),
+                    pending_close: None,
+                    handshake_complete: false,
+                    last_activity: None,
+                    closing_timeout: None,
+                    initial_read_keys: EncryptionKeys::empty(),
+                    initial_write_keys: EncryptionKeys::empty(),
+                    handshake_read_keys: EncryptionKeys::empty(),
+                    handshake_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_keys: EncryptionKeys::empty(),
+                    one_rtt_write_keys: EncryptionKeys::empty(),
+                    pending_crypto: alloc::vec::Vec::new(),
+                };
+            }
+        };
+        
+        let server_initial_secret = match key_schedule.derive_server_initial_secret(&initial_secret) {
+            Ok(secret) => secret,
+            Err(e) => {
+                eprintln!("Failed to derive server initial secret: {:?}", e);
+                return Self {
+                    side,
+                    state: ConnectionState::Closed,
+                    scid,
+                    dcid,
+                    config,
+                    stats: ConnectionStats::default(),
+                    packet_parser,
+                    crypto_backend,
+                    tls_session: None,
+                    streams,
+                    flow_control,
+                    loss_detector,
+                    congestion_controller,
+                    pn_spaces,
+                    pending_events: alloc::vec::Vec::new(),
+                    pending_stream_writes: alloc::vec::Vec::new(),
+                    pending_stream_resets: alloc::vec::Vec::new(),
+                    pending_close: None,
+                    handshake_complete: false,
+                    last_activity: None,
+                    closing_timeout: None,
+                    initial_read_keys: EncryptionKeys::empty(),
+                    initial_write_keys: EncryptionKeys::empty(),
+                    handshake_read_keys: EncryptionKeys::empty(),
+                    handshake_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_keys: EncryptionKeys::empty(),
+                    one_rtt_write_keys: EncryptionKeys::empty(),
+                    pending_crypto: alloc::vec::Vec::new(),
+                };
+            }
+        };
+        
+        // Use AES-128-GCM for Initial packets (RFC 9001 Section 5.2)
+        let cipher_suite = 0x1301; // TLS_AES_128_GCM_SHA256
+        let aead = match crypto_backend.create_aead(cipher_suite) {
+            Ok(aead) => aead,
+            Err(e) => {
+                eprintln!("Failed to create AEAD: {:?}", e);
+                return Self {
+                    side,
+                    state: ConnectionState::Closed,
+                    scid,
+                    dcid,
+                    config,
+                    stats: ConnectionStats::default(),
+                    packet_parser,
+                    crypto_backend,
+                    tls_session: None,
+                    streams,
+                    flow_control,
+                    loss_detector,
+                    congestion_controller,
+                    pn_spaces,
+                    pending_events: alloc::vec::Vec::new(),
+                    pending_stream_writes: alloc::vec::Vec::new(),
+                    pending_stream_resets: alloc::vec::Vec::new(),
+                    pending_close: None,
+                    handshake_complete: false,
+                    last_activity: None,
+                    closing_timeout: None,
+                    initial_read_keys: EncryptionKeys::empty(),
+                    initial_write_keys: EncryptionKeys::empty(),
+                    handshake_read_keys: EncryptionKeys::empty(),
+                    handshake_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_keys: EncryptionKeys::empty(),
+                    one_rtt_write_keys: EncryptionKeys::empty(),
+                    pending_crypto: alloc::vec::Vec::new(),
+                };
+            }
+        };
+        
+        let hp = match crypto_backend.create_header_protection(cipher_suite) {
+            Ok(hp) => hp,
+            Err(e) => {
+                eprintln!("Failed to create header protection: {:?}", e);
+                return Self {
+                    side,
+                    state: ConnectionState::Closed,
+                    scid,
+                    dcid,
+                    config,
+                    stats: ConnectionStats::default(),
+                    packet_parser,
+                    crypto_backend,
+                    tls_session: None,
+                    streams,
+                    flow_control,
+                    loss_detector,
+                    congestion_controller,
+                    pn_spaces,
+                    pending_events: alloc::vec::Vec::new(),
+                    pending_stream_writes: alloc::vec::Vec::new(),
+                    pending_stream_resets: alloc::vec::Vec::new(),
+                    pending_close: None,
+                    handshake_complete: false,
+                    last_activity: None,
+                    closing_timeout: None,
+                    initial_read_keys: EncryptionKeys::empty(),
+                    initial_write_keys: EncryptionKeys::empty(),
+                    handshake_read_keys: EncryptionKeys::empty(),
+                    handshake_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_keys: EncryptionKeys::empty(),
+                    one_rtt_write_keys: EncryptionKeys::empty(),
+                    pending_crypto: alloc::vec::Vec::new(),
+                };
+            }
+        };
+        
+        // Derive packet keys and IVs
+        let key_len = aead.key_len();
+        let iv_len = aead.iv_len();
+        let hp_key_len = hp.key_len();
+        
+        let client_key = match key_schedule.derive_packet_key(&client_initial_secret, key_len) {
+            Ok(k) => k,
+            Err(_) => return Self {
+                side,
+                state: ConnectionState::Closed,
+                scid,
+                dcid,
+                config,
+                stats: ConnectionStats::default(),
+                packet_parser,
+                crypto_backend,
+                tls_session: None,
+                streams,
+                flow_control,
+                loss_detector,
+                congestion_controller,
+                pn_spaces,
+                pending_events: alloc::vec::Vec::new(),
+                pending_stream_writes: alloc::vec::Vec::new(),
+                pending_stream_resets: alloc::vec::Vec::new(),
+                pending_close: None,
+                handshake_complete: false,
+                last_activity: None,
+                closing_timeout: None,
+                initial_read_keys: EncryptionKeys::empty(),
+                initial_write_keys: EncryptionKeys::empty(),
+                handshake_read_keys: EncryptionKeys::empty(),
+                handshake_write_keys: EncryptionKeys::empty(),
+                one_rtt_read_keys: EncryptionKeys::empty(),
+                one_rtt_write_keys: EncryptionKeys::empty(),
+                pending_crypto: alloc::vec::Vec::new(),
+            },
+        };
+        let client_iv = match key_schedule.derive_packet_iv(&client_initial_secret, iv_len) {
+            Ok(iv) => iv,
+            Err(_) => return Self {
+                side,
+                state: ConnectionState::Closed,
+                scid,
+                dcid,
+                config,
+                stats: ConnectionStats::default(),
+                packet_parser,
+                crypto_backend,
+                tls_session: None,
+                streams,
+                flow_control,
+                loss_detector,
+                congestion_controller,
+                pn_spaces,
+                pending_events: alloc::vec::Vec::new(),
+                pending_stream_writes: alloc::vec::Vec::new(),
+                pending_stream_resets: alloc::vec::Vec::new(),
+                pending_close: None,
+                handshake_complete: false,
+                last_activity: None,
+                closing_timeout: None,
+                initial_read_keys: EncryptionKeys::empty(),
+                initial_write_keys: EncryptionKeys::empty(),
+                handshake_read_keys: EncryptionKeys::empty(),
+                handshake_write_keys: EncryptionKeys::empty(),
+                one_rtt_read_keys: EncryptionKeys::empty(),
+                one_rtt_write_keys: EncryptionKeys::empty(),
+                pending_crypto: alloc::vec::Vec::new(),
+            },
+        };
+        let client_hp_key = match key_schedule.derive_header_protection_key(&client_initial_secret, hp_key_len) {
+            Ok(k) => k,
+            Err(_) => return Self {
+                side,
+                state: ConnectionState::Closed,
+                scid,
+                dcid,
+                config,
+                stats: ConnectionStats::default(),
+                packet_parser,
+                crypto_backend,
+                tls_session: None,
+                streams,
+                flow_control,
+                loss_detector,
+                congestion_controller,
+                pn_spaces,
+                pending_events: alloc::vec::Vec::new(),
+                pending_stream_writes: alloc::vec::Vec::new(),
+                pending_stream_resets: alloc::vec::Vec::new(),
+                pending_close: None,
+                handshake_complete: false,
+                last_activity: None,
+                closing_timeout: None,
+                initial_read_keys: EncryptionKeys::empty(),
+                initial_write_keys: EncryptionKeys::empty(),
+                handshake_read_keys: EncryptionKeys::empty(),
+                handshake_write_keys: EncryptionKeys::empty(),
+                one_rtt_read_keys: EncryptionKeys::empty(),
+                one_rtt_write_keys: EncryptionKeys::empty(),
+                pending_crypto: alloc::vec::Vec::new(),
+            },
+        };
+        
+        let server_key = match key_schedule.derive_packet_key(&server_initial_secret, key_len) {
+            Ok(k) => k,
+            Err(_) => return Self {
+                side,
+                state: ConnectionState::Closed,
+                scid,
+                dcid,
+                config,
+                stats: ConnectionStats::default(),
+                packet_parser,
+                crypto_backend,
+                tls_session: None,
+                streams,
+                flow_control,
+                loss_detector,
+                congestion_controller,
+                pn_spaces,
+                pending_events: alloc::vec::Vec::new(),
+                pending_stream_writes: alloc::vec::Vec::new(),
+                pending_stream_resets: alloc::vec::Vec::new(),
+                pending_close: None,
+                handshake_complete: false,
+                last_activity: None,
+                closing_timeout: None,
+                initial_read_keys: EncryptionKeys::empty(),
+                initial_write_keys: EncryptionKeys::empty(),
+                handshake_read_keys: EncryptionKeys::empty(),
+                handshake_write_keys: EncryptionKeys::empty(),
+                one_rtt_read_keys: EncryptionKeys::empty(),
+                one_rtt_write_keys: EncryptionKeys::empty(),
+                pending_crypto: alloc::vec::Vec::new(),
+            },
+        };
+        let server_iv = match key_schedule.derive_packet_iv(&server_initial_secret, iv_len) {
+            Ok(iv) => iv,
+            Err(_) => return Self {
+                side,
+                state: ConnectionState::Closed,
+                scid,
+                dcid,
+                config,
+                stats: ConnectionStats::default(),
+                packet_parser,
+                crypto_backend,
+                tls_session: None,
+                streams,
+                flow_control,
+                loss_detector,
+                congestion_controller,
+                pn_spaces,
+                pending_events: alloc::vec::Vec::new(),
+                pending_stream_writes: alloc::vec::Vec::new(),
+                pending_stream_resets: alloc::vec::Vec::new(),
+                pending_close: None,
+                handshake_complete: false,
+                last_activity: None,
+                closing_timeout: None,
+                initial_read_keys: EncryptionKeys::empty(),
+                initial_write_keys: EncryptionKeys::empty(),
+                handshake_read_keys: EncryptionKeys::empty(),
+                handshake_write_keys: EncryptionKeys::empty(),
+                one_rtt_read_keys: EncryptionKeys::empty(),
+                one_rtt_write_keys: EncryptionKeys::empty(),
+                pending_crypto: alloc::vec::Vec::new(),
+            },
+        };
+        let server_hp_key = match key_schedule.derive_header_protection_key(&server_initial_secret, hp_key_len) {
+            Ok(k) => k,
+            Err(_) => return Self {
+                side,
+                state: ConnectionState::Closed,
+                scid,
+                dcid,
+                config,
+                stats: ConnectionStats::default(),
+                packet_parser,
+                crypto_backend,
+                tls_session: None,
+                streams,
+                flow_control,
+                loss_detector,
+                congestion_controller,
+                pn_spaces,
+                pending_events: alloc::vec::Vec::new(),
+                pending_stream_writes: alloc::vec::Vec::new(),
+                pending_stream_resets: alloc::vec::Vec::new(),
+                pending_close: None,
+                handshake_complete: false,
+                last_activity: None,
+                closing_timeout: None,
+                initial_read_keys: EncryptionKeys::empty(),
+                initial_write_keys: EncryptionKeys::empty(),
+                handshake_read_keys: EncryptionKeys::empty(),
+                handshake_write_keys: EncryptionKeys::empty(),
+                one_rtt_read_keys: EncryptionKeys::empty(),
+                one_rtt_write_keys: EncryptionKeys::empty(),
+                pending_crypto: alloc::vec::Vec::new(),
+            },
+        };
+        
+        // For server: read client Initial (use client keys), write server Initial (use server keys)
+        // For client: read server Initial (use server keys), write client Initial (use client keys)
+        let (initial_read_keys, initial_write_keys) = if side == Side::Server {
+            let read_aead = match crypto_backend.create_aead(cipher_suite) {
+                Ok(a) => a,
+                Err(_) => return Self {
+                    side,
+                    state: ConnectionState::Closed,
+                    scid,
+                    dcid,
+                    config,
+                    stats: ConnectionStats::default(),
+                    packet_parser,
+                    crypto_backend,
+                    tls_session: None,
+                    streams,
+                    flow_control,
+                    loss_detector,
+                    congestion_controller,
+                    pn_spaces,
+                    pending_events: alloc::vec::Vec::new(),
+                    pending_stream_writes: alloc::vec::Vec::new(),
+                    pending_stream_resets: alloc::vec::Vec::new(),
+                    pending_close: None,
+                    handshake_complete: false,
+                    last_activity: None,
+                    closing_timeout: None,
+                    initial_read_keys: EncryptionKeys::empty(),
+                    initial_write_keys: EncryptionKeys::empty(),
+                    handshake_read_keys: EncryptionKeys::empty(),
+                    handshake_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_keys: EncryptionKeys::empty(),
+                    one_rtt_write_keys: EncryptionKeys::empty(),
+                    pending_crypto: alloc::vec::Vec::new(),
+                },
+            };
+            let read_hp = match crypto_backend.create_header_protection(cipher_suite) {
+                Ok(h) => h,
+                Err(_) => return Self {
+                    side,
+                    state: ConnectionState::Closed,
+                    scid,
+                    dcid,
+                    config,
+                    stats: ConnectionStats::default(),
+                    packet_parser,
+                    crypto_backend,
+                    tls_session: None,
+                    streams,
+                    flow_control,
+                    loss_detector,
+                    congestion_controller,
+                    pn_spaces,
+                    pending_events: alloc::vec::Vec::new(),
+                    pending_stream_writes: alloc::vec::Vec::new(),
+                    pending_stream_resets: alloc::vec::Vec::new(),
+                    pending_close: None,
+                    handshake_complete: false,
+                    last_activity: None,
+                    closing_timeout: None,
+                    initial_read_keys: EncryptionKeys::empty(),
+                    initial_write_keys: EncryptionKeys::empty(),
+                    handshake_read_keys: EncryptionKeys::empty(),
+                    handshake_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_keys: EncryptionKeys::empty(),
+                    one_rtt_write_keys: EncryptionKeys::empty(),
+                    pending_crypto: alloc::vec::Vec::new(),
+                },
+            };
+            (
+                EncryptionKeys::new(client_key.clone(), client_iv.clone(), client_hp_key.clone(), read_aead, read_hp),
+                EncryptionKeys::new(server_key, server_iv, server_hp_key, aead, hp),
+            )
+        } else {
+            let write_aead = match crypto_backend.create_aead(cipher_suite) {
+                Ok(a) => a,
+                Err(_) => return Self {
+                    side,
+                    state: ConnectionState::Closed,
+                    scid,
+                    dcid,
+                    config,
+                    stats: ConnectionStats::default(),
+                    packet_parser,
+                    crypto_backend,
+                    tls_session: None,
+                    streams,
+                    flow_control,
+                    loss_detector,
+                    congestion_controller,
+                    pn_spaces,
+                    pending_events: alloc::vec::Vec::new(),
+                    pending_stream_writes: alloc::vec::Vec::new(),
+                    pending_stream_resets: alloc::vec::Vec::new(),
+                    pending_close: None,
+                    handshake_complete: false,
+                    last_activity: None,
+                    closing_timeout: None,
+                    initial_read_keys: EncryptionKeys::empty(),
+                    initial_write_keys: EncryptionKeys::empty(),
+                    handshake_read_keys: EncryptionKeys::empty(),
+                    handshake_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_keys: EncryptionKeys::empty(),
+                    one_rtt_write_keys: EncryptionKeys::empty(),
+                    pending_crypto: alloc::vec::Vec::new(),
+                },
+            };
+            let write_hp = match crypto_backend.create_header_protection(cipher_suite) {
+                Ok(h) => h,
+                Err(_) => return Self {
+                    side,
+                    state: ConnectionState::Closed,
+                    scid,
+                    dcid,
+                    config,
+                    stats: ConnectionStats::default(),
+                    packet_parser,
+                    crypto_backend,
+                    tls_session: None,
+                    streams,
+                    flow_control,
+                    loss_detector,
+                    congestion_controller,
+                    pn_spaces,
+                    pending_events: alloc::vec::Vec::new(),
+                    pending_stream_writes: alloc::vec::Vec::new(),
+                    pending_stream_resets: alloc::vec::Vec::new(),
+                    pending_close: None,
+                    handshake_complete: false,
+                    last_activity: None,
+                    closing_timeout: None,
+                    initial_read_keys: EncryptionKeys::empty(),
+                    initial_write_keys: EncryptionKeys::empty(),
+                    handshake_read_keys: EncryptionKeys::empty(),
+                    handshake_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_keys: EncryptionKeys::empty(),
+                    one_rtt_write_keys: EncryptionKeys::empty(),
+                    pending_crypto: alloc::vec::Vec::new(),
+                },
+            };
+            (
+                EncryptionKeys::new(server_key.clone(), server_iv.clone(), server_hp_key.clone(), aead, hp),
+                EncryptionKeys::new(client_key, client_iv, client_hp_key, write_aead, write_hp),
+            )
+        };
+        
+        // Initialize TLS session for server connections
+        // Load certificates from config.cert_data and config.key_data
+        let tls_session = if side == Side::Server {
+            let alpn_protocols: Vec<&[u8]> = config.alpn_protocols.iter()
+                .map(|p| p.as_slice())
+                .collect();
+            let cert_data = config.cert_data.as_ref().map(|b| b.as_ref());
+            let key_data = config.key_data.as_ref().map(|b| b.as_ref());
+            match crypto_backend.create_tls_session(side, None, &alpn_protocols, cert_data, key_data) {
+                Ok(session) => Some(session),
+                Err(e) => {
+                    eprintln!("Warning: Failed to create TLS session: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None // Client TLS session created on connect
+        };
+        
         Self {
             side,
             state: ConnectionState::Handshaking,
@@ -365,7 +1014,7 @@ impl QuicConnection {
             stats: ConnectionStats::default(),
             packet_parser,
             crypto_backend,
-            tls_session: None,
+            tls_session,
             streams,
             flow_control,
             loss_detector,
@@ -378,6 +1027,13 @@ impl QuicConnection {
             handshake_complete: false,
             last_activity: None,
             closing_timeout: None,
+            initial_read_keys,
+            initial_write_keys,
+            handshake_read_keys: EncryptionKeys::empty(),
+            handshake_write_keys: EncryptionKeys::empty(),
+            one_rtt_read_keys: EncryptionKeys::empty(),
+            one_rtt_write_keys: EncryptionKeys::empty(),
+            pending_crypto: alloc::vec::Vec::new(),
         }
     }
     
@@ -416,11 +1072,33 @@ impl QuicConnection {
                                 self.state = ConnectionState::Active;
                                 self.pending_events.push(ConnectionEvent::HandshakeComplete);
                             }
-                            crate::crypto::TlsEvent::ReadSecret(_level, _secret) => {
-                                // Keys installed, can start encrypting at new level
+                            crate::crypto::TlsEvent::ReadSecret(level, secret) => {
+                                // New read keys available - install them
+                                let key_schedule = self.crypto_backend.create_key_schedule();
+                                let cipher_suite = 0x1301; // TODO: Get from TLS session
+                                let target_keys = match level {
+                                    CryptoLevel::Initial => &mut self.initial_read_keys,
+                                    CryptoLevel::Handshake => &mut self.handshake_read_keys,
+                                    CryptoLevel::OneRTT => &mut self.one_rtt_read_keys,
+                                    CryptoLevel::ZeroRTT => continue,
+                                };
+                                if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
+                                    eprintln!("Failed to install read keys for level {:?}: {:?}", level, e);
+                                }
                             }
-                            crate::crypto::TlsEvent::WriteSecret(_level, _secret) => {
-                                // Keys installed, can start encrypting at new level
+                            crate::crypto::TlsEvent::WriteSecret(level, secret) => {
+                                // New write keys available - install them
+                                let key_schedule = self.crypto_backend.create_key_schedule();
+                                let cipher_suite = 0x1301; // TODO: Get from TLS session
+                                let target_keys = match level {
+                                    CryptoLevel::Initial => &mut self.initial_write_keys,
+                                    CryptoLevel::Handshake => &mut self.handshake_write_keys,
+                                    CryptoLevel::OneRTT => &mut self.one_rtt_write_keys,
+                                    CryptoLevel::ZeroRTT => continue,
+                                };
+                                if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
+                                    eprintln!("Failed to install write keys for level {:?}: {:?}", level, e);
+                                }
                             }
                             _ => {}
                         }
@@ -558,6 +1236,8 @@ impl CryptoBackend for StubCryptoBackend {
         _side: Side,
         _server_name: Option<&str>,
         _alpn_protocols: &[&[u8]],
+        _cert_data: Option<&[u8]>,
+        _key_data: Option<&[u8]>,
     ) -> Result<Box<dyn TlsSession>> {
         Err(Error::Transport(crate::error::TransportError::InternalError))
     }
@@ -615,45 +1295,182 @@ impl Connection for QuicConnection {
         self.stats.packets_received += 1;
         self.stats.bytes_received += datagram.data.len() as u64;
 
-        // Phase 7: Full packet processing pipeline
-        // 1. Parse packet header to determine type and extract metadata
-        // 2. Decrypt packet payload using crypto keys for appropriate level
-        // 3. Parse frames from decrypted payload
-        // 4. Process each frame and update connection state
+        // Parse packet header to determine type and encryption level
+        use crate::packet::api::{Packet, ParseContext};
+        let parse_ctx = ParseContext::with_dcid_len(self.dcid.len());
+        let mut packet = match Packet::parse_with_context(datagram.data.clone(), parse_ctx) {
+            Ok(p) => p,
+            Err(_) => {
+                // Invalid packet - drop silently
+                return Ok(());
+            }
+        };
         
-        // For now, simplified: assume we can extract frames directly
-        // Real implementation would:
-        // - Parse packet header (Initial/Handshake/0-RTT/1-RTT)
-        // - Look up crypto keys for encryption level
-        // - Decrypt payload
-        // - Parse frame sequence
+        // Determine encryption level from packet type
+        let (encryption_level, read_keys) = match packet.header.ty {
+            crate::packet::types::PacketType::Initial => {
+                (CryptoLevel::Initial, &mut self.initial_read_keys)
+            }
+            crate::packet::types::PacketType::Handshake => {
+                (CryptoLevel::Handshake, &mut self.handshake_read_keys)
+            }
+            crate::packet::types::PacketType::OneRtt => {
+                (CryptoLevel::OneRTT, &mut self.one_rtt_read_keys)
+            }
+            _ => {
+                // Other packet types not yet supported
+                return Ok(());
+            }
+        };
         
+        // Check if we have keys for this level
+        if read_keys.aead.is_none() || read_keys.hp.is_none() {
+            // Keys not available yet - buffer or drop
+            return Ok(());
+        }
+        
+        // Remove header protection (RFC 9001 Section 5.4)
+        // This reveals the actual packet number
+        let hp = read_keys.hp.as_ref().unwrap();
+        let hp_key = &read_keys.hp_key;
+        if let Err(_) = packet.remove_header_protection(hp.as_ref(), hp_key, &datagram.data) {
+            return Ok(());
+        }
+        
+        // Packet number should now be available after header protection removal
+        let packet_number = match packet.header.packet_number {
+            Some(pn) => pn,
+            None => {
+                // Header protection removal failed or didn't extract PN
+                return Ok(());
+            }
+        };
+        
+        // Calculate payload offset (needed for decryption)
+        // For Initial packets, PN is in bytes after SCID
+        let pn_offset = if packet.header.ty == crate::packet::types::PacketType::Initial {
+            // Long header: 1 (flags) + 4 (version) + 1 (dcid_len) + dcid + 1 (scid_len) + scid
+            let dcid_len = if datagram.data.len() > 5 { datagram.data[5] as usize } else { return Ok(()) };
+            let scid_len = if datagram.data.len() > 6 + dcid_len { datagram.data[6 + dcid_len] as usize } else { return Ok(()) };
+            7 + dcid_len + scid_len
+        } else {
+            // Short header: 1 (flags) + dcid + variable PN
+            1 + self.dcid.len()
+        };
+        
+        // Determine PN length from first byte (after HP removal, we need to check the actual length)
+        // For now, we'll calculate it from the packet number value
+        let pn_len = if packet_number < 256 { 1 } else if packet_number < 65536 { 2 } else if packet_number < 16777216 { 3 } else { 4 };
+        
+        // Payload starts after header + PN
+        let payload_offset = pn_offset + pn_len;
+        if datagram.data.len() <= payload_offset {
+            return Ok(());
+        }
+        
+        let encrypted_payload = &datagram.data[payload_offset..];
+        
+        // Decrypt payload using AEAD
+        let aead = read_keys.aead.as_ref().unwrap();
+        let key = &read_keys.key;
+        let iv = &read_keys.iv;
+        
+        // Build header for AEAD (everything before payload)
+        let header = &datagram.data[..payload_offset];
+        
+        // Allocate buffer for decrypted payload
+        let mut decrypted = vec![0u8; encrypted_payload.len()];
+        let decrypted_len = match aead.open(key, iv, packet_number, header, encrypted_payload, &mut decrypted) {
+            Ok(len) => len,
+            Err(_) => {
+                // Decryption failed - drop packet
+                return Ok(());
+            }
+        };
+        
+        // Parse frames from decrypted payload
         use crate::frames::FrameParser;
         let parser = crate::frames::parse::DefaultFrameParser;
-        
-        // Skip packet header for simplification (assume payload starts at offset 0)
-        // In reality, we'd parse header first to get payload offset
         let mut offset = 0;
-        let payload = &datagram.data[..];
+        let payload = &decrypted[..decrypted_len];
         
         while offset < payload.len() {
             let frame_result = parser.parse_frame(&payload[offset..]);
             
             match frame_result {
                 Ok((frame, consumed)) => {
+                    // Special handling for CRYPTO frames - feed to TLS
+                    if let Frame::Crypto(crypto_frame) = &frame {
+                        if let Some(ref mut tls) = self.tls_session {
+                            if let Err(_) = tls.process_input(crypto_frame.data, encryption_level) {
+                                // TLS error - close connection
+                                self.state = ConnectionState::Closing;
+                                return Ok(());
+                            }
+                            
+                            // Process TLS output events
+                            while let Some(event) = tls.get_output() {
+                                match event {
+                                    crate::crypto::TlsEvent::WriteData(level, data) => {
+                                        // TLS wants to send data - queue as CRYPTO frame
+                                        self.pending_crypto.push((level, Bytes::from(data)));
+                                    }
+                                    crate::crypto::TlsEvent::HandshakeComplete => {
+                                        self.handshake_complete = true;
+                                        self.state = ConnectionState::Active;
+                                        self.pending_events.push(ConnectionEvent::HandshakeComplete);
+                                    }
+                                    crate::crypto::TlsEvent::ReadSecret(level, secret) => {
+                                        // New read keys available - install them
+                                        let key_schedule = self.crypto_backend.create_key_schedule();
+                                        // Use AES-128-GCM (0x1301) as default - should match negotiated cipher
+                                        let cipher_suite = 0x1301; // TODO: Get from TLS session
+                                        let target_keys = match level {
+                                            CryptoLevel::Initial => &mut self.initial_read_keys,
+                                            CryptoLevel::Handshake => &mut self.handshake_read_keys,
+                                            CryptoLevel::OneRTT => &mut self.one_rtt_read_keys,
+                                            CryptoLevel::ZeroRTT => {
+                                                // 0-RTT read keys not used on server
+                                                continue;
+                                            }
+                                        };
+                                        if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
+                                            eprintln!("Failed to install read keys for level {:?}: {:?}", level, e);
+                                        }
+                                    }
+                                    crate::crypto::TlsEvent::WriteSecret(level, secret) => {
+                                        // New write keys available - install them
+                                        let key_schedule = self.crypto_backend.create_key_schedule();
+                                        let cipher_suite = 0x1301; // TODO: Get from TLS session
+                                        let target_keys = match level {
+                                            CryptoLevel::Initial => &mut self.initial_write_keys,
+                                            CryptoLevel::Handshake => &mut self.handshake_write_keys,
+                                            CryptoLevel::OneRTT => &mut self.one_rtt_write_keys,
+                                            CryptoLevel::ZeroRTT => {
+                                                // 0-RTT write keys not used on server
+                                                continue;
+                                            }
+                                        };
+                                        if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
+                                            eprintln!("Failed to install write keys for level {:?}: {:?}", level, e);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    
                     self.process_frame(frame, datagram.recv_time)?;
                     offset += consumed;
                     
-                    // If we consumed nothing, break to avoid infinite loop
                     if consumed == 0 {
                         break;
                     }
                 }
                 Err(_e) => {
-                    // Malformed frame - close connection with protocol violation
-                    self.state = ConnectionState::Closing;
-                    self.pending_events.push(ConnectionEvent::ConnectionClosed);
-                    return Ok(());
+                    // Malformed frame - drop packet
+                    break;
                 }
             }
         }
@@ -703,29 +1520,177 @@ impl Connection for QuicConnection {
     }
 
     fn poll_send(&mut self, buf: &mut BytesMut, now: Instant) -> Option<DatagramOutput> {
-        // Phase 7: Complete packet sending pipeline
-        
-        // Check congestion window (assume 1200 byte packet)
+        // Check congestion window
         if !self.congestion_controller.can_send(1200) {
             return None;
         }
 
-        // Collect frames to send (priority order):
-        // 1. ACK frames (for received packets)
-        // 2. CRYPTO frames (handshake data)
-        // 3. STREAM frames (application data)
-        // 4. Flow control frames (MAX_DATA, MAX_STREAM_DATA)
-        // 5. Connection management frames
-        
-        // For now, simplified: just return None
-        // Real implementation would:
-        // - Build frame sequence
-        // - Calculate packet size
-        // - Build packet header
-        // - Encrypt payload
-        // - Write to buf
-        // - Record sent packet in loss detector
-        // - Update congestion controller
+        // Priority: Send CRYPTO frames first (handshake data)
+        if let Some((level, crypto_data)) = self.pending_crypto.pop() {
+            // For now, only handle Initial level
+            if level != CryptoLevel::Initial {
+                // Put it back for later
+                self.pending_crypto.push((level, crypto_data));
+                return None;
+            }
+            
+            let write_keys = &mut self.initial_write_keys;
+            if write_keys.aead.is_none() {
+                return None;
+            }
+            
+            // Build Initial packet
+            // Header: flags + version + DCID len + DCID + SCID len + SCID + Length + PN + Payload
+            let dcid_bytes = self.dcid.as_bytes();
+            let scid_bytes = self.scid.as_bytes();
+            
+            // Increment packet number
+            let pn = write_keys.packet_number;
+            write_keys.packet_number += 1;
+            
+            // Determine PN length (1-4 bytes, use 1 byte for now)
+            let pn_len = 1;
+            let pn_bytes = [(pn & 0xff) as u8];
+            
+            // Build CRYPTO frame
+            use crate::frames::Frame;
+            let crypto_frame = Frame::Crypto(crate::frames::CryptoFrame {
+                offset: 0, // TODO: Track offset properly
+                data: &crypto_data,
+            });
+            
+            // Serialize CRYPTO frame
+            use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
+            let serializer = DefaultFrameSerializer;
+            let mut frame_buf = BytesMut::new();
+            match serializer.serialize_frame(&crypto_frame, &mut frame_buf) {
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+            
+            // Encrypt payload - we'll estimate length first, then adjust if needed
+            let plaintext = frame_buf.freeze();
+            let aead = write_keys.aead.as_ref().unwrap();
+            let key = &write_keys.key;
+            let iv = &write_keys.iv;
+            let tag_len = aead.tag_len();
+            
+            // Estimate encrypted length (plaintext + tag)
+            let estimated_encrypted_len = plaintext.len() + tag_len;
+            let estimated_payload_len = pn_len + estimated_encrypted_len;
+            
+            // Build full header including Length and PN (for AEAD AAD)
+            buf.clear();
+            buf.reserve(1200);
+            
+            // Long header byte
+            let first_byte = 0xc0 | ((pn_len - 1) as u8);
+            buf.put_u8(first_byte);
+            buf.put_u32(VERSION_1);
+            buf.put_u8(dcid_bytes.len() as u8);
+            buf.put_slice(dcid_bytes);
+            buf.put_u8(scid_bytes.len() as u8);
+            buf.put_slice(scid_bytes);
+            
+            // Length field (estimate - will be correct after encryption)
+            let length_field_start = buf.len();
+            if estimated_payload_len < 64 {
+                buf.put_u8(estimated_payload_len as u8);
+            } else if estimated_payload_len < 16384 {
+                buf.put_u8(0x40 | ((estimated_payload_len >> 8) as u8));
+                buf.put_u8((estimated_payload_len & 0xff) as u8);
+            } else {
+                buf.put_u8(0x80 | ((estimated_payload_len >> 24) as u8));
+                buf.put_u8((estimated_payload_len >> 16) as u8);
+                buf.put_u8((estimated_payload_len >> 8) as u8);
+                buf.put_u8((estimated_payload_len & 0xff) as u8);
+            }
+            
+            // Packet number
+            buf.put_slice(&pn_bytes);
+            
+            let header_len = buf.len();
+            let header_for_aead = &buf[..]; // Full header for AEAD AAD
+            
+            // Encrypt payload
+            let mut encrypted_buf = vec![0u8; plaintext.len() + tag_len];
+            let encrypted_len = match aead.seal(key, iv, pn, header_for_aead, &plaintext, &mut encrypted_buf) {
+                Ok(len) => len,
+                Err(_) => return None,
+            };
+            
+            // Update Length field if actual length differs (should be rare)
+            let actual_payload_len = pn_len + encrypted_len;
+            if actual_payload_len != estimated_payload_len {
+                // Rebuild length field (in practice this should rarely happen)
+                let old_len_field_len = buf.len() - length_field_start - pn_len;
+                buf.truncate(length_field_start);
+                if actual_payload_len < 64 {
+                    buf.put_u8(actual_payload_len as u8);
+                } else if actual_payload_len < 16384 {
+                    buf.put_u8(0x40 | ((actual_payload_len >> 8) as u8));
+                    buf.put_u8((actual_payload_len & 0xff) as u8);
+                } else {
+                    buf.put_u8(0x80 | ((actual_payload_len >> 24) as u8));
+                    buf.put_u8((actual_payload_len >> 16) as u8);
+                    buf.put_u8((actual_payload_len >> 8) as u8);
+                    buf.put_u8((actual_payload_len & 0xff) as u8);
+                }
+                buf.put_slice(&pn_bytes);
+            }
+            
+            // Append encrypted payload
+            buf.put_slice(&encrypted_buf[..encrypted_len]);
+            
+            // Apply header protection (RFC 9001 Section 5.4)
+            let hp = write_keys.hp.as_ref().unwrap();
+            let hp_key = &write_keys.hp_key;
+            
+            // Sample is 16 bytes starting 4 bytes after the start of the packet number
+            // PN starts at: header_len - pn_len - encrypted_len (but encrypted_len is after PN)
+            // Actually, PN is at: header_len - pn_len (before we added encrypted payload)
+            let pn_start = header_len - pn_len;
+            let sample_offset = pn_start + pn_len + 4; // 4 bytes after PN end
+            if buf.len() < sample_offset + 16 {
+                return None;
+            }
+            
+            let sample = &buf[sample_offset..sample_offset + 16];
+            let mut mask = vec![0u8; 5]; // 5 bytes: 1 for first byte, 4 for PN
+            if let Err(_) = hp.build_mask(hp_key, sample, &mut mask) {
+                return None;
+            }
+            
+            // Apply mask to first byte (bits 0-4: Reserved and PN Length) and PN
+            buf[0] ^= mask[0] & 0x1f; // Mask bits 0-4 (Reserved + PN Length)
+            for i in 0..pn_len {
+                buf[pn_start + i] ^= mask[1 + i];
+            }
+            
+            // Record sent packet
+            self.loss_detector.on_packet_sent(
+                crate::types::PacketNumberSpace::Initial,
+                pn,
+                buf.len(),
+                true, // is_retransmittable (CRYPTO frames are retransmittable)
+                now,
+            );
+            self.congestion_controller.on_packet_sent(
+                pn,
+                crate::types::PacketNumberSpace::Initial,
+                buf.len(),
+                true, // is_ack_eliciting
+                now,
+            );
+            self.stats.packets_sent += 1;
+            self.stats.bytes_sent += buf.len() as u64;
+            
+            let data = buf.split();
+            return Some(DatagramOutput {
+                data,
+                send_time: None,
+            });
+        }
         
         None
     }

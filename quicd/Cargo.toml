@@ -41,7 +41,7 @@ tracing-opentelemetry = { workspace = true }
 libloading = { workspace = true }
 
 # Internal crates
-quicd-quic = { path = "../quicd-quic" }
+quicd-quic = { path = "../quicd-quic", features = ["boring-crypto"] }
 quicd-x = { path = "../quicd-x" }
 quicd-h3 = { path = "../quicd-h3" }
 

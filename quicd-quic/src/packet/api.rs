@@ -181,24 +181,81 @@ impl Packet {
     ///
     /// # Arguments
     ///
-    /// * `hp_key` - Header protection key (16 bytes)
+    /// * `hp` - Header protection provider
+    /// * `hp_key` - Header protection key
     /// * `buf` - Original packet buffer (needed for sampling)
-    pub fn remove_header_protection(&mut self, hp_key: &[u8], buf: &[u8]) -> Result<()> {
-        // RFC 9001 Section 5.4: Header protection algorithm
-        // 1. Extract 16-byte sample from payload
-        // 2. Compute mask using HP algorithm
-        // 3. XOR first byte and packet number bytes
+    pub fn remove_header_protection(
+        &mut self,
+        hp: &dyn crate::crypto::HeaderProtectionProvider,
+        hp_key: &[u8],
+        buf: &[u8],
+    ) -> Result<()> {
+        // RFC 9001 Section 5.4: Header protection removal
+        // 1. Determine packet number offset
+        let is_long = (buf[0] & 0x80) != 0;
+        let pn_offset = if is_long {
+            // Long header: 1 (first byte) + 4 (version) + 1 (dcid_len) + dcid + 1 (scid_len) + scid
+            if buf.len() < 6 {
+                return Err(Error::Transport(TransportError::FrameEncodingError));
+            }
+            let dcid_len = buf[5] as usize;
+            if buf.len() < 7 + dcid_len {
+                return Err(Error::Transport(TransportError::FrameEncodingError));
+            }
+            let scid_len = buf[6 + dcid_len] as usize;
+            7 + dcid_len + scid_len
+        } else {
+            // Short header: 1 (first byte) + DCID length
+            // We need to know DCID length - assume it's in the header
+            if self.header.dcid.len() == 0 {
+                return Err(Error::Transport(TransportError::FrameEncodingError));
+            }
+            1 + self.header.dcid.len()
+        };
         
-        // For simplicity, mark as removed
-        // Real implementation would apply XOR masks
+        // 2. Extract 16-byte sample starting 4 bytes after PN offset (RFC 9001 Section 5.4.2)
+        let sample_offset = pn_offset + 4;
+        if buf.len() < sample_offset + 16 {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+        let sample = &buf[sample_offset..sample_offset + 16];
+        
+        // 3. Build 5-byte mask using HP algorithm
+        let mut mask = [0u8; 5];
+        hp.build_mask(hp_key, sample, &mut mask)?;
+        
+        // 4. Apply mask to first byte to reveal actual PN length
+        let first_byte = buf[0];
+        let masked_first_byte = if is_long {
+            // Long header: mask 4 least significant bits
+            (first_byte ^ (mask[0] & 0x0f))
+        } else {
+            // Short header: mask 5 least significant bits
+            (first_byte ^ (mask[0] & 0x1f))
+        };
+        
+        // Extract actual PN length from unmasked first byte
+        let actual_pn_length = ((masked_first_byte & 0x03) + 1) as usize;
+        
+        // 5. Extract and unmask packet number
+        if buf.len() < pn_offset + actual_pn_length {
+            return Err(Error::Transport(TransportError::FrameEncodingError));
+        }
+        
+        let mut pn_bytes = [0u8; 4];
+        for i in 0..actual_pn_length {
+            pn_bytes[i] = buf[pn_offset + i] ^ mask[1 + i];
+        }
+        
+        // Convert to u64 (left-padded with zeros)
+        let mut pn_value = 0u64;
+        for i in 0..actual_pn_length {
+            pn_value = (pn_value << 8) | (pn_bytes[i] as u64);
+        }
+        
+        // Store unmasked packet number in header
+        self.header.packet_number = Some(pn_value);
         self.hp_removed = true;
-        
-        // TODO: Implement actual header protection removal algorithm
-        // This requires:
-        // 1. Determining sample offset (4 bytes after PN for Long, after PN for Short)
-        // 2. Extracting 16-byte sample
-        // 3. Computing ChaCha20 or AES-ECB mask
-        // 4. Applying XOR masks to header
         
         Ok(())
     }
