@@ -523,6 +523,12 @@ pub const DEFAULT_MAX_STREAMS_UNI: u64 = 100;
 /// Default initial maximum data (15 MB)
 pub const DEFAULT_INITIAL_MAX_DATA: u64 = 15 * 1024 * 1024;
 
+/// Default initial maximum stream data for bidirectional streams (6 MB)
+pub const DEFAULT_INITIAL_MAX_STREAM_DATA_BIDI: u64 = 6 * 1024 * 1024;
+
+/// Default initial maximum stream data for unidirectional streams (6 MB)
+pub const DEFAULT_INITIAL_MAX_STREAM_DATA_UNI: u64 = 6 * 1024 * 1024;
+
 
 // Additional types needed by the crate
 pub type StatelessResetToken = [u8; 16];

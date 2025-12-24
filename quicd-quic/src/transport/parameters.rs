@@ -83,6 +83,13 @@ pub struct TransportParameters {
 
 impl Default for TransportParameters {
     fn default() -> Self {
+        Self::default_client()
+    }
+}
+
+impl TransportParameters {
+    /// Create default client parameters
+    pub fn default_client() -> Self {
         Self {
             original_destination_connection_id: None,
             initial_source_connection_id: None,
@@ -104,9 +111,15 @@ impl Default for TransportParameters {
             unknown_parameters: alloc::vec::Vec::new(),
         }
     }
-}
 
-impl TransportParameters {
+    /// Create default server parameters
+    pub fn default_server() -> Self {
+        let mut params = Self::default_client();
+        // Server can provide stateless reset token
+        params.stateless_reset_token = None; // Set by implementation
+        params
+    }
+
     /// Validate transport parameters
     ///
     /// Checks that all parameters are within valid ranges per RFC 9000.

@@ -8,7 +8,7 @@ use crate::error::{Error, Result, TransportError};
 use crate::packet::header::{DefaultHeaderParser, HeaderForm};
 use crate::packet::number::{DefaultPacketNumberDecoder, DefaultPacketNumberEncoder, PacketNumberLen};
 use crate::packet::parser::PacketParser;
-use crate::packet::types::{PacketHeader, LongPacketType, ParsedPacket, Token, VERSION_1, VERSION_NEGOTIATION};
+use crate::packet::types::{PacketHeader, PacketType, ParsedPacket, Token, VERSION_1, VERSION_NEGOTIATION};
 use crate::types::{ConnectionId, PacketNumber, Instant};
 use bytes::{Bytes, BytesMut, BufMut};
 
@@ -65,23 +65,14 @@ pub struct Packet {
 /// Wrapper around PacketHeader for easier API
 #[derive(Debug, Clone)]
 pub struct PacketHeaderWrapper {
-    pub ty: PacketTypeWrapper,
+    pub ty: PacketType,
     pub dcid: ConnectionId,
     pub scid: Option<ConnectionId>,
     pub version: u32,
     pub packet_number: Option<PacketNumber>,
 }
 
-/// Simplified packet type for API
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PacketTypeWrapper {
-    Initial,
-    ZeroRtt,
-    Handshake,
-    Retry,
-    Short,
-    VersionNegotiation,
-}
+
 
 impl Packet {
     /// Parse a QUIC packet from bytes with optional context
@@ -124,14 +115,14 @@ impl Packet {
         let ty = if is_long {
             let type_bits = (first_byte >> 4) & 0x03;
             match type_bits {
-                0x00 => PacketTypeWrapper::Initial,
-                0x01 => PacketTypeWrapper::ZeroRtt,
-                0x02 => PacketTypeWrapper::Handshake,
-                0x03 => PacketTypeWrapper::Retry,
+                0x00 => PacketType::Initial,
+                0x01 => PacketType::ZeroRtt,
+                0x02 => PacketType::Handshake,
+                0x03 => PacketType::Retry,
                 _ => return Err(Error::Transport(TransportError::FrameEncodingError)),
             }
         } else {
-            PacketTypeWrapper::Short
+            PacketType::OneRtt
         };
         
         let dcid = if is_long {
@@ -222,7 +213,7 @@ impl Packet {
     ) -> Self {
         Self {
             header: PacketHeaderWrapper {
-                ty: PacketTypeWrapper::VersionNegotiation,
+                ty: PacketType::VersionNegotiation,
                 dcid: dcid.clone(),
                 scid: Some(scid.clone()),
                 version: VERSION_NEGOTIATION,
@@ -239,7 +230,7 @@ impl Packet {
         let mut buf = BytesMut::with_capacity(1200);
         
         match self.header.ty {
-            PacketTypeWrapper::VersionNegotiation => {
+            PacketType::VersionNegotiation => {
                 // RFC 9000 Section 17.2.1: Version Negotiation packet
                 // First byte: Long header (0x80) + unused bits (0x40 for fixed bit not required in VN)
                 buf.put_u8(0x80 | 0x40);

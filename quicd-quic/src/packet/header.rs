@@ -43,50 +43,8 @@ pub const PACKET_NUMBER_LENGTH_MASK: u8 = 0x03;
 // Packet Type Enumeration
 // ============================================================================
 
-/// Packet Type (RFC 9000 Section 17)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PacketType {
-    /// Initial packet (Long Header, type 0x0)
-    Initial,
-    /// 0-RTT packet (Long Header, type 0x1)
-    ZeroRtt,
-    /// Handshake packet (Long Header, type 0x2)
-    Handshake,
-    /// Retry packet (Long Header, type 0x3)
-    Retry,
-    /// 1-RTT packet (Short Header)
-    OneRtt,
-    /// Version Negotiation packet (special Long Header)
-    VersionNegotiation,
-}
+pub use crate::packet::types::PacketType;
 
-impl PacketType {
-    /// Returns true if this is a long header packet type
-    pub fn is_long_header(&self) -> bool {
-        !matches!(self, PacketType::OneRtt)
-    }
-
-    /// Returns true if this packet type carries an ACK-eliciting payload
-    pub fn is_ack_eliciting_type(&self) -> bool {
-        !matches!(
-            self,
-            PacketType::Retry | PacketType::VersionNegotiation
-        )
-    }
-
-    /// Get the packet number space for this packet type
-    pub fn packet_number_space(&self) -> Option<crate::types::PacketNumberSpace> {
-        use crate::types::PacketNumberSpace;
-        match self {
-            PacketType::Initial => Some(PacketNumberSpace::Initial),
-            PacketType::Handshake => Some(PacketNumberSpace::Handshake),
-            PacketType::ZeroRtt | PacketType::OneRtt => {
-                Some(PacketNumberSpace::ApplicationData)
-            }
-            PacketType::Retry | PacketType::VersionNegotiation => None,
-        }
-    }
-}
 
 // ============================================================================
 // Header Structures (Zero-Copy, Lifetime-Bound)

@@ -17,10 +17,7 @@ pub const VERSION_1: Version = 0x00000001;
 /// Version used for Version Negotiation packets
 pub const VERSION_NEGOTIATION: Version = 0x00000000;
 
-/// Token (RFC 9000 Section 8)
-///
-/// Opaque blob used for address validation.
-pub type Token = Bytes;
+pub use crate::types::Token;
 
 /// Header Form (RFC 9000 Section 17.2)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,41 +28,58 @@ pub enum HeaderForm {
     Short,
 }
 
-/// Long Packet Type (RFC 9000 Section 17.2)
-///
-/// Encoded in bits 4-5 of the first byte for long header packets.
+/// Packet Type (RFC 9000 Section 17)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LongPacketType {
-    /// Initial packet (0x00)
-    Initial = 0x00,
-    /// 0-RTT packet (0x01)
-    ZeroRtt = 0x01,
-    /// Handshake packet (0x02)
-    Handshake = 0x02,
-    /// Retry packet (0x03)
-    Retry = 0x03,
+pub enum PacketType {
+    /// Initial packet (Long Header, type 0x0)
+    Initial,
+    /// 0-RTT packet (Long Header, type 0x1)
+    ZeroRtt,
+    /// Handshake packet (Long Header, type 0x2)
+    Handshake,
+    /// Retry packet (Long Header, type 0x3)
+    Retry,
+    /// 1-RTT packet (Short Header)
+    OneRtt,
+    /// Version Negotiation packet (special Long Header)
+    VersionNegotiation,
 }
 
-impl LongPacketType {
-    /// Parse from first byte bits
+impl PacketType {
+    /// Parse from first byte bits (for Long Header packets)
     pub fn from_first_byte(first_byte: u8) -> Option<Self> {
         let type_bits = (first_byte >> 4) & 0x03;
         match type_bits {
-            0x00 => Some(LongPacketType::Initial),
-            0x01 => Some(LongPacketType::ZeroRtt),
-            0x02 => Some(LongPacketType::Handshake),
-            0x03 => Some(LongPacketType::Retry),
+            0x00 => Some(PacketType::Initial),
+            0x01 => Some(PacketType::ZeroRtt),
+            0x02 => Some(PacketType::Handshake),
+            0x03 => Some(PacketType::Retry),
             _ => None,
         }
     }
 
-    /// Get packet number space for this packet type
-    pub fn packet_number_space(self) -> PacketNumberSpace {
+    /// Returns true if this is a long header packet type
+    pub fn is_long_header(&self) -> bool {
+        !matches!(self, PacketType::OneRtt)
+    }
+
+    /// Returns true if this packet type carries an ACK-eliciting payload
+    pub fn is_ack_eliciting_type(&self) -> bool {
+        !matches!(
+            self,
+            PacketType::Retry | PacketType::VersionNegotiation
+        )
+    }
+
+    /// Get the packet number space for this packet type
+    pub fn packet_number_space(&self) -> Option<PacketNumberSpace> {
         match self {
-            LongPacketType::Initial => PacketNumberSpace::Initial,
-            LongPacketType::ZeroRtt => PacketNumberSpace::ApplicationData,
-            LongPacketType::Handshake => PacketNumberSpace::Handshake,
-            LongPacketType::Retry => panic!("Retry packets do not have packet numbers"),
+            PacketType::Initial => Some(PacketNumberSpace::Initial),
+            PacketType::Handshake => Some(PacketNumberSpace::Handshake),
+            PacketType::ZeroRtt | PacketType::OneRtt => {
+                Some(PacketNumberSpace::ApplicationData)
+            }
+            PacketType::Retry | PacketType::VersionNegotiation => None,
         }
     }
 }
@@ -76,7 +90,7 @@ impl LongPacketType {
 #[derive(Debug, Clone)]
 pub struct LongHeader {
     /// Packet type
-    pub packet_type: LongPacketType,
+    pub packet_type: PacketType,
     
     /// QUIC version
     pub version: Version,
@@ -173,9 +187,7 @@ impl PacketHeader {
     /// Get the packet number space (if applicable)
     pub fn packet_number_space(&self) -> Option<PacketNumberSpace> {
         match self {
-            PacketHeader::Long(h) if h.packet_type != LongPacketType::Retry => {
-                Some(h.packet_type.packet_number_space())
-            }
+            PacketHeader::Long(h) => h.packet_type.packet_number_space(),
             PacketHeader::Short(_) => Some(PacketNumberSpace::ApplicationData),
             _ => None,
         }

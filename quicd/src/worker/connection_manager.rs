@@ -15,7 +15,7 @@ use bytes::{Bytes, BytesMut};
 use crate::netio::buffer::WorkerBuffer;
 use crate::routing::{RoutingConnectionIdGenerator, current_generation};
 use crossbeam_channel::Sender as CrossbeamSender;
-use quicd_quic::{ConnectionConfig, Packet, PacketTypeWrapper, VERSION_1, Side, QuicConnection, DatagramInput};
+use quicd_quic::{ConnectionConfig, Packet, PacketType, VERSION_1, Side, QuicConnection, DatagramInput};
 use quicd_quic::{Connection, ConnectionEvent, ConnectionState as QuicConnectionState, StreamId as QuicStreamId};
 use quicd_quic::cid::{ConnectionIdGenerator, ConnectionId};
 use quicd_quic::crypto::CryptoLevel;
@@ -300,8 +300,8 @@ impl ConnectionManager {
         // - Short header packets do not have version field (RFC 8999 Section 5.2)
         // - Version Negotiation packets MUST NOT trigger VN response (prevent loops)
         //
-        if matches!(packet.header.ty, PacketTypeWrapper::Initial | PacketTypeWrapper::ZeroRtt | 
-                    PacketTypeWrapper::Handshake | PacketTypeWrapper::Retry) {
+        if matches!(packet.header.ty, PacketType::Initial | PacketType::ZeroRtt | 
+                    PacketType::Handshake | PacketType::Retry) {
             
             // Check if version is supported
             if packet.header.version != VERSION_1 {
@@ -355,9 +355,9 @@ impl ConnectionManager {
                 // RFC 9001 Section 5.4: Remove header protection BEFORE decryption
                 // Determine encryption level from packet type
                 let encryption_level = match packet.header.ty {
-                    PacketTypeWrapper::Initial => quicd_quic::crypto::CryptoLevel::Initial,
-                    PacketTypeWrapper::Handshake => quicd_quic::crypto::CryptoLevel::Handshake,
-                    PacketTypeWrapper::Short => quicd_quic::crypto::CryptoLevel::OneRTT,
+                    PacketType::Initial => quicd_quic::crypto::CryptoLevel::Initial,
+                    PacketType::Handshake => quicd_quic::crypto::CryptoLevel::Handshake,
+                    PacketType::OneRtt => quicd_quic::crypto::CryptoLevel::OneRTT,
                     _ => {
                         error!("Unsupported packet type for existing connection: {:?}", packet.header.ty);
                         return vec![];
@@ -404,7 +404,7 @@ impl ConnectionManager {
         }
         
         // New connection with supported version
-        if packet.header.ty == PacketTypeWrapper::Initial {
+        if packet.header.ty == PacketType::Initial {
             // RFC 9000 Section 14.1: Validate minimum datagram size for Initial packets
             if datagram_size < 1200 {
                 debug!("Dropping undersized Initial packet ({} bytes) from {}", 

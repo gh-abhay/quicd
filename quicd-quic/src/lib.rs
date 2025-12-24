@@ -242,8 +242,8 @@ pub use crypto::backend::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtec
 pub use frames::{Frame, FrameParser};
 pub use frames::parse::{FrameSerializer, DefaultFrameParser, DefaultFrameSerializer};
 pub use packet::header::{Header, HeaderForm, PacketType, LongHeader, ShortHeader, DefaultHeaderParser};
-pub use packet::types::{LongPacketType, Token, ParsedPacket};
-pub use packet::api::{Packet, ParseContext, PacketHeaderWrapper, PacketTypeWrapper};
+pub use packet::types::{Token, ParsedPacket};
+pub use packet::api::{Packet, ParseContext, PacketHeaderWrapper};
 pub use packet::parser::PacketParser as PacketParserTrait;
 pub use packet::number::{PacketNumberLen, PacketNumberEncoder, PacketNumberDecoder, DefaultPacketNumberEncoder, DefaultPacketNumberDecoder};
 pub use recovery::{CongestionController, LossDetector, RttEstimator};

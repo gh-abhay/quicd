@@ -29,14 +29,14 @@ pub mod protection;
 pub mod api;
 
 // Re-export specific types to avoid ambiguity
-pub use header::{Header, HeaderForm, PacketType, LongHeader as LongHeaderDetail, ShortHeader as ShortHeaderDetail};
+pub use header::{Header, HeaderForm, LongHeader as LongHeaderDetail, ShortHeader as ShortHeaderDetail};
 pub use number::PacketNumberLen;
 pub use space::PacketNumberSpaceState;
 pub use types::{
-    LongHeader, ShortHeader, LongPacketType, ParsedPacket, DatagramInput, DatagramOutput,
+    LongHeader, ShortHeader, PacketType, ParsedPacket, DatagramInput, DatagramOutput,
     Token, VERSION_1, VERSION_NEGOTIATION, PacketHeader,
 };
-pub use api::{Packet, ParseContext, PacketHeaderWrapper, PacketTypeWrapper};
+pub use api::{Packet, ParseContext, PacketHeaderWrapper};
 
 // Parser traits - use qualified names to avoid conflict
 pub use parser::{
