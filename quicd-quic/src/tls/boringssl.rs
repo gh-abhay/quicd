@@ -77,34 +77,77 @@ impl BoringTlsSession {
         cert_data: Option<&[u8]>,
         key_data: Option<&[u8]>,
     ) -> Result<Box<dyn TlsSession>> {
+        eprintln!("DEBUG: BoringTlsSession::new_server called: cert_data={:?}, key_data={:?}, alpn_protocols={:?}", 
+                 cert_data.map(|d| d.len()), key_data.map(|d| d.len()), alpn_protocols);
+        
         let mut ctx = SslContext::builder(SslMethod::tls_server())
-            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+            .map_err(|e| {
+                eprintln!("DEBUG: Failed to create SSL context builder: {:?}", e);
+                Error::Crypto(CryptoError { code: 0x0150 })
+            })?;
         
         ctx.set_min_proto_version(Some(SslVersion::TLS1_3))
-            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+            .map_err(|e| {
+                eprintln!("DEBUG: Failed to set min proto version: {:?}", e);
+                Error::Crypto(CryptoError { code: 0x0150 })
+            })?;
         
         ctx.set_max_proto_version(Some(SslVersion::TLS1_3))
-            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+            .map_err(|e| {
+                eprintln!("DEBUG: Failed to set max proto version: {:?}", e);
+                Error::Crypto(CryptoError { code: 0x0150 })
+            })?;
 
         // Load certificate and private key from memory
-        if let (Some(cert_bytes), Some(key_bytes)) = (cert_data, key_data) {
-            // Parse certificate chain from PEM
-            use boring::x509::X509;
-            let cert = X509::from_pem(cert_bytes)
-                .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
-            
-            // Set certificate
-            ctx.set_certificate(&cert)
-                .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
-            
-            // Parse private key from PEM
-            use boring::pkey::PKey;
-            let key = PKey::private_key_from_pem(key_bytes)
-                .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
-            
-            // Set private key
-            ctx.set_private_key(&key)
-                .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+        match (cert_data, key_data) {
+            (Some(cert_bytes), Some(key_bytes)) => {
+                eprintln!("DEBUG: Loading certificate ({} bytes) and key ({} bytes)", cert_bytes.len(), key_bytes.len());
+                
+                // Parse certificate chain from PEM
+                use boring::x509::X509;
+                let cert = X509::from_pem(cert_bytes)
+                    .map_err(|e| {
+                        eprintln!("DEBUG: Failed to parse certificate PEM: {:?}", e);
+                        Error::Crypto(CryptoError { code: 0x0150 })
+                    })?;
+                
+                eprintln!("DEBUG: Certificate parsed successfully");
+                
+                // Set certificate
+                ctx.set_certificate(&cert)
+                    .map_err(|e| {
+                        eprintln!("DEBUG: Failed to set certificate: {:?}", e);
+                        Error::Crypto(CryptoError { code: 0x0150 })
+                    })?;
+                
+                eprintln!("DEBUG: Certificate set successfully");
+                
+                // Parse private key from PEM
+                use boring::pkey::PKey;
+                let key = PKey::private_key_from_pem(key_bytes)
+                    .map_err(|e| {
+                        eprintln!("DEBUG: Failed to parse private key PEM: {:?}", e);
+                        Error::Crypto(CryptoError { code: 0x0150 })
+                    })?;
+                
+                eprintln!("DEBUG: Private key parsed successfully");
+                
+                // Set private key
+                ctx.set_private_key(&key)
+                    .map_err(|e| {
+                        eprintln!("DEBUG: Failed to set private key: {:?}", e);
+                        Error::Crypto(CryptoError { code: 0x0150 })
+                    })?;
+                
+                eprintln!("DEBUG: Private key set successfully");
+            }
+            (None, None) => {
+                eprintln!("DEBUG: WARNING: No certificate or key data provided!");
+            }
+            _ => {
+                eprintln!("DEBUG: ERROR: Certificate and key must both be provided or both be None");
+                return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+            }
         }
 
         // Set ALPN callback

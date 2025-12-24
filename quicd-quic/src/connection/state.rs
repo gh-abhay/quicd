@@ -1255,50 +1255,10 @@ impl QuicConnection {
                 Ok(())
             }
 
-            Frame::Crypto(crypto_frame) => {
-                // Feed crypto data to TLS session
-                if let Some(ref mut tls) = self.tls_session {
-                    let level = CryptoLevel::Handshake; // TODO: determine from packet type
-                    tls.process_input(crypto_frame.data, level)?;
-                    while let Some(event) = tls.get_output() {
-                        match event {
-                            crate::crypto::TlsEvent::HandshakeComplete => {
-                                self.handshake_complete = true;
-                                self.state = ConnectionState::Active;
-                                self.pending_events.push(ConnectionEvent::HandshakeComplete);
-                            }
-                            crate::crypto::TlsEvent::ReadSecret(level, secret) => {
-                                // New read keys available - install them
-                                let key_schedule = self.crypto_backend.create_key_schedule();
-                                let cipher_suite = 0x1301; // TODO: Get from TLS session
-                                let target_keys = match level {
-                                    CryptoLevel::Initial => &mut self.initial_read_keys,
-                                    CryptoLevel::Handshake => &mut self.handshake_read_keys,
-                                    CryptoLevel::OneRTT => &mut self.one_rtt_read_keys,
-                                    CryptoLevel::ZeroRTT => continue,
-                                };
-                                if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
-                                    eprintln!("Failed to install read keys for level {:?}: {:?}", level, e);
-                                }
-                            }
-                            crate::crypto::TlsEvent::WriteSecret(level, secret) => {
-                                // New write keys available - install them
-                                let key_schedule = self.crypto_backend.create_key_schedule();
-                                let cipher_suite = 0x1301; // TODO: Get from TLS session
-                                let target_keys = match level {
-                                    CryptoLevel::Initial => &mut self.initial_write_keys,
-                                    CryptoLevel::Handshake => &mut self.handshake_write_keys,
-                                    CryptoLevel::OneRTT => &mut self.one_rtt_write_keys,
-                                    CryptoLevel::ZeroRTT => continue,
-                                };
-                                if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
-                                    eprintln!("Failed to install write keys for level {:?}: {:?}", level, e);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+            Frame::Crypto(_crypto_frame) => {
+                // CRYPTO frames are already processed in process_datagram() before calling process_frame()
+                // They are reassembled by offset and fed to TLS there.
+                // This is just a no-op to acknowledge the frame was received.
                 Ok(())
             }
 
@@ -1758,7 +1718,9 @@ impl Connection for QuicConnection {
                                                     }
                                                 };
                                                 if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
-                                                    eprintln!("Failed to install read keys for level {:?}: {:?}", level, e);
+                                                    eprintln!("ERROR: Failed to install read keys for level {:?}: {:?}", level, e);
+                                                    // Key installation failure is critical - return error
+                                                    return Err(e);
                                                 }
                                             }
                                             crate::crypto::TlsEvent::WriteSecret(level, secret) => {
@@ -1775,7 +1737,9 @@ impl Connection for QuicConnection {
                                                     }
                                                 };
                                                 if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
-                                                    eprintln!("Failed to install write keys for level {:?}: {:?}", level, e);
+                                                    eprintln!("ERROR: Failed to install write keys for level {:?}: {:?}", level, e);
+                                                    // Key installation failure is critical - return error
+                                                    return Err(e);
                                                 }
                                             }
                                             _ => {}
@@ -1860,15 +1824,18 @@ impl Connection for QuicConnection {
         eprintln!("DEBUG: poll_send called, pending_crypto={}", self.pending_crypto.len());
         if let Some((level, crypto_data)) = self.pending_crypto.pop() {
             eprintln!("DEBUG: Sending CRYPTO frame: level={:?}, data_len={}", level, crypto_data.len());
-            // For now, only handle Initial level
-            if level != CryptoLevel::Initial {
-                eprintln!("DEBUG: Non-Initial level, putting back");
-                // Put it back for later
-                self.pending_crypto.push((level, crypto_data));
-                return None;
-            }
             
-            let write_keys = &mut self.initial_write_keys;
+            // Get write keys for the appropriate encryption level
+            let write_keys = match level {
+                CryptoLevel::Initial => &mut self.initial_write_keys,
+                CryptoLevel::Handshake => &mut self.handshake_write_keys,
+                CryptoLevel::OneRTT => &mut self.one_rtt_write_keys,
+                CryptoLevel::ZeroRTT => {
+                    // 0-RTT not used on server
+                    self.pending_crypto.push((level, crypto_data));
+                    return None;
+                }
+            };
             if write_keys.aead.is_none() {
                 eprintln!("DEBUG: Initial write keys not available!");
                 // Put it back
@@ -1921,7 +1888,19 @@ impl Connection for QuicConnection {
             buf.reserve(1200);
             
             // Long header byte
-            let first_byte = 0xc0 | ((pn_len - 1) as u8);
+            // RFC 9000 Section 17.2: Long Header Packet Types
+            // Initial: 0xc0, Handshake: 0xe0, 0-RTT: 0xd0, Retry: 0xf0
+            let packet_type_byte = match level {
+                CryptoLevel::Initial => 0xc0,
+                CryptoLevel::Handshake => 0xe0,
+                CryptoLevel::ZeroRTT => 0xd0,
+                CryptoLevel::OneRTT => {
+                    // 1-RTT uses short header - handled separately
+                    self.pending_crypto.push((level, crypto_data));
+                    return None;
+                }
+            };
+            let first_byte = packet_type_byte | ((pn_len - 1) as u8);
             buf.put_u8(first_byte);
             buf.put_u32(VERSION_1);
             buf.put_u8(dcid_bytes.len() as u8);
@@ -1984,11 +1963,18 @@ impl Connection for QuicConnection {
             let hp_key = &write_keys.hp_key;
             
             // Sample is 16 bytes starting 4 bytes after the start of the packet number
-            // PN starts at: header_len - pn_len - encrypted_len (but encrypted_len is after PN)
-            // Actually, PN is at: header_len - pn_len (before we added encrypted payload)
+            // RFC 9001 Section 5.4.2: Sample starts 4 bytes after the start of the packet number
+            // PN starts at: header_len - pn_len (before we added encrypted payload)
             let pn_start = header_len - pn_len;
             let sample_offset = pn_start + pn_len + 4; // 4 bytes after PN end
+            // After appending encrypted payload, buf.len() = header_len + encrypted_len
+            // sample_offset = header_len - pn_len + pn_len + 4 = header_len + 4
+            // We need at least sample_offset + 16 = header_len + 4 + 16 bytes
             if buf.len() < sample_offset + 16 {
+                eprintln!("DEBUG: Buffer too short for header protection sample: buf_len={}, sample_offset={}, needed={}", 
+                         buf.len(), sample_offset, sample_offset + 16);
+                // Put it back
+                self.pending_crypto.push((level, crypto_data));
                 return None;
             }
             
@@ -2008,8 +1994,14 @@ impl Connection for QuicConnection {
             }
             
             // Record sent packet
+            let pn_space = match level {
+                CryptoLevel::Initial => crate::types::PacketNumberSpace::Initial,
+                CryptoLevel::Handshake => crate::types::PacketNumberSpace::Handshake,
+                CryptoLevel::OneRTT => crate::types::PacketNumberSpace::ApplicationData,
+                CryptoLevel::ZeroRTT => crate::types::PacketNumberSpace::ApplicationData,
+            };
             self.loss_detector.on_packet_sent(
-                crate::types::PacketNumberSpace::Initial,
+                pn_space,
                 pn,
                 buf.len(),
                 true, // is_retransmittable (CRYPTO frames are retransmittable)
@@ -2017,7 +2009,7 @@ impl Connection for QuicConnection {
             );
             self.congestion_controller.on_packet_sent(
                 pn,
-                crate::types::PacketNumberSpace::Initial,
+                pn_space,
                 buf.len(),
                 true, // is_ack_eliciting
                 now,
@@ -2026,6 +2018,7 @@ impl Connection for QuicConnection {
             self.stats.bytes_sent += buf.len() as u64;
             
             let data = buf.split();
+            eprintln!("DEBUG: Successfully constructed {:?} packet: len={}", level, data.len());
             return Some(DatagramOutput {
                 data,
                 send_time: None,
