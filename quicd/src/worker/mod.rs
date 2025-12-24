@@ -303,6 +303,12 @@ impl NetworkWorker {
         conn_config.cert_data = Some(self.cert_data.clone());
         conn_config.key_data = Some(self.key_data.clone());
         
+        // Collect all ALPN protocols from registered applications (RFC 9001 Section 8.1)
+        conn_config.alpn_protocols = self.app_registry.get_all_alpn_protocols()
+            .into_iter()
+            .map(|alpn| alpn.as_bytes().to_vec())
+            .collect();
+        
         // Create connection manager for this worker (with routing-aware CID generator)
         let mut conn_manager = ConnectionManager::new(
             conn_config,

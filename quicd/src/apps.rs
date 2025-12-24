@@ -56,6 +56,11 @@ impl AppRegistry {
         self.factories.keys().map(|s| s.as_str()).collect()
     }
 
+    /// Get all registered ALPN protocols as owned Strings (for TLS configuration).
+    pub fn get_all_alpn_protocols(&self) -> Vec<String> {
+        self.factories.keys().cloned().collect()
+    }
+
     /// Get the number of registered applications.
     pub fn len(&self) -> usize {
         self.factories.len()

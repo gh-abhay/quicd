@@ -256,6 +256,7 @@ impl QuicServer for DefaultQuicServer {
             max_packet_size: 1200,
             cert_data: None,
             key_data: None,
+            alpn_protocols: Vec::new(), // Server skeleton - not used in production
         };
 
         let conn = QuicConnection::new(Side::Server, scid, dcid, conn_config);

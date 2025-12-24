@@ -53,6 +53,11 @@ pub struct ConnectionConfig {
     /// Private key data (for server) - read once at startup to avoid disk I/O contention
     pub key_data: Option<Bytes>,
 
+    /// ALPN protocols supported/offered (RFC 9001 Section 8.1)
+    /// Server: list of protocols willing to accept
+    /// Client: list of protocols to offer (in order of preference)
+    pub alpn_protocols: Vec<Vec<u8>>,
+
     /// Idle timeout
     pub idle_timeout: Duration,
 
@@ -66,6 +71,7 @@ impl Default for ConnectionConfig {
             local_params: TransportParameters::default(),
             cert_data: None,
             key_data: None,
+            alpn_protocols: Vec::new(),
             idle_timeout: Duration::from_secs(30),
             max_packet_size: 1200,
         }
