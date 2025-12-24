@@ -445,8 +445,23 @@ impl QuicConnection {
         let pn_spaces = crate::packet::space::PacketNumberSpaceManager::new();
         
         // Derive Initial encryption keys (RFC 9001 Section 5.2)
-        // Initial keys are derived from DCID, not from TLS
+        // Initial keys are derived from the client's Destination Connection ID
+        // Both client_initial_secret and server_initial_secret are derived from
+        // the same initial_secret, which comes from the client's DCID
+        // 
+        // RFC 9001 Section 5.2:
+        //   initial_secret = HKDF-Extract(initial_salt, client_dst_connection_id)
+        //   client_initial_secret = HKDF-Expand-Label(initial_secret, "client in", ...)
+        //   server_initial_secret = HKDF-Expand-Label(initial_secret, "server in", ...)
+        //
+        // For server: read using client_initial_secret, write using server_initial_secret
+        // For client: read using server_initial_secret, write using client_initial_secret
         let key_schedule = crypto_backend.create_key_schedule();
+        
+        // Derive initial_secret from client's DCID (RFC 9001 Section 5.2)
+        // Note: For server, dcid is the client's DCID from the received Initial packet
+        // For client, dcid is the server's DCID from the received Initial packet
+        eprintln!("DEBUG: Key derivation: side={:?}, dcid={:?}, scid={:?}", side, dcid, scid);
         let initial_secret = match key_schedule.derive_initial_secret(&dcid, VERSION_1) {
             Ok(secret) => secret,
             Err(e) => {
@@ -484,11 +499,12 @@ impl QuicConnection {
             }
         };
         
-        // Derive client and server Initial secrets
+        // Derive client_initial_secret and server_initial_secret from the same initial_secret
+        // (RFC 9001 Section 5.2)
         let client_initial_secret = match key_schedule.derive_client_initial_secret(&initial_secret) {
             Ok(secret) => secret,
             Err(e) => {
-                eprintln!("Failed to derive client initial secret: {:?}", e);
+                eprintln!("Failed to derive client initial secret for keys: {:?}", e);
                 return Self {
                     side,
                     state: ConnectionState::Closed,
@@ -525,7 +541,7 @@ impl QuicConnection {
         let server_initial_secret = match key_schedule.derive_server_initial_secret(&initial_secret) {
             Ok(secret) => secret,
             Err(e) => {
-                eprintln!("Failed to derive server initial secret: {:?}", e);
+                eprintln!("Failed to derive server initial secret for keys: {:?}", e);
                 return Self {
                     side,
                     state: ConnectionState::Closed,
@@ -562,7 +578,7 @@ impl QuicConnection {
         // Use AES-128-GCM for Initial packets (RFC 9001 Section 5.2)
         let cipher_suite = 0x1301; // TLS_AES_128_GCM_SHA256
         let aead = match crypto_backend.create_aead(cipher_suite) {
-            Ok(aead) => aead,
+            Ok(a) => a,
             Err(e) => {
                 eprintln!("Failed to create AEAD: {:?}", e);
                 return Self {
@@ -636,6 +652,77 @@ impl QuicConnection {
         };
         
         // Derive packet keys and IVs
+        // Use AES-128-GCM for Initial packets (RFC 9001 Section 5.2)
+        let cipher_suite = 0x1301; // TLS_AES_128_GCM_SHA256
+        let aead = match crypto_backend.create_aead(cipher_suite) {
+            Ok(a) => a,
+            Err(_) => return Self {
+                side,
+                state: ConnectionState::Closed,
+                scid,
+                dcid,
+                config,
+                stats: ConnectionStats::default(),
+                packet_parser,
+                crypto_backend,
+                tls_session: None,
+                streams,
+                flow_control,
+                loss_detector,
+                congestion_controller,
+                pn_spaces,
+                pending_events: alloc::vec::Vec::new(),
+                pending_stream_writes: alloc::vec::Vec::new(),
+                pending_stream_resets: alloc::vec::Vec::new(),
+                pending_close: None,
+                handshake_complete: false,
+                last_activity: None,
+                closing_timeout: None,
+                initial_read_keys: EncryptionKeys::empty(),
+                initial_write_keys: EncryptionKeys::empty(),
+                handshake_read_keys: EncryptionKeys::empty(),
+                handshake_write_keys: EncryptionKeys::empty(),
+                one_rtt_read_keys: EncryptionKeys::empty(),
+                one_rtt_write_keys: EncryptionKeys::empty(),
+                pending_crypto: alloc::vec::Vec::new(),
+            },
+        };
+        
+        let hp = match crypto_backend.create_header_protection(cipher_suite) {
+            Ok(h) => h,
+            Err(_) => return Self {
+                side,
+                state: ConnectionState::Closed,
+                scid,
+                dcid,
+                config,
+                stats: ConnectionStats::default(),
+                packet_parser,
+                crypto_backend,
+                tls_session: None,
+                streams,
+                flow_control,
+                loss_detector,
+                congestion_controller,
+                pn_spaces,
+                pending_events: alloc::vec::Vec::new(),
+                pending_stream_writes: alloc::vec::Vec::new(),
+                pending_stream_resets: alloc::vec::Vec::new(),
+                pending_close: None,
+                handshake_complete: false,
+                last_activity: None,
+                closing_timeout: None,
+                initial_read_keys: EncryptionKeys::empty(),
+                initial_write_keys: EncryptionKeys::empty(),
+                handshake_read_keys: EncryptionKeys::empty(),
+                handshake_write_keys: EncryptionKeys::empty(),
+                one_rtt_read_keys: EncryptionKeys::empty(),
+                one_rtt_write_keys: EncryptionKeys::empty(),
+                pending_crypto: alloc::vec::Vec::new(),
+            },
+        };
+        
+        // Derive packet keys and IVs
         let key_len = aead.key_len();
         let iv_len = aead.iv_len();
         let hp_key_len = hp.key_len();
@@ -673,6 +760,7 @@ impl QuicConnection {
                 pending_crypto: alloc::vec::Vec::new(),
             },
         };
+        
         let client_iv = match key_schedule.derive_packet_iv(&client_initial_secret, iv_len) {
             Ok(iv) => iv,
             Err(_) => return Self {
@@ -1331,9 +1419,11 @@ impl Connection for QuicConnection {
         
         // Remove header protection (RFC 9001 Section 5.4)
         // This reveals the actual packet number
+        // We need a mutable copy of the buffer to modify it in-place
+        let mut datagram_buf = datagram.data.to_vec();
         let hp = read_keys.hp.as_ref().unwrap();
         let hp_key = &read_keys.hp_key;
-        if let Err(_) = packet.remove_header_protection(hp.as_ref(), hp_key, &datagram.data) {
+        if let Err(_) = packet.remove_header_protection(hp.as_ref(), hp_key, &mut datagram_buf) {
             return Ok(());
         }
         
@@ -1347,42 +1437,106 @@ impl Connection for QuicConnection {
         };
         
         // Calculate payload offset (needed for decryption)
-        // For Initial packets, PN is in bytes after SCID
-        let pn_offset = if packet.header.ty == crate::packet::types::PacketType::Initial {
+        // We need to find where the Packet Number is, then add its length to get payload start
+        // For Initial packets, we need to parse Token and Length fields
+        // Use the mutable buffer for parsing
+        let (pn_offset, length_field) = if packet.header.ty == crate::packet::types::PacketType::Initial {
             // Long header: 1 (flags) + 4 (version) + 1 (dcid_len) + dcid + 1 (scid_len) + scid
-            let dcid_len = if datagram.data.len() > 5 { datagram.data[5] as usize } else { return Ok(()) };
-            let scid_len = if datagram.data.len() > 6 + dcid_len { datagram.data[6 + dcid_len] as usize } else { return Ok(()) };
-            7 + dcid_len + scid_len
+            let dcid_len = if datagram_buf.len() > 5 { datagram_buf[5] as usize } else { return Ok(()) };
+            let scid_len = if datagram_buf.len() > 6 + dcid_len { datagram_buf[6 + dcid_len] as usize } else { return Ok(()) };
+            let mut offset = 7 + dcid_len + scid_len;
+            
+            // Parse Token Length (variable-length integer)
+            if datagram_buf.len() < offset {
+                return Ok(());
+            }
+            let (token_len, token_len_bytes) = match crate::types::VarIntCodec::decode(&datagram_buf[offset..]) {
+                Some((len, bytes)) => (len as usize, bytes),
+                None => return Ok(()),
+            };
+            offset += token_len_bytes;
+            
+            // Skip Token field
+            if datagram_buf.len() < offset + token_len {
+                return Ok(());
+            }
+            offset += token_len;
+            
+            // Parse Length field (variable-length integer)
+            if datagram_buf.len() < offset {
+                return Ok(());
+            }
+            let (length_field, length_bytes) = match crate::types::VarIntCodec::decode(&datagram_buf[offset..]) {
+                Some((len, bytes)) => (len, bytes),
+                None => return Ok(()),
+            };
+            offset += length_bytes;
+            
+            // Return (pn_offset, length_field)
+            // RFC 9000: Length field specifies length of Packet Number + Payload
+            (offset, Some(length_field as usize))
         } else {
             // Short header: 1 (flags) + dcid + variable PN
-            1 + self.dcid.len()
+            // No Length field in short headers
+            (1 + self.dcid.len(), None)
         };
         
-        // Determine PN length from first byte (after HP removal, we need to check the actual length)
-        // For now, we'll calculate it from the packet number value
-        let pn_len = if packet_number < 256 { 1 } else if packet_number < 65536 { 2 } else if packet_number < 16777216 { 3 } else { 4 };
+        // Use the actual PN length that was determined during header protection removal
+        let pn_len = packet.header.packet_number_len.unwrap_or_else(|| {
+            // Fallback: calculate from packet number value
+            if packet_number < 256 { 1 } else if packet_number < 65536 { 2 } else if packet_number < 16777216 { 3 } else { 4 }
+        });
         
-        // Payload starts after header + PN
+        // RFC 9000: Length field specifies length of Packet Number + Payload
+        // For long headers, use Length field to determine payload size
+        // For short headers, payload extends to end of packet
+        let encrypted_payload = if let Some(length_field) = length_field {
+            // Long header: Length field specifies PN + Payload length
+            // Payload length = Length field - PN length
+            let payload_len = length_field.checked_sub(pn_len).unwrap_or(0);
+            let payload_offset = pn_offset + pn_len;
+            if datagram_buf.len() < payload_offset + payload_len {
+                return Ok(());
+            }
+            &datagram_buf[payload_offset..payload_offset + payload_len]
+        } else {
+            // Short header: payload extends to end of packet
+            let payload_offset = pn_offset + pn_len;
+            if datagram_buf.len() <= payload_offset {
+                return Ok(());
+            }
+            &datagram_buf[payload_offset..]
+        };
+        
+        // Payload offset for AAD construction (header + PN)
         let payload_offset = pn_offset + pn_len;
-        if datagram.data.len() <= payload_offset {
-            return Ok(());
-        }
-        
-        let encrypted_payload = &datagram.data[payload_offset..];
         
         // Decrypt payload using AEAD
         let aead = read_keys.aead.as_ref().unwrap();
         let key = &read_keys.key;
         let iv = &read_keys.iv;
         
-        // Build header for AEAD (everything before payload)
-        let header = &datagram.data[..payload_offset];
+        // Build header for AEAD AAD (RFC 9001 Section 5.3)
+        // AAD is the header up to and including the unprotected packet number
+        // Since we modified datagram_buf in-place during header protection removal,
+        // we can now use it directly for the AAD
+        let header = &datagram_buf[..payload_offset];
+        eprintln!("DEBUG: AEAD AAD: aad_len={}, pn_len={}, pn={}, payload_offset={}, pn_offset={}", 
+                 header.len(), pn_len, packet_number, payload_offset, pn_offset);
+        eprintln!("DEBUG: AAD first 20 bytes: {:02x?}", &header[..header.len().min(20)]);
+        eprintln!("DEBUG: AAD last 10 bytes: {:02x?}", &header[header.len().saturating_sub(10)..]);
         
         // Allocate buffer for decrypted payload
         let mut decrypted = vec![0u8; encrypted_payload.len()];
+        eprintln!("DEBUG: Attempting decryption: key_len={}, iv_len={}, pn={}, header_len={}, payload_len={}", 
+                 key.len(), iv.len(), packet_number, header.len(), encrypted_payload.len());
         let decrypted_len = match aead.open(key, iv, packet_number, header, encrypted_payload, &mut decrypted) {
-            Ok(len) => len,
-            Err(_) => {
+            Ok(len) => {
+                eprintln!("DEBUG: Decryption successful: decrypted_len={}", len);
+                len
+            }
+            Err(e) => {
+                eprintln!("DEBUG: Decryption failed: {:?}", e);
                 // Decryption failed - drop packet
                 return Ok(());
             }
@@ -1394,22 +1548,49 @@ impl Connection for QuicConnection {
         let mut offset = 0;
         let payload = &decrypted[..decrypted_len];
         
+        eprintln!("DEBUG: Parsing frames from decrypted payload: len={}", payload.len());
         while offset < payload.len() {
             let frame_result = parser.parse_frame(&payload[offset..]);
             
             match frame_result {
                 Ok((frame, consumed)) => {
+                    eprintln!("DEBUG: Parsed frame: type={:?}, consumed={}, offset={}", 
+                             std::mem::discriminant(&frame), consumed, offset);
                     // Special handling for CRYPTO frames - feed to TLS
                     if let Frame::Crypto(crypto_frame) = &frame {
                         if let Some(ref mut tls) = self.tls_session {
-                            if let Err(_) = tls.process_input(crypto_frame.data, encryption_level) {
+                            eprintln!("DEBUG: Processing CRYPTO frame: level={:?}, data_len={}", encryption_level, crypto_frame.data.len());
+                            if let Err(e) = tls.process_input(crypto_frame.data, encryption_level) {
+                                eprintln!("DEBUG: TLS process_input error: {:?}", e);
                                 // TLS error - close connection
                                 self.state = ConnectionState::Closing;
                                 return Ok(());
                             }
                             
                             // Process TLS output events
+                            let mut event_count = 0;
                             while let Some(event) = tls.get_output() {
+                                event_count += 1;
+                                match &event {
+                                    crate::crypto::TlsEvent::WriteData(level, data) => {
+                                        eprintln!("DEBUG: TLS WriteData: level={:?}, len={}", level, data.len());
+                                    }
+                                    crate::crypto::TlsEvent::ReadData(_, _) => {
+                                        eprintln!("DEBUG: TLS ReadData");
+                                    }
+                                    crate::crypto::TlsEvent::HandshakeComplete => {
+                                        eprintln!("DEBUG: TLS HandshakeComplete");
+                                    }
+                                    crate::crypto::TlsEvent::ReadSecret(level, _) => {
+                                        eprintln!("DEBUG: TLS ReadSecret: level={:?}", level);
+                                    }
+                                    crate::crypto::TlsEvent::WriteSecret(level, _) => {
+                                        eprintln!("DEBUG: TLS WriteSecret: level={:?}", level);
+                                    }
+                                    crate::crypto::TlsEvent::Done => {
+                                        eprintln!("DEBUG: TLS Done");
+                                    }
+                                }
                                 match event {
                                     crate::crypto::TlsEvent::WriteData(level, data) => {
                                         // TLS wants to send data - queue as CRYPTO frame
@@ -1458,7 +1639,12 @@ impl Connection for QuicConnection {
                                     _ => {}
                                 }
                             }
+                            eprintln!("DEBUG: Processed {} TLS events", event_count);
+                        } else {
+                            eprintln!("DEBUG: No TLS session available!");
                         }
+                    } else {
+                        eprintln!("DEBUG: Non-CRYPTO frame: {:?}", std::mem::discriminant(&frame));
                     }
                     
                     self.process_frame(frame, datagram.recv_time)?;
@@ -1468,7 +1654,8 @@ impl Connection for QuicConnection {
                         break;
                     }
                 }
-                Err(_e) => {
+                Err(e) => {
+                    eprintln!("DEBUG: Frame parsing error at offset {}: {:?}", offset, e);
                     // Malformed frame - drop packet
                     break;
                 }
@@ -1526,9 +1713,12 @@ impl Connection for QuicConnection {
         }
 
         // Priority: Send CRYPTO frames first (handshake data)
+        eprintln!("DEBUG: poll_send called, pending_crypto={}", self.pending_crypto.len());
         if let Some((level, crypto_data)) = self.pending_crypto.pop() {
+            eprintln!("DEBUG: Sending CRYPTO frame: level={:?}, data_len={}", level, crypto_data.len());
             // For now, only handle Initial level
             if level != CryptoLevel::Initial {
+                eprintln!("DEBUG: Non-Initial level, putting back");
                 // Put it back for later
                 self.pending_crypto.push((level, crypto_data));
                 return None;
@@ -1536,6 +1726,9 @@ impl Connection for QuicConnection {
             
             let write_keys = &mut self.initial_write_keys;
             if write_keys.aead.is_none() {
+                eprintln!("DEBUG: Initial write keys not available!");
+                // Put it back
+                self.pending_crypto.push((level, crypto_data));
                 return None;
             }
             
@@ -1661,8 +1854,11 @@ impl Connection for QuicConnection {
                 return None;
             }
             
-            // Apply mask to first byte (bits 0-4: Reserved and PN Length) and PN
-            buf[0] ^= mask[0] & 0x1f; // Mask bits 0-4 (Reserved + PN Length)
+            // Apply mask to first byte
+            // For Initial packets (long header), mask 4 bits (0x0f)
+            // For short header, mask 5 bits (0x1f)
+            // Since this is Initial packet, use 0x0f
+            buf[0] ^= mask[0] & 0x0f; // Mask bits 0-3 (Reserved + PN Length for long header)
             for i in 0..pn_len {
                 buf[pn_start + i] ^= mask[1 + i];
             }

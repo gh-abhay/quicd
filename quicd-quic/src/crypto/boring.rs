@@ -158,11 +158,17 @@ impl AeadProvider for BoringAead {
             nonce.copy_from_slice(iv);
             
             // Packet number in network byte order (big-endian), left-padded with zeros
+            // RFC 9001 Section 5.3: "The 62 bits of the reconstructed QUIC packet number
+            // in network byte order are left-padded with zeros to the size of the IV.
+            // The exclusive OR of the padded packet number and the IV forms the AEAD nonce."
             let pn_bytes = packet_number.to_be_bytes();
             // XOR the last bytes of nonce with packet number bytes
-            let pn_start = iv_len.saturating_sub(8);
-            for i in 0..8.min(iv_len - pn_start) {
-                nonce[pn_start + i] ^= pn_bytes[i];
+            // For a 12-byte IV, we XOR the last 8 bytes (or fewer if IV is shorter)
+            // This effectively left-pads the packet number with zeros
+            let bytes_to_xor = 8.min(iv_len);
+            let start_idx = iv_len - bytes_to_xor;
+            for i in 0..bytes_to_xor {
+                nonce[start_idx + i] ^= pn_bytes[i];
             }
             
             let mut ctx: ffi::EVP_AEAD_CTX = std::mem::zeroed();
@@ -272,7 +278,11 @@ impl HeaderProtectionProvider for BoringHeaderProtection {
 }
 
 // Helper functions for HKDF
-fn hkdf_extract(salt: &[u8], secret: &[u8]) -> Result<Vec<u8>> {
+// BoringSSL HKDF_extract signature: (out, out_len, md, secret, secret_len, salt, salt_len)
+// where secret is the IKM (Input Keying Material) and salt is the salt
+// RFC 9001: HKDF-Extract(salt, IKM) -> PRK
+// So we call: HKDF_extract(..., IKM, salt)
+fn hkdf_extract(ikm: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
     unsafe {
         let mut out_len: usize = 0;
         let mut out = vec![0u8; ffi::EVP_MAX_MD_SIZE as usize];
@@ -280,9 +290,9 @@ fn hkdf_extract(salt: &[u8], secret: &[u8]) -> Result<Vec<u8>> {
             out.as_mut_ptr(),
             &mut out_len,
             ffi::EVP_sha256(),
-            secret.as_ptr(),
-            secret.len(),
-            salt.as_ptr(),
+            ikm.as_ptr(),      // IKM (Input Keying Material)
+            ikm.len(),
+            salt.as_ptr(),     // Salt
             salt.len(),
         ) != 1 {
              return Err(Error::Crypto(CryptoError { code: 0x0150 }));
@@ -311,13 +321,25 @@ fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>> {
 }
 
 fn hkdf_expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> Result<Vec<u8>> {
+    // RFC 8446 Section 7.1: HKDF-Expand-Label structure
+    // Info = OutputLength (2 bytes) || LabelLength (1 byte) || Label (variable) || ContextLength (1 byte) || Context (variable)
+    // Label = "tls13 " || label
+    const LABEL_PREFIX: &[u8] = b"tls13 ";
+    let label_bytes = label.as_bytes();
+    
     let mut info = Vec::new();
+    // OutputLength (2 bytes, big-endian u16)
     info.extend_from_slice(&(len as u16).to_be_bytes());
-    let full_label = format!("tls13 {}", label);
-    info.push(full_label.len() as u8);
-    info.extend_from_slice(full_label.as_bytes());
+    // LabelLength (1 byte): length of LABEL_PREFIX + label
+    info.push((LABEL_PREFIX.len() + label_bytes.len()) as u8);
+    // Label: LABEL_PREFIX || label
+    info.extend_from_slice(LABEL_PREFIX);
+    info.extend_from_slice(label_bytes);
+    // ContextLength (1 byte)
     info.push(context.len() as u8);
+    // Context
     info.extend_from_slice(context);
+    
     hkdf_expand(secret, &info, len)
 }
 
@@ -328,7 +350,10 @@ impl KeySchedule for BoringKeySchedule {
         let initial_salt = [
             0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a
         ];
-        let secret = hkdf_extract(&initial_salt, dcid.as_bytes())?;
+        // RFC 9001 Section 5.2: initial_secret = HKDF-Extract(initial_salt, client_dst_connection_id)
+        // In BoringSSL HKDF_extract: (out, md, secret, salt) where secret is IKM and salt is salt
+        // So we pass: secret=dcid (IKM), salt=initial_salt
+        let secret = hkdf_extract(dcid.as_bytes(), &initial_salt)?;
         let mut out = [0u8; 32];
         if secret.len() != 32 {
              return Err(Error::Crypto(CryptoError { code: 0x0150 }));

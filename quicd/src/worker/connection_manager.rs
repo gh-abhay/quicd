@@ -405,8 +405,12 @@ impl ConnectionManager {
         
         // New connection with supported version
         if packet.header.ty == PacketType::Initial {
+            eprintln!("DEBUG: Received Initial packet: version=0x{:08X}, dcid={:?}, size={}", 
+                     packet.header.version, packet.header.dcid, datagram_size);
             // RFC 9000 Section 14.1: Validate minimum datagram size for Initial packets
             if datagram_size < 1200 {
+                eprintln!("DEBUG: Dropping undersized Initial packet ({} bytes) from {}", 
+                       datagram_size, peer_addr);
                 debug!("Dropping undersized Initial packet ({} bytes) from {}", 
                        datagram_size, peer_addr);
                 return vec![];
@@ -417,6 +421,7 @@ impl ConnectionManager {
             let scid = self.cid_generator.generate(20);
             let dcid = packet.header.dcid.clone();
             
+            eprintln!("DEBUG: Creating new connection: scid={:?}, dcid={:?}", scid, dcid);
             // Create QUIC connection state machine
             let conn = QuicConnection::new(
                 Side::Server,
@@ -454,19 +459,24 @@ impl ConnectionManager {
             
             // Now process the Initial packet
             if let Some(state) = self.get_connection_mut(slab_idx) {
+                eprintln!("DEBUG: Processing Initial packet");
                 let datagram_input = DatagramInput {
                     data: bytes,
                     recv_time: Self::to_quic_instant(now),
                 };
                 if let Err(e) = state.conn.process_datagram(datagram_input) {
+                    eprintln!("DEBUG: Failed to process initial packet: {}", e);
                     error!("Failed to process initial packet: {}", e);
                     // Remove the connection on failure
                     self.remove_connection(slab_idx);
                     return vec![];
                 }
+                eprintln!("DEBUG: Initial packet processed successfully");
             }
             
+            eprintln!("DEBUG: Generating response packets");
             let packets = self.generate_packets(slab_idx, now);
+            eprintln!("DEBUG: Generated {} response packets", packets.len());
             self.check_handshake_complete(slab_idx);
             
             return packets;

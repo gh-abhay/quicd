@@ -70,6 +70,7 @@ pub struct PacketHeaderWrapper {
     pub scid: Option<ConnectionId>,
     pub version: u32,
     pub packet_number: Option<PacketNumber>,
+    pub packet_number_len: Option<usize>, // Store actual packet number length after HP removal
 }
 
 
@@ -162,6 +163,7 @@ impl Packet {
                 scid,
                 version,
                 packet_number: None, // Not yet decoded
+                packet_number_len: None, // Not yet decoded
             },
             payload,
             header_len,
@@ -188,7 +190,7 @@ impl Packet {
         &mut self,
         hp: &dyn crate::crypto::HeaderProtectionProvider,
         hp_key: &[u8],
-        buf: &[u8],
+        buf: &mut [u8],
     ) -> Result<()> {
         // RFC 9001 Section 5.4: Header protection removal
         // 1. Determine packet number offset
@@ -203,7 +205,39 @@ impl Packet {
                 return Err(Error::Transport(TransportError::FrameEncodingError));
             }
             let scid_len = buf[6 + dcid_len] as usize;
-            7 + dcid_len + scid_len
+            let mut offset = 7 + dcid_len + scid_len;
+            
+            // For Initial packets, parse Token Length and Token fields
+            if self.header.ty == crate::packet::types::PacketType::Initial {
+                // Parse Token Length (variable-length integer)
+                if buf.len() < offset {
+                    return Err(Error::Transport(TransportError::FrameEncodingError));
+                }
+                let (token_len, token_len_bytes) = match crate::types::VarIntCodec::decode(&buf[offset..]) {
+                    Some((len, bytes)) => (len as usize, bytes),
+                    None => return Err(Error::Transport(TransportError::FrameEncodingError)),
+                };
+                offset += token_len_bytes;
+                
+                // Skip Token field
+                if buf.len() < offset + token_len {
+                    return Err(Error::Transport(TransportError::FrameEncodingError));
+                }
+                offset += token_len;
+            }
+            
+            // Parse Length field (variable-length integer) - present in all long header packets
+            if buf.len() < offset {
+                return Err(Error::Transport(TransportError::FrameEncodingError));
+            }
+            let (_length, length_bytes) = match crate::types::VarIntCodec::decode(&buf[offset..]) {
+                Some((len, bytes)) => (len, bytes),
+                None => return Err(Error::Transport(TransportError::FrameEncodingError)),
+            };
+            offset += length_bytes;
+            
+            // Now offset points to Packet Number
+            offset
         } else {
             // Short header: 1 (first byte) + DCID length
             // We need to know DCID length - assume it's in the header
@@ -225,26 +259,28 @@ impl Packet {
         hp.build_mask(hp_key, sample, &mut mask)?;
         
         // 4. Apply mask to first byte to reveal actual PN length
-        let first_byte = buf[0];
-        let masked_first_byte = if is_long {
+        // Modify the buffer in-place
+        if is_long {
             // Long header: mask 4 least significant bits
-            (first_byte ^ (mask[0] & 0x0f))
+            buf[0] ^= mask[0] & 0x0f;
         } else {
             // Short header: mask 5 least significant bits
-            (first_byte ^ (mask[0] & 0x1f))
-        };
+            buf[0] ^= mask[0] & 0x1f;
+        }
         
-        // Extract actual PN length from unmasked first byte
-        let actual_pn_length = ((masked_first_byte & 0x03) + 1) as usize;
+        // Extract actual PN length from unmasked first byte (now in buf[0])
+        let actual_pn_length = ((buf[0] & 0x03) + 1) as usize;
         
-        // 5. Extract and unmask packet number
+        // 5. Extract and unmask packet number (modify buffer in-place)
         if buf.len() < pn_offset + actual_pn_length {
             return Err(Error::Transport(TransportError::FrameEncodingError));
         }
         
         let mut pn_bytes = [0u8; 4];
         for i in 0..actual_pn_length {
-            pn_bytes[i] = buf[pn_offset + i] ^ mask[1 + i];
+            // Unmask the packet number bytes in the buffer
+            buf[pn_offset + i] ^= mask[1 + i];
+            pn_bytes[i] = buf[pn_offset + i];
         }
         
         // Convert to u64 (left-padded with zeros)
@@ -253,8 +289,9 @@ impl Packet {
             pn_value = (pn_value << 8) | (pn_bytes[i] as u64);
         }
         
-        // Store unmasked packet number in header
+        // Store unmasked packet number and length in header
         self.header.packet_number = Some(pn_value);
+        self.header.packet_number_len = Some(actual_pn_length);
         self.hp_removed = true;
         
         Ok(())
@@ -275,6 +312,7 @@ impl Packet {
                 scid: Some(scid.clone()),
                 version: VERSION_NEGOTIATION,
                 packet_number: None,
+                packet_number_len: None,
             },
             payload: Bytes::new(), // Will be filled during serialization
             header_len: 0,

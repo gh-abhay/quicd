@@ -178,13 +178,18 @@ impl TlsSession for BoringTlsSession {
         unsafe {
             ffi::SSL_set_ex_data(self.ssl.as_ptr(), get_ex_data_index(), &mut ex_data as *mut ExData as *mut c_void);
 
-            if ffi::SSL_provide_quic_data(
+            let provide_result = ffi::SSL_provide_quic_data(
                 self.ssl.as_ptr(),
                 level_int,
                 data.as_ptr(),
                 data.len(),
-            ) != 1 {
+            );
+            if provide_result != 1 {
+                let ssl_error = unsafe { ffi::SSL_get_error(self.ssl.as_ptr(), provide_result) };
+                let error_code = unsafe { ffi::ERR_get_error() };
                 ffi::SSL_set_ex_data(self.ssl.as_ptr(), get_ex_data_index(), ptr::null_mut());
+                eprintln!("DEBUG: SSL_provide_quic_data failed: result={}, ssl_error={:?}, error_code={:x}, level={:?}, data_len={}", 
+                         provide_result, ssl_error, error_code, level, data.len());
                 return Err(Error::Crypto(CryptoError { code: 0x0150 }));
             }
 
