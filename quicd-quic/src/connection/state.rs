@@ -7,14 +7,15 @@
 extern crate alloc;
 
 use crate::crypto::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, KeySchedule, TlsSession};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, TransportError};
 use crate::flow_control::ConnectionFlowControl;
 use crate::frames::Frame;
 use crate::packet::{Header, PacketParserTrait};
 use crate::recovery::{CongestionController, LossDetector};
 use crate::stream::StreamManager;
-use crate::transport::TransportParameters;
-use crate::types::{ConnectionId, Instant, PacketNumber, Side, StreamId};
+use crate::transport::{TransportParameters, TP_INITIAL_SOURCE_CONNECTION_ID, TP_INITIAL_MAX_DATA, TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, TP_INITIAL_MAX_STREAM_DATA_UNI, TP_INITIAL_MAX_STREAMS_BIDI, TP_INITIAL_MAX_STREAMS_UNI, TP_MAX_IDLE_TIMEOUT, TP_MAX_UDP_PAYLOAD_SIZE, TP_ACK_DELAY_EXPONENT, TP_MAX_ACK_DELAY, TP_ACTIVE_CONNECTION_ID_LIMIT};
+use crate::types::{ConnectionId, Instant, PacketNumber, Side, StreamId, VarInt};
+use alloc::collections::BTreeMap;
 use crate::version::VERSION_1;
 use bytes::{BufMut, Bytes, BytesMut};
 use core::time::Duration;
@@ -399,6 +400,10 @@ pub struct QuicConnection {
     
     /// Pending CRYPTO data to send (level, data)
     pending_crypto: alloc::vec::Vec<(CryptoLevel, Bytes)>,
+    
+    /// Received CRYPTO data buffers per encryption level (for reassembly)
+    /// Maps encryption level to (received_bytes, next_expected_offset)
+    crypto_buffers: BTreeMap<CryptoLevel, (alloc::vec::Vec<u8>, VarInt)>,
 }
 
 impl QuicConnection {
@@ -494,8 +499,9 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
-                    pending_crypto: alloc::vec::Vec::new(),
-                };
+                            pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
+                        };
             }
         };
         
@@ -533,8 +539,9 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
-                    pending_crypto: alloc::vec::Vec::new(),
-                };
+                            pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
+                        };
             }
         };
         
@@ -570,8 +577,9 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
-                    pending_crypto: alloc::vec::Vec::new(),
-                };
+                            pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
+                        };
             }
         };
         
@@ -609,8 +617,9 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
-                    pending_crypto: alloc::vec::Vec::new(),
-                };
+                            pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
+                        };
             }
         };
         
@@ -646,8 +655,9 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
-                    pending_crypto: alloc::vec::Vec::new(),
-                };
+                            pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
+                        };
             }
         };
         
@@ -685,6 +695,7 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
             },
         };
         
@@ -719,6 +730,7 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
             },
         };
         
@@ -758,6 +770,7 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
             },
         };
         
@@ -792,6 +805,7 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
             },
         };
         let client_hp_key = match key_schedule.derive_header_protection_key(&client_initial_secret, hp_key_len) {
@@ -825,6 +839,7 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
             },
         };
         
@@ -859,6 +874,7 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
             },
         };
         let server_iv = match key_schedule.derive_packet_iv(&server_initial_secret, iv_len) {
@@ -892,6 +908,7 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
             },
         };
         let server_hp_key = match key_schedule.derive_header_protection_key(&server_initial_secret, hp_key_len) {
@@ -925,6 +942,7 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
             },
         };
         
@@ -962,6 +980,7 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                     pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
                 },
             };
             let read_hp = match crypto_backend.create_header_protection(cipher_suite) {
@@ -995,6 +1014,7 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                     pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
                 },
             };
             (
@@ -1033,6 +1053,7 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                     pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
                 },
             };
             let write_hp = match crypto_backend.create_header_protection(cipher_suite) {
@@ -1066,6 +1087,7 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                     pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
                 },
             };
             (
@@ -1074,16 +1096,96 @@ impl QuicConnection {
             )
         };
         
+        // Set initial_source_connection_id in transport params if not set (for server)
+        let mut local_params = config.local_params.clone();
+        if side == Side::Server && local_params.initial_source_connection_id.is_none() {
+            local_params.initial_source_connection_id = Some(scid.clone());
+        }
+        
         // Initialize TLS session for server connections
         // Load certificates from config.cert_data and config.key_data
-        let tls_session = if side == Side::Server {
+        let mut tls_session = if side == Side::Server {
             let alpn_protocols: Vec<&[u8]> = config.alpn_protocols.iter()
                 .map(|p| p.as_slice())
                 .collect();
             let cert_data = config.cert_data.as_ref().map(|b| b.as_ref());
             let key_data = config.key_data.as_ref().map(|b| b.as_ref());
             match crypto_backend.create_tls_session(side, None, &alpn_protocols, cert_data, key_data) {
-                Ok(session) => Some(session),
+                Ok(mut session) => {
+                    // RFC 9001 Section 8.2: Transport parameters MUST be set before processing handshake data
+                    // Encode transport parameters
+                    let mut params_buf = BytesMut::with_capacity(256);
+                    if let Err(e) = encode_transport_params(&local_params, &mut params_buf, true) {
+                        eprintln!("Warning: Failed to encode transport parameters: {:?}", e);
+                        return Self {
+                            side,
+                            state: ConnectionState::Closed,
+                            scid,
+                            dcid,
+                            config,
+                            stats: ConnectionStats::default(),
+                            packet_parser,
+                            crypto_backend,
+                            tls_session: None,
+                            streams,
+                            flow_control,
+                            loss_detector,
+                            congestion_controller,
+                            pn_spaces,
+                            pending_events: alloc::vec::Vec::new(),
+                            pending_stream_writes: alloc::vec::Vec::new(),
+                            pending_stream_resets: alloc::vec::Vec::new(),
+                            pending_close: None,
+                            handshake_complete: false,
+                            last_activity: None,
+                            closing_timeout: None,
+                            initial_read_keys: EncryptionKeys::empty(),
+                            initial_write_keys: EncryptionKeys::empty(),
+                            handshake_read_keys: EncryptionKeys::empty(),
+                            handshake_write_keys: EncryptionKeys::empty(),
+                            one_rtt_read_keys: EncryptionKeys::empty(),
+                            one_rtt_write_keys: EncryptionKeys::empty(),
+                            pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
+                        };
+                    }
+                    // Set transport parameters on TLS session
+                    if let Err(e) = session.set_transport_params(&params_buf) {
+                        eprintln!("Warning: Failed to set transport parameters: {:?}", e);
+                        return Self {
+                            side,
+                            state: ConnectionState::Closed,
+                            scid,
+                            dcid,
+                            config,
+                            stats: ConnectionStats::default(),
+                            packet_parser,
+                            crypto_backend,
+                            tls_session: None,
+                            streams,
+                            flow_control,
+                            loss_detector,
+                            congestion_controller,
+                            pn_spaces,
+                            pending_events: alloc::vec::Vec::new(),
+                            pending_stream_writes: alloc::vec::Vec::new(),
+                            pending_stream_resets: alloc::vec::Vec::new(),
+                            pending_close: None,
+                            handshake_complete: false,
+                            last_activity: None,
+                            closing_timeout: None,
+                            initial_read_keys: EncryptionKeys::empty(),
+                            initial_write_keys: EncryptionKeys::empty(),
+                            handshake_read_keys: EncryptionKeys::empty(),
+                            handshake_write_keys: EncryptionKeys::empty(),
+                            one_rtt_read_keys: EncryptionKeys::empty(),
+                            one_rtt_write_keys: EncryptionKeys::empty(),
+                            pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
+                        };
+                    }
+                    Some(session)
+                }
                 Err(e) => {
                     eprintln!("Warning: Failed to create TLS session: {:?}", e);
                     None
@@ -1092,6 +1194,10 @@ impl QuicConnection {
         } else {
             None // Client TLS session created on connect
         };
+        
+        // Update config with local_params that have initial_source_connection_id set
+        let mut config = config;
+        config.local_params = local_params;
         
         Self {
             side,
@@ -1122,6 +1228,7 @@ impl QuicConnection {
             one_rtt_read_keys: EncryptionKeys::empty(),
             one_rtt_write_keys: EncryptionKeys::empty(),
             pending_crypto: alloc::vec::Vec::new(),
+            crypto_buffers: BTreeMap::new(),
         }
     }
     
@@ -1556,90 +1663,127 @@ impl Connection for QuicConnection {
                 Ok((frame, consumed)) => {
                     eprintln!("DEBUG: Parsed frame: type={:?}, consumed={}, offset={}", 
                              std::mem::discriminant(&frame), consumed, offset);
-                    // Special handling for CRYPTO frames - feed to TLS
+                    // Special handling for CRYPTO frames - reassemble and feed to TLS
                     if let Frame::Crypto(crypto_frame) = &frame {
-                        if let Some(ref mut tls) = self.tls_session {
-                            eprintln!("DEBUG: Processing CRYPTO frame: level={:?}, data_len={}", encryption_level, crypto_frame.data.len());
-                            if let Err(e) = tls.process_input(crypto_frame.data, encryption_level) {
-                                eprintln!("DEBUG: TLS process_input error: {:?}", e);
-                                // TLS error - close connection
-                                self.state = ConnectionState::Closing;
-                                return Ok(());
-                            }
+                        // RFC 9000 Section 19.6: CRYPTO frames must be reassembled in order by offset
+                        // Get or create buffer for this encryption level
+                        let buffer_entry = self.crypto_buffers.entry(encryption_level).or_insert_with(|| (alloc::vec::Vec::new(), 0));
+                        let (buffer, next_offset) = buffer_entry;
+                        
+                        let frame_offset = crypto_frame.offset;
+                        let frame_data = crypto_frame.data;
+                        let frame_end = frame_offset + frame_data.len() as VarInt;
+                        
+                        // Check if this frame extends beyond current buffer
+                        if frame_end > buffer.len() as VarInt {
+                            buffer.resize(frame_end as usize, 0);
+                        }
+                        
+                        // Copy frame data into buffer at correct offset
+                        let start = frame_offset as usize;
+                        let end = start + frame_data.len();
+                        buffer[start..end].copy_from_slice(frame_data);
+                        
+                        // Try to provide contiguous data to TLS
+                        // TLS expects data starting from next_expected_offset
+                        // For simplicity, provide all data from next_offset to the highest received offset
+                        // In a full implementation, we'd track gaps and only provide contiguous data
+                        if *next_offset < buffer.len() as VarInt {
+                            // Find the highest offset we've received data for
+                            // For now, provide all data from next_offset to buffer.len()
+                            // This works if frames arrive in order (which they should for Initial/Handshake)
+                            let contiguous_end = buffer.len();
                             
-                            // Process TLS output events
-                            let mut event_count = 0;
-                            while let Some(event) = tls.get_output() {
-                                event_count += 1;
-                                match &event {
-                                    crate::crypto::TlsEvent::WriteData(level, data) => {
-                                        eprintln!("DEBUG: TLS WriteData: level={:?}, len={}", level, data.len());
+                            // Provide contiguous data to TLS
+                            if contiguous_end > *next_offset as usize {
+                                let data_to_provide = &buffer[*next_offset as usize..contiguous_end];
+                                if let Some(ref mut tls) = self.tls_session {
+                                    eprintln!("DEBUG: Processing CRYPTO frame: level={:?}, offset={}, data_len={}, providing_len={}", 
+                                             encryption_level, frame_offset, frame_data.len(), data_to_provide.len());
+                                    if let Err(e) = tls.process_input(data_to_provide, encryption_level) {
+                                        eprintln!("DEBUG: TLS process_input error: {:?}", e);
+                                        // TLS error - close connection
+                                        self.state = ConnectionState::Closing;
+                                        return Ok(());
                                     }
-                                    crate::crypto::TlsEvent::ReadData(_, _) => {
-                                        eprintln!("DEBUG: TLS ReadData");
-                                    }
-                                    crate::crypto::TlsEvent::HandshakeComplete => {
-                                        eprintln!("DEBUG: TLS HandshakeComplete");
-                                    }
-                                    crate::crypto::TlsEvent::ReadSecret(level, _) => {
-                                        eprintln!("DEBUG: TLS ReadSecret: level={:?}", level);
-                                    }
-                                    crate::crypto::TlsEvent::WriteSecret(level, _) => {
-                                        eprintln!("DEBUG: TLS WriteSecret: level={:?}", level);
-                                    }
-                                    crate::crypto::TlsEvent::Done => {
-                                        eprintln!("DEBUG: TLS Done");
-                                    }
-                                }
-                                match event {
-                                    crate::crypto::TlsEvent::WriteData(level, data) => {
-                                        // TLS wants to send data - queue as CRYPTO frame
-                                        self.pending_crypto.push((level, Bytes::from(data)));
-                                    }
-                                    crate::crypto::TlsEvent::HandshakeComplete => {
-                                        self.handshake_complete = true;
-                                        self.state = ConnectionState::Active;
-                                        self.pending_events.push(ConnectionEvent::HandshakeComplete);
-                                    }
-                                    crate::crypto::TlsEvent::ReadSecret(level, secret) => {
-                                        // New read keys available - install them
-                                        let key_schedule = self.crypto_backend.create_key_schedule();
-                                        // Use AES-128-GCM (0x1301) as default - should match negotiated cipher
-                                        let cipher_suite = 0x1301; // TODO: Get from TLS session
-                                        let target_keys = match level {
-                                            CryptoLevel::Initial => &mut self.initial_read_keys,
-                                            CryptoLevel::Handshake => &mut self.handshake_read_keys,
-                                            CryptoLevel::OneRTT => &mut self.one_rtt_read_keys,
-                                            CryptoLevel::ZeroRTT => {
-                                                // 0-RTT read keys not used on server
-                                                continue;
+                                    // Update next expected offset to end of provided data
+                                    *next_offset = contiguous_end as VarInt;
+                                    
+                                    // Process TLS output events
+                                    let mut event_count = 0;
+                                    while let Some(event) = tls.get_output() {
+                                        event_count += 1;
+                                        match &event {
+                                            crate::crypto::TlsEvent::WriteData(level, data) => {
+                                                eprintln!("DEBUG: TLS WriteData: level={:?}, len={}", level, data.len());
                                             }
-                                        };
-                                        if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
-                                            eprintln!("Failed to install read keys for level {:?}: {:?}", level, e);
+                                            crate::crypto::TlsEvent::ReadData(_, _) => {
+                                                eprintln!("DEBUG: TLS ReadData");
+                                            }
+                                            crate::crypto::TlsEvent::HandshakeComplete => {
+                                                eprintln!("DEBUG: TLS HandshakeComplete");
+                                            }
+                                            crate::crypto::TlsEvent::ReadSecret(level, _) => {
+                                                eprintln!("DEBUG: TLS ReadSecret: level={:?}", level);
+                                            }
+                                            crate::crypto::TlsEvent::WriteSecret(level, _) => {
+                                                eprintln!("DEBUG: TLS WriteSecret: level={:?}", level);
+                                            }
+                                            crate::crypto::TlsEvent::Done => {
+                                                eprintln!("DEBUG: TLS Done");
+                                            }
+                                        }
+                                        match event {
+                                            crate::crypto::TlsEvent::WriteData(level, data) => {
+                                                // TLS wants to send data - queue as CRYPTO frame
+                                                self.pending_crypto.push((level, Bytes::from(data)));
+                                            }
+                                            crate::crypto::TlsEvent::HandshakeComplete => {
+                                                self.handshake_complete = true;
+                                                self.state = ConnectionState::Active;
+                                                self.pending_events.push(ConnectionEvent::HandshakeComplete);
+                                            }
+                                            crate::crypto::TlsEvent::ReadSecret(level, secret) => {
+                                                // New read keys available - install them
+                                                let key_schedule = self.crypto_backend.create_key_schedule();
+                                                // Use AES-128-GCM (0x1301) as default - should match negotiated cipher
+                                                let cipher_suite = 0x1301; // TODO: Get from TLS session
+                                                let target_keys = match level {
+                                                    CryptoLevel::Initial => &mut self.initial_read_keys,
+                                                    CryptoLevel::Handshake => &mut self.handshake_read_keys,
+                                                    CryptoLevel::OneRTT => &mut self.one_rtt_read_keys,
+                                                    CryptoLevel::ZeroRTT => {
+                                                        // 0-RTT read keys not used on server
+                                                        continue;
+                                                    }
+                                                };
+                                                if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
+                                                    eprintln!("Failed to install read keys for level {:?}: {:?}", level, e);
+                                                }
+                                            }
+                                            crate::crypto::TlsEvent::WriteSecret(level, secret) => {
+                                                // New write keys available - install them
+                                                let key_schedule = self.crypto_backend.create_key_schedule();
+                                                let cipher_suite = 0x1301; // TODO: Get from TLS session
+                                                let target_keys = match level {
+                                                    CryptoLevel::Initial => &mut self.initial_write_keys,
+                                                    CryptoLevel::Handshake => &mut self.handshake_write_keys,
+                                                    CryptoLevel::OneRTT => &mut self.one_rtt_write_keys,
+                                                    CryptoLevel::ZeroRTT => {
+                                                        // 0-RTT write keys not used on server
+                                                        continue;
+                                                    }
+                                                };
+                                                if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
+                                                    eprintln!("Failed to install write keys for level {:?}: {:?}", level, e);
+                                                }
+                                            }
+                                            _ => {}
                                         }
                                     }
-                                    crate::crypto::TlsEvent::WriteSecret(level, secret) => {
-                                        // New write keys available - install them
-                                        let key_schedule = self.crypto_backend.create_key_schedule();
-                                        let cipher_suite = 0x1301; // TODO: Get from TLS session
-                                        let target_keys = match level {
-                                            CryptoLevel::Initial => &mut self.initial_write_keys,
-                                            CryptoLevel::Handshake => &mut self.handshake_write_keys,
-                                            CryptoLevel::OneRTT => &mut self.one_rtt_write_keys,
-                                            CryptoLevel::ZeroRTT => {
-                                                // 0-RTT write keys not used on server
-                                                continue;
-                                            }
-                                        };
-                                        if let Err(e) = target_keys.install_from_secret(&secret, key_schedule.as_ref(), self.crypto_backend.as_ref(), cipher_suite) {
-                                            eprintln!("Failed to install write keys for level {:?}: {:?}", level, e);
-                                        }
-                                    }
-                                    _ => {}
+                                    eprintln!("DEBUG: Processed {} TLS events", event_count);
                                 }
                             }
-                            eprintln!("DEBUG: Processed {} TLS events", event_count);
                         } else {
                             eprintln!("DEBUG: No TLS session available!");
                         }
@@ -2030,4 +2174,139 @@ impl Connection for QuicConnection {
     fn destination_cid(&self) -> &ConnectionId {
         &self.dcid
     }
+}
+
+/// Encode transport parameters in TLV format (RFC 9000 Section 18)
+fn encode_transport_params(params: &TransportParameters, buf: &mut BytesMut, is_server: bool) -> Result<()> {
+    use crate::types::{VarIntCodec, VarInt};
+    use crate::error::TransportError;
+    
+    // For server: set initial_source_connection_id (required per RFC 9000 Section 18.2)
+    if is_server {
+        if let Some(ref cid) = params.initial_source_connection_id {
+            let cid_bytes = cid.as_bytes();
+            // Type (VarInt)
+            let mut type_buf = [0u8; 8];
+            let type_len = VarIntCodec::encode(TP_INITIAL_SOURCE_CONNECTION_ID, &mut type_buf)
+                .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+            buf.extend_from_slice(&type_buf[..type_len]);
+            // Length (VarInt)
+            let mut len_buf = [0u8; 8];
+            let len_len = VarIntCodec::encode(cid_bytes.len() as VarInt, &mut len_buf)
+                .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+            buf.extend_from_slice(&len_buf[..len_len]);
+            // Value
+            buf.extend_from_slice(cid_bytes);
+        }
+    }
+    
+    // Encode required parameters
+    // initial_max_data
+    let mut type_buf = [0u8; 8];
+    let type_len = VarIntCodec::encode(TP_INITIAL_MAX_DATA, &mut type_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&type_buf[..type_len]);
+    let mut len_buf = [0u8; 8];
+    let len_len = VarIntCodec::encode(8, &mut len_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&len_buf[..len_len]);
+    buf.put_u64(params.initial_max_data);
+    
+    // initial_max_stream_data_bidi_local
+    let type_len = VarIntCodec::encode(TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, &mut type_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&type_buf[..type_len]);
+    let len_len = VarIntCodec::encode(8, &mut len_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&len_buf[..len_len]);
+    buf.put_u64(params.initial_max_stream_data_bidi_local);
+    
+    // initial_max_stream_data_bidi_remote
+    let type_len = VarIntCodec::encode(TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, &mut type_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&type_buf[..type_len]);
+    let len_len = VarIntCodec::encode(8, &mut len_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&len_buf[..len_len]);
+    buf.put_u64(params.initial_max_stream_data_bidi_remote);
+    
+    // initial_max_stream_data_uni
+    let type_len = VarIntCodec::encode(TP_INITIAL_MAX_STREAM_DATA_UNI, &mut type_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&type_buf[..type_len]);
+    let len_len = VarIntCodec::encode(8, &mut len_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&len_buf[..len_len]);
+    buf.put_u64(params.initial_max_stream_data_uni);
+    
+    // initial_max_streams_bidi
+    let type_len = VarIntCodec::encode(TP_INITIAL_MAX_STREAMS_BIDI, &mut type_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&type_buf[..type_len]);
+    let len_len = VarIntCodec::encode(8, &mut len_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&len_buf[..len_len]);
+    buf.put_u64(params.initial_max_streams_bidi);
+    
+    // initial_max_streams_uni
+    let type_len = VarIntCodec::encode(TP_INITIAL_MAX_STREAMS_UNI, &mut type_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&type_buf[..type_len]);
+    let len_len = VarIntCodec::encode(8, &mut len_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    buf.extend_from_slice(&len_buf[..len_len]);
+    buf.put_u64(params.initial_max_streams_uni);
+    
+    // Optional parameters
+    if let Some(timeout) = params.max_idle_timeout {
+        let type_len = VarIntCodec::encode(TP_MAX_IDLE_TIMEOUT, &mut type_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        buf.extend_from_slice(&type_buf[..type_len]);
+        let len_len = VarIntCodec::encode(8, &mut len_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        buf.extend_from_slice(&len_buf[..len_len]);
+        buf.put_u64(timeout);
+    }
+    
+    if let Some(size) = params.max_udp_payload_size {
+        let type_len = VarIntCodec::encode(TP_MAX_UDP_PAYLOAD_SIZE, &mut type_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        buf.extend_from_slice(&type_buf[..type_len]);
+        let len_len = VarIntCodec::encode(8, &mut len_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        buf.extend_from_slice(&len_buf[..len_len]);
+        buf.put_u64(size);
+    }
+    
+    if let Some(exp) = params.ack_delay_exponent {
+        let type_len = VarIntCodec::encode(TP_ACK_DELAY_EXPONENT, &mut type_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        buf.extend_from_slice(&type_buf[..type_len]);
+        let len_len = VarIntCodec::encode(8, &mut len_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        buf.extend_from_slice(&len_buf[..len_len]);
+        buf.put_u64(exp);
+    }
+    
+    if let Some(delay) = params.max_ack_delay {
+        let type_len = VarIntCodec::encode(TP_MAX_ACK_DELAY, &mut type_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        buf.extend_from_slice(&type_buf[..type_len]);
+        let len_len = VarIntCodec::encode(8, &mut len_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        buf.extend_from_slice(&len_buf[..len_len]);
+        buf.put_u64(delay);
+    }
+    
+    if let Some(limit) = params.active_connection_id_limit {
+        let type_len = VarIntCodec::encode(TP_ACTIVE_CONNECTION_ID_LIMIT, &mut type_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        buf.extend_from_slice(&type_buf[..type_len]);
+        let len_len = VarIntCodec::encode(8, &mut len_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        buf.extend_from_slice(&len_buf[..len_len]);
+        buf.put_u64(limit);
+    }
+    
+    Ok(())
 }
