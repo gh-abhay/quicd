@@ -401,9 +401,17 @@ pub struct QuicConnection {
     /// Pending CRYPTO data to send (level, data)
     pending_crypto: alloc::vec::Vec<(CryptoLevel, Bytes)>,
     
+    /// Send offset for each crypto level (tracks how much we've sent)
+    /// Maps encryption level to the next offset to send
+    crypto_send_offsets: BTreeMap<CryptoLevel, VarInt>,
+    
     /// Received CRYPTO data buffers per encryption level (for reassembly)
     /// Maps encryption level to (received_bytes, next_expected_offset)
     crypto_buffers: BTreeMap<CryptoLevel, (alloc::vec::Vec<u8>, VarInt)>,
+    /// Largest received packet number per packet number space (for ACK generation)
+    largest_received_pn_initial: Option<PacketNumber>,
+    largest_received_pn_handshake: Option<PacketNumber>,
+    largest_received_pn_appdata: Option<PacketNumber>,
 }
 
 impl QuicConnection {
@@ -500,7 +508,11 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                             pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
                         };
             }
         };
@@ -540,7 +552,11 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                             pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
                         };
             }
         };
@@ -578,7 +594,11 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                             pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
                         };
             }
         };
@@ -618,7 +638,11 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                             pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
                         };
             }
         };
@@ -656,7 +680,11 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                             pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
                         };
             }
         };
@@ -695,7 +723,11 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
             },
         };
         
@@ -730,7 +762,11 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
             },
         };
         
@@ -770,7 +806,11 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
             },
         };
         
@@ -805,7 +845,11 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
             },
         };
         let client_hp_key = match key_schedule.derive_header_protection_key(&client_initial_secret, hp_key_len) {
@@ -839,7 +883,11 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
             },
         };
         
@@ -874,7 +922,11 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
             },
         };
         let server_iv = match key_schedule.derive_packet_iv(&server_initial_secret, iv_len) {
@@ -908,7 +960,11 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
             },
         };
         let server_hp_key = match key_schedule.derive_header_protection_key(&server_initial_secret, hp_key_len) {
@@ -942,7 +998,11 @@ impl QuicConnection {
                 one_rtt_read_keys: EncryptionKeys::empty(),
                 one_rtt_write_keys: EncryptionKeys::empty(),
                 pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
             },
         };
         
@@ -980,7 +1040,11 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                     pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
                 },
             };
             let read_hp = match crypto_backend.create_header_protection(cipher_suite) {
@@ -1014,7 +1078,11 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                     pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
                 },
             };
             (
@@ -1053,7 +1121,11 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                     pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
                 },
             };
             let write_hp = match crypto_backend.create_header_protection(cipher_suite) {
@@ -1087,7 +1159,11 @@ impl QuicConnection {
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
                     pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
                 },
             };
             (
@@ -1146,7 +1222,11 @@ impl QuicConnection {
                             one_rtt_read_keys: EncryptionKeys::empty(),
                             one_rtt_write_keys: EncryptionKeys::empty(),
                             pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
                         };
                     }
                     // Set transport parameters on TLS session
@@ -1181,7 +1261,11 @@ impl QuicConnection {
                             one_rtt_read_keys: EncryptionKeys::empty(),
                             one_rtt_write_keys: EncryptionKeys::empty(),
                             pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
                         };
                     }
                     Some(session)
@@ -1228,7 +1312,11 @@ impl QuicConnection {
             one_rtt_read_keys: EncryptionKeys::empty(),
             one_rtt_write_keys: EncryptionKeys::empty(),
             pending_crypto: alloc::vec::Vec::new(),
+            crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
+            largest_received_pn_initial: None,
+            largest_received_pn_handshake: None,
+            largest_received_pn_appdata: None,
         }
     }
     
@@ -1462,15 +1550,15 @@ impl Connection for QuicConnection {
         };
         
         // Determine encryption level from packet type
-        let (encryption_level, read_keys) = match packet.header.ty {
+        let (encryption_level, read_keys, pn_space) = match packet.header.ty {
             crate::packet::types::PacketType::Initial => {
-                (CryptoLevel::Initial, &mut self.initial_read_keys)
+                (CryptoLevel::Initial, &mut self.initial_read_keys, crate::types::PacketNumberSpace::Initial)
             }
             crate::packet::types::PacketType::Handshake => {
-                (CryptoLevel::Handshake, &mut self.handshake_read_keys)
+                (CryptoLevel::Handshake, &mut self.handshake_read_keys, crate::types::PacketNumberSpace::Handshake)
             }
             crate::packet::types::PacketType::OneRtt => {
-                (CryptoLevel::OneRTT, &mut self.one_rtt_read_keys)
+                (CryptoLevel::OneRTT, &mut self.one_rtt_read_keys, crate::types::PacketNumberSpace::ApplicationData)
             }
             _ => {
                 // Other packet types not yet supported
@@ -1502,6 +1590,37 @@ impl Connection for QuicConnection {
                 return Ok(());
             }
         };
+        
+        // Track largest received packet number for ACK generation
+        match pn_space {
+            crate::types::PacketNumberSpace::Initial => {
+                if let Some(current) = self.largest_received_pn_initial {
+                    if packet_number > current {
+                        self.largest_received_pn_initial = Some(packet_number);
+                    }
+                } else {
+                    self.largest_received_pn_initial = Some(packet_number);
+                }
+            }
+            crate::types::PacketNumberSpace::Handshake => {
+                if let Some(current) = self.largest_received_pn_handshake {
+                    if packet_number > current {
+                        self.largest_received_pn_handshake = Some(packet_number);
+                    }
+                } else {
+                    self.largest_received_pn_handshake = Some(packet_number);
+                }
+            }
+            crate::types::PacketNumberSpace::ApplicationData => {
+                if let Some(current) = self.largest_received_pn_appdata {
+                    if packet_number > current {
+                        self.largest_received_pn_appdata = Some(packet_number);
+                    }
+                } else {
+                    self.largest_received_pn_appdata = Some(packet_number);
+                }
+            }
+        }
         
         // Calculate payload offset (needed for decryption)
         // We need to find where the Packet Number is, then add its length to get payload start
@@ -1696,6 +1815,8 @@ impl Connection for QuicConnection {
                                         match event {
                                             crate::crypto::TlsEvent::WriteData(level, data) => {
                                                 // TLS wants to send data - queue as CRYPTO frame
+                                                // Reset offset for this level when new data arrives
+                                                self.crypto_send_offsets.remove(&level);
                                                 self.pending_crypto.push((level, Bytes::from(data)));
                                             }
                                             crate::crypto::TlsEvent::HandshakeComplete => {
@@ -1821,8 +1942,26 @@ impl Connection for QuicConnection {
         }
 
         // Priority: Send CRYPTO frames first (handshake data)
+        // RFC 9000: Initial packets must be sent before Handshake packets
+        // Find Initial packet first, then Handshake, then others
         eprintln!("DEBUG: poll_send called, pending_crypto={}", self.pending_crypto.len());
-        if let Some((level, crypto_data)) = self.pending_crypto.pop() {
+        
+        // First, try to find an Initial packet (highest priority)
+        let initial_idx = self.pending_crypto.iter().position(|(level, _)| *level == CryptoLevel::Initial);
+        let crypto_item = if let Some(idx) = initial_idx {
+            Some(self.pending_crypto.remove(idx))
+        } else {
+            // No Initial packet, try Handshake
+            let handshake_idx = self.pending_crypto.iter().position(|(level, _)| *level == CryptoLevel::Handshake);
+            if let Some(idx) = handshake_idx {
+                Some(self.pending_crypto.remove(idx))
+            } else {
+                // No Initial or Handshake, take any
+                self.pending_crypto.pop()
+            }
+        };
+        
+        if let Some((level, crypto_data)) = crypto_item {
             eprintln!("DEBUG: Sending CRYPTO frame: level={:?}, data_len={}", level, crypto_data.len());
             
             // Get write keys for the appropriate encryption level
@@ -1843,6 +1982,35 @@ impl Connection for QuicConnection {
                 return None;
             }
             
+            // Get current send offset for this crypto level
+            let offset = *self.crypto_send_offsets.entry(level).or_insert(0);
+            
+            // Calculate how much data we can fit in this packet
+            // RFC 9000: Maximum datagram size is 1200 bytes
+            // Packet structure: Header (~47 bytes) + Length (2 bytes) + PN (1 byte) + Encrypted payload
+            // Encrypted payload = Plaintext + AEAD tag (16 bytes)
+            // CRYPTO frame overhead: type (1 byte) + offset varint (1-8 bytes) + length varint (1-8 bytes)
+            // Conservative estimate: header ~50 bytes, so max plaintext ~1100 bytes
+            // But we need to account for CRYPTO frame encoding, so use ~1000 bytes
+            const MAX_PLAINTEXT_PAYLOAD: usize = 1000;
+            
+            // Check if we've already sent all of this crypto data
+            if offset >= crypto_data.len() as VarInt {
+                // All data sent for this item, move to next pending crypto
+                // Reset offset for this level (in case new data arrives)
+                self.crypto_send_offsets.remove(&level);
+                return self.poll_send(buf, now);
+            }
+            
+            let remaining_data = &crypto_data[offset as usize..];
+            
+            // Determine how much data to send in this packet
+            let data_to_send = if remaining_data.len() > MAX_PLAINTEXT_PAYLOAD {
+                &remaining_data[..MAX_PLAINTEXT_PAYLOAD]
+            } else {
+                remaining_data
+            };
+            
             // Build Initial packet
             // Header: flags + version + DCID len + DCID + SCID len + SCID + Length + PN + Payload
             let dcid_bytes = self.dcid.as_bytes();
@@ -1852,21 +2020,50 @@ impl Connection for QuicConnection {
             let pn = write_keys.packet_number;
             write_keys.packet_number += 1;
             
-            // Determine PN length (1-4 bytes, use 1 byte for now)
-            let pn_len = 1;
-            let pn_bytes = [(pn & 0xff) as u8];
+            // Determine PN length (1-4 bytes)
+            // RFC 9001 Appendix A.3: Server Initial uses 2-byte PN encoding
+            // Use 2 bytes for Initial packets to match the sample
+            let pn_len = if level == CryptoLevel::Initial { 2 } else { 1 };
+            let pn_bytes: Vec<u8> = match pn_len {
+                1 => vec![(pn & 0xff) as u8],
+                2 => vec![((pn >> 8) & 0xff) as u8, (pn & 0xff) as u8],
+                3 => vec![((pn >> 16) & 0xff) as u8, ((pn >> 8) & 0xff) as u8, (pn & 0xff) as u8],
+                4 => vec![((pn >> 24) & 0xff) as u8, ((pn >> 16) & 0xff) as u8, ((pn >> 8) & 0xff) as u8, (pn & 0xff) as u8],
+                _ => vec![(pn & 0xff) as u8],
+            };
             
-            // Build CRYPTO frame
+            // RFC 9001 Appendix A.3: Server's Initial packet includes an ACK frame
+            // Build frames: ACK (if we have received packets) + CRYPTO
             use crate::frames::Frame;
-            let crypto_frame = Frame::Crypto(crate::frames::CryptoFrame {
-                offset: 0, // TODO: Track offset properly
-                data: &crypto_data,
-            });
-            
-            // Serialize CRYPTO frame
             use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
             let serializer = DefaultFrameSerializer;
             let mut frame_buf = BytesMut::new();
+            
+            // Add ACK frame for Initial packets if we've received any
+            if level == CryptoLevel::Initial && self.side == Side::Server {
+                if let Some(largest_acked) = self.largest_received_pn_initial {
+                    // RFC 9000 Section 19.3: ACK frame format
+                    // largest_acked, ack_delay, ack_range_count, first_ack_range
+                    let ack_frame = Frame::Ack(crate::frames::AckFrame {
+                        largest_acked,
+                        ack_delay: 0, // ACK delay in microseconds (0 for immediate)
+                        ack_range_count: 0, // No additional ranges
+                        first_ack_range: 0, // All packets up to largest_acked are acknowledged
+                        ack_ranges: &[], // Empty - no gaps
+                    });
+                    if let Err(_) = serializer.serialize_frame(&ack_frame, &mut frame_buf) {
+                        // If ACK serialization fails, continue without it
+                    }
+                }
+            }
+            
+            // Build CRYPTO frame with proper offset
+            let crypto_frame = Frame::Crypto(crate::frames::CryptoFrame {
+                offset: offset,
+                data: data_to_send,
+            });
+            
+            // Serialize CRYPTO frame
             match serializer.serialize_frame(&crypto_frame, &mut frame_buf) {
                 Ok(_) => {}
                 Err(_) => return None,
@@ -1903,10 +2100,27 @@ impl Connection for QuicConnection {
             let first_byte = packet_type_byte | ((pn_len - 1) as u8);
             buf.put_u8(first_byte);
             buf.put_u32(VERSION_1);
-            buf.put_u8(dcid_bytes.len() as u8);
-            buf.put_slice(dcid_bytes);
+            
+            // RFC 9001 Appendix A.3: Server's Initial packet uses empty DCID (length 0)
+            // The client will use the server's SCID as DCID in subsequent packets
+            if level == CryptoLevel::Initial && self.side == Side::Server {
+                // Server's Initial: empty DCID
+                buf.put_u8(0);
+            } else {
+                buf.put_u8(dcid_bytes.len() as u8);
+                buf.put_slice(dcid_bytes);
+            }
+            
             buf.put_u8(scid_bytes.len() as u8);
             buf.put_slice(scid_bytes);
+            
+            // RFC 9000 Section 17.2.2: Initial packets MUST include Token Length and Token fields
+            // RFC 9000 Section 17.2.2.1: Server MUST set Token Length to 0
+            if level == CryptoLevel::Initial {
+                // Token Length: variable-length integer encoding 0 (1 byte: 0x00)
+                buf.put_u8(0x00);
+                // Token: empty (Token Length is 0, so no token bytes)
+            }
             
             // Length field (estimate - will be correct after encryption)
             let length_field_start = buf.len();
@@ -1922,37 +2136,83 @@ impl Connection for QuicConnection {
                 buf.put_u8((estimated_payload_len & 0xff) as u8);
             }
             
+            // RFC 9000 Section 14.1: Initial packets MUST be at least 1200 bytes
+            // Add PADDING frames (0x00 bytes) to reach minimum size for Initial packets
+            // We need to do this BEFORE encrypting so we know the exact plaintext size
+            let mut final_plaintext = plaintext.to_vec();
+            if level == CryptoLevel::Initial {
+                // Calculate padding needed to reach 1200 bytes total packet size
+                // Current header (before Length field and PN): buf.len() - estimated_length_field_size - pn_len
+                // We'll use a conservative estimate and add extra padding for safety
+                // Header is approximately: 1 (first byte) + 4 (version) + 1 (DCID len) + DCID + 1 (SCID len) + SCID + 1 (Token Len) + length_field + pn_len
+                // For server Initial: DCID is empty (1 byte for length), SCID is 20 bytes, Token Len is 1 byte
+                // So header ≈ 1 + 4 + 1 + 0 + 1 + 20 + 1 + 2 (length field) + 1 (PN) = 31 bytes
+                // We need: 31 + encrypted_payload >= 1200
+                // encrypted_payload = plaintext + 16 (tag)
+                // So: plaintext >= 1200 - 31 - 16 = 1153 bytes
+                // Use 1160 bytes as target to be safe
+                const MIN_PLAINTEXT_FOR_INITIAL: usize = 1160;
+                
+                if final_plaintext.len() < MIN_PLAINTEXT_FOR_INITIAL {
+                    let padding_needed = MIN_PLAINTEXT_FOR_INITIAL - final_plaintext.len();
+                    // PADDING frame is just 0x00 bytes
+                    final_plaintext.extend(vec![0x00; padding_needed]);
+                }
+            }
+            
+            // Calculate actual encrypted length (plaintext + tag)
+            let actual_encrypted_len = final_plaintext.len() + tag_len;
+            let actual_payload_len = pn_len + actual_encrypted_len;
+            
+            // Rebuild Length field with actual length
+            // RFC 9000 Section 16: Variable-length integer encoding
+            // 2MSB encode length: 00=1 byte, 01=2 bytes, 10=4 bytes, 11=8 bytes
+            buf.truncate(length_field_start);
+            if actual_payload_len < 64 {
+                // 1-byte encoding: 00xxxxxx (6 bits, range 0-63)
+                buf.put_u8(actual_payload_len as u8);
+            } else if actual_payload_len < 16384 {
+                // 2-byte encoding: 01xxxxxx xxxxxxxx (14 bits, range 0-16383)
+                // First byte: 0x40 (01) | upper 6 bits of value
+                // Second byte: lower 8 bits of value
+                buf.put_u8(0x40 | ((actual_payload_len >> 8) as u8 & 0x3f));
+                buf.put_u8((actual_payload_len & 0xff) as u8);
+            } else if actual_payload_len < 1073741824 {
+                // 4-byte encoding: 10xxxxxx xxxxxxxx xxxxxxxx xxxxxxxx (30 bits)
+                buf.put_u8(0x80 | ((actual_payload_len >> 24) as u8 & 0x3f));
+                buf.put_u8((actual_payload_len >> 16) as u8);
+                buf.put_u8((actual_payload_len >> 8) as u8);
+                buf.put_u8((actual_payload_len & 0xff) as u8);
+            } else {
+                // 8-byte encoding: 11xxxxxx ... (62 bits)
+                buf.put_u8(0xc0 | ((actual_payload_len >> 56) as u8 & 0x3f));
+                buf.put_u8((actual_payload_len >> 48) as u8);
+                buf.put_u8((actual_payload_len >> 40) as u8);
+                buf.put_u8((actual_payload_len >> 32) as u8);
+                buf.put_u8((actual_payload_len >> 24) as u8);
+                buf.put_u8((actual_payload_len >> 16) as u8);
+                buf.put_u8((actual_payload_len >> 8) as u8);
+                buf.put_u8((actual_payload_len & 0xff) as u8);
+            }
+            
             // Packet number
             buf.put_slice(&pn_bytes);
             
+            // Now calculate AAD with the correct Length field
             let header_len = buf.len();
-            let header_for_aead = &buf[..]; // Full header for AEAD AAD
+            let header_for_aead = &buf[..]; // Full header for AEAD AAD (RFC 9001 Section 5.3)
             
-            // Encrypt payload
-            let mut encrypted_buf = vec![0u8; plaintext.len() + tag_len];
-            let encrypted_len = match aead.seal(key, iv, pn, header_for_aead, &plaintext, &mut encrypted_buf) {
+            // Encrypt payload (including any padding) with correct AAD
+            let mut encrypted_buf = vec![0u8; final_plaintext.len() + tag_len];
+            let encrypted_len = match aead.seal(key, iv, pn, header_for_aead, &final_plaintext, &mut encrypted_buf) {
                 Ok(len) => len,
                 Err(_) => return None,
             };
             
-            // Update Length field if actual length differs (should be rare)
-            let actual_payload_len = pn_len + encrypted_len;
-            if actual_payload_len != estimated_payload_len {
-                // Rebuild length field (in practice this should rarely happen)
-                let old_len_field_len = buf.len() - length_field_start - pn_len;
-                buf.truncate(length_field_start);
-                if actual_payload_len < 64 {
-                    buf.put_u8(actual_payload_len as u8);
-                } else if actual_payload_len < 16384 {
-                    buf.put_u8(0x40 | ((actual_payload_len >> 8) as u8));
-                    buf.put_u8((actual_payload_len & 0xff) as u8);
-                } else {
-                    buf.put_u8(0x80 | ((actual_payload_len >> 24) as u8));
-                    buf.put_u8((actual_payload_len >> 16) as u8);
-                    buf.put_u8((actual_payload_len >> 8) as u8);
-                    buf.put_u8((actual_payload_len & 0xff) as u8);
-                }
-                buf.put_slice(&pn_bytes);
+            // Verify encrypted length matches our calculation
+            if encrypted_len != actual_encrypted_len {
+                eprintln!("DEBUG: Encrypted length mismatch: expected {}, got {}", actual_encrypted_len, encrypted_len);
+                return None;
             }
             
             // Append encrypted payload
@@ -1963,13 +2223,13 @@ impl Connection for QuicConnection {
             let hp_key = &write_keys.hp_key;
             
             // Sample is 16 bytes starting 4 bytes after the start of the packet number
-            // RFC 9001 Section 5.4.2: Sample starts 4 bytes after the start of the packet number
+            // RFC 9001 Section 5.4.2: sample_offset = pn_offset + 4
             // PN starts at: header_len - pn_len (before we added encrypted payload)
+            // After appending encrypted payload, the PN is still at the same position
             let pn_start = header_len - pn_len;
-            let sample_offset = pn_start + pn_len + 4; // 4 bytes after PN end
-            // After appending encrypted payload, buf.len() = header_len + encrypted_len
-            // sample_offset = header_len - pn_len + pn_len + 4 = header_len + 4
-            // We need at least sample_offset + 16 = header_len + 4 + 16 bytes
+            // Sample starts 4 bytes after PN start, which is in the encrypted payload
+            let sample_offset = pn_start + 4;
+            // We need at least sample_offset + 16 bytes total
             if buf.len() < sample_offset + 16 {
                 eprintln!("DEBUG: Buffer too short for header protection sample: buf_len={}, sample_offset={}, needed={}", 
                          buf.len(), sample_offset, sample_offset + 16);
@@ -2016,6 +2276,20 @@ impl Connection for QuicConnection {
             );
             self.stats.packets_sent += 1;
             self.stats.bytes_sent += buf.len() as u64;
+            
+            // Update send offset
+            let new_offset = offset + data_to_send.len() as VarInt;
+            *self.crypto_send_offsets.entry(level).or_insert(0) = new_offset;
+            
+            // If there's remaining data, put it back in pending_crypto
+            if new_offset < crypto_data.len() as VarInt {
+                eprintln!("DEBUG: Splitting CRYPTO frame: sent {} bytes, {} remaining", 
+                         data_to_send.len(), crypto_data.len() - new_offset as usize);
+                self.pending_crypto.push((level, crypto_data));
+            } else {
+                // All data sent, reset offset for this level
+                self.crypto_send_offsets.remove(&level);
+            }
             
             let data = buf.split();
             eprintln!("DEBUG: Successfully constructed {:?} packet: len={}", level, data.len());
