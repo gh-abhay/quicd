@@ -211,10 +211,15 @@ impl ConnectionManager {
         // Insert into Slab
         let slab_idx = self.connections.insert(state);
         
-        // Register DCID mapping
+        // Register DCID mapping (client-chosen CID)
         self.dcid_to_slab.insert(dcid, slab_idx);
         
-        // Register SCID mapping
+        // Register SCID mapping (server-chosen CID)
+        // RFC 9000 Section 5.1: The server's SCID is what the client will use as DCID
+        // in subsequent packets. We must be able to route those packets to this connection.
+        self.dcid_to_slab.insert(scid.clone(), slab_idx);
+        
+        // Also register SCID mapping for egress command routing
         self.scid_to_slab.insert(scid, slab_idx);
         
         debug!(
@@ -266,10 +271,8 @@ impl ConnectionManager {
                 if bytes.len() > 1 + len {
                     if let Some(dcid) = ConnectionId::from_slice(&bytes[1..1+len]) {
                         if let Some(slab_idx) = self.find_by_dcid(&dcid) {
-                            if let Some(state) = self.get_connection(slab_idx) {
-                                parse_context = quicd_quic::packet::ParseContext::with_dcid_len(state.dcid_len);
-                                break;
-                            }
+                            parse_context = quicd_quic::packet::ParseContext::with_dcid_len(len);
+                            break;
                         }
                     }
                 }

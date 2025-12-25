@@ -1584,12 +1584,34 @@ impl Connection for QuicConnection {
         }
         
         // Packet number should now be available after header protection removal
-        let packet_number = match packet.header.packet_number {
-            Some(pn) => pn,
+        // However, it's truncated - we need to reconstruct the full packet number
+        // RFC 9000 Appendix A.3: Packet number reconstruction
+        let truncated_pn = match packet.header.packet_number {
+            Some(pn) => pn as u32, // Truncated packet number (1-4 bytes)
             None => {
                 // Header protection removal failed or didn't extract PN
                 return Ok(());
             }
+        };
+        
+        // Get the largest received packet number for this packet number space
+        let largest_pn = match pn_space {
+            crate::types::PacketNumberSpace::Initial => self.largest_received_pn_initial,
+            crate::types::PacketNumberSpace::Handshake => self.largest_received_pn_handshake,
+            crate::types::PacketNumberSpace::ApplicationData => self.largest_received_pn_appdata,
+        };
+        
+        // Reconstruct full packet number from truncated value (RFC 9000 Appendix A.3)
+        // For the first packet in a packet number space, use the truncated value directly
+        let packet_number = if let Some(largest) = largest_pn {
+            use crate::packet::number::{PacketNumberDecoder, DefaultPacketNumberDecoder};
+            let decoder = DefaultPacketNumberDecoder;
+            let pn_len = packet.header.packet_number_len.unwrap_or(1);
+            let pn_nbits = pn_len * 8; // Number of bits in truncated packet number
+            decoder.decode(largest, truncated_pn, pn_nbits)
+        } else {
+            // First packet in this packet number space - use truncated value directly
+            truncated_pn as u64
         };
         
         // Track largest received packet number for ACK generation
@@ -1625,31 +1647,35 @@ impl Connection for QuicConnection {
         
         // Calculate payload offset (needed for decryption)
         // We need to find where the Packet Number is, then add its length to get payload start
-        // For Initial packets, we need to parse Token and Length fields
-        // Use the mutable buffer for parsing
-        let (pn_offset, length_field) = if packet.header.ty == crate::packet::types::PacketType::Initial {
+        // For Long header packets, we need to parse DCID, SCID, and Length fields
+        // For Initial packets, we also need to parse the Token field
+        let (pn_offset, length_field) = if packet.header.ty.is_long_header() {
             // Long header: 1 (flags) + 4 (version) + 1 (dcid_len) + dcid + 1 (scid_len) + scid
-            let dcid_len = if datagram_buf.len() > 5 { datagram_buf[5] as usize } else { return Ok(()) };
-            let scid_len = if datagram_buf.len() > 6 + dcid_len { datagram_buf[6 + dcid_len] as usize } else { return Ok(()) };
+            if datagram_buf.len() < 6 { return Ok(()); }
+            let dcid_len = datagram_buf[5] as usize;
+            if datagram_buf.len() < 6 + dcid_len + 1 { return Ok(()); }
+            let scid_len = datagram_buf[6 + dcid_len] as usize;
             let mut offset = 7 + dcid_len + scid_len;
             
-            // Parse Token Length (variable-length integer)
-            if datagram_buf.len() < offset {
-                return Ok(());
+            // For Initial packets, parse Token Length and Token fields
+            if packet.header.ty == crate::packet::types::PacketType::Initial {
+                if datagram_buf.len() < offset {
+                    return Ok(());
+                }
+                let (token_len, token_len_bytes) = match crate::types::VarIntCodec::decode(&datagram_buf[offset..]) {
+                    Some((len, bytes)) => (len as usize, bytes),
+                    None => return Ok(()),
+                };
+                offset += token_len_bytes;
+                
+                // Skip Token field
+                if datagram_buf.len() < offset + token_len {
+                    return Ok(());
+                }
+                offset += token_len;
             }
-            let (token_len, token_len_bytes) = match crate::types::VarIntCodec::decode(&datagram_buf[offset..]) {
-                Some((len, bytes)) => (len as usize, bytes),
-                None => return Ok(()),
-            };
-            offset += token_len_bytes;
             
-            // Skip Token field
-            if datagram_buf.len() < offset + token_len {
-                return Ok(());
-            }
-            offset += token_len;
-            
-            // Parse Length field (variable-length integer)
+            // Parse Length field (variable-length integer) - present in all long header packets
             if datagram_buf.len() < offset {
                 return Ok(());
             }
@@ -1664,8 +1690,8 @@ impl Connection for QuicConnection {
             (offset, Some(length_field as usize))
         } else {
             // Short header: 1 (flags) + dcid + variable PN
-            // No Length field in short headers
-            (1 + self.dcid.len(), None)
+            // The DCID in a packet from the peer is our SCID
+            (1 + packet.header.dcid.len(), None)
         };
         
         // Use the actual PN length that was determined during header protection removal
@@ -2102,15 +2128,10 @@ impl Connection for QuicConnection {
             buf.put_u8(first_byte);
             buf.put_u32(VERSION_1);
             
-            // RFC 9001 Appendix A.3: Server's Initial packet uses empty DCID (length 0)
-            // The client will use the server's SCID as DCID in subsequent packets
-            if level == CryptoLevel::Initial && self.side == Side::Server {
-                // Server's Initial: empty DCID
-                buf.put_u8(0);
-            } else {
-                buf.put_u8(dcid_bytes.len() as u8);
-                buf.put_slice(dcid_bytes);
-            }
+            // RFC 9000 Section 7.2: Server MUST use the SCID from the client's Initial
+            // as the DCID in its Initial packet.
+            buf.put_u8(dcid_bytes.len() as u8);
+            buf.put_slice(dcid_bytes);
             
             buf.put_u8(scid_bytes.len() as u8);
             buf.put_slice(scid_bytes);
