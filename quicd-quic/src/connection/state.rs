@@ -13,7 +13,7 @@ use crate::frames::Frame;
 use crate::packet::{Header, PacketParserTrait};
 use crate::recovery::{CongestionController, LossDetector};
 use crate::stream::StreamManager;
-use crate::transport::{TransportParameters, TP_INITIAL_SOURCE_CONNECTION_ID, TP_INITIAL_MAX_DATA, TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, TP_INITIAL_MAX_STREAM_DATA_UNI, TP_INITIAL_MAX_STREAMS_BIDI, TP_INITIAL_MAX_STREAMS_UNI, TP_MAX_IDLE_TIMEOUT, TP_MAX_UDP_PAYLOAD_SIZE, TP_ACK_DELAY_EXPONENT, TP_MAX_ACK_DELAY, TP_ACTIVE_CONNECTION_ID_LIMIT};
+use crate::transport::{TransportParameters, TP_ORIGINAL_DESTINATION_CONNECTION_ID, TP_INITIAL_SOURCE_CONNECTION_ID, TP_INITIAL_MAX_DATA, TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, TP_INITIAL_MAX_STREAM_DATA_UNI, TP_INITIAL_MAX_STREAMS_BIDI, TP_INITIAL_MAX_STREAMS_UNI, TP_MAX_IDLE_TIMEOUT, TP_MAX_UDP_PAYLOAD_SIZE, TP_ACK_DELAY_EXPONENT, TP_MAX_ACK_DELAY, TP_ACTIVE_CONNECTION_ID_LIMIT};
 use crate::types::{ConnectionId, Instant, PacketNumber, Side, StreamId, VarInt};
 use alloc::collections::BTreeMap;
 use crate::version::VERSION_1;
@@ -1190,8 +1190,9 @@ impl QuicConnection {
                 Ok(mut session) => {
                     // RFC 9001 Section 8.2: Transport parameters MUST be set before processing handshake data
                     // Encode transport parameters
+                    // For server, original_destination_connection_id is the client's DCID
                     let mut params_buf = BytesMut::with_capacity(256);
-                    if let Err(e) = encode_transport_params(&local_params, &mut params_buf, true) {
+                    if let Err(e) = encode_transport_params(&local_params, &mut params_buf, true, Some(&dcid)) {
                         eprintln!("Warning: Failed to encode transport parameters: {:?}", e);
                         return Self {
                             side,
@@ -2444,9 +2445,26 @@ impl Connection for QuicConnection {
 }
 
 /// Encode transport parameters in TLV format (RFC 9000 Section 18)
-fn encode_transport_params(params: &TransportParameters, buf: &mut BytesMut, is_server: bool) -> Result<()> {
+fn encode_transport_params(params: &TransportParameters, buf: &mut BytesMut, is_server: bool, original_dcid: Option<&ConnectionId>) -> Result<()> {
     use crate::types::{VarIntCodec, VarInt};
     use crate::error::TransportError;
+    
+    // For server: encode original_destination_connection_id (required per RFC 9000 Section 18.2)
+    // This is the DCID from the client's first Initial packet
+    if is_server {
+        if let Some(dcid) = original_dcid {
+            let cid_bytes = dcid.as_bytes();
+            let mut type_buf = [0u8; 8];
+            let type_len = VarIntCodec::encode(TP_ORIGINAL_DESTINATION_CONNECTION_ID, &mut type_buf)
+                .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+            buf.extend_from_slice(&type_buf[..type_len]);
+            let mut len_buf = [0u8; 8];
+            let len_len = VarIntCodec::encode(cid_bytes.len() as VarInt, &mut len_buf)
+                .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+            buf.extend_from_slice(&len_buf[..len_len]);
+            buf.extend_from_slice(cid_bytes);
+        }
+    }
     
     // For server: set initial_source_connection_id (required per RFC 9000 Section 18.2)
     if is_server {
