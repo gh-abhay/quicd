@@ -412,6 +412,9 @@ pub struct QuicConnection {
     largest_received_pn_initial: Option<PacketNumber>,
     largest_received_pn_handshake: Option<PacketNumber>,
     largest_received_pn_appdata: Option<PacketNumber>,
+    
+    /// Track which streams have been opened (to emit StreamOpened event only once)
+    opened_streams: alloc::collections::BTreeSet<StreamId>,
 }
 
 impl QuicConnection {
@@ -513,6 +516,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
                         };
             }
         };
@@ -557,6 +561,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
                         };
             }
         };
@@ -599,6 +604,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
                         };
             }
         };
@@ -643,6 +649,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
                         };
             }
         };
@@ -685,6 +692,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
                         };
             }
         };
@@ -728,6 +736,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
         
@@ -767,6 +776,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
         
@@ -811,6 +821,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
         
@@ -850,6 +861,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
         let client_hp_key = match key_schedule.derive_header_protection_key(&client_initial_secret, hp_key_len) {
@@ -888,6 +900,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
         
@@ -927,6 +940,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
         let server_iv = match key_schedule.derive_packet_iv(&server_initial_secret, iv_len) {
@@ -965,6 +979,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
         let server_hp_key = match key_schedule.derive_header_protection_key(&server_initial_secret, hp_key_len) {
@@ -1003,6 +1018,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
         
@@ -1045,6 +1061,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
                 },
             };
             let read_hp = match crypto_backend.create_header_protection(cipher_suite) {
@@ -1083,6 +1100,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
                 },
             };
             (
@@ -1126,6 +1144,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
                 },
             };
             let write_hp = match crypto_backend.create_header_protection(cipher_suite) {
@@ -1164,6 +1183,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
                 },
             };
             (
@@ -1228,6 +1248,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
                         };
                     }
                     // Set transport parameters on TLS session
@@ -1267,6 +1288,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
                         };
                     }
                     Some(session)
@@ -1318,6 +1340,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            opened_streams: alloc::collections::BTreeSet::new(),
         }
     }
     
@@ -1334,10 +1357,27 @@ impl QuicConnection {
         
         match frame {
             Frame::Stream(stream_frame) => {
+                let stream_id = stream_frame.stream_id;
+                
+                // Check if this is a new stream (first data received)
+                // For peer-initiated streams, we need to emit StreamOpened event
+                let is_new_stream = self.opened_streams.insert(stream_id);
+                
+                if is_new_stream {
+                    // New stream opened by peer - emit StreamOpened event
+                    eprintln!("DEBUG: New stream opened: stream_id={:?}", stream_id);
+                    self.pending_events.push(ConnectionEvent::StreamOpened {
+                        stream_id,
+                    });
+                }
+                
+                eprintln!("DEBUG: Processing STREAM frame: stream_id={:?}, data_len={}, fin={}", 
+                         stream_id, stream_frame.data.len(), stream_frame.fin);
+                
                 // Update stream data, check flow control, enqueue event
                 self.flow_control.recv.on_data_received(stream_frame.data.len() as u64)?;
                 self.pending_events.push(ConnectionEvent::StreamData {
-                    stream_id: stream_frame.stream_id,
+                    stream_id,
                     data: Bytes::copy_from_slice(stream_frame.data),
                     fin: stream_frame.fin,
                 });
