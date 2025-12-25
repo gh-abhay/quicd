@@ -2055,6 +2055,7 @@ impl Connection for QuicConnection {
                                                 self.pending_crypto.push((level, Bytes::from(data)));
                                             }
                                             crate::crypto::TlsEvent::HandshakeComplete => {
+                                                eprintln!("DEBUG: ✓✓✓ SETTING handshake_complete = true");
                                                 self.handshake_complete = true;
                                                 self.state = ConnectionState::Active;
                                                 self.pending_events.push(ConnectionEvent::HandshakeComplete);
@@ -2337,6 +2338,97 @@ impl Connection for QuicConnection {
                             return Some(DatagramOutput { data, send_time: None });
                         }
                     }
+                }
+            }
+        }
+        
+        // If handshake just completed and we haven't sent HANDSHAKE_DONE yet, send it BEFORE CRYPTO frames
+        eprintln!("DEBUG: HANDSHAKE_DONE check: side={:?}, handshake_complete={}, handshake_done_sent={}, has_1rtt_keys={}", 
+                 self.side, self.handshake_complete, self.handshake_done_sent, self.one_rtt_write_keys.aead.is_some());
+        if self.side == Side::Server && self.handshake_complete && !self.handshake_done_sent {
+            eprintln!("DEBUG: Inside main HANDSHAKE_DONE condition");
+            if let Some(_) = self.one_rtt_write_keys.aead {
+                eprintln!("DEBUG: Has 1-RTT AEAD keys");
+                use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
+                let serializer = DefaultFrameSerializer;
+                let mut frame_buf = BytesMut::new();
+                let hd_frame = Frame::HandshakeDone;
+                if serializer.serialize_frame(&hd_frame, &mut frame_buf).is_ok() {
+                    eprintln!("DEBUG: Frame serialized successfully, len={}", frame_buf.len());
+                    let plaintext = frame_buf.freeze();
+                    let write_keys = &mut self.one_rtt_write_keys;
+                    let pn = write_keys.packet_number;
+                    write_keys.packet_number += 1;
+
+                    // Short header first byte: Fixed bit set (0x40), key phase 0, PN len 1
+                    let pn_len: usize = 1;
+                    let first_byte: u8 = 0x40 | ((pn_len - 1) as u8 & 0x03);
+                    let pn_bytes: Vec<u8> = vec![(pn & 0xff) as u8];
+
+                    let dcid_bytes = self.dcid.as_bytes();
+
+                    // AEAD encrypt
+                    let aead = write_keys.aead.as_ref().unwrap();
+                    let key = &write_keys.key;
+                    let iv = &write_keys.iv;
+                    let tag_len = aead.tag_len();
+
+                    buf.clear();
+                    buf.reserve(1200);
+                    buf.put_u8(first_byte);
+                    buf.put_slice(dcid_bytes);
+                    buf.put_slice(&pn_bytes);
+
+                    // Compute minimum ciphertext length needed for header protection sample
+                    // RFC 9001 Section 5.4.2: sample starts 4 bytes after PN start, needs 16 bytes
+                    // Derivation: required_ciphertext_len >= 20 - pn_len
+                    let required_ciphertext_len = 20usize.saturating_sub(pn_len);
+                    let mut final_plaintext = plaintext.to_vec();
+                    let current_ciphertext_len = final_plaintext.len() + tag_len;
+                    if current_ciphertext_len < required_ciphertext_len {
+                        let pad_len = required_ciphertext_len - current_ciphertext_len;
+                        eprintln!(
+                            "DEBUG: Padding HANDSHAKE_DONE plaintext: current_ct_len={}, required_ct_len={}, pad_len={}",
+                            current_ciphertext_len, required_ciphertext_len, pad_len
+                        );
+                        final_plaintext.extend(std::iter::repeat(0x00).take(pad_len));
+                    }
+
+                    let header_for_aead = &buf[..];
+                    let mut encrypted_buf = vec![0u8; final_plaintext.len() + tag_len];
+                    let encrypted_len = match aead.seal(key, iv, pn, header_for_aead, &final_plaintext, &mut encrypted_buf) {
+                        Ok(len) => len,
+                        Err(_) => return None,
+                    };
+
+                    buf.put_slice(&encrypted_buf[..encrypted_len]);
+
+                    // Header protection for short header (mask 5 bits)
+                    let hp = write_keys.hp.as_ref().unwrap();
+                    let hp_key = &write_keys.hp_key;
+                    let pn_start = 1 + dcid_bytes.len();
+                    let sample_offset = pn_start + 4;
+                    if buf.len() < sample_offset + 16 { return None; }
+                    let sample = &buf[sample_offset..sample_offset + 16];
+                    let mut mask = vec![0u8; 5];
+                    if hp.build_mask(hp_key, sample, &mut mask).is_err() { return None; }
+                    buf[0] ^= mask[0] & 0x1f; // short header mask
+                    for i in 0..pn_len {
+                        buf[pn_start + i] ^= mask[1 + i];
+                    }
+
+                    // Accounting
+                    let pn_space = crate::types::PacketNumberSpace::ApplicationData;
+                    self.loss_detector.on_packet_sent(pn_space, pn, buf.len(), true, now);
+                    self.congestion_controller.on_packet_sent(pn, pn_space, buf.len(), true, now);
+                    self.stats.packets_sent += 1;
+                    self.stats.bytes_sent += buf.len() as u64;
+
+                    self.handshake_done_sent = true;
+                    eprintln!("DEBUG: ✓✓✓ SENT HANDSHAKE_DONE packet, pn={}, packet_len={}", pn, buf.len());
+
+                    let data = buf.split();
+                    return Some(DatagramOutput { data, send_time: None });
                 }
             }
         }
@@ -2856,77 +2948,6 @@ impl Connection for QuicConnection {
                             return Some(DatagramOutput { data, send_time: None });
                         }
                     }
-                }
-            }
-        }
-
-        // If handshake just completed and we haven't sent HANDSHAKE_DONE yet, send it in 1-RTT short header
-        if self.side == Side::Server && self.handshake_complete && !self.handshake_done_sent {
-            if let Some(_) = self.one_rtt_write_keys.aead {
-                use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
-                let serializer = DefaultFrameSerializer;
-                let mut frame_buf = BytesMut::new();
-                let hd_frame = Frame::HandshakeDone;
-                if serializer.serialize_frame(&hd_frame, &mut frame_buf).is_ok() {
-                    let plaintext = frame_buf.freeze();
-                    let write_keys = &mut self.one_rtt_write_keys;
-                    let pn = write_keys.packet_number;
-                    write_keys.packet_number += 1;
-
-                    // Short header first byte: Fixed bit set (0x40), key phase 0, PN len 1
-                    let pn_len: usize = 1;
-                    let first_byte: u8 = 0x40 | ((pn_len - 1) as u8 & 0x03);
-                    let pn_bytes: Vec<u8> = vec![(pn & 0xff) as u8];
-
-                    let dcid_bytes = self.dcid.as_bytes();
-
-                    // AEAD encrypt
-                    let aead = write_keys.aead.as_ref().unwrap();
-                    let key = &write_keys.key;
-                    let iv = &write_keys.iv;
-                    let tag_len = aead.tag_len();
-
-                    buf.clear();
-                    buf.reserve(1200);
-                    buf.put_u8(first_byte);
-                    buf.put_slice(dcid_bytes);
-                    buf.put_slice(&pn_bytes);
-
-                    let header_len = buf.len();
-                    let header_for_aead = &buf[..];
-                    let mut encrypted_buf = vec![0u8; plaintext.len() + tag_len];
-                    let encrypted_len = match aead.seal(key, iv, pn, header_for_aead, &plaintext, &mut encrypted_buf) {
-                        Ok(len) => len,
-                        Err(_) => return None,
-                    };
-
-                    buf.put_slice(&encrypted_buf[..encrypted_len]);
-
-                    // Header protection for short header (mask 5 bits)
-                    let hp = write_keys.hp.as_ref().unwrap();
-                    let hp_key = &write_keys.hp_key;
-                    let pn_start = 1 + dcid_bytes.len();
-                    let sample_offset = pn_start + 4;
-                    if buf.len() < sample_offset + 16 { return None; }
-                    let sample = &buf[sample_offset..sample_offset + 16];
-                    let mut mask = vec![0u8; 5];
-                    if hp.build_mask(hp_key, sample, &mut mask).is_err() { return None; }
-                    buf[0] ^= mask[0] & 0x1f; // short header mask
-                    for i in 0..pn_len {
-                        buf[pn_start + i] ^= mask[1 + i];
-                    }
-
-                    // Accounting
-                    let pn_space = crate::types::PacketNumberSpace::ApplicationData;
-                    self.loss_detector.on_packet_sent(pn_space, pn, buf.len(), true, now);
-                    self.congestion_controller.on_packet_sent(pn, pn_space, buf.len(), true, now);
-                    self.stats.packets_sent += 1;
-                    self.stats.bytes_sent += buf.len() as u64;
-
-                    self.handshake_done_sent = true;
-
-                    let data = buf.split();
-                    return Some(DatagramOutput { data, send_time: None });
                 }
             }
         }
