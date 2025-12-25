@@ -2468,111 +2468,136 @@ fn encode_transport_params(params: &TransportParameters, buf: &mut BytesMut, is_
     }
     
     // Encode required parameters
+    // RFC 9000 Section 18.2: Integer transport parameters use variable-length integer encoding
     // initial_max_data
     let mut type_buf = [0u8; 8];
     let type_len = VarIntCodec::encode(TP_INITIAL_MAX_DATA, &mut type_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&type_buf[..type_len]);
+    // Encode value as VarInt, then encode its length
+    let mut value_buf = [0u8; 8];
+    let value_len = VarIntCodec::encode(params.initial_max_data, &mut value_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     let mut len_buf = [0u8; 8];
-    let len_len = VarIntCodec::encode(8, &mut len_buf)
+    let len_len = VarIntCodec::encode(value_len as VarInt, &mut len_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&len_buf[..len_len]);
-    buf.put_u64(params.initial_max_data);
+    buf.extend_from_slice(&value_buf[..value_len]);
     
     // initial_max_stream_data_bidi_local
     let type_len = VarIntCodec::encode(TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, &mut type_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&type_buf[..type_len]);
-    let len_len = VarIntCodec::encode(8, &mut len_buf)
+    let value_len = VarIntCodec::encode(params.initial_max_stream_data_bidi_local, &mut value_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    let len_len = VarIntCodec::encode(value_len as VarInt, &mut len_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&len_buf[..len_len]);
-    buf.put_u64(params.initial_max_stream_data_bidi_local);
+    buf.extend_from_slice(&value_buf[..value_len]);
     
     // initial_max_stream_data_bidi_remote
     let type_len = VarIntCodec::encode(TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, &mut type_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&type_buf[..type_len]);
-    let len_len = VarIntCodec::encode(8, &mut len_buf)
+    let value_len = VarIntCodec::encode(params.initial_max_stream_data_bidi_remote, &mut value_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    let len_len = VarIntCodec::encode(value_len as VarInt, &mut len_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&len_buf[..len_len]);
-    buf.put_u64(params.initial_max_stream_data_bidi_remote);
+    buf.extend_from_slice(&value_buf[..value_len]);
     
     // initial_max_stream_data_uni
     let type_len = VarIntCodec::encode(TP_INITIAL_MAX_STREAM_DATA_UNI, &mut type_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&type_buf[..type_len]);
-    let len_len = VarIntCodec::encode(8, &mut len_buf)
+    let value_len = VarIntCodec::encode(params.initial_max_stream_data_uni, &mut value_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    let len_len = VarIntCodec::encode(value_len as VarInt, &mut len_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&len_buf[..len_len]);
-    buf.put_u64(params.initial_max_stream_data_uni);
+    buf.extend_from_slice(&value_buf[..value_len]);
     
     // initial_max_streams_bidi
     let type_len = VarIntCodec::encode(TP_INITIAL_MAX_STREAMS_BIDI, &mut type_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&type_buf[..type_len]);
-    let len_len = VarIntCodec::encode(8, &mut len_buf)
+    let value_len = VarIntCodec::encode(params.initial_max_streams_bidi, &mut value_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    let len_len = VarIntCodec::encode(value_len as VarInt, &mut len_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&len_buf[..len_len]);
-    buf.put_u64(params.initial_max_streams_bidi);
+    buf.extend_from_slice(&value_buf[..value_len]);
     
     // initial_max_streams_uni
     let type_len = VarIntCodec::encode(TP_INITIAL_MAX_STREAMS_UNI, &mut type_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&type_buf[..type_len]);
-    let len_len = VarIntCodec::encode(8, &mut len_buf)
+    let value_len = VarIntCodec::encode(params.initial_max_streams_uni, &mut value_buf)
+        .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+    let len_len = VarIntCodec::encode(value_len as VarInt, &mut len_buf)
         .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
     buf.extend_from_slice(&len_buf[..len_len]);
-    buf.put_u64(params.initial_max_streams_uni);
+    buf.extend_from_slice(&value_buf[..value_len]);
     
     // Optional parameters
     if let Some(timeout) = params.max_idle_timeout {
         let type_len = VarIntCodec::encode(TP_MAX_IDLE_TIMEOUT, &mut type_buf)
             .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
         buf.extend_from_slice(&type_buf[..type_len]);
-        let len_len = VarIntCodec::encode(8, &mut len_buf)
+        let value_len = VarIntCodec::encode(timeout, &mut value_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        let len_len = VarIntCodec::encode(value_len as VarInt, &mut len_buf)
             .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
         buf.extend_from_slice(&len_buf[..len_len]);
-        buf.put_u64(timeout);
+        buf.extend_from_slice(&value_buf[..value_len]);
     }
     
     if let Some(size) = params.max_udp_payload_size {
         let type_len = VarIntCodec::encode(TP_MAX_UDP_PAYLOAD_SIZE, &mut type_buf)
             .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
         buf.extend_from_slice(&type_buf[..type_len]);
-        let len_len = VarIntCodec::encode(8, &mut len_buf)
+        let value_len = VarIntCodec::encode(size, &mut value_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        let len_len = VarIntCodec::encode(value_len as VarInt, &mut len_buf)
             .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
         buf.extend_from_slice(&len_buf[..len_len]);
-        buf.put_u64(size);
+        buf.extend_from_slice(&value_buf[..value_len]);
     }
     
     if let Some(exp) = params.ack_delay_exponent {
         let type_len = VarIntCodec::encode(TP_ACK_DELAY_EXPONENT, &mut type_buf)
             .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
         buf.extend_from_slice(&type_buf[..type_len]);
-        let len_len = VarIntCodec::encode(8, &mut len_buf)
+        let value_len = VarIntCodec::encode(exp, &mut value_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        let len_len = VarIntCodec::encode(value_len as VarInt, &mut len_buf)
             .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
         buf.extend_from_slice(&len_buf[..len_len]);
-        buf.put_u64(exp);
+        buf.extend_from_slice(&value_buf[..value_len]);
     }
     
     if let Some(delay) = params.max_ack_delay {
         let type_len = VarIntCodec::encode(TP_MAX_ACK_DELAY, &mut type_buf)
             .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
         buf.extend_from_slice(&type_buf[..type_len]);
-        let len_len = VarIntCodec::encode(8, &mut len_buf)
+        let value_len = VarIntCodec::encode(delay, &mut value_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        let len_len = VarIntCodec::encode(value_len as VarInt, &mut len_buf)
             .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
         buf.extend_from_slice(&len_buf[..len_len]);
-        buf.put_u64(delay);
+        buf.extend_from_slice(&value_buf[..value_len]);
     }
     
     if let Some(limit) = params.active_connection_id_limit {
         let type_len = VarIntCodec::encode(TP_ACTIVE_CONNECTION_ID_LIMIT, &mut type_buf)
             .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
         buf.extend_from_slice(&type_buf[..type_len]);
-        let len_len = VarIntCodec::encode(8, &mut len_buf)
+        let value_len = VarIntCodec::encode(limit, &mut value_buf)
+            .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
+        let len_len = VarIntCodec::encode(value_len as VarInt, &mut len_buf)
             .ok_or_else(|| Error::Transport(TransportError::TransportParameterError))?;
         buf.extend_from_slice(&len_buf[..len_len]);
-        buf.put_u64(limit);
+        buf.extend_from_slice(&value_buf[..value_len]);
     }
     
     Ok(())
