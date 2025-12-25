@@ -186,11 +186,14 @@ impl Packet {
     /// * `hp` - Header protection provider
     /// * `hp_key` - Header protection key
     /// * `buf` - Original packet buffer (needed for sampling)
+    /// * `dcid_len_override` - Optional DCID length override for Short headers
+    ///                         (used when the parsed DCID length might be incorrect)
     pub fn remove_header_protection(
         &mut self,
         hp: &dyn crate::crypto::HeaderProtectionProvider,
         hp_key: &[u8],
         buf: &mut [u8],
+        dcid_len_override: Option<usize>,
     ) -> Result<()> {
         // RFC 9001 Section 5.4: Header protection removal
         // 1. Determine packet number offset
@@ -240,11 +243,18 @@ impl Packet {
             offset
         } else {
             // Short header: 1 (first byte) + DCID length
-            // We need to know DCID length - assume it's in the header
-            if self.header.dcid.len() == 0 {
+            // For 1-RTT packets, the DCID is the server's SCID
+            // Use override if provided, otherwise use the parsed DCID length
+            let dcid_len = dcid_len_override.unwrap_or_else(|| {
+                if self.header.dcid.len() == 0 {
+                    return 0;
+                }
+                self.header.dcid.len()
+            });
+            if dcid_len == 0 {
                 return Err(Error::Transport(TransportError::FrameEncodingError));
             }
-            1 + self.header.dcid.len()
+            1 + dcid_len
         };
         
         // 2. Extract 16-byte sample starting 4 bytes after PN offset (RFC 9001 Section 5.4.2)

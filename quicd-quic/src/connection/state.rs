@@ -1579,7 +1579,16 @@ impl Connection for QuicConnection {
         let mut datagram_buf = datagram.data.to_vec();
         let hp = read_keys.hp.as_ref().unwrap();
         let hp_key = &read_keys.hp_key;
-        if let Err(_) = packet.remove_header_protection(hp.as_ref(), hp_key, &mut datagram_buf) {
+        
+        // For 1-RTT Short header packets, the DCID is the server's SCID
+        // Use the connection's SCID length to ensure correct packet number offset
+        let dcid_len_override = if packet.header.ty == crate::packet::types::PacketType::OneRtt {
+            Some(self.scid.len())
+        } else {
+            None
+        };
+        
+        if let Err(_) = packet.remove_header_protection(hp.as_ref(), hp_key, &mut datagram_buf, dcid_len_override) {
             return Ok(());
         }
         
@@ -1602,16 +1611,29 @@ impl Connection for QuicConnection {
         };
         
         // Reconstruct full packet number from truncated value (RFC 9000 Appendix A.3)
-        // For the first packet in a packet number space, use the truncated value directly
+        use crate::packet::number::{PacketNumberDecoder, DefaultPacketNumberDecoder};
+        let decoder = DefaultPacketNumberDecoder;
+        let pn_len = packet.header.packet_number_len.unwrap_or(1);
+        let pn_nbits = pn_len * 8; // Number of bits in truncated packet number
+        
+        // For the first packet, try the truncated value directly first (RFC 9000)
+        // If that seems unreasonable (too large), use decoder with largest_pn=0
         let packet_number = if let Some(largest) = largest_pn {
-            use crate::packet::number::{PacketNumberDecoder, DefaultPacketNumberDecoder};
-            let decoder = DefaultPacketNumberDecoder;
-            let pn_len = packet.header.packet_number_len.unwrap_or(1);
-            let pn_nbits = pn_len * 8; // Number of bits in truncated packet number
+            // We have a previous packet number - use decoder to reconstruct
             decoder.decode(largest, truncated_pn, pn_nbits)
         } else {
-            // First packet in this packet number space - use truncated value directly
-            truncated_pn as u64
+            // First packet in this packet number space
+            // RFC 9000: For the first packet, use truncated value if reasonable
+            // If truncated value is very large (> 1000), it's likely not the actual packet number
+            // and we should try decoder with largest_pn=0
+            if truncated_pn < 1000 {
+                // Small truncated value - use directly (likely correct for first packet)
+                truncated_pn as u64
+            } else {
+                // Large truncated value - try decoder with largest_pn=0
+                // This handles cases where the truncated value wraps around
+                decoder.decode(0, truncated_pn, pn_nbits)
+            }
         };
         
         // Track largest received packet number for ACK generation
@@ -1690,8 +1712,10 @@ impl Connection for QuicConnection {
             (offset, Some(length_field as usize))
         } else {
             // Short header: 1 (flags) + dcid + variable PN
-            // The DCID in a packet from the peer is our SCID
-            (1 + packet.header.dcid.len(), None)
+            // For 1-RTT packets, the DCID in the packet is the server's SCID
+            // Use the connection's SCID length to ensure correct packet number offset
+            let dcid_len = self.scid.len();
+            (1 + dcid_len, None)
         };
         
         // Use the actual PN length that was determined during header protection removal
@@ -1743,17 +1767,109 @@ impl Connection for QuicConnection {
         let mut decrypted = vec![0u8; encrypted_payload.len()];
         eprintln!("DEBUG: Attempting decryption: key_len={}, iv_len={}, pn={}, header_len={}, payload_len={}", 
                  key.len(), iv.len(), packet_number, header.len(), encrypted_payload.len());
-        let decrypted_len = match aead.open(key, iv, packet_number, header, encrypted_payload, &mut decrypted) {
+        
+        // Try decryption with the reconstructed packet number
+        let (decrypted_len, final_packet_number) = match aead.open(key, iv, packet_number, header, encrypted_payload, &mut decrypted) {
             Ok(len) => {
                 eprintln!("DEBUG: Decryption successful: decrypted_len={}", len);
-                len
+                (len, packet_number)
             }
             Err(e) => {
-                eprintln!("DEBUG: Decryption failed: {:?}", e);
-                // Decryption failed - drop packet
-                return Ok(());
+                // If this is the first packet in the space and decryption failed,
+                // try candidate packet numbers. For 1-RTT, first packets are typically small (0-20)
+                if largest_pn.is_none() {
+                    eprintln!("DEBUG: Decryption failed with pn={}, trying candidate packet numbers", packet_number);
+                    let pn_win = 1u64 << pn_nbits; // 2^pn_nbits for the packet number length
+                    
+                    // Build candidate list: try small numbers first (likely for first packet),
+                    // then try wraparound candidates
+                    let mut candidates = Vec::new();
+                    
+                    // For first packet, try small numbers (0-20) - these are most likely
+                    for small_pn in 0..=20 {
+                        candidates.push(small_pn);
+                    }
+                    
+                    // Also try wraparound candidates around the truncated value
+                    candidates.push(truncated_pn as u64);
+                    if truncated_pn as u64 + pn_win < (1u64 << 62) {
+                        candidates.push(truncated_pn as u64 + pn_win);
+                    }
+                    if truncated_pn as u64 >= pn_win {
+                        candidates.push((truncated_pn as u64).wrapping_sub(pn_win));
+                    }
+                    
+                    // Remove duplicates and the already-tried packet_number
+                    candidates.sort();
+                    candidates.dedup();
+                    candidates.retain(|&x| x != packet_number);
+                    
+                    let mut found = None;
+                    for candidate_pn in candidates.iter() {
+                        eprintln!("DEBUG: Trying candidate pn={}", candidate_pn);
+                        match aead.open(key, iv, *candidate_pn, header, encrypted_payload, &mut decrypted) {
+                            Ok(len) => {
+                                eprintln!("DEBUG: Decryption successful with candidate pn={}: decrypted_len={}", candidate_pn, len);
+                                found = Some((len, *candidate_pn));
+                                break;
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                    
+                    match found {
+                        Some((len, correct_pn)) => (len, correct_pn),
+                        None => {
+                            eprintln!("DEBUG: Decryption failed with all {} candidates: {:?}", candidates.len(), e);
+                            // Decryption failed - drop packet
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    eprintln!("DEBUG: Decryption failed: {:?}", e);
+                    // Decryption failed - drop packet
+                    return Ok(());
+                }
             }
         };
+        
+        // Use the final (possibly corrected) packet number
+        // If we corrected it during decryption, update the tracking
+        let original_packet_number = packet_number;
+        let packet_number = final_packet_number;
+        
+        // Update largest received packet number if we corrected it during decryption
+        if final_packet_number != original_packet_number {
+            match pn_space {
+                crate::types::PacketNumberSpace::Initial => {
+                    if let Some(current) = self.largest_received_pn_initial {
+                        if final_packet_number > current {
+                            self.largest_received_pn_initial = Some(final_packet_number);
+                        }
+                    } else {
+                        self.largest_received_pn_initial = Some(final_packet_number);
+                    }
+                }
+                crate::types::PacketNumberSpace::Handshake => {
+                    if let Some(current) = self.largest_received_pn_handshake {
+                        if final_packet_number > current {
+                            self.largest_received_pn_handshake = Some(final_packet_number);
+                        }
+                    } else {
+                        self.largest_received_pn_handshake = Some(final_packet_number);
+                    }
+                }
+                crate::types::PacketNumberSpace::ApplicationData => {
+                    if let Some(current) = self.largest_received_pn_appdata {
+                        if final_packet_number > current {
+                            self.largest_received_pn_appdata = Some(final_packet_number);
+                        }
+                    } else {
+                        self.largest_received_pn_appdata = Some(final_packet_number);
+                    }
+                }
+            }
+        }
         
         // Parse frames from decrypted payload
         use crate::frames::FrameParser;
@@ -1771,9 +1887,14 @@ impl Connection for QuicConnection {
                              std::mem::discriminant(&frame), consumed, offset);
                     // Special handling for CRYPTO frames - reassemble and feed to TLS
                     if let Frame::Crypto(crypto_frame) = &frame {
-                        // RFC 9000 Section 19.6: CRYPTO frames must be reassembled in order by offset
-                        // Get or create buffer for this encryption level
-                        let buffer_entry = self.crypto_buffers.entry(encryption_level).or_insert_with(|| (alloc::vec::Vec::new(), 0));
+                        // RFC 9000: CRYPTO frames are only used during handshake (Initial and Handshake levels)
+                        // After handshake completes, CRYPTO frames in 1-RTT packets should be ignored
+                        if encryption_level == CryptoLevel::OneRTT && self.handshake_complete {
+                            eprintln!("DEBUG: Ignoring CRYPTO frame in 1-RTT packet after handshake complete");
+                        } else {
+                            // RFC 9000 Section 19.6: CRYPTO frames must be reassembled in order by offset
+                            // Get or create buffer for this encryption level
+                            let buffer_entry = self.crypto_buffers.entry(encryption_level).or_insert_with(|| (alloc::vec::Vec::new(), 0));
                         let (buffer, next_offset) = buffer_entry;
                         
                         let frame_offset = crypto_frame.offset;
@@ -1896,8 +2017,9 @@ impl Connection for QuicConnection {
                                     eprintln!("DEBUG: Processed {} TLS events", event_count);
                                 }
                             }
-                        } else {
-                            eprintln!("DEBUG: No TLS session available!");
+                            } else {
+                                eprintln!("DEBUG: No TLS session available!");
+                            }
                         }
                     } else {
                         eprintln!("DEBUG: Non-CRYPTO frame: {:?}", std::mem::discriminant(&frame));
