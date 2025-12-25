@@ -1626,7 +1626,9 @@ impl Connection for QuicConnection {
 
         // Parse packet header to determine type and encryption level
         use crate::packet::api::{Packet, ParseContext};
-        let parse_ctx = ParseContext::with_dcid_len(self.dcid.len());
+        // For short headers, peers use our SCID as their DCID. Ensure the parser
+        // expects that length so PN offset and payload slicing are correct.
+        let parse_ctx = ParseContext::with_dcid_len(self.scid.len());
         let mut packet = match Packet::parse_with_context(datagram.data.clone(), parse_ctx) {
             Ok(p) => p,
             Err(_) => {
@@ -1635,14 +1637,18 @@ impl Connection for QuicConnection {
             }
         };
         
-        // RFC 9000 Section 7.2: The DCID for outgoing packets should be the peer's SCID
-        // When we receive the first packet from the peer, update our DCID to match their SCID
-        // This ensures we use the correct connection ID in all packets we send back
-        if let Some(ref scid) = packet.header.scid {
-            if self.dcid.as_bytes() != scid.as_bytes() {
-                eprintln!("DEBUG: Updating self.dcid from {:02x?} to peer's SCID {:02x?}", 
-                         self.dcid.as_bytes(), scid.as_bytes());
-                self.dcid = scid.clone();
+        // RFC 9000 §7.2: For server→client packets, the DCID MUST be the client's SCID from
+        // the client's Initial. Update exactly once when we see the peer's SCID (only on server).
+        if self.side == Side::Server {
+            if let Some(ref scid) = packet.header.scid {
+                if self.dcid.as_bytes() != scid.as_bytes() {
+                    eprintln!(
+                        "DEBUG: RFC9000 DCID swap: updating outbound DCID from {:02x?} to client's SCID {:02x?}",
+                        self.dcid.as_bytes(),
+                        scid.as_bytes()
+                    );
+                    self.dcid = scid.clone();
+                }
             }
         }
         
