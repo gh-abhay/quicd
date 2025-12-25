@@ -117,7 +117,30 @@ pub fn build_registry(app_configs: &HashMap<String, ApplicationConfig>) -> Resul
                         let h3_cfg = h3_config.clone();
                         Arc::new(move || {
                             // Convert our config to quicd-h3 config
-                            let h3_lib_config = quicd_h3::H3Config::default(); // TODO: Map from our config
+                            let h3_lib_config = quicd_h3::H3Config {
+                                qpack: quicd_h3::QpackConfig {
+                                    max_table_capacity: h3_cfg.qpack.max_table_capacity as u64,
+                                    blocked_streams: h3_cfg.qpack.blocked_streams as u64,
+                                },
+                                push: quicd_h3::PushConfig {
+                                    enabled: h3_cfg.push.enabled,
+                                    max_concurrent: h3_cfg.push.max_concurrent as u64,
+                                    max_push_id: 1000, // Default from quicd-h3
+                                },
+                                handler: quicd_h3::HandlerConfig {
+                                    file_serving_enabled: h3_cfg.handler.file_serving_enabled,
+                                    file_root: h3_cfg.handler.file_root.clone().into(),
+                                    directory_listing: h3_cfg.handler.directory_listing,
+                                    compression_enabled: h3_cfg.handler.compression_enabled,
+                                    compression_algorithms: h3_cfg.handler.compression_algorithms.clone(),
+                                    index_files: h3_cfg.handler.index_files.clone(),
+                                },
+                                limits: quicd_h3::LimitsConfig {
+                                    max_field_section_size: h3_cfg.limits.max_field_section_size as u64,
+                                    max_concurrent_streams: h3_cfg.limits.max_concurrent_streams as u64,
+                                    idle_timeout_secs: h3_cfg.limits.idle_timeout_secs,
+                                },
+                            };
                             Arc::new(quicd_h3::H3Application::new(h3_lib_config))
                         })
                     };
