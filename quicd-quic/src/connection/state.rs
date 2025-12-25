@@ -1635,6 +1635,17 @@ impl Connection for QuicConnection {
             }
         };
         
+        // RFC 9000 Section 7.2: The DCID for outgoing packets should be the peer's SCID
+        // When we receive the first packet from the peer, update our DCID to match their SCID
+        // This ensures we use the correct connection ID in all packets we send back
+        if let Some(ref scid) = packet.header.scid {
+            if self.dcid.as_bytes() != scid.as_bytes() {
+                eprintln!("DEBUG: Updating self.dcid from {:02x?} to peer's SCID {:02x?}", 
+                         self.dcid.as_bytes(), scid.as_bytes());
+                self.dcid = scid.clone();
+            }
+        }
+        
         // Determine encryption level from packet type
         let (encryption_level, read_keys, pn_space) = match packet.header.ty {
             crate::packet::types::PacketType::Initial => {
@@ -2430,6 +2441,180 @@ impl Connection for QuicConnection {
                     let data = buf.split();
                     return Some(DatagramOutput { data, send_time: None });
                 }
+            }
+        }
+        
+        // RFC 9001 Section 4.1.2: After HANDSHAKE_DONE is sent, all data MUST use 1-RTT encryption
+        // Priority: If handshake is complete, prioritize 1-RTT crypto, otherwise prioritize Initial/Handshake
+        
+        // Handle 1-RTT CRYPTO frames with Short Header (after HANDSHAKE_DONE sent)
+        // NOTE: OneRTT crypto can arrive BEFORE handshake_complete=true (TLS generates NewSessionTicket)
+        if self.handshake_done_sent && self.one_rtt_write_keys.aead.is_some() {
+            if let Some(one_rtt_idx) = self.pending_crypto.iter().position(|(level, _)| *level == CryptoLevel::OneRTT) {
+                let (level, crypto_data) = self.pending_crypto.remove(one_rtt_idx);
+                eprintln!("DEBUG: Sending 1-RTT CRYPTO frame: data_len={}", crypto_data.len());
+                
+                // Get 1-RTT write keys
+                let write_keys = &mut self.one_rtt_write_keys;
+                if write_keys.aead.is_none() {
+                    eprintln!("DEBUG: 1-RTT keys not available yet!");
+                    self.pending_crypto.push((level, crypto_data));
+                    return None;
+                }
+                
+                // Get current send offset for OneRTT crypto
+                let offset = *self.crypto_send_offsets.entry(CryptoLevel::OneRTT).or_insert(0);
+                
+                // Check if we've already sent all of this crypto data
+                if offset >= crypto_data.len() as VarInt {
+                    // All data sent for this item
+                    self.crypto_send_offsets.remove(&CryptoLevel::OneRTT);
+                    return self.poll_send(buf, now);
+                }
+                
+                let remaining_data = &crypto_data[offset as usize..];
+                const MAX_PLAINTEXT_PAYLOAD: usize = 1000;
+                let data_to_send = if remaining_data.len() > MAX_PLAINTEXT_PAYLOAD {
+                    &remaining_data[..MAX_PLAINTEXT_PAYLOAD]
+                } else {
+                    remaining_data
+                };
+                
+                // Build 1-RTT Short Header packet
+                // RFC 9000 Section 17.3: Short Header Packet Format
+                // Header form (1 bit, set to 0) + Fixed bit (1 bit, set to 1) + Spin bit + Reserved (2 bits) + Key phase + PN len (2 bits) + DCID + PN + Encrypted payload
+                
+                use crate::frames::Frame;
+                use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
+                let serializer = DefaultFrameSerializer;
+                let mut frame_buf = BytesMut::new();
+                
+                // Build CRYPTO frame
+                let crypto_frame = Frame::Crypto(crate::frames::CryptoFrame {
+                    offset: offset,
+                    data: data_to_send,
+                });
+                
+                if serializer.serialize_frame(&crypto_frame, &mut frame_buf).is_err() {
+                    self.pending_crypto.push((level, crypto_data));
+                    return None;
+                }
+                
+                // Increment packet number for 1-RTT
+                let pn = write_keys.packet_number;
+                write_keys.packet_number += 1;
+                
+                // Use 1-byte packet number encoding for simplicity
+                let pn_len = 1;
+                let pn_bytes = vec![(pn & 0xff) as u8];
+                
+                // Prepare buffer for packet
+                buf.clear();
+                buf.reserve(1200);
+                
+                // Short header first byte
+                // Bit 7: Header form (0 = short header)
+                // Bit 6: Fixed bit (1, always set)
+                // Bit 5: Spin bit (0)
+                // Bits 4-3: Reserved (00)
+                // Bit 2: Key phase (0 for 1-RTT)
+                // Bits 1-0: Packet number length (00 = 1 byte)
+                let first_byte: u8 = 0x40; // 01000000 binary - short header, fixed bit set, everything else 0
+                buf.put_u8(first_byte);
+                
+                // Add connection ID
+                let dcid_bytes = self.dcid.as_bytes();
+                eprintln!("DEBUG: 1-RTT PACKET: dcid_len={}, dcid={:02x?}", dcid_bytes.len(), dcid_bytes);
+                buf.put_slice(dcid_bytes);
+                
+                // Now we need to encrypt the payload
+                let plaintext = frame_buf.freeze();
+                let aead = write_keys.aead.as_ref().unwrap();
+                let key = &write_keys.key;
+                let iv = &write_keys.iv;
+                let tag_len = aead.tag_len();
+                
+                // Add packet number to buffer
+                let header_len = buf.len();
+                buf.put_slice(&pn_bytes);
+                let header_for_aead = &buf[..];
+                
+                // Encrypt payload
+                let mut ciphertext = vec![0u8; plaintext.len() + tag_len];
+                let encrypted_len = match aead.seal(key, iv, pn, header_for_aead, &plaintext, &mut ciphertext) {
+                    Ok(len) => len,
+                    Err(_) => {
+                        eprintln!("DEBUG: AEAD seal failed for 1-RTT CRYPTO");
+                        self.pending_crypto.push((level, crypto_data));
+                        return None;
+                    }
+                };
+                
+                // Truncate ciphertext to actual encrypted length
+                ciphertext.truncate(encrypted_len);
+                
+                // Add encrypted payload to buffer
+                buf.put_slice(&ciphertext);
+                
+                // Apply header protection
+                // RFC 9001 Section 5.4: Header protection
+                // Sample is located at: (packet number start + 4) ... (packet number start + 20)
+                let pn_start = 1 + dcid_bytes.len(); // first_byte + DCID
+                let sample_offset = pn_start + 4;
+                
+                eprintln!("DEBUG: 1-RTT HP: buffer_len={}, pn_start={}, sample_offset={}, pn_len={}", 
+                         buf.len(), pn_start, sample_offset, pn_len);
+                eprintln!("DEBUG: 1-RTT HP: first_byte=0x{:02x}, pn_bytes={:02x}", buf[0], buf[pn_start]);
+                
+                if buf.len() < sample_offset + 16 {
+                    eprintln!("DEBUG: Buffer too small for header protection sample: need {} bytes", sample_offset + 16);
+                    self.pending_crypto.push((level, crypto_data));
+                    return None;
+                }
+                
+                let sample = &buf[sample_offset..sample_offset + 16];
+                eprintln!("DEBUG: 1-RTT HP: sample_bytes={:02x?}", &sample[0..std::cmp::min(8, sample.len())]);
+                
+                let mut mask = vec![0u8; 5];
+                let hp = write_keys.hp.as_ref().unwrap();
+                let hp_key = &write_keys.hp_key;
+                eprintln!("DEBUG: 1-RTT HP: hp_key={:02x?}", &hp_key[0..std::cmp::min(16, hp_key.len())]);
+                if hp.build_mask(hp_key, sample, &mut mask).is_err() {
+                    eprintln!("DEBUG: 1-RTT HP: mask generation failed");
+                    self.pending_crypto.push((level, crypto_data));
+                    return None;
+                }
+                
+                eprintln!("DEBUG: 1-RTT HP: mask={:02x?}", mask);
+                
+                // Apply mask to first byte (mask 5 bits for short header)
+                let mask_first_byte = mask[0] & 0x1f;
+                buf[0] ^= mask_first_byte; // Short header masks bits 0-4 (5 bits)
+                eprintln!("DEBUG: 1-RTT HP: first_byte after HP: 0x{:02x}", buf[0]);
+                
+                // Apply mask to packet number
+                for i in 0..pn_len {
+                    buf[pn_start + i] ^= mask[1 + i];
+                }
+                eprintln!("DEBUG: 1-RTT HP: pn_bytes after HP: {:02x?}", &buf[pn_start..pn_start+pn_len]);
+                
+                // Update state
+                let new_offset = offset + (data_to_send.len() as VarInt);
+                self.crypto_send_offsets.insert(CryptoLevel::OneRTT, new_offset);
+                
+                // Record for loss detection
+                let pn_space = crate::types::PacketNumberSpace::ApplicationData;
+                self.loss_detector.on_packet_sent(pn_space, pn, buf.len(), true, now);
+                self.congestion_controller.on_packet_sent(pn, pn_space, buf.len(), true, now);
+                self.stats.packets_sent += 1;
+                self.stats.bytes_sent += buf.len() as u64;
+                
+                // Log the final packet bytes for debugging
+                eprintln!("DEBUG: ✓ SENT 1-RTT CRYPTO packet, pn={}, packet_len={}, bytes={:02x?}", 
+                         pn, buf.len(), &buf[0..std::cmp::min(50, buf.len())]);
+                
+                let data = buf.split();
+                return Some(DatagramOutput { data, send_time: None });
             }
         }
         
