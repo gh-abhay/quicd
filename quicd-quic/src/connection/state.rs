@@ -412,6 +412,8 @@ pub struct QuicConnection {
     largest_received_pn_initial: Option<PacketNumber>,
     largest_received_pn_handshake: Option<PacketNumber>,
     largest_received_pn_appdata: Option<PacketNumber>,
+    /// Largest Handshake packet number we've ACKed
+    largest_acked_pn_handshake: Option<PacketNumber>,
     
     /// Track which streams have been opened (to emit StreamOpened event only once)
     opened_streams: alloc::collections::BTreeSet<StreamId>,
@@ -516,6 +518,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
                         };
             }
@@ -561,6 +564,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
                         };
             }
@@ -604,6 +608,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
                         };
             }
@@ -649,6 +654,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
                         };
             }
@@ -692,6 +698,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
                         };
             }
@@ -736,6 +743,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
@@ -776,6 +784,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
@@ -821,6 +830,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
@@ -861,6 +871,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
@@ -900,6 +911,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
@@ -940,6 +952,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
@@ -979,6 +992,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
@@ -1018,6 +1032,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
@@ -1061,6 +1076,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
                 },
             };
@@ -1100,6 +1116,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
                 },
             };
@@ -1144,6 +1161,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
                 },
             };
@@ -1183,6 +1201,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
                 },
             };
@@ -1248,6 +1267,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
                         };
                     }
@@ -1288,6 +1308,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
                         };
                     }
@@ -1340,6 +1361,7 @@ impl QuicConnection {
             largest_received_pn_initial: None,
             largest_received_pn_handshake: None,
             largest_received_pn_appdata: None,
+            largest_acked_pn_handshake: None,
             opened_streams: alloc::collections::BTreeSet::new(),
         }
     }
@@ -2245,6 +2267,25 @@ impl Connection for QuicConnection {
                     }
                 }
             }
+
+            // Add ACK frame for Handshake packets if we've received any and haven't ACKed yet
+            if level == CryptoLevel::Handshake && self.side == Side::Server {
+                if let Some(largest_acked) = self.largest_received_pn_handshake {
+                    let already_acked = self.largest_acked_pn_handshake.unwrap_or(0);
+                    if largest_acked > already_acked {
+                        let ack_frame = Frame::Ack(crate::frames::AckFrame {
+                            largest_acked,
+                            ack_delay: 0,
+                            ack_range_count: 0,
+                            first_ack_range: 0,
+                            ack_ranges: &[],
+                        });
+                        if serializer.serialize_frame(&ack_frame, &mut frame_buf).is_ok() {
+                            self.largest_acked_pn_handshake = Some(largest_acked);
+                        }
+                    }
+                }
+            }
             
             // Build CRYPTO frame with proper offset
             let crypto_frame = Frame::Crypto(crate::frames::CryptoFrame {
@@ -2482,7 +2523,159 @@ impl Connection for QuicConnection {
                 send_time: None,
             });
         }
-        
+
+        // If no crypto data to send, consider sending an ACK-only Handshake packet
+        if self.side == Side::Server {
+            if let Some(largest_acked) = self.largest_received_pn_handshake {
+                let already_acked = self.largest_acked_pn_handshake.unwrap_or(0);
+                if largest_acked > already_acked {
+                    if self.handshake_write_keys.aead.is_some() {
+                        // Build ACK frame
+                        use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
+                        let serializer = DefaultFrameSerializer;
+                        let mut frame_buf = BytesMut::new();
+                        let ack_frame = Frame::Ack(crate::frames::AckFrame {
+                            largest_acked,
+                            ack_delay: 0,
+                            ack_range_count: 0,
+                            first_ack_range: 0,
+                            ack_ranges: &[],
+                        });
+
+                        if serializer.serialize_frame(&ack_frame, &mut frame_buf).is_ok() {
+                            let plaintext = frame_buf.freeze();
+                            let write_keys = &mut self.handshake_write_keys;
+                            let pn = write_keys.packet_number;
+                            write_keys.packet_number += 1;
+
+                            // Handshake packets use long header type 0xe0
+                            let pn_len: usize = 1;
+                            let pn_bytes: Vec<u8> = vec![(pn & 0xff) as u8];
+
+                            let dcid_bytes = self.dcid.as_bytes();
+                            let scid_bytes = self.scid.as_bytes();
+
+                            // Encrypt payload
+                            let aead = write_keys.aead.as_ref().unwrap();
+                            let key = &write_keys.key;
+                            let iv = &write_keys.iv;
+                            let tag_len = aead.tag_len();
+
+                            buf.clear();
+                            buf.reserve(1200);
+
+                            let packet_type_byte = 0xe0;
+                            let first_byte = packet_type_byte | ((pn_len - 1) as u8);
+                            buf.put_u8(first_byte);
+                            buf.put_u32(VERSION_1);
+
+                            buf.put_u8(dcid_bytes.len() as u8);
+                            buf.put_slice(dcid_bytes);
+
+                            buf.put_u8(scid_bytes.len() as u8);
+                            buf.put_slice(scid_bytes);
+
+                            // Length placeholder
+                            let length_field_start = buf.len();
+                            let estimated_encrypted_len = plaintext.len() + tag_len;
+                            let estimated_payload_len = pn_len + estimated_encrypted_len;
+                            if estimated_payload_len < 64 {
+                                buf.put_u8(estimated_payload_len as u8);
+                            } else if estimated_payload_len < 16384 {
+                                buf.put_u8(0x40 | ((estimated_payload_len >> 8) as u8));
+                                buf.put_u8((estimated_payload_len & 0xff) as u8);
+                            } else {
+                                buf.put_u8(0x80 | ((estimated_payload_len >> 24) as u8));
+                                buf.put_u8((estimated_payload_len >> 16) as u8);
+                                buf.put_u8((estimated_payload_len >> 8) as u8);
+                                buf.put_u8((estimated_payload_len & 0xff) as u8);
+                            }
+
+                            // Packet number
+                            buf.put_slice(&pn_bytes);
+
+                            // Encrypt
+                            let header_len = buf.len();
+                            let header_for_aead = &buf[..];
+                            let mut encrypted_buf = vec![0u8; plaintext.len() + tag_len];
+                            let encrypted_len = match aead.seal(key, iv, pn, header_for_aead, &plaintext, &mut encrypted_buf) {
+                                Ok(len) => len,
+                                Err(_) => return None,
+                            };
+
+                            let actual_payload_len = pn_len + encrypted_len;
+                            buf.truncate(length_field_start);
+                            if actual_payload_len < 64 {
+                                buf.put_u8(actual_payload_len as u8);
+                            } else if actual_payload_len < 16384 {
+                                buf.put_u8(0x40 | ((actual_payload_len >> 8) as u8 & 0x3f));
+                                buf.put_u8((actual_payload_len & 0xff) as u8);
+                            } else if actual_payload_len < 1073741824 {
+                                buf.put_u8(0x80 | ((actual_payload_len >> 24) as u8 & 0x3f));
+                                buf.put_u8((actual_payload_len >> 16) as u8);
+                                buf.put_u8((actual_payload_len >> 8) as u8);
+                                buf.put_u8((actual_payload_len & 0xff) as u8);
+                            } else {
+                                buf.put_u8(0xc0 | ((actual_payload_len >> 56) as u8 & 0x3f));
+                                buf.put_u8((actual_payload_len >> 48) as u8);
+                                buf.put_u8((actual_payload_len >> 40) as u8);
+                                buf.put_u8((actual_payload_len >> 32) as u8);
+                                buf.put_u8((actual_payload_len >> 24) as u8);
+                                buf.put_u8((actual_payload_len >> 16) as u8);
+                                buf.put_u8((actual_payload_len >> 8) as u8);
+                                buf.put_u8((actual_payload_len & 0xff) as u8);
+                            }
+
+                            buf.put_slice(&pn_bytes);
+                            buf.put_slice(&encrypted_buf[..encrypted_len]);
+
+                            let hp = write_keys.hp.as_ref().unwrap();
+                            let hp_key = &write_keys.hp_key;
+
+                            let pn_start = header_len - pn_len;
+                            let sample_offset = pn_start + 4;
+                            if buf.len() < sample_offset + 16 {
+                                return None;
+                            }
+                            let sample = &buf[sample_offset..sample_offset + 16];
+                            let mut mask = vec![0u8; 5];
+                            if hp.build_mask(hp_key, sample, &mut mask).is_err() {
+                                return None;
+                            }
+
+                            buf[0] ^= mask[0] & 0x0f;
+                            for i in 0..pn_len {
+                                buf[pn_start + i] ^= mask[1 + i];
+                            }
+
+                            let pn_space = crate::types::PacketNumberSpace::Handshake;
+                            self.loss_detector.on_packet_sent(
+                                pn_space,
+                                pn,
+                                buf.len(),
+                                false, // ACK-only packet is not retransmittable
+                                now,
+                            );
+                            self.congestion_controller.on_packet_sent(
+                                pn,
+                                pn_space,
+                                buf.len(),
+                                false, // ACK-only packet is not ack-eliciting
+                                now,
+                            );
+                            self.stats.packets_sent += 1;
+                            self.stats.bytes_sent += buf.len() as u64;
+
+                            self.largest_acked_pn_handshake = Some(largest_acked);
+
+                            let data = buf.split();
+                            return Some(DatagramOutput { data, send_time: None });
+                        }
+                    }
+                }
+            }
+        }
+
         None
     }
 
