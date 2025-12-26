@@ -284,12 +284,18 @@ impl HeaderProtectionProvider for BoringHeaderProtection {
 // So we call: HKDF_extract(..., IKM, salt)
 fn hkdf_extract(ikm: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
     unsafe {
+        hkdf_extract_with_hash(ikm, salt, ffi::EVP_sha256())
+    }
+}
+
+fn hkdf_extract_with_hash(ikm: &[u8], salt: &[u8], md: *const ffi::EVP_MD) -> Result<Vec<u8>> {
+    unsafe {
         let mut out_len: usize = 0;
         let mut out = vec![0u8; ffi::EVP_MAX_MD_SIZE as usize];
         if ffi::HKDF_extract(
             out.as_mut_ptr(),
             &mut out_len,
-            ffi::EVP_sha256(),
+            md,
             ikm.as_ptr(),      // IKM (Input Keying Material)
             ikm.len(),
             salt.as_ptr(),     // Salt
@@ -304,11 +310,17 @@ fn hkdf_extract(ikm: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
 
 fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>> {
     unsafe {
+        hkdf_expand_with_hash(prk, info, len, ffi::EVP_sha256())
+    }
+}
+
+fn hkdf_expand_with_hash(prk: &[u8], info: &[u8], len: usize, md: *const ffi::EVP_MD) -> Result<Vec<u8>> {
+    unsafe {
         let mut out = vec![0u8; len];
         if ffi::HKDF_expand(
             out.as_mut_ptr(),
             len,
-            ffi::EVP_sha256(),
+            md,
             prk.as_ptr(),
             prk.len(),
             info.as_ptr(),
@@ -321,6 +333,12 @@ fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>> {
 }
 
 fn hkdf_expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> Result<Vec<u8>> {
+    unsafe {
+        hkdf_expand_label_with_hash(secret, label, context, len, ffi::EVP_sha256())
+    }
+}
+
+fn hkdf_expand_label_with_hash(secret: &[u8], label: &str, context: &[u8], len: usize, md: *const ffi::EVP_MD) -> Result<Vec<u8>> {
     // RFC 8446 Section 7.1: HKDF-Expand-Label structure
     // Info = OutputLength (2 bytes) || LabelLength (1 byte) || Label (variable) || ContextLength (1 byte) || Context (variable)
     // Label = "tls13 " || label
@@ -340,7 +358,7 @@ fn hkdf_expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> 
     // Context
     info.extend_from_slice(context);
     
-    hkdf_expand(secret, &info, len)
+    hkdf_expand_with_hash(secret, &info, len, md)
 }
 
 struct BoringKeySchedule;
@@ -376,15 +394,36 @@ impl KeySchedule for BoringKeySchedule {
         Ok(out)
     }
 
-    fn derive_packet_key(&self, secret: &[u8], len: usize) -> Result<Vec<u8>> {
-        hkdf_expand_label(secret, "quic key", &[], len)
+    fn derive_packet_key(&self, secret: &[u8], len: usize, cipher_suite: u16) -> Result<Vec<u8>> {
+        // RFC 9001 Section 5.1: Hash function matches cipher suite
+        // 0x1301 (AES_128_GCM_SHA256) and 0x1303 (CHACHA20_POLY1305_SHA256) use SHA-256
+        // 0x1302 (AES_256_GCM_SHA384) uses SHA-384
+        let md = unsafe {
+            match cipher_suite {
+                0x1302 => ffi::EVP_sha384(),
+                _ => ffi::EVP_sha256(),
+            }
+        };
+        hkdf_expand_label_with_hash(secret, "quic key", &[], len, md)
     }
 
-    fn derive_packet_iv(&self, secret: &[u8], len: usize) -> Result<Vec<u8>> {
-        hkdf_expand_label(secret, "quic iv", &[], len)
+    fn derive_packet_iv(&self, secret: &[u8], len: usize, cipher_suite: u16) -> Result<Vec<u8>> {
+        let md = unsafe {
+            match cipher_suite {
+                0x1302 => ffi::EVP_sha384(),
+                _ => ffi::EVP_sha256(),
+            }
+        };
+        hkdf_expand_label_with_hash(secret, "quic iv", &[], len, md)
     }
 
-    fn derive_header_protection_key(&self, secret: &[u8], len: usize) -> Result<Vec<u8>> {
-        hkdf_expand_label(secret, "quic hp", &[], len)
+    fn derive_header_protection_key(&self, secret: &[u8], len: usize, cipher_suite: u16) -> Result<Vec<u8>> {
+        let md = unsafe {
+            match cipher_suite {
+                0x1302 => ffi::EVP_sha384(),
+                _ => ffi::EVP_sha256(),
+            }
+        };
+        hkdf_expand_label_with_hash(secret, "quic hp", &[], len, md)
     }
 }

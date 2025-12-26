@@ -58,20 +58,22 @@ pub trait HeaderProtectionProvider: Send + Sync {
 
 pub trait KeySchedule: Send + Sync {
     // HKDF operations
+    // Initial secrets always use SHA-256 regardless of negotiated cipher
     fn derive_initial_secret(&self, dcid: &ConnectionId, version: u32) -> Result<[u8; 32]>;
     fn derive_client_initial_secret(&self, initial_secret: &[u8]) -> Result<[u8; 32]>;
     fn derive_server_initial_secret(&self, initial_secret: &[u8]) -> Result<[u8; 32]>;
-    fn derive_packet_key(&self, secret: &[u8], len: usize) -> Result<Vec<u8>>;
-    fn derive_packet_iv(&self, secret: &[u8], len: usize) -> Result<Vec<u8>>;
-    fn derive_header_protection_key(&self, secret: &[u8], len: usize) -> Result<Vec<u8>>;
+    // Handshake and OneRTT keys use hash function matching cipher suite
+    fn derive_packet_key(&self, secret: &[u8], len: usize, cipher_suite: u16) -> Result<Vec<u8>>;
+    fn derive_packet_iv(&self, secret: &[u8], len: usize, cipher_suite: u16) -> Result<Vec<u8>>;
+    fn derive_header_protection_key(&self, secret: &[u8], len: usize, cipher_suite: u16) -> Result<Vec<u8>>;
 }
 
 pub enum TlsEvent {
     WriteData(CryptoLevel, Vec<u8>),
     ReadData(CryptoLevel, Vec<u8>),
     HandshakeComplete,
-    ReadSecret(CryptoLevel, Vec<u8>),
-    WriteSecret(CryptoLevel, Vec<u8>),
+    ReadSecret(CryptoLevel, Vec<u8>, u16), // Added cipher_suite as third parameter
+    WriteSecret(CryptoLevel, Vec<u8>, u16), // Added cipher_suite as third parameter
     Done,
 }
 

@@ -319,7 +319,7 @@ static QUIC_METHOD: ffi::SSL_QUIC_METHOD = ffi::SSL_QUIC_METHOD {
 unsafe extern "C" fn set_read_secret(
     ssl: *mut ffi::SSL,
     level: ffi::ssl_encryption_level_t,
-    _cipher: *const ffi::SSL_CIPHER,
+    cipher: *const ffi::SSL_CIPHER,
     secret: *const u8,
     secret_len: usize,
 ) -> i32 {
@@ -340,14 +340,24 @@ unsafe extern "C" fn set_read_secret(
         _ => return 0,
     };
 
-    ex_data.events.push_back(TlsEvent::ReadSecret(crypto_level, vec));
+    // Extract cipher suite ID from SSL_CIPHER
+    // SSL_CIPHER_get_id returns the full cipher ID (0x03000000 | suite_id)
+    // We need to mask to get just the suite ID (lower 16 bits)
+    let cipher_suite = if !cipher.is_null() {
+        let full_id = ffi::SSL_CIPHER_get_id(cipher);
+        (full_id & 0xFFFF) as u16
+    } else {
+        0x1301 // Default to TLS_AES_128_GCM_SHA256 if cipher is null
+    };
+
+    ex_data.events.push_back(TlsEvent::ReadSecret(crypto_level, vec, cipher_suite));
     1
 }
 
 unsafe extern "C" fn set_write_secret(
     ssl: *mut ffi::SSL,
     level: ffi::ssl_encryption_level_t,
-    _cipher: *const ffi::SSL_CIPHER,
+    cipher: *const ffi::SSL_CIPHER,
     secret: *const u8,
     secret_len: usize,
 ) -> i32 {
@@ -368,7 +378,15 @@ unsafe extern "C" fn set_write_secret(
         _ => return 0,
     };
 
-    ex_data.events.push_back(TlsEvent::WriteSecret(crypto_level, vec));
+    // Extract cipher suite ID from SSL_CIPHER
+    let cipher_suite = if !cipher.is_null() {
+        let full_id = ffi::SSL_CIPHER_get_id(cipher);
+        (full_id & 0xFFFF) as u16
+    } else {
+        0x1301 // Default to TLS_AES_128_GCM_SHA256 if cipher is null
+    };
+
+    ex_data.events.push_back(TlsEvent::WriteSecret(crypto_level, vec, cipher_suite));
     1
 }
 

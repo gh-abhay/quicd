@@ -91,14 +91,26 @@ impl EncryptionKeys {
         crypto_backend: &dyn CryptoBackend,
         cipher_suite: u16, // TLS cipher suite (e.g., 0x1301 for AES_128_GCM_SHA256)
     ) -> Result<()> {
-        // Derive keys using HKDF (RFC 9001 Section 5.1)
-        let key_len = 16; // AES-128-GCM uses 16-byte keys (adjust for other ciphers)
+        // Derive key lengths based on cipher suite
+        // RFC 9001 Section 5: Key lengths depend on AEAD algorithm
+        let key_len = match cipher_suite {
+            0x1301 => 16, // TLS_AES_128_GCM_SHA256: 16-byte keys
+            0x1302 => 32, // TLS_AES_256_GCM_SHA384: 32-byte keys
+            0x1303 => 32, // TLS_CHACHA20_POLY1305_SHA256: 32-byte keys
+            _ => 16, // Default to 16 for unknown ciphers
+        };
         let iv_len = 12;  // Standard nonce length for QUIC
-        let hp_key_len = 16; // Header protection key length
+        // HP key length also depends on cipher suite
+        let hp_key_len = match cipher_suite {
+            0x1301 => 16, // AES-128: 16-byte HP keys
+            0x1302 => 32, // AES-256: 32-byte HP keys
+            0x1303 => 32, // ChaCha20: 32-byte HP keys
+            _ => 16,
+        };
         
-        let packet_key = key_schedule.derive_packet_key(secret, key_len)?;
-        let packet_iv = key_schedule.derive_packet_iv(secret, iv_len)?;
-        let hp_key = key_schedule.derive_header_protection_key(secret, hp_key_len)?;
+        let packet_key = key_schedule.derive_packet_key(secret, key_len, cipher_suite)?;
+        let packet_iv = key_schedule.derive_packet_iv(secret, iv_len, cipher_suite)?;
+        let hp_key = key_schedule.derive_header_protection_key(secret, hp_key_len, cipher_suite)?;
         
         // Create AEAD and HP providers
         let aead = crypto_backend.create_aead(cipher_suite)?;
@@ -800,11 +812,13 @@ impl QuicConnection {
         };
         
         // Derive packet keys and IVs
+        // RFC 9001: Initial packets always use AES-128-GCM-SHA256 (0x1301)
+        let initial_cipher_suite = 0x1301u16;
         let key_len = aead.key_len();
         let iv_len = aead.iv_len();
         let hp_key_len = hp.key_len();
         
-        let client_key = match key_schedule.derive_packet_key(&client_initial_secret, key_len) {
+        let client_key = match key_schedule.derive_packet_key(&client_initial_secret, key_len, initial_cipher_suite) {
             Ok(k) => k,
             Err(_) => return Self {
                 side,
@@ -846,7 +860,7 @@ impl QuicConnection {
             },
         };
         
-        let client_iv = match key_schedule.derive_packet_iv(&client_initial_secret, iv_len) {
+        let client_iv = match key_schedule.derive_packet_iv(&client_initial_secret, iv_len, initial_cipher_suite) {
             Ok(iv) => iv,
             Err(_) => return Self {
                 side,
@@ -887,7 +901,7 @@ impl QuicConnection {
             opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
-        let client_hp_key = match key_schedule.derive_header_protection_key(&client_initial_secret, hp_key_len) {
+        let client_hp_key = match key_schedule.derive_header_protection_key(&client_initial_secret, hp_key_len, initial_cipher_suite) {
             Ok(k) => k,
             Err(_) => return Self {
                 side,
@@ -929,7 +943,7 @@ impl QuicConnection {
             },
         };
         
-        let server_key = match key_schedule.derive_packet_key(&server_initial_secret, key_len) {
+        let server_key = match key_schedule.derive_packet_key(&server_initial_secret, key_len, initial_cipher_suite) {
             Ok(k) => k,
             Err(_) => return Self {
                 side,
@@ -970,7 +984,7 @@ impl QuicConnection {
             opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
-        let server_iv = match key_schedule.derive_packet_iv(&server_initial_secret, iv_len) {
+        let server_iv = match key_schedule.derive_packet_iv(&server_initial_secret, iv_len, initial_cipher_suite) {
             Ok(iv) => iv,
             Err(_) => return Self {
                 side,
@@ -1011,7 +1025,7 @@ impl QuicConnection {
             opened_streams: alloc::collections::BTreeSet::new(),
             },
         };
-        let server_hp_key = match key_schedule.derive_header_protection_key(&server_initial_secret, hp_key_len) {
+        let server_hp_key = match key_schedule.derive_header_protection_key(&server_initial_secret, hp_key_len, initial_cipher_suite) {
             Ok(k) => k,
             Err(_) => return Self {
                 side,
@@ -1672,8 +1686,11 @@ impl Connection for QuicConnection {
         // Check if we have keys for this level
         if read_keys.aead.is_none() || read_keys.hp.is_none() {
             // Keys not available yet - buffer or drop
+            eprintln!("DEBUG: Keys not available for level={:?}, aead={}, hp={}", 
+                     encryption_level, read_keys.aead.is_some(), read_keys.hp.is_some());
             return Ok(());
         }
+        eprintln!("DEBUG: ✓ Keys available for level={:?}, proceeding with decryption", encryption_level);
         
         // Remove header protection (RFC 9001 Section 5.4)
         // This reveals the actual packet number
@@ -2054,10 +2071,10 @@ impl Connection for QuicConnection {
                                             crate::crypto::TlsEvent::HandshakeComplete => {
                                                 eprintln!("DEBUG: TLS HandshakeComplete");
                                             }
-                                            crate::crypto::TlsEvent::ReadSecret(level, _) => {
+                                            crate::crypto::TlsEvent::ReadSecret(level, _, _) => {
                                                 eprintln!("DEBUG: TLS ReadSecret: level={:?}", level);
                                             }
-                                            crate::crypto::TlsEvent::WriteSecret(level, _) => {
+                                            crate::crypto::TlsEvent::WriteSecret(level, _, _) => {
                                                 eprintln!("DEBUG: TLS WriteSecret: level={:?}", level);
                                             }
                                             crate::crypto::TlsEvent::Done => {
@@ -2077,11 +2094,10 @@ impl Connection for QuicConnection {
                                                 self.state = ConnectionState::Active;
                                                 self.pending_events.push(ConnectionEvent::HandshakeComplete);
                                             }
-                                            crate::crypto::TlsEvent::ReadSecret(level, secret) => {
+                                            crate::crypto::TlsEvent::ReadSecret(level, secret, cipher_suite) => {
                                                 // New read keys available - install them
+                                                eprintln!("DEBUG: Installing READ keys for level={:?}, secret_len={}, cipher_suite=0x{:04x}", level, secret.len(), cipher_suite);
                                                 let key_schedule = self.crypto_backend.create_key_schedule();
-                                                // Use AES-128-GCM (0x1301) as default - should match negotiated cipher
-                                                let cipher_suite = 0x1301; // TODO: Get from TLS session
                                                 let target_keys = match level {
                                                     CryptoLevel::Initial => &mut self.initial_read_keys,
                                                     CryptoLevel::Handshake => &mut self.handshake_read_keys,
@@ -2095,12 +2111,14 @@ impl Connection for QuicConnection {
                                                     eprintln!("ERROR: Failed to install read keys for level {:?}: {:?}", level, e);
                                                     // Key installation failure is critical - return error
                                                     return Err(e);
+                                                } else {
+                                                    eprintln!("DEBUG: ✓ Successfully installed READ keys for level={:?}", level);
                                                 }
                                             }
-                                            crate::crypto::TlsEvent::WriteSecret(level, secret) => {
+                                            crate::crypto::TlsEvent::WriteSecret(level, secret, cipher_suite) => {
                                                 // New write keys available - install them
+                                                eprintln!("DEBUG: Installing WRITE keys for level={:?}, secret_len={}, cipher_suite=0x{:04x}", level, secret.len(), cipher_suite);
                                                 let key_schedule = self.crypto_backend.create_key_schedule();
-                                                let cipher_suite = 0x1301; // TODO: Get from TLS session
                                                 let target_keys = match level {
                                                     CryptoLevel::Initial => &mut self.initial_write_keys,
                                                     CryptoLevel::Handshake => &mut self.handshake_write_keys,
@@ -2114,6 +2132,8 @@ impl Connection for QuicConnection {
                                                     eprintln!("ERROR: Failed to install write keys for level {:?}: {:?}", level, e);
                                                     // Key installation failure is critical - return error
                                                     return Err(e);
+                                                } else {
+                                                    eprintln!("DEBUG: ✓ Successfully installed WRITE keys for level={:?}", level);
                                                 }
                                             }
                                             _ => {}
