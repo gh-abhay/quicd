@@ -269,8 +269,10 @@ impl ConnectionHandle {
         let state_clone = state.clone();
         tokio_handle.spawn(async move {
             while let Some(event) = ingress_rx.recv().await {
+                eprintln!("EVENT PUMP: Processing {:?}", event);
                 Self::process_event_internal(&state_clone, event);
             }
+            eprintln!("EVENT PUMP: Channel closed, pump exiting");
         });
         
         Self {
@@ -305,12 +307,20 @@ impl ConnectionHandle {
                 }
             }
             Event::StreamData { stream_id, data, fin } => {
+                eprintln!("EVENT PUMP: StreamData for {:?}, {} bytes, fin={}", stream_id, data.len(), fin);
                 let stream_state = state.streams.entry(stream_id).or_insert_with(StreamState::new);
-                stream_state.buffers.push_back(data);
+                
+                // Only push non-empty data to buffers
+                if !data.is_empty() {
+                    stream_state.buffers.push_back(data);
+                }
+                
                 if fin {
                     stream_state.fin_received = true;
                 }
+                eprintln!("EVENT PUMP: Stream state now has {} buffers, fin={}", stream_state.buffers.len(), stream_state.fin_received);
                 if let Some(waker) = stream_state.read_waker.take() {
+                    eprintln!("EVENT PUMP: Waking read waker");
                     waker.wake();
                 }
             }
