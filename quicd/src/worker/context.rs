@@ -233,6 +233,7 @@ impl WorkerContext {
             cid,
             ingress_rx,
             self.egress_tx.clone(),
+            &self.runtime_handle,
         );
         
         info!(

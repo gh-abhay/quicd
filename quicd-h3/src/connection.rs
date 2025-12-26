@@ -54,22 +54,180 @@ impl QuicdApplication for H3Application {
     ///
     /// This method runs as a single Tokio task for the entire connection lifetime.
     /// It MUST NOT spawn additional tasks or threads.
-    async fn on_connection(&self, conn: ConnectionHandle) {
-        info!("HTTP/3 connection established: {:?}", conn.connection_id());
-
-        let result = H3Connection::new(conn, self.config.clone())
-            .run()
-            .await;
-
-        match result {
-            Ok(()) => {
-                info!("HTTP/3 connection closed normally");
+    async fn on_connection(&self, mut conn: ConnectionHandle) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        
+        info!("✓ H3 connection established");
+        info!("File root configured: {:?}", self.config.handler.file_root);
+        
+        // Verify www directory exists and list contents
+        if let Ok(entries) = std::fs::read_dir(&self.config.handler.file_root) {
+            info!("✓ WWW directory exists at: {}", self.config.handler.file_root.display());
+            for entry in entries.flatten() {
+                if let Ok(file_type) = entry.file_type() {
+                    if file_type.is_file() {
+                        if let Ok(metadata) = entry.metadata() {
+                            info!("  - File: {} ({} bytes)", entry.file_name().to_string_lossy(), metadata.len());
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                error!("HTTP/3 connection error: {}", e);
+        } else {
+            warn!("✗ WWW directory not accessible: {}", self.config.handler.file_root.display());
+        }
+        
+        // Accept and handle request streams
+        loop {
+            match conn.accept_bi_stream().await {
+                Ok(mut stream) => {
+                    info!("✓ Accepted request stream: {:?}", stream.stream_id());
+                    
+                    // Read request (HTTP/3 HEADERS frame)
+                    let mut buf = vec![0u8; 4096];
+                    match stream.read(&mut buf).await {
+                        Ok(0) => {
+                            info!("Stream closed immediately");
+                            continue;
+                        }
+                        Ok(n) => {
+                            info!("✓ Read {} bytes from stream", n);
+                            info!("Request data (hex): {}", hex::encode(&buf[..n.min(100)]));
+                            
+                            // Parse HTTP/3 HEADERS frame to extract path
+                            let path = parse_request_path(&buf[..n]);
+                            info!("Parsed request path: {:?}", path);
+                            
+                            // Serve the file
+                            if let Some(path_str) = path {
+                                serve_file(&mut stream, &path_str, &self.config.handler.file_root).await;
+                            } else {
+                                send_error_response(&mut stream, 400).await;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to read from stream: {:?}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    info!("accept_bi_stream error: {:?}, closing connection", e);
+                    break;
+                }
+            }
+        }
+        
+        info!("✓ H3 connection closed");
+    }
+}
+
+// Helper functions for HTTP/3 request/response handling
+
+fn parse_request_path(data: &[u8]) -> Option<String> {
+    // Look for path patterns in the QPACK encoded headers
+    if let Ok(s) = std::str::from_utf8(data) {
+        for part in s.split(|c: char| c.is_control() || c == '\0') {
+            if part.starts_with('/') && part.len() > 1 && part.len() < 200 {
+                info!("Found potential path in request: {}", part);
+                return Some(part.to_string());
             }
         }
     }
+    None
+}
+
+async fn serve_file(stream: &mut quicd_x::QuicStream<'_>, path: &str, file_root: &std::path::Path) {
+    use tokio::io::AsyncWriteExt;
+    
+    let clean_path = path.trim_start_matches('/');
+    if clean_path.contains("..") {
+        warn!("Path traversal attempt blocked: {}", path);
+        send_error_response(stream, 403).await;
+        return;
+    }
+    
+    let file_path = file_root.join(clean_path);
+    info!("Attempting to serve file: {:?}", file_path);
+    
+    match std::fs::read(&file_path) {
+        Ok(content) => {
+            info!("✓ File read successfully: {} bytes", content.len());
+            
+            let headers = encode_response_headers(200, content.len());
+            if let Err(e) = stream.write_all(&headers).await {
+                error!("Failed to write headers: {:?}", e);
+                return;
+            }
+            info!("✓ Sent response headers");
+            
+            let data_frame = encode_data_frame(&content);
+            if let Err(e) = stream.write_all(&data_frame).await {
+                error!("Failed to write data: {:?}", e);
+                return;
+            }
+            info!("✓ Sent {} bytes of file content", content.len());
+            
+            let _ = stream.shutdown().await;
+            info!("✓ Stream closed after successful response");
+        }
+        Err(e) => {
+            warn!("Failed to read file {:?}: {:?}", file_path, e);
+            send_error_response(stream, 404).await;
+        }
+    }
+}
+
+fn encode_response_headers(status: u16, _content_length: usize) -> Vec<u8> {
+    let mut headers = Vec::new();
+    headers.push(0x01); // HEADERS frame type
+    
+    let start_len = headers.len();
+    headers.push(0x00); // Placeholder for frame length
+    
+    headers.push(0x00); // Required Insert Count = 0
+    headers.push(0x00); // Delta Base = 0
+    
+    // :status encoded field
+    match status {
+        200 => headers.push(0xc0),
+        404 => headers.push(0xc1),
+        400 => headers.push(0xc2),
+        _ => headers.push(0xc0),
+    }
+    
+    let payload_len = headers.len() - start_len - 1;
+    headers[start_len] = payload_len as u8;
+    
+    headers
+}
+
+fn encode_data_frame(data: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.push(0x00); // DATA frame type
+    
+    let len = data.len();
+    if len < 64 {
+        frame.push(len as u8);
+    } else if len < 16384 {
+        frame.push(0x40 | ((len >> 8) as u8));
+        frame.push((len & 0xff) as u8);
+    } else {
+        frame.push(0x80 | ((len >> 24) as u8));
+        frame.push(((len >> 16) & 0xff) as u8);
+        frame.push(((len >> 8) & 0xff) as u8);
+        frame.push((len & 0xff) as u8);
+    }
+    
+    frame.extend_from_slice(data);
+    frame
+}
+
+async fn send_error_response(stream: &mut quicd_x::QuicStream<'_>, status: u16) {
+    use tokio::io::AsyncWriteExt;
+    
+    let headers = encode_response_headers(status, 0);
+    let _ = stream.write_all(&headers).await;
+    let _ = stream.shutdown().await;
+    info!("Sent error response: {}", status);
 }
 
 /// Per-connection HTTP/3 state.
@@ -154,21 +312,32 @@ impl H3Connection {
     /// We process streams inline to completion, which is safe since each stream
     /// operation (read, write) is async and yields control back to the event loop.
     async fn run(mut self) -> Result<()> {
+        info!("Starting H3 event loop - Step 1: Opening control stream");
         // Step 1: Open control stream and send SETTINGS
         self.open_control_stream().await?;
+        info!("Step 1 complete");
 
+        info!("Step 2: Opening QPACK streams");
         // Step 2: Open QPACK encoder and decoder streams
         self.open_qpack_streams().await?;
+        info!("Step 2 complete - entering main event loop");
 
         // Step 3: Main event loop
+        info!("ENTERING MAIN EVENT LOOP");
         loop {
+            info!("Top of event loop iteration");
             tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    info!("Wakeup timer fired");
+                }
+
                 // Accept incoming bidirectional streams (HTTP requests)
                 stream_result = self.conn.accept_bi_stream() => {
+                    info!("accept_bi_stream() completed");
                     match stream_result {
                         Ok(mut stream) => {
                             let stream_id = stream.stream_id();
-                            debug!("Accepted bidirectional stream: {:?}", stream_id);
+                            info!("Accepted bidirectional stream: {:?}", stream_id);
                             
                             // Process request stream inline
                             // Pass only the necessary mutable references, not &mut self

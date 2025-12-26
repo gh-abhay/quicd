@@ -534,6 +534,7 @@ impl ConnectionManager {
                     XConnectionId(conn_id_u64),
                     rx,
                     egress_tx,
+                    &tokio_handle,
                 );
                 
                 // Get negotiated ALPN from connection wrapper
@@ -549,12 +550,13 @@ impl ConnectionManager {
                         match app_registry.get(alpn_str) {
                             Some(factory) => {
                                 let app = factory();
-                                info!("Application task spawned for connection {} with ALPN: {}", conn_id_u64, alpn_str);
+                                info!("Spawning application task for connection {} with ALPN: {}", conn_id_u64, alpn_str);
                                 
                                 // Spawn exactly ONE tokio task per connection
                                 tokio_handle.spawn(async move {
+                                    info!("✓ Application task STARTED for connection {}", conn_id_u64);
                                     app.on_connection(handle).await;
-                                    debug!("Application task completed for connection {}", conn_id_u64);
+                                    info!("✓ Application task COMPLETED for connection {}", conn_id_u64);
                                 });
                             }
                             None => {

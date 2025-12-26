@@ -239,15 +239,13 @@ impl SharedConnectionState {
 /// - **Egress**: Unbounded `crossbeam::Sender` to worker (high throughput)
 /// - All operations are event-driven and non-blocking
 /// - Exactly ONE task per connection - do not spawn additional tasks
-/// - No poller thread - events are processed directly by application
+/// - Events processed by internal pump task that wakes futures
 pub struct ConnectionHandle {
     conn_id: ConnectionId,
-    /// Ingress receiver (bounded) - directly accessed by application
-    ingress_rx: parking_lot::Mutex<mpsc::Receiver<Event>>,
     /// Egress sender (unbounded) - shared across all connections for this worker
     egress_tx: Sender<Command>,
-    /// Shared state for stream data and control flow
-    state: parking_lot::Mutex<SharedConnectionState>,
+    /// Shared state for stream data and control flow (Arc for event pump task)
+    state: std::sync::Arc<parking_lot::Mutex<SharedConnectionState>>,
 }
 
 impl ConnectionHandle {
@@ -257,32 +255,34 @@ impl ConnectionHandle {
     /// - `conn_id`: Unique connection identifier
     /// - `ingress_rx`: Bounded tokio::mpsc receiver for events (capacity 32-64)
     /// - `egress_tx`: Unbounded crossbeam sender for commands (shared across all connections)
+    /// - `tokio_handle`: Handle to tokio runtime for spawning event pump task
     pub fn new(
         conn_id: ConnectionId,
-        ingress_rx: mpsc::Receiver<Event>,
+        mut ingress_rx: mpsc::Receiver<Event>,
         egress_tx: Sender<Command>,
+        tokio_handle: &tokio::runtime::Handle,
     ) -> Self {
+        let state = std::sync::Arc::new(parking_lot::Mutex::new(SharedConnectionState::new()));
+        
+        // Spawn event pump task to process incoming events
+        // This task runs until the ingress channel closes (connection closed)
+        let state_clone = state.clone();
+        tokio_handle.spawn(async move {
+            while let Some(event) = ingress_rx.recv().await {
+                Self::process_event_internal(&state_clone, event);
+            }
+        });
+        
         Self {
             conn_id,
-            ingress_rx: parking_lot::Mutex::new(ingress_rx),
             egress_tx,
-            state: parking_lot::Mutex::new(SharedConnectionState::new()),
+            state,
         }
     }
     
-    /// Receive the next event from the worker.
-    /// Returns None when the connection is closed.
-    ///
-    /// Applications should call this in a loop to process all pending events.
-    pub async fn recv_event(&self) -> Option<Event> {
-        let mut rx = self.ingress_rx.lock();
-        rx.recv().await
-    }
-    
-    /// Process a single event and update internal state.
-    /// Called internally when polling for stream data, etc.
-    fn process_event(&self, event: Event) {
-        let mut state = self.state.lock();
+    /// Internal event processing used by event pump task
+    fn process_event_internal(state: &parking_lot::Mutex<SharedConnectionState>, event: Event) {
+        let mut state = state.lock();
         
         match event {
             Event::StreamOpened { stream_id, is_bidirectional } => {
@@ -333,11 +333,11 @@ impl ConnectionHandle {
             Event::ConnectionClosing { error_code, reason } => {
                 state.closed = true;
                 state.close_error = Some((error_code, reason));
-                self.wake_all_waiters(&mut state);
+                Self::wake_all_waiters_internal(&mut state);
             }
             Event::ConnectionClosed => {
                 state.closed = true;
-                self.wake_all_waiters(&mut state);
+                Self::wake_all_waiters_internal(&mut state);
             }
             Event::MaxStreamsUpdated { .. } => {
                 // Flow control update - wake stream open operations
@@ -348,7 +348,7 @@ impl ConnectionHandle {
         }
     }
     
-    fn wake_all_waiters(&self, state: &mut SharedConnectionState) {
+    fn wake_all_waiters_internal(state: &mut SharedConnectionState) {
         // Wake all stream readers
         for stream_state in state.streams.values_mut() {
             if let Some(waker) = stream_state.read_waker.take() {
@@ -378,16 +378,6 @@ impl ConnectionHandle {
             type Output = io::Result<StreamId>;
             
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                // Check for pending events first
-                let mut rx = self.handle.ingress_rx.lock();
-                if let Ok(event) = rx.try_recv() {
-                    drop(rx);
-                    self.handle.process_event(event);
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                drop(rx);
-                
                 let mut state = self.handle.state.lock();
                 
                 if let Some(stream_id) = state.pending_stream_confirms.pop_front() {
@@ -428,16 +418,6 @@ impl ConnectionHandle {
             type Output = io::Result<StreamId>;
             
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                // Process pending events first
-                let mut rx = self.handle.ingress_rx.lock();
-                if let Ok(event) = rx.try_recv() {
-                    drop(rx);
-                    self.handle.process_event(event);
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                drop(rx);
-                
                 let mut state = self.handle.state.lock();
                 
                 if let Some(stream_id) = state.pending_bi_streams.pop_front() {
@@ -481,15 +461,6 @@ impl ConnectionHandle {
             type Output = io::Result<StreamId>;
             
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let mut rx = self.handle.ingress_rx.lock();
-                if let Ok(event) = rx.try_recv() {
-                    drop(rx);
-                    self.handle.process_event(event);
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                drop(rx);
-                
                 let mut state = self.handle.state.lock();
                 
                 if let Some(stream_id) = state.pending_stream_confirms.pop_front() {
@@ -530,15 +501,6 @@ impl ConnectionHandle {
             type Output = io::Result<StreamId>;
             
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let mut rx = self.handle.ingress_rx.lock();
-                if let Ok(event) = rx.try_recv() {
-                    drop(rx);
-                    self.handle.process_event(event);
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                drop(rx);
-                
                 let mut state = self.handle.state.lock();
                 
                 if let Some(stream_id) = state.pending_uni_streams.pop_front() {
@@ -587,15 +549,6 @@ impl ConnectionHandle {
             type Output = io::Result<Bytes>;
             
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let mut rx = self.handle.ingress_rx.lock();
-                if let Ok(event) = rx.try_recv() {
-                    drop(rx);
-                    self.handle.process_event(event);
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                drop(rx);
-                
                 let mut state = self.handle.state.lock();
                 
                 if let Some(data) = state.datagrams.pop_front() {
@@ -705,15 +658,6 @@ impl<'a> AsyncRead for QuicStream<'a> {
         let stream_id = self.stream_id;
         
         // Process any pending events first
-        let mut rx = self.handle.ingress_rx.lock();
-        if let Ok(event) = rx.try_recv() {
-            drop(rx);
-            self.handle.process_event(event);
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-        drop(rx);
-        
         // Fetch data from shared state
         let mut state = self.handle.state.lock();
         

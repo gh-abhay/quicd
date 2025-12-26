@@ -36,6 +36,9 @@ mime_guess = "2.0"
 # Logging
 tracing = "0.1"
 
+# Utilities
+hex = "0.4"
+
 [dev-dependencies]
 tokio = { version = "1.48", features = ["full", "test-util"] }
 proptest = "1.6"
