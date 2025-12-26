@@ -123,15 +123,20 @@ impl QuicdApplication for H3Application {
 // Helper functions for HTTP/3 request/response handling
 
 fn parse_request_path(data: &[u8]) -> Option<String> {
-    // Look for path patterns in the QPACK encoded headers
+    // First try to parse as UTF-8 text (for compatibility with simple test clients)
     if let Ok(s) = std::str::from_utf8(data) {
-        for part in s.split(|c: char| c.is_control() || c == '\0') {
+        info!("Request as UTF-8: {:?}", s);
+        for part in s.split(|c: char| c.is_whitespace() || c.is_control()) {
+            info!("  Checking part: {:?}", part);
             if part.starts_with('/') && part.len() > 1 && part.len() < 200 {
-                info!("Found potential path in request: {}", part);
+                info!("✓ Found path in request: {}", part);
                 return Some(part.to_string());
             }
         }
     }
+    
+    // TODO: Add proper HTTP/3 HEADERS frame parsing here
+    warn!("Could not parse request path from {} bytes", data.len());
     None
 }
 
