@@ -60,30 +60,40 @@ impl QuicdApplication for H3Application {
         info!("✓ H3 connection established");
         info!("File root configured: {:?}", self.config.handler.file_root);
         
-        // RFC 9114 Section 6.2: Open control stream and send SETTINGS
-        match conn.open_uni_stream().await {
-            Ok(mut control_stream) => {
-                info!("✓ Opened control stream: {:?}", control_stream.stream_id());
-                
-                // Send stream type byte (0x00 = control stream)
-                let stream_type = vec![0x00];
-                if let Err(e) = control_stream.write_all(&stream_type).await {
-                    error!("Failed to write control stream type: {:?}", e);
+        // Check if we should use HTTP/0.9 (for interop tests) or HTTP/3
+        // HTTP/0.9 doesn't use control streams or SETTINGS
+        let testcase = std::env::var("TESTCASE").or(std::env::var("TESTCASE_SERVER")).unwrap_or_default();
+        let use_http09 = testcase != "http3";
+        info!("Test case: {}, using HTTP/0.9: {}", testcase, use_http09);
+        
+        if !use_http09 {
+            // RFC 9114 Section 6.2: Open control stream and send SETTINGS (HTTP/3 only)
+            match conn.open_uni_stream().await {
+                Ok(mut control_stream) => {
+                    info!("✓ Opened control stream: {:?}", control_stream.stream_id());
+                    
+                    // Send stream type byte (0x00 = control stream)
+                    let stream_type = vec![0x00];
+                    if let Err(e) = control_stream.write_all(&stream_type).await {
+                        error!("Failed to write control stream type: {:?}", e);
+                        return;
+                    }
+                    
+                    // Send SETTINGS frame
+                    let settings = encode_settings_frame();
+                    if let Err(e) = control_stream.write_all(&settings).await {
+                        error!("Failed to write SETTINGS frame: {:?}", e);
+                        return;
+                    }
+                    info!("✓ Sent SETTINGS frame on control stream");
+                }
+                Err(e) => {
+                    error!("Failed to open control stream: {:?}", e);
                     return;
                 }
-                
-                // Send SETTINGS frame
-                let settings = encode_settings_frame();
-                if let Err(e) = control_stream.write_all(&settings).await {
-                    error!("Failed to write SETTINGS frame: {:?}", e);
-                    return;
-                }
-                info!("✓ Sent SETTINGS frame on control stream");
             }
-            Err(e) => {
-                error!("Failed to open control stream: {:?}", e);
-                return;
-            }
+        } else {
+            info!("Using HTTP/0.9 mode (no control stream)");
         }
         
         // Verify www directory exists and list contents
@@ -121,15 +131,26 @@ impl QuicdApplication for H3Application {
                                     info!("✓ Read {} bytes from stream", n);
                                     info!("Request data (hex): {}", hex::encode(&buf[..n.min(100)]));
                                     
-                                    // Parse HTTP/3 HEADERS frame to extract path
+                                    // Parse request path (works for both HTTP/0.9 and HTTP/3)
                                     let path = parse_request_path(&buf[..n]);
                                     info!("Parsed request path: {:?}", path);
                                     
                                     // Serve the file
                                     if let Some(path_str) = path {
-                                        serve_file(&mut stream, &path_str, &self.config.handler.file_root).await;
+                                        serve_file(&mut stream, &path_str, &self.config.handler.file_root, use_http09).await;
+                                        // In HTTP/0.9 mode, close connection after serving file
+                                        if use_http09 {
+                                            info!("HTTP/0.9: Closing connection after serving file");
+                                            conn.close(0, "HTTP/0.9 response complete".to_string());
+                                            return; // Exit the connection handler
+                                        }
                                     } else {
-                                        send_error_response(&mut stream, 400).await;
+                                        if use_http09 {
+                                            // HTTP/0.9 doesn't have error responses, just close
+                                            let _ = stream.shutdown().await;
+                                        } else {
+                                            send_error_response(&mut stream, 400).await;
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -207,13 +228,15 @@ fn parse_request_path(data: &[u8]) -> Option<String> {
     None
 }
 
-async fn serve_file(stream: &mut quicd_x::QuicStream<'_>, path: &str, file_root: &std::path::Path) {
+async fn serve_file(stream: &mut quicd_x::QuicStream<'_>, path: &str, file_root: &std::path::Path, http09_mode: bool) {
     use tokio::io::AsyncWriteExt;
     
     let clean_path = path.trim_start_matches('/');
     if clean_path.contains("..") {
         warn!("Path traversal attempt blocked: {}", path);
-        send_error_response(stream, 403).await;
+        if !http09_mode {
+            send_error_response(stream, 403).await;
+        }
         return;
     }
     
@@ -224,28 +247,47 @@ async fn serve_file(stream: &mut quicd_x::QuicStream<'_>, path: &str, file_root:
         Ok(content) => {
             info!("✓ File read successfully: {} bytes", content.len());
             
-            let headers = encode_response_headers(200, content.len());
-            info!("Headers frame (hex): {}", hex::encode(&headers));
-            if let Err(e) = stream.write_all(&headers).await {
-                error!("Failed to write headers: {:?}", e);
-                return;
+            if http09_mode {
+                // HTTP/0.9: Send raw file bytes without any framing
+                info!("Sending HTTP/0.9 response (raw {} bytes)", content.len());
+                info!("First 32 bytes of file (hex): {}", hex::encode(&content[..content.len().min(32)]));
+                if let Err(e) = stream.write_all(&content).await {
+                    error!("Failed to write file content: {:?}", e);
+                    return;
+                }
+                // Ensure data is flushed before shutdown
+                if let Err(e) = stream.flush().await {
+                    error!("Failed to flush stream: {:?}", e);
+                    return;
+                }
+                info!("✓ Sent {} bytes of raw file content", content.len());
+            } else {
+                // HTTP/3: Send proper HEADERS and DATA frames
+                let headers = encode_response_headers(200, content.len());
+                info!("Headers frame (hex): {}", hex::encode(&headers));
+                if let Err(e) = stream.write_all(&headers).await {
+                    error!("Failed to write headers: {:?}", e);
+                    return;
+                }
+                info!("✓ Sent response headers");
+                
+                let data_frame = encode_data_frame(&content);
+                info!("Data frame header (first 20 bytes hex): {}", hex::encode(&data_frame[..data_frame.len().min(20)]));
+                if let Err(e) = stream.write_all(&data_frame).await {
+                    error!("Failed to write data: {:?}", e);
+                    return;
+                }
+                info!("✓ Sent {} bytes of file content", content.len());
             }
-            info!("✓ Sent response headers");
-            
-            let data_frame = encode_data_frame(&content);
-            info!("Data frame header (first 20 bytes hex): {}", hex::encode(&data_frame[..data_frame.len().min(20)]));
-            if let Err(e) = stream.write_all(&data_frame).await {
-                error!("Failed to write data: {:?}", e);
-                return;
-            }
-            info!("✓ Sent {} bytes of file content", content.len());
             
             let _ = stream.shutdown().await;
             info!("✓ Stream closed after successful response");
         }
         Err(e) => {
             warn!("Failed to read file {:?}: {:?}", file_path, e);
-            send_error_response(stream, 404).await;
+            if !http09_mode {
+                send_error_response(stream, 404).await;
+            }
         }
     }
 }

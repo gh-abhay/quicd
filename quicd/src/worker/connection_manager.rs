@@ -781,15 +781,26 @@ impl ConnectionManager {
         
         match cmd {
             Command::WriteStreamData { conn_id, stream_id, data, fin } => {
+                eprintln!("HANDLE_COMMAND: WriteStreamData conn_id={:?}, stream_id={:?}, len={}, fin={}", 
+                          conn_id, stream_id, data.len(), fin);
                 // Find connection by ID and write data to stream
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
+                    eprintln!("HANDLE_COMMAND: Found connection at slab_idx={}", slab_idx);
                     if let Some(state) = self.get_connection_mut(slab_idx) {
                         let quic_stream_id = QuicStreamId(stream_id.0);
+                        let data_len = data.len();
+                        eprintln!("HANDLE_COMMAND: Calling write_stream, data_len={}", data_len);
                         if let Err(e) = state.conn.write_stream(quic_stream_id, data, fin) {
                             error!("Failed to write to stream {:?}: {}", stream_id, e);
+                        } else {
+                            eprintln!("HANDLE_COMMAND: write_stream succeeded");
                         }
                     }
-                    return self.generate_packets(slab_idx, now);
+                    let packets = self.generate_packets(slab_idx, now);
+                    eprintln!("HANDLE_COMMAND: generate_packets returned {} packets", packets.len());
+                    return packets;
+                } else {
+                    eprintln!("HANDLE_COMMAND: Connection not found for conn_id={:?}", conn_id);
                 }
             }
             Command::OpenBiStream { conn_id } => {

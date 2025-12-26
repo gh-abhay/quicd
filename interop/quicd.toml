@@ -280,7 +280,7 @@ enable_per_connection_metrics = false
 # ----------------------------------------------------------------------------
 [applications.http3]
 type = "builtin:http3"
-alpn = ["h3", "h3-29"]  # Handles both standard h3 and draft-29
+alpn = ["hq-interop", "hq-29", "h3", "h3-29"]  # hq-interop for HTTP/0.9, h3 for HTTP/3
 enabled = true
 
 # QPACK Configuration (RFC 9204)

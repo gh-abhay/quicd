@@ -272,7 +272,21 @@ impl WorkerContext {
                     "WriteStreamData"
                 );
                 if let Some(conn_state) = self.get_connection_mut(&conn_id) {
-                    // TODO: Call quic_conn.write_stream(stream_id, data, fin)
+                    // Call into quicd-quic to write stream data
+                    use quicd_quic::connection::Connection;
+                    if let Err(e) = conn_state.quic_conn.write_stream(
+                        quicd_quic::types::StreamId(stream_id.0),
+                        data,
+                        fin
+                    ) {
+                        error!(
+                            worker_id = self.worker_id,
+                            conn_id = conn_id.0,
+                            stream_id = stream_id.0,
+                            error = ?e,
+                            "Failed to write stream data"
+                        );
+                    }
                 }
             }
             Command::CloseConnection { conn_id, error_code, reason } => {

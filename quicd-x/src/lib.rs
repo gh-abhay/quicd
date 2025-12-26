@@ -671,48 +671,57 @@ impl<'a> AsyncRead for QuicStream<'a> {
         // Fetch data from shared state
         let mut state = self.handle.state.lock();
         
-        if let Some(stream_state) = state.streams.get_mut(&stream_id) {
-            if let Some(mut chunk) = stream_state.buffers.pop_front() {
-                let len = std::cmp::min(chunk.len(), buf.remaining());
-                buf.put_slice(&chunk[..len]);
-                chunk.advance(len);
-                
-                // Put back remaining if not fully consumed
-                if !chunk.is_empty() {
-                    stream_state.buffers.push_front(chunk);
-                }
-                
-                // Update flow control
-                let this = self.as_mut().get_mut();
-                this.bytes_read += len;
-                if this.bytes_read >= 1024 {
-                    let _ = this.egress_tx.send(Command::StreamDataRead {
-                        conn_id: this.conn_id,
-                        stream_id: this.stream_id,
-                        len: this.bytes_read,
-                    });
-                    this.bytes_read = 0;
-                }
-                
-                return Poll::Ready(Ok(()));
+        eprintln!("POLL_READ: stream_id={:?}, streams.len()={}, streams.contains_key={}", 
+                  stream_id, state.streams.len(), state.streams.contains_key(&stream_id));
+        
+        // Get or create stream state (important: create even if no data yet, so waker can be registered)
+        let stream_state = state.streams.entry(stream_id).or_insert_with(StreamState::new);
+        
+        eprintln!("POLL_READ: Found stream state, buffers.len()={}, fin={}", 
+                  stream_state.buffers.len(), stream_state.fin_received);
+        
+        // Check if we have buffered data
+        if let Some(mut chunk) = stream_state.buffers.pop_front() {
+            eprintln!("POLL_READ: Popped chunk of {} bytes", chunk.len());
+            let len = std::cmp::min(chunk.len(), buf.remaining());
+            buf.put_slice(&chunk[..len]);
+            chunk.advance(len);
+            
+            // Put back remaining if not fully consumed
+            if !chunk.is_empty() {
+                stream_state.buffers.push_front(chunk);
             }
             
-            // Check for FIN
-            if stream_state.fin_received {
-                return Poll::Ready(Ok(()));
+            // Update flow control
+            let this = self.as_mut().get_mut();
+            this.bytes_read += len;
+            if this.bytes_read >= 1024 {
+                let _ = this.egress_tx.send(Command::StreamDataRead {
+                    conn_id: this.conn_id,
+                    stream_id: this.stream_id,
+                    len: this.bytes_read,
+                });
+                this.bytes_read = 0;
             }
             
-            // Check for Reset
-            if let Some(error_code) = stream_state.reset_error {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    format!("stream reset: {}", error_code)
-                )));
-            }
-            
-            // Register waker
-            stream_state.read_waker = Some(cx.waker().clone());
+            return Poll::Ready(Ok(()));
         }
+        
+        // Check for FIN
+        if stream_state.fin_received {
+            return Poll::Ready(Ok(()));
+        }
+        
+        // Check for Reset
+        if let Some(error_code) = stream_state.reset_error {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                format!("stream reset: {}", error_code)
+            )));
+        }
+        
+        // Register waker (now guaranteed to work since we created stream_state above)
+        stream_state.read_waker = Some(cx.waker().clone());
         
         // Check for Connection Close
         if state.closed {
