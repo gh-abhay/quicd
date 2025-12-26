@@ -591,58 +591,112 @@ impl NetworkWorker {
             }
 
             // Batch submit all outgoing packets
+            // RFC 9000 §12.2: Short header packets MUST be last in datagram (no Length field)
+            // Only coalesce long header packets (Initial, Handshake, 0-RTT)
             let mut send_sq_full = false;
             for (dest, packets) in by_dest {
                 eprintln!("worker: Sending {} packets to {}", packets.len(), dest);
-                // Convert Vec<u8> to WorkerBuffer for sending
-                // We allocate new buffers and copy data since WorkerBuffer doesn't expose mutable API
-                let buffers: Vec<WorkerBuffer> = packets.into_iter().filter_map(|data| {
-                    // For now, skip packets that are too large for buffer
+                
+                // Separate long and short header packets
+                // Short header: bit 7 = 0, Long header: bit 7 = 1
+                let mut long_header_packets = Vec::new();
+                let mut short_header_packets = Vec::new();
+                
+                for data in packets {
+                    if data.is_empty() {
+                        warn!(worker_id, "Empty packet data, skipping");
+                        continue;
+                    }
+                    
                     if data.len() > 2048 {
                         warn!(worker_id, "Packet too large: {} bytes", data.len());
-                        return None;
+                        continue;
                     }
                     
-                    eprintln!("worker: Packet size: {} bytes", data.len());
+                    eprintln!("worker: Packet size: {} bytes, first byte: 0x{:02x}", data.len(), data[0]);
                     
-                    // Allocate buffer and write data
-                    Some(WorkerBuffer::from_vec(data, &buffer_pool))
-                }).collect();
-                
-                eprintln!("worker: Converted {} packets to WorkerBuffer", buffers.len());
-                
-                if buffers.is_empty() {
-                    continue;
+                    // Check bit 7 of first byte (0x80)
+                    if (data[0] & 0x80) != 0 {
+                        // Long header packet - can be coalesced
+                        long_header_packets.push(data);
+                    } else {
+                        // Short header packet - MUST be sent alone per RFC 9000
+                        short_header_packets.push(data);
+                    }
                 }
                 
-                match submit_send_op(
-                    &mut ring,
-                    socket_fd,
-                    dest,
-                    buffers,
-                    &mut send_in_flight,
-                    &mut next_send_id,
-                    &mut send_op_pool,
-                ) {
-                    Ok(()) => {
-                        eprintln!("worker: Successfully submitted send operation");
-                    }
-                    Err(e)
-                        if e.kind() == io::ErrorKind::Other
+                // Send all long header packets together (coalesced)
+                if !long_header_packets.is_empty() {
+                    let buffers: Vec<WorkerBuffer> = long_header_packets.into_iter()
+                        .map(|data| WorkerBuffer::from_vec(data, &buffer_pool))
+                        .collect();
+                    
+                    eprintln!("worker: Sending {} coalesced long header packets", buffers.len());
+                    
+                    match submit_send_op(
+                        &mut ring,
+                        socket_fd,
+                        dest,
+                        buffers,
+                        &mut send_in_flight,
+                        &mut next_send_id,
+                        &mut send_op_pool,
+                    ) {
+                        Ok(()) => {
+                            eprintln!("worker: Successfully submitted coalesced long header packets");
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Other
                             && e.to_string().contains("submission queue full") =>
-                    {
-                        // SQ full - packet will be lost, but QUIC will retransmit
-                        send_sq_full = true;
-                        warn!(
-                            worker_id,
-                            peer = %dest,
-                            "Submission queue full - dropping outgoing packet (QUIC will retransmit)"
-                        );
-                        record_metric(MetricsEvent::NetworkSendError);
+                        {
+                            send_sq_full = true;
+                            warn!(
+                                worker_id,
+                                peer = %dest,
+                                "Submission queue full - dropping outgoing packet (QUIC will retransmit)"
+                            );
+                            record_metric(MetricsEvent::NetworkSendError);
+                        }
+                        Err(e) => {
+                            error!(worker_id, peer = %dest, error = ?e, "Failed to submit send op");
+                            record_metric(MetricsEvent::NetworkSendError);
+                        }
                     }
-                    Err(e) => {
-                        error!(worker_id, peer = %dest, error = ?e, "Failed to submit send op");
-                        record_metric(MetricsEvent::NetworkSendError);
+                }
+                
+                // Send each short header packet SEPARATELY (not coalesced)
+                for data in short_header_packets {
+                    let buffer = WorkerBuffer::from_vec(data, &buffer_pool);
+                    let buffers = vec![buffer];
+                    
+                    eprintln!("worker: Sending 1 short header packet (not coalesced)");
+                    
+                    match submit_send_op(
+                        &mut ring,
+                        socket_fd,
+                        dest,
+                        buffers,
+                        &mut send_in_flight,
+                        &mut next_send_id,
+                        &mut send_op_pool,
+                    ) {
+                        Ok(()) => {
+                            eprintln!("worker: Successfully submitted short header packet");
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Other
+                            && e.to_string().contains("submission queue full") =>
+                        {
+                            send_sq_full = true;
+                            warn!(
+                                worker_id,
+                                peer = %dest,
+                                "Submission queue full - dropping outgoing packet (QUIC will retransmit)"
+                            );
+                            record_metric(MetricsEvent::NetworkSendError);
+                        }
+                        Err(e) => {
+                            error!(worker_id, peer = %dest, error = ?e, "Failed to submit send op");
+                            record_metric(MetricsEvent::NetworkSendError);
+                        }
                     }
                 }
             }

@@ -2420,19 +2420,64 @@ impl Connection for QuicConnection {
 
                     buf.put_slice(&encrypted_buf[..encrypted_len]);
 
+                    // COMPREHENSIVE LOGGING BEFORE HEADER PROTECTION
+                    eprintln!("\n===== HANDSHAKE_DONE PACKET (PN={}) BEFORE HP =====", pn);
+                    eprintln!("Buffer length before HP: {}", buf.len());
+                    eprintln!("Packet structure: [first_byte] [DCID:{}] [PN:{}] [ciphertext:{}]",
+                        dcid_bytes.len(), pn_len, buf.len() - 1 - dcid_bytes.len() - pn_len);
+                    eprintln!("First byte (UNPROTECTED): 0x{:02x} = 0b{:08b}", buf[0], buf[0]);
+                    eprintln!("  Bit 7: Header form = {}", (buf[0] >> 7) & 1);
+                    eprintln!("  Bit 6: Fixed bit = {}", (buf[0] >> 6) & 1);
+                    eprintln!("  Bit 5: Spin bit = {}", (buf[0] >> 5) & 1);
+                    eprintln!("  Bits 4-3: Reserved = {:02b}", (buf[0] >> 3) & 0x3);
+                    eprintln!("  Bit 2: Key phase = {}", (buf[0] >> 2) & 1);
+                    eprintln!("  Bits 1-0: PN length (pn_len_encoded) = {:02b} (means {} bytes)", buf[0] & 0x3, (buf[0] & 0x3) + 1);
+                    eprintln!("DCID ({} bytes): {:02x?}", dcid_bytes.len(), dcid_bytes);
+                    eprintln!("PN bytes ({} bytes, UNPROTECTED): {:02x?}", pn_len, &pn_bytes);
+                    eprintln!("Plaintext: {} bytes", final_plaintext.len());
+                    eprintln!("Ciphertext+tag: {} bytes", encrypted_len);
+
                     // Header protection for short header (mask 5 bits)
                     let hp = write_keys.hp.as_ref().unwrap();
                     let hp_key = &write_keys.hp_key;
                     let pn_start = 1 + dcid_bytes.len();
-                    let sample_offset = pn_start + 4;
+                    let sample_offset = pn_start + pn_len + 4 - pn_len;  // pn_start + 4 but showing the math
                     if buf.len() < sample_offset + 16 { return None; }
                     let sample = &buf[sample_offset..sample_offset + 16];
+                    
+                    eprintln!("\nHP Calculation:");
+                    eprintln!("  pn_start = 1 + {} = {}", dcid_bytes.len(), pn_start);
+                    eprintln!("  sample_offset = pn_start + 4 = {} (RFC 9001 §5.4.2)", sample_offset);
+                    eprintln!("  Sample (16 bytes): {:02x?}", sample);
+                    eprintln!("  HP key ({} bytes): {:02x?}", hp_key.len(), hp_key);
+                    
                     let mut mask = vec![0u8; 5];
                     if hp.build_mask(hp_key, sample, &mut mask).is_err() { return None; }
-                    buf[0] ^= mask[0] & 0x1f; // short header mask
+                    
+                    eprintln!("  HP mask (5 bytes): {:02x?}", mask);
+                    eprintln!("    mask[0] = 0x{:02x} = 0b{:08b}", mask[0], mask[0]);
+                    eprintln!("      bits 4-0 (to mask first byte): 0x{:02x}", mask[0] & 0x1f);
+                    eprintln!("      bits 1-0 alone: {:02b}", mask[0] & 0x3);
+                    
+                    // Apply HP
+                    buf[0] ^= mask[0] & 0x1f;
                     for i in 0..pn_len {
                         buf[pn_start + i] ^= mask[1 + i];
                     }
+                    
+                    eprintln!("\nAfter HP Application:");
+                    eprintln!("First byte (PROTECTED): 0x{:02x} = 0b{:08b}", buf[0], buf[0]);
+                    eprintln!("  Bits 1-0: PN length (pn_len_encoded) = {:02b} (client will interpret as {} bytes)", buf[0] & 0x3, (buf[0] & 0x3) + 1);
+                    eprintln!("PN bytes ({} bytes, PROTECTED): {:02x?}", pn_len, &buf[pn_start..pn_start+pn_len]);
+                    
+                    eprintln!("Full packet first 60 bytes (PROTECTED):");
+                    let hex_str: String = buf[0..std::cmp::min(60, buf.len())]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    eprintln!("  {}", hex_str);
+                    eprintln!("===== END HANDSHAKE_DONE PACKET =====\n");
 
                     // Accounting
                     let pn_space = crate::types::PacketNumberSpace::ApplicationData;
@@ -2561,6 +2606,17 @@ impl Connection for QuicConnection {
                 
                 // Add encrypted payload to buffer
                 buf.put_slice(&ciphertext);
+
+                // COMPREHENSIVE LOGGING BEFORE HEADER PROTECTION
+                eprintln!("\n===== 1-RTT CRYPTO PACKET (PN={}) BEFORE HP =====", pn);
+                eprintln!("Total packet length: {} bytes", buf.len());
+                eprintln!("First byte (unprotected): 0x{:02x}", buf[0]);
+                eprintln!("DCID length: {}, bytes: {:02x?}", dcid_bytes.len(), dcid_bytes);
+                let pn_start_prelim = 1 + dcid_bytes.len();
+                eprintln!("PN length: {}, bytes (unprotected): {:02x?}", pn_len, &buf[pn_start_prelim..pn_start_prelim+pn_len]);
+                eprintln!("Plaintext CRYPTO frame length: {}", plaintext.len());
+                eprintln!("Ciphertext length (incl tag): {}", ciphertext.len());
+                eprintln!("Full packet bytes before HP (first 60): {:02x?}", &buf[0..std::cmp::min(60, buf.len())]);
                 
                 // Apply header protection
                 // RFC 9001 Section 5.4: Header protection
@@ -2568,41 +2624,41 @@ impl Connection for QuicConnection {
                 let pn_start = 1 + dcid_bytes.len(); // first_byte + DCID
                 let sample_offset = pn_start + 4;
                 
-                eprintln!("DEBUG: 1-RTT HP: buffer_len={}, pn_start={}, sample_offset={}, pn_len={}", 
-                         buf.len(), pn_start, sample_offset, pn_len);
-                eprintln!("DEBUG: 1-RTT HP: first_byte=0x{:02x}, pn_bytes={:02x}", buf[0], buf[pn_start]);
+                eprintln!("HP calculation: pn_start={}, sample_offset={}", pn_start, sample_offset);
                 
                 if buf.len() < sample_offset + 16 {
-                    eprintln!("DEBUG: Buffer too small for header protection sample: need {} bytes", sample_offset + 16);
+                    eprintln!("ERROR: Buffer too small for header protection sample: need {} bytes, have {}", sample_offset + 16, buf.len());
                     self.pending_crypto.push((level, crypto_data));
                     return None;
                 }
                 
                 let sample = &buf[sample_offset..sample_offset + 16];
-                eprintln!("DEBUG: 1-RTT HP: sample_bytes={:02x?}", &sample[0..std::cmp::min(8, sample.len())]);
+                eprintln!("HP sample (16 bytes): {:02x?}", sample);
                 
                 let mut mask = vec![0u8; 5];
                 let hp = write_keys.hp.as_ref().unwrap();
                 let hp_key = &write_keys.hp_key;
-                eprintln!("DEBUG: 1-RTT HP: hp_key={:02x?}", &hp_key[0..std::cmp::min(16, hp_key.len())]);
+                eprintln!("HP key: {:02x?}", hp_key);
                 if hp.build_mask(hp_key, sample, &mut mask).is_err() {
-                    eprintln!("DEBUG: 1-RTT HP: mask generation failed");
+                    eprintln!("ERROR: HP mask generation failed");
                     self.pending_crypto.push((level, crypto_data));
                     return None;
                 }
                 
-                eprintln!("DEBUG: 1-RTT HP: mask={:02x?}", mask);
+                eprintln!("HP mask (5 bytes): {:02x?}", mask);
                 
                 // Apply mask to first byte (mask 5 bits for short header)
                 let mask_first_byte = mask[0] & 0x1f;
                 buf[0] ^= mask_first_byte; // Short header masks bits 0-4 (5 bits)
-                eprintln!("DEBUG: 1-RTT HP: first_byte after HP: 0x{:02x}", buf[0]);
+                eprintln!("First byte after HP: 0x{:02x} (masked with 0x{:02x})", buf[0], mask_first_byte);
                 
                 // Apply mask to packet number
                 for i in 0..pn_len {
                     buf[pn_start + i] ^= mask[1 + i];
                 }
-                eprintln!("DEBUG: 1-RTT HP: pn_bytes after HP: {:02x?}", &buf[pn_start..pn_start+pn_len]);
+                eprintln!("PN bytes after HP: {:02x?}", &buf[pn_start..pn_start+pn_len]);
+                eprintln!("Full packet bytes after HP (first 60): {:02x?}", &buf[0..std::cmp::min(60, buf.len())]);
+                eprintln!("===== END 1-RTT CRYPTO PACKET =====\n");
                 
                 // Update state
                 let new_offset = offset + (data_to_send.len() as VarInt);
@@ -2614,10 +2670,6 @@ impl Connection for QuicConnection {
                 self.congestion_controller.on_packet_sent(pn, pn_space, buf.len(), true, now);
                 self.stats.packets_sent += 1;
                 self.stats.bytes_sent += buf.len() as u64;
-                
-                // Log the final packet bytes for debugging
-                eprintln!("DEBUG: ✓ SENT 1-RTT CRYPTO packet, pn={}, packet_len={}, bytes={:02x?}", 
-                         pn, buf.len(), &buf[0..std::cmp::min(50, buf.len())]);
                 
                 let data = buf.split();
                 return Some(DatagramOutput { data, send_time: None });
