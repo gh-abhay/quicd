@@ -60,6 +60,32 @@ impl QuicdApplication for H3Application {
         info!("✓ H3 connection established");
         info!("File root configured: {:?}", self.config.handler.file_root);
         
+        // RFC 9114 Section 6.2: Open control stream and send SETTINGS
+        match conn.open_uni_stream().await {
+            Ok(mut control_stream) => {
+                info!("✓ Opened control stream: {:?}", control_stream.stream_id());
+                
+                // Send stream type byte (0x00 = control stream)
+                let stream_type = vec![0x00];
+                if let Err(e) = control_stream.write_all(&stream_type).await {
+                    error!("Failed to write control stream type: {:?}", e);
+                    return;
+                }
+                
+                // Send SETTINGS frame
+                let settings = encode_settings_frame();
+                if let Err(e) = control_stream.write_all(&settings).await {
+                    error!("Failed to write SETTINGS frame: {:?}", e);
+                    return;
+                }
+                info!("✓ Sent SETTINGS frame on control stream");
+            }
+            Err(e) => {
+                error!("Failed to open control stream: {:?}", e);
+                return;
+            }
+        }
+        
         // Verify www directory exists and list contents
         if let Ok(entries) = std::fs::read_dir(&self.config.handler.file_root) {
             info!("✓ WWW directory exists at: {}", self.config.handler.file_root.display());
@@ -76,42 +102,83 @@ impl QuicdApplication for H3Application {
             warn!("✗ WWW directory not accessible: {}", self.config.handler.file_root.display());
         }
         
-        // Accept and handle request streams
+        // Accept and handle both bidirectional (requests) and unidirectional (control/QPACK) streams
         loop {
-            match conn.accept_bi_stream().await {
-                Ok(mut stream) => {
-                    info!("✓ Accepted request stream: {:?}", stream.stream_id());
-                    
-                    // Read request (HTTP/3 HEADERS frame)
-                    let mut buf = vec![0u8; 4096];
-                    match stream.read(&mut buf).await {
-                        Ok(0) => {
-                            info!("Stream closed immediately");
-                            continue;
-                        }
-                        Ok(n) => {
-                            info!("✓ Read {} bytes from stream", n);
-                            info!("Request data (hex): {}", hex::encode(&buf[..n.min(100)]));
+            tokio::select! {
+                result = conn.accept_bi_stream() => {
+                    match result {
+                        Ok(mut stream) => {
+                            info!("✓ Accepted request stream: {:?}", stream.stream_id());
                             
-                            // Parse HTTP/3 HEADERS frame to extract path
-                            let path = parse_request_path(&buf[..n]);
-                            info!("Parsed request path: {:?}", path);
-                            
-                            // Serve the file
-                            if let Some(path_str) = path {
-                                serve_file(&mut stream, &path_str, &self.config.handler.file_root).await;
-                            } else {
-                                send_error_response(&mut stream, 400).await;
+                            // Read request (HTTP/3 HEADERS frame)
+                            let mut buf = vec![0u8; 4096];
+                            match stream.read(&mut buf).await {
+                                Ok(0) => {
+                                    info!("Stream closed immediately");
+                                    continue;
+                                }
+                                Ok(n) => {
+                                    info!("✓ Read {} bytes from stream", n);
+                                    info!("Request data (hex): {}", hex::encode(&buf[..n.min(100)]));
+                                    
+                                    // Parse HTTP/3 HEADERS frame to extract path
+                                    let path = parse_request_path(&buf[..n]);
+                                    info!("Parsed request path: {:?}", path);
+                                    
+                                    // Serve the file
+                                    if let Some(path_str) = path {
+                                        serve_file(&mut stream, &path_str, &self.config.handler.file_root).await;
+                                    } else {
+                                        send_error_response(&mut stream, 400).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to read from stream: {:?}", e);
+                                }
                             }
                         }
                         Err(e) => {
-                            error!("Failed to read from stream: {:?}", e);
+                            info!("accept_bi_stream error: {:?}, closing connection", e);
+                            break;
                         }
                     }
                 }
-                Err(e) => {
-                    info!("accept_bi_stream error: {:?}, closing connection", e);
-                    break;
+                result = conn.accept_uni_stream() => {
+                    match result {
+                        Ok(mut stream) => {
+                            info!("✓ Accepted unidirectional stream from client: {:?}", stream.stream_id());
+                            
+                            // Read stream type byte
+                            let mut stream_type_buf = [0u8; 1];
+                            match stream.read_exact(&mut stream_type_buf).await {
+                                Ok(_) => {
+                                    let stream_type = stream_type_buf[0];
+                                    info!("Stream type: 0x{:02x}", stream_type);
+                                    
+                                    match stream_type {
+                                        0x00 => {
+                                            info!("Client control stream");
+                                            // Read and log SETTINGS frame
+                                            let mut settings_buf = vec![0u8; 256];
+                                            if let Ok(n) = stream.read(&mut settings_buf).await {
+                                                info!("Received {} bytes on control stream: {}", n, hex::encode(&settings_buf[..n]));
+                                            }
+                                        }
+                                        0x02 => info!("Client QPACK encoder stream"),
+                                        0x03 => info!("Client QPACK decoder stream"),
+                                        _ => info!("Unknown stream type: 0x{:02x}", stream_type),
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to read stream type: {:?}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            info!("accept_uni_stream ended: {:?}", e);
+                            // Don't break - continue accepting bi streams
+                        }
+                    }
                 }
             }
         }
@@ -158,6 +225,7 @@ async fn serve_file(stream: &mut quicd_x::QuicStream<'_>, path: &str, file_root:
             info!("✓ File read successfully: {} bytes", content.len());
             
             let headers = encode_response_headers(200, content.len());
+            info!("Headers frame (hex): {}", hex::encode(&headers));
             if let Err(e) = stream.write_all(&headers).await {
                 error!("Failed to write headers: {:?}", e);
                 return;
@@ -165,6 +233,7 @@ async fn serve_file(stream: &mut quicd_x::QuicStream<'_>, path: &str, file_root:
             info!("✓ Sent response headers");
             
             let data_frame = encode_data_frame(&content);
+            info!("Data frame header (first 20 bytes hex): {}", hex::encode(&data_frame[..data_frame.len().min(20)]));
             if let Err(e) = stream.write_all(&data_frame).await {
                 error!("Failed to write data: {:?}", e);
                 return;
@@ -223,6 +292,16 @@ fn encode_data_frame(data: &[u8]) -> Vec<u8> {
     }
     
     frame.extend_from_slice(data);
+    frame
+}
+
+fn encode_settings_frame() -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.push(0x04); // SETTINGS frame type
+    
+    // Empty SETTINGS frame (no settings to advertise)
+    frame.push(0x00); // Frame length = 0
+    
     frame
 }
 
