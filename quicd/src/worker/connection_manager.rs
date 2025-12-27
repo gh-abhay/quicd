@@ -776,7 +776,7 @@ impl ConnectionManager {
         }
     }
     
-    pub fn handle_command(&mut self, cmd: Command) -> Vec<(SocketAddr, Vec<u8>)> {
+    pub fn handle_command(&mut self, cmd: Command) -> (Vec<(SocketAddr, Vec<u8>)>, Option<usize>) {
         let now = Instant::now();
         
         match cmd {
@@ -793,12 +793,11 @@ impl ConnectionManager {
                         if let Err(e) = state.conn.write_stream(quic_stream_id, data, fin) {
                             error!("Failed to write to stream {:?}: {}", stream_id, e);
                         } else {
-                            eprintln!("HANDLE_COMMAND: write_stream succeeded");
+                            eprintln!("HANDLE_COMMAND: write_stream succeeded, deferring packet generation");
                         }
                     }
-                    let packets = self.generate_packets(slab_idx, now);
-                    eprintln!("HANDLE_COMMAND: generate_packets returned {} packets", packets.len());
-                    return packets;
+                    // Return empty packets and slab_idx to defer packet generation
+                    return (Vec::new(), Some(slab_idx));
                 } else {
                     eprintln!("HANDLE_COMMAND: Connection not found for conn_id={:?}", conn_id);
                 }
@@ -819,7 +818,8 @@ impl ConnectionManager {
                             }
                         }
                     }
-                    return self.generate_packets(slab_idx, now);
+                    let packets = self.generate_packets(slab_idx, now);
+                    return (packets, None);
                 }
             }
             Command::OpenUniStream { conn_id } => {
@@ -838,7 +838,8 @@ impl ConnectionManager {
                             }
                         }
                     }
-                    return self.generate_packets(slab_idx, now);
+                    let packets = self.generate_packets(slab_idx, now);
+                    return (packets, None);
                 }
             }
             Command::SendDatagram { conn_id, data } => {
@@ -849,7 +850,8 @@ impl ConnectionManager {
                             error!("Failed to send datagram: {}", e);
                         }
                     }
-                    return self.generate_packets(slab_idx, now);
+                    let packets = self.generate_packets(slab_idx, now);
+                    return (packets, None);
                 }
             }
             Command::CloseConnection { conn_id, error_code, reason } => {
@@ -858,7 +860,8 @@ impl ConnectionManager {
                     if let Some(state) = self.get_connection_mut(slab_idx) {
                         state.conn.close(error_code, reason.as_bytes());
                     }
-                    return self.generate_packets(slab_idx, now);
+                    let packets = self.generate_packets(slab_idx, now);
+                    return (packets, None);
                 }
             }
             Command::ResetStream { conn_id, stream_id, error_code } => {
@@ -870,7 +873,8 @@ impl ConnectionManager {
                             error!("Failed to reset stream {:?}: {}", stream_id, e);
                         }
                     }
-                    return self.generate_packets(slab_idx, now);
+                    let packets = self.generate_packets(slab_idx, now);
+                    return (packets, None);
                 }
             }
             Command::StopSending { conn_id, stream_id, error_code } => {
@@ -878,7 +882,8 @@ impl ConnectionManager {
                 // TODO: Implement proper STOP_SENDING frame handling in quicd-quic
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
                     debug!("STOP_SENDING requested for stream {:?} with error {}", stream_id, error_code);
-                    return self.generate_packets(slab_idx, now);
+                    let packets = self.generate_packets(slab_idx, now);
+                    return (packets, None);
                 }
             }
             Command::AbortConnection { conn_id, error_code } => {
@@ -887,7 +892,8 @@ impl ConnectionManager {
                     if let Some(state) = self.get_connection_mut(slab_idx) {
                         state.conn.close(error_code, b"connection aborted");
                     }
-                    return self.generate_packets(slab_idx, now);
+                    let packets = self.generate_packets(slab_idx, now);
+                    return (packets, None);
                 }
             }
             Command::StreamDataRead { conn_id, stream_id, len } => {
@@ -896,11 +902,12 @@ impl ConnectionManager {
                 // TODO: Implement explicit flow control update in quicd-quic
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
                     trace!("Application consumed {} bytes from stream {:?}", len, stream_id);
-                    return self.generate_packets(slab_idx, now);
+                    let packets = self.generate_packets(slab_idx, now);
+                    return (packets, None);
                 }
             }
         }
-        vec![]
+        (vec![], None)
     }
     
     /// Helper to find Slab index by quicd_x ConnectionId.
@@ -1024,7 +1031,7 @@ impl ConnectionManager {
         responses
     }
     
-    fn generate_packets(&mut self, slab_idx: SlabIndex, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+    pub fn generate_packets(&mut self, slab_idx: SlabIndex, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
         if let Some(state) = self.get_connection_mut(slab_idx) {
             let mut out = Vec::new();
             

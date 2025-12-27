@@ -426,12 +426,17 @@ impl NetworkWorker {
             // Worker batches commands to amortize processing overhead.
             // ═══════════════════════════════════════════════════════════════════
             let mut egress_packets = Vec::new();
+            let mut pending_packet_gen = std::collections::HashSet::new(); // Connections needing packet generation
             for _ in 0..128 {
                 match egress_rx.try_recv() {
                     Ok(command) => {
                         // Process command through connection manager
-                        let cmd_packets = conn_manager.handle_command(command);
+                        let (cmd_packets, maybe_slab_idx) = conn_manager.handle_command(command);
                         egress_packets.extend(cmd_packets);
+                        // Collect slab indices for deferred packet generation
+                        if let Some(slab_idx) = maybe_slab_idx {
+                            pending_packet_gen.insert(slab_idx);
+                        }
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -439,6 +444,12 @@ impl NetworkWorker {
                         break;
                     }
                 }
+            }
+            // Generate packets for all connections with pending writes (batched)
+            let now = std::time::Instant::now();
+            for slab_idx in pending_packet_gen {
+                let packets = conn_manager.generate_packets(slab_idx, now);
+                egress_packets.extend(packets);
             }
 
             // ═══════════════════════════════════════════════════════════════════

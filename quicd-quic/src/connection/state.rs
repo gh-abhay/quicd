@@ -3673,6 +3673,21 @@ impl Connection for QuicConnection {
             return Err(Error::Transport(crate::error::TransportError::FlowControlError));
         }
         
+        // RFC 9000: If sending FIN with empty data and we have pending data for this stream,
+        // coalesce by setting FIN on the last pending write for this stream.
+        // This ensures HTTP/0.9 responses send data + FIN in the same STREAM frame.
+        if data.is_empty() && fin {
+            // Find the last pending write for this stream_id
+            for i in (0..self.pending_stream_writes.len()).rev() {
+                if self.pending_stream_writes[i].0 == stream_id {
+                    // Set FIN on the existing write
+                    self.pending_stream_writes[i].2 = true;
+                    eprintln!("DEBUG: Coalesced FIN with existing data for stream {:?}", stream_id);
+                    return Ok(());
+                }
+            }
+        }
+        
         // Queue stream write for next packet generation
         // Flow control credit will be consumed when frames are actually sent in poll_send()
         self.pending_stream_writes.push((stream_id, data, fin));
