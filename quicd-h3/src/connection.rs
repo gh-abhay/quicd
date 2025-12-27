@@ -138,11 +138,12 @@ impl QuicdApplication for H3Application {
                                     // Serve the file
                                     if let Some(path_str) = path {
                                         serve_file(&mut stream, &path_str, &self.config.handler.file_root, use_http09).await;
-                                        // In HTTP/0.9 mode, close connection after serving file
+                                        // In HTTP/0.9 mode, stream shutdown is sufficient
+                                        // Don't close connection - let it naturally timeout or client close it
                                         if use_http09 {
-                                            info!("HTTP/0.9: Closing connection after serving file");
-                                            conn.close(0, "HTTP/0.9 response complete".to_string());
-                                            return; // Exit the connection handler
+                                            info!("HTTP/0.9: Stream closed, waiting for client to close connection");
+                                            // Just return - connection will remain open for potential reuse
+                                            // or will be closed by client or timeout
                                         }
                                     } else {
                                         if use_http09 {
