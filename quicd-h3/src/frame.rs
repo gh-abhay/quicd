@@ -311,7 +311,7 @@ impl FrameParser {
                 ParserState::ReadingLength { frame_type } => {
                     if let Some(length) = try_read_varint(&mut self.buffer)? {
                         eprintln!("FrameParser: Read frame length: {} for type 0x{:x}", length, frame_type);
-                        if length > u64::MAX as u64 {
+                        if length > u64::MAX {
                             return Err(Error::protocol(
                                 ErrorCode::FrameError,
                                 format!("frame length too large: {}", length),

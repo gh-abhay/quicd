@@ -44,6 +44,7 @@ libloading = { workspace = true }
 quicd-quic = { path = "../quicd-quic", features = ["boring-crypto"] }
 quicd-x = { path = "../quicd-x" }
 quicd-h3 = { path = "../quicd-h3" }
+quicd-hq-interop = { path = "../quicd-hq-interop" }
 
 # eBPF routing dependencies
 aya = { workspace = true }

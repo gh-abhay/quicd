@@ -95,6 +95,7 @@ impl ApplicationConfig {
             let builtin_name = &self.app_type[8..];
             match builtin_name {
                 "http3" => Ok(ApplicationType::Http3),
+                "hq-interop" => Ok(ApplicationType::HqInterop),
                 "moq" => Ok(ApplicationType::Moq),
                 _ => Err(format!("Unknown builtin application type: {}", builtin_name)),
             }
@@ -107,12 +108,14 @@ impl ApplicationConfig {
 }
 
 /// Application type enumeration.
-///
 /// Determines which configuration schema is used for an application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationType {
     /// HTTP/3 protocol (RFC 9114)
     Http3,
+
+    /// HTTP/0.9 over QUIC (hq-interop)
+    HqInterop,
 
     /// Media over QUIC
     Moq,
@@ -129,6 +132,9 @@ pub enum ApplicationType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ApplicationTypeConfig {
+    /// HQ-Interop configuration (must come before Http3 for proper deserialization)
+    HqInterop(HqInteropConfig),
+
     /// HTTP/3 configuration
     Http3(Http3Config),
 
@@ -159,6 +165,13 @@ impl ApplicationTypeConfig {
                     Err(vec![format!("Type mismatch: expected '{}' but got Http3 config", type_str)])
                 }
             }
+            ApplicationTypeConfig::HqInterop(cfg) => {
+                if type_str == "builtin:hq-interop" {
+                    cfg.validate().map_err(|e| vec![e])
+                } else {
+                    Err(vec![format!("Type mismatch: expected '{}' but got HqInterop config", type_str)])
+                }
+            }
             ApplicationTypeConfig::Moq(cfg) => {
                 if type_str == "builtin:moq" {
                     cfg.validate().map_err(|e| vec![e])
@@ -182,6 +195,15 @@ impl ApplicationTypeConfig {
     pub fn as_http3(&self) -> Option<&Http3Config> {
         match self {
             ApplicationTypeConfig::Http3(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Try to extract HqInterop configuration.
+    #[allow(dead_code)]
+    pub fn as_hq_interop(&self) -> Option<&HqInteropConfig> {
+        match self {
+            ApplicationTypeConfig::HqInterop(cfg) => Some(cfg),
             _ => None,
         }
     }
@@ -392,6 +414,56 @@ impl Http3Config {
         }
 
         Ok(())
+    }
+}
+
+/// HQ-Interop (HTTP/0.9 over QUIC) application configuration.
+///
+/// This contains settings for the hq-interop protocol used in QUIC interoperability testing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HqInteropConfig {
+    /// HTTP Handler Configuration
+    #[serde(default)]
+    pub handler: HqInteropHandlerConfig,
+}
+
+impl Default for HqInteropConfig {
+    fn default() -> Self {
+        Self {
+            handler: HqInteropHandlerConfig::default(),
+        }
+    }
+}
+
+impl HqInteropConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate handler settings
+        if self.handler.file_root.is_empty() {
+            return Err("Handler file_root cannot be empty".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+/// Handler configuration for HQ-Interop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HqInteropHandlerConfig {
+    /// Root directory for file serving
+    pub file_root: String,
+
+    /// Index files to try for directory requests (e.g., "index.html")
+    pub index_files: Vec<String>,
+}
+
+impl Default for HqInteropHandlerConfig {
+    fn default() -> Self {
+        Self {
+            file_root: "/www".to_string(),
+            index_files: vec!["index.html".to_string()],
+        }
     }
 }
 

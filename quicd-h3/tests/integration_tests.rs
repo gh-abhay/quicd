@@ -28,7 +28,10 @@ async fn create_test_app() -> (H3Application, TempDir) {
 
 #[tokio::test]
 async fn test_h3_application_creation() {
-    let config = H3Config::default();
+    let temp_dir = TempDir::new().unwrap();
+    let mut config = H3Config::default();
+    config.handler.file_root = temp_dir.path().to_path_buf();
+    
     let app = H3Application::new(config.clone());
     
     assert_eq!(app.config().qpack.max_table_capacity, config.qpack.max_table_capacity);
