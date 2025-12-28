@@ -338,10 +338,13 @@ impl FrameParser {
                     frames.push(frame);
 
                     self.state = ParserState::ReadingType;
+                    // Continue loop to parse more frames - we made progress by completing a frame
+                    continue;
                 }
             }
 
-            // Safety check: ensure we made progress
+            // Safety check: ensure we made progress (consumed bytes from buffer)
+            // This prevents infinite loops when we can't parse anything
             if self.buffer.len() == initial_len {
                 break;
             }

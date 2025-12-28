@@ -151,6 +151,7 @@ impl BoringTlsSession {
         }
 
         // Set ALPN callback
+        // CRITICAL: Iterate through CLIENT protocols first to respect client preference (RFC 7301).
         if !alpn_protocols.is_empty() {
             let mut protos_flat = Vec::new();
             for p in alpn_protocols {
@@ -159,6 +160,34 @@ impl BoringTlsSession {
             }
             
             ctx.set_alpn_select_callback(move |_, client_protos| {
+                // Debug: Log client ALPN protocols
+                eprintln!("DEBUG: Client offered ALPN protocols:");
+                let mut debug_idx = 0;
+                while debug_idx < client_protos.len() {
+                    let len = client_protos[debug_idx] as usize;
+                    debug_idx += 1;
+                    if debug_idx + len > client_protos.len() {
+                        break;
+                    }
+                    let proto = &client_protos[debug_idx..debug_idx + len];
+                    eprintln!("  - {:?}", String::from_utf8_lossy(proto));
+                    debug_idx += len;
+                }
+                
+                eprintln!("DEBUG: Server supports ALPN protocols:");
+                let mut debug_server_idx = 0;
+                while debug_server_idx < protos_flat.len() {
+                    let slen = protos_flat[debug_server_idx] as usize;
+                    debug_server_idx += 1;
+                    if debug_server_idx + slen > protos_flat.len() {
+                        break;
+                    }
+                    let sproto = &protos_flat[debug_server_idx..debug_server_idx + slen];
+                    eprintln!("  - {:?}", String::from_utf8_lossy(sproto));
+                    debug_server_idx += slen;
+                }
+                
+                // Iterate through CLIENT protocols first (client preference, RFC 7301)
                 let mut client_idx = 0;
                 while client_idx < client_protos.len() {
                     let len = client_protos[client_idx] as usize;
@@ -168,6 +197,7 @@ impl BoringTlsSession {
                     }
                     let proto = &client_protos[client_idx..client_idx + len];
                     
+                    // Check if this client protocol is in server's list
                     let mut server_idx = 0;
                     while server_idx < protos_flat.len() {
                         let slen = protos_flat[server_idx] as usize;
@@ -177,6 +207,7 @@ impl BoringTlsSession {
                         }
                         let sproto = &protos_flat[server_idx..server_idx + slen];
                         if proto == sproto {
+                            eprintln!("DEBUG: Selected ALPN: {:?}", String::from_utf8_lossy(proto));
                             return Ok(proto);
                         }
                         server_idx += slen;
@@ -184,6 +215,7 @@ impl BoringTlsSession {
                     
                     client_idx += len;
                 }
+                eprintln!("DEBUG: No matching ALPN found - returning NOACK");
                 Err(boring::ssl::AlpnError::NOACK)
             });
         }
@@ -253,11 +285,36 @@ impl TlsSession for BoringTlsSession {
                         // Normal - need more data
                         return Ok(());
                     }
-                    _ => {
-                        // Error occurred
-                        return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+                    ffi::SSL_ERROR_SYSCALL => {
+                        // For QUIC, SSL_ERROR_SYSCALL with error_code=0 means "would block"
+                        // (no actual system call is made since QUIC doesn't use socket I/O)
+                        let error_code = unsafe { ffi::ERR_get_error() };
+                        if error_code == 0 {
+                            // Normal - need more data (QUIC non-blocking mode)
+                            return Ok(());
+                        }
+                        // Otherwise fall through to error handling
                     }
+                    _ => {}
                 }
+                
+                // Error occurred - get details
+                let error_code = unsafe { ffi::ERR_get_error() };
+                        
+                        // Get error string from BoringSSL
+                        let mut err_buf = [0u8; 256];
+                        unsafe {
+                            ffi::ERR_error_string_n(error_code, err_buf.as_mut_ptr() as *mut i8, err_buf.len());
+                        }
+                        let err_str = std::ffi::CStr::from_bytes_until_nul(&err_buf)
+                            .ok()
+                            .and_then(|c| c.to_str().ok())
+                            .unwrap_or("unknown error");
+                        
+                        eprintln!("DEBUG: SSL_do_handshake failed: handshake_result={}, ssl_error={:?}, error_code={:x}", 
+                                 handshake_result, err, error_code);
+                        eprintln!("DEBUG: BoringSSL error string: {}", err_str);
+                        return Err(Error::Crypto(CryptoError { code: error_code as u64 }));
             }
         }
         
@@ -294,15 +351,18 @@ impl TlsSession for BoringTlsSession {
     }
 
     fn set_transport_params(&mut self, params: &[u8]) -> Result<()> {
+        eprintln!("DEBUG: Setting transport params: len={}", params.len());
         unsafe {
             if ffi::SSL_set_quic_transport_params(
                 self.ssl.as_ptr(),
                 params.as_ptr(),
                 params.len(),
             ) != 1 {
+                eprintln!("DEBUG: SSL_set_quic_transport_params FAILED");
                 return Err(Error::Crypto(CryptoError { code: 0x0150 }));
             }
         }
+        eprintln!("DEBUG: Transport params set successfully");
         Ok(())
     }
 }

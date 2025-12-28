@@ -18,15 +18,17 @@ pub type AppFactory = Arc<dyn Fn() -> Arc<dyn QuicdApplication> + Send + Sync>;
 /// The registry is built during server initialization based on
 /// configuration and is used to route connections to the appropriate
 /// application based on ALPN negotiation.
+/// 
+/// Uses Vec to maintain ALPN order for deterministic TLS negotiation.
 pub struct AppRegistry {
-    factories: HashMap<String, AppFactory>,
+    factories: Vec<(String, AppFactory)>,
 }
 
 impl AppRegistry {
     /// Create a new empty application registry.
     pub fn new() -> Self {
         Self {
-            factories: HashMap::new(),
+            factories: Vec::new(),
         }
     }
 
@@ -39,26 +41,27 @@ impl AppRegistry {
         factory: AppFactory,
     ) -> Result<Self> {
         let alpn = alpn.into();
-        if self.factories.contains_key(&alpn) {
+        if self.factories.iter().any(|(a, _)| a == &alpn) {
             anyhow::bail!("ALPN '{}' is already registered", alpn);
         }
-        self.factories.insert(alpn, factory);
+        self.factories.push((alpn, factory));
         Ok(self)
     }
 
     /// Get the application factory for a given ALPN.
     pub fn get(&self, alpn: &str) -> Option<&AppFactory> {
-        self.factories.get(alpn)
+        self.factories.iter().find(|(a, _)| a == alpn).map(|(_, f)| f)
     }
 
     /// List all registered ALPNs.
     pub fn alpns(&self) -> Vec<&str> {
-        self.factories.keys().map(|s| s.as_str()).collect()
+        self.factories.iter().map(|(s, _)| s.as_str()).collect()
     }
 
     /// Get all registered ALPN protocols as owned Strings (for TLS configuration).
+    /// Maintains insertion order for deterministic ALPN negotiation.
     pub fn get_all_alpn_protocols(&self) -> Vec<String> {
-        self.factories.keys().cloned().collect()
+        self.factories.iter().map(|(s, _)| s.clone()).collect()
     }
 
     /// Get the number of registered applications.
@@ -84,10 +87,27 @@ impl Default for AppRegistry {
 /// the appropriate application instances (HTTP/3, plugins, etc.).
 /// 
 /// Each application can register multiple ALPN identifiers.
+/// 
+/// Applications are sorted to ensure HTTP/3 ALPNs are registered before
+/// hq-interop for proper ALPN negotiation priority.
 pub fn build_registry(app_configs: &HashMap<String, ApplicationConfig>) -> Result<AppRegistry> {
     let mut registry = AppRegistry::new();
 
-    for (app_name, app_config) in app_configs {
+    // Sort applications to ensure predictable ALPN order: http3 before hq-interop
+    let mut sorted_apps: Vec<_> = app_configs.iter().collect();
+    sorted_apps.sort_by_key(|(name, config)| {
+        // Priority order: http3 (0), hq-interop (1), others (2)
+        let priority = if config.app_type == "builtin:http3" {
+            0
+        } else if config.app_type == "builtin:hq-interop" {
+            1
+        } else {
+            2
+        };
+        (priority, *name)
+    });
+
+    for (app_name, app_config) in sorted_apps {
         // Skip disabled applications
         if !app_config.enabled {
             tracing::info!("Application '{}' is disabled, skipping", app_name);

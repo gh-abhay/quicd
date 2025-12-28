@@ -438,10 +438,18 @@ pub struct QuicConnection {
 
 impl QuicConnection {
     /// Create new connection with all components
+    /// 
+    /// # Parameters
+    /// - `side`: Client or Server
+    /// - `scid`: Source Connection ID (our ID for receiving)
+    /// - `dcid`: Destination Connection ID (peer's ID for sending to them)
+    /// - `original_dcid`: For servers only - the DCID from client's Initial packet (RFC 9000 §18.2)
+    /// - `config`: Connection configuration
     pub fn new(
         side: Side,
         scid: ConnectionId,
         dcid: ConnectionId,
+        original_dcid: Option<ConnectionId>,
         config: ConnectionConfig,
     ) -> Self {
         // Create packet parser
@@ -496,8 +504,18 @@ impl QuicConnection {
         // Derive initial_secret from client's DCID (RFC 9001 Section 5.2)
         // Note: For server, dcid is the client's DCID from the received Initial packet
         // For client, dcid is the server's DCID from the received Initial packet
-        eprintln!("DEBUG: Key derivation: side={:?}, dcid={:?}, scid={:?}", side, dcid, scid);
-        let initial_secret = match key_schedule.derive_initial_secret(&dcid, VERSION_1) {
+        //
+        // CRITICAL FIX: When server creates connection, `dcid` parameter is the client's SCID (which might be empty).
+        // But RFC 9001 says initial keys are derived from Destination Connection ID field from the first Initial packet sent by the client.
+        // This is passed as `original_dcid` parameter for servers.
+        let initial_secret_dcid = if side == Side::Server {
+            original_dcid.as_ref().expect("Server must have original_dcid")
+        } else {
+            &dcid
+        };
+        
+        eprintln!("DEBUG: Key derivation: side={:?}, dcid={:?}, scid={:?}, initial_secret_dcid={:?}", side, dcid, scid, initial_secret_dcid);
+        let initial_secret = match key_schedule.derive_initial_secret(initial_secret_dcid, VERSION_1) {
             Ok(secret) => secret,
             Err(e) => {
                 eprintln!("Failed to derive initial secret: {:?}", e);
@@ -1282,9 +1300,10 @@ impl QuicConnection {
                 Ok(mut session) => {
                     // RFC 9001 Section 8.2: Transport parameters MUST be set before processing handshake data
                     // Encode transport parameters
-                    // For server, original_destination_connection_id is the client's DCID
+                    // For server, original_destination_connection_id is the DCID from client's Initial packet
+                    // NOT the SCID - see RFC 9000 §18.2
                     let mut params_buf = BytesMut::with_capacity(256);
-                    if let Err(e) = encode_transport_params(&local_params, &mut params_buf, true, Some(&dcid)) {
+                    if let Err(e) = encode_transport_params(&local_params, &mut params_buf, true, original_dcid.as_ref()) {
                         eprintln!("Warning: Failed to encode transport parameters: {:?}", e);
                         return Self {
                             side,
@@ -1578,94 +1597,92 @@ impl QuicConnection {
             }
         }
     }
-}
-
-// Stub implementations for missing components
-struct StubCryptoBackend;
-
-impl CryptoBackend for StubCryptoBackend {
-    fn create_aead(&self, _cipher_suite: u16) -> Result<Box<dyn crate::crypto::AeadProvider>> {
-        Err(Error::Transport(crate::error::TransportError::InternalError))
+    
+    /// Calculate the total length of a QUIC packet from header information.
+    /// 
+    /// RFC 9000 §12.2: For coalesced packets, long headers include a Length field
+    /// that specifies PN + Payload length. Short headers extend to end of datagram.
+    /// 
+    /// Returns (packet_length, is_short_header) or None if parsing fails.
+    fn calculate_packet_length(&self, buf: &[u8]) -> Option<(usize, bool)> {
+        if buf.is_empty() {
+            return None;
+        }
+        
+        let first_byte = buf[0];
+        let is_long = (first_byte & 0x80) != 0;
+        
+        if !is_long {
+            // Short header (1-RTT): extends to end of datagram
+            eprintln!("DEBUG: calculate_packet_length: short header, returning buf.len()={}", buf.len());
+            return Some((buf.len(), true));
+        }
+        
+        // Long header parsing - need to find Length field
+        // Format: Flags (1) + Version (4) + DCID Len (1) + DCID + SCID Len (1) + SCID + [Token] + Length + PN + Payload
+        
+        if buf.len() < 6 {
+            eprintln!("DEBUG: calculate_packet_length: buf too short for basic header, len={}", buf.len());
+            return None;
+        }
+        
+        let dcid_len = buf[5] as usize;
+        if buf.len() < 6 + dcid_len + 1 {
+            eprintln!("DEBUG: calculate_packet_length: buf too short for DCID, dcid_len={}, buf_len={}", dcid_len, buf.len());
+            return None;
+        }
+        
+        let scid_len = buf[6 + dcid_len] as usize;
+        let mut offset = 7 + dcid_len + scid_len;
+        
+        eprintln!("DEBUG: calculate_packet_length: dcid_len={}, scid_len={}, offset after CIDs={}", dcid_len, scid_len, offset);
+        
+        if buf.len() < offset {
+            eprintln!("DEBUG: calculate_packet_length: buf too short after CIDs, offset={}, buf_len={}", offset, buf.len());
+            return None;
+        }
+        
+        // For Initial packets, skip Token field
+        let type_bits = (first_byte >> 4) & 0x03;
+        eprintln!("DEBUG: calculate_packet_length: first_byte=0x{:02x}, type_bits={}", first_byte, type_bits);
+        if type_bits == 0x00 {
+            // Initial packet - has Token Length + Token
+            let (token_len, token_len_bytes) = crate::types::VarIntCodec::decode(&buf[offset..])?;
+            offset += token_len_bytes;
+            offset += token_len as usize;
+            eprintln!("DEBUG: calculate_packet_length: Initial packet - token_len={}, token_len_bytes={}, offset after token={}", 
+                     token_len, token_len_bytes, offset);
+        }
+        
+        if buf.len() < offset + 1 {
+            eprintln!("DEBUG: calculate_packet_length: buf too short for Length field, offset={}, buf_len={}", offset, buf.len());
+            return None;
+        }
+        
+        // Parse Length field (varint specifying PN + Payload length)
+        let (length_field, length_bytes) = crate::types::VarIntCodec::decode(&buf[offset..])?;
+        offset += length_bytes;
+        
+        // Total packet length = header bytes parsed so far + Length field value
+        let total_length = offset + length_field as usize;
+        
+        eprintln!("DEBUG: calculate_packet_length: length_field={}, length_bytes={}, total_length={}", 
+                 length_field, length_bytes, total_length);
+        
+        Some((total_length, false))
     }
     
-    fn create_header_protection(&self, _cipher_suite: u16) -> Result<Box<dyn crate::crypto::HeaderProtectionProvider>> {
-        Err(Error::Transport(crate::error::TransportError::InternalError))
-    }
-    
-    fn create_key_schedule(&self) -> Box<dyn crate::crypto::KeySchedule> {
-        panic!("stub not implemented")
-    }
-    
-    fn create_tls_session(
-        &self,
-        _side: Side,
-        _server_name: Option<&str>,
-        _alpn_protocols: &[&[u8]],
-        _cert_data: Option<&[u8]>,
-        _key_data: Option<&[u8]>,
-    ) -> Result<Box<dyn TlsSession>> {
-        Err(Error::Transport(crate::error::TransportError::InternalError))
-    }
-}
-
-struct StubLossDetector;
-
-impl LossDetector for StubLossDetector {
-    fn on_packet_sent(
-        &mut self,
-        _space: crate::types::PacketNumberSpace,
-        _packet_number: PacketNumber,
-        _size: usize,
-        _is_retransmittable: bool,
-        _send_time: Instant,
-    ) {}
-    
-    fn on_ack_received(
-        &mut self,
-        _space: crate::types::PacketNumberSpace,
-        _largest_acked: PacketNumber,
-        _ack_delay: Duration,
-        _ack_ranges: &[(PacketNumber, PacketNumber)],
-        _recv_time: Instant,
-    ) -> crate::error::Result<(alloc::vec::Vec<PacketNumber>, alloc::vec::Vec<PacketNumber>)> {
-        Ok((alloc::vec::Vec::new(), alloc::vec::Vec::new()))
-    }
-    
-    fn detect_lost_packets(
-        &mut self,
-        _space: crate::types::PacketNumberSpace,
-        _now: Instant,
-    ) -> alloc::vec::Vec<PacketNumber> {
-        alloc::vec::Vec::new()
-    }
-    
-    fn get_loss_detection_timer(&self) -> Option<Instant> {
-        None
-    }
-    
-    fn on_loss_detection_timeout(&mut self, _now: Instant) -> crate::recovery::LossDetectionAction {
-        crate::recovery::LossDetectionAction::None
-    }
-    
-    fn pto_count(&self) -> u32 {
-        0
-    }
-    
-    fn discard_pn_space(&mut self, _space: crate::types::PacketNumberSpace) {}
-}
-
-impl Connection for QuicConnection {
-    fn process_datagram(&mut self, datagram: DatagramInput) -> Result<()> {
-        self.last_activity = Some(datagram.recv_time);
-        self.stats.packets_received += 1;
-        self.stats.bytes_received += datagram.data.len() as u64;
-
+    /// Process a single QUIC packet from within a datagram.
+    /// 
+    /// This method handles one complete QUIC packet: header parsing, decryption,
+    /// and frame processing. Returns Ok(()) even on errors (packets are dropped silently).
+    fn process_single_packet(&mut self, packet_data: Bytes, recv_time: crate::types::Instant) -> Result<()> {
         // Parse packet header to determine type and encryption level
         use crate::packet::api::{Packet, ParseContext};
         // For short headers, peers use our SCID as their DCID. Ensure the parser
         // expects that length so PN offset and payload slicing are correct.
         let parse_ctx = ParseContext::with_dcid_len(self.scid.len());
-        let mut packet = match Packet::parse_with_context(datagram.data.clone(), parse_ctx) {
+        let mut packet = match Packet::parse_with_context(packet_data.clone(), parse_ctx) {
             Ok(p) => p,
             Err(_) => {
                 // Invalid packet - drop silently
@@ -1673,20 +1690,8 @@ impl Connection for QuicConnection {
             }
         };
         
-        // RFC 9000 §7.2: For server→client packets, the DCID MUST be the client's SCID from
-        // the client's Initial. Update exactly once when we see the peer's SCID (only on server).
-        if self.side == Side::Server {
-            if let Some(ref scid) = packet.header.scid {
-                if self.dcid.as_bytes() != scid.as_bytes() {
-                    eprintln!(
-                        "DEBUG: RFC9000 DCID swap: updating outbound DCID from {:02x?} to client's SCID {:02x?}",
-                        self.dcid.as_bytes(),
-                        scid.as_bytes()
-                    );
-                    self.dcid = scid.clone();
-                }
-            }
-        }
+        // NOTE: dcid is already set correctly to client's SCID during connection initialization
+        // per RFC 9000 §7.2, so no need to update it here.
         
         // Determine encryption level from packet type
         let (encryption_level, read_keys, pn_space) = match packet.header.ty {
@@ -1717,7 +1722,7 @@ impl Connection for QuicConnection {
         // Remove header protection (RFC 9001 Section 5.4)
         // This reveals the actual packet number
         // We need a mutable copy of the buffer to modify it in-place
-        let mut datagram_buf = datagram.data.to_vec();
+        let mut packet_buf = packet_data.to_vec();
         let hp = read_keys.hp.as_ref().unwrap();
         let hp_key = &read_keys.hp_key;
         
@@ -1729,7 +1734,7 @@ impl Connection for QuicConnection {
             None
         };
         
-        if let Err(_) = packet.remove_header_protection(hp.as_ref(), hp_key, &mut datagram_buf, dcid_len_override) {
+        if let Err(_) = packet.remove_header_protection(hp.as_ref(), hp_key, &mut packet_buf, dcid_len_override) {
             return Ok(());
         }
         
@@ -1814,35 +1819,35 @@ impl Connection for QuicConnection {
         // For Initial packets, we also need to parse the Token field
         let (pn_offset, length_field) = if packet.header.ty.is_long_header() {
             // Long header: 1 (flags) + 4 (version) + 1 (dcid_len) + dcid + 1 (scid_len) + scid
-            if datagram_buf.len() < 6 { return Ok(()); }
-            let dcid_len = datagram_buf[5] as usize;
-            if datagram_buf.len() < 6 + dcid_len + 1 { return Ok(()); }
-            let scid_len = datagram_buf[6 + dcid_len] as usize;
+            if packet_buf.len() < 6 { return Ok(()); }
+            let dcid_len = packet_buf[5] as usize;
+            if packet_buf.len() < 6 + dcid_len + 1 { return Ok(()); }
+            let scid_len = packet_buf[6 + dcid_len] as usize;
             let mut offset = 7 + dcid_len + scid_len;
             
             // For Initial packets, parse Token Length and Token fields
             if packet.header.ty == crate::packet::types::PacketType::Initial {
-                if datagram_buf.len() < offset {
+                if packet_buf.len() < offset {
                     return Ok(());
                 }
-                let (token_len, token_len_bytes) = match crate::types::VarIntCodec::decode(&datagram_buf[offset..]) {
+                let (token_len, token_len_bytes) = match crate::types::VarIntCodec::decode(&packet_buf[offset..]) {
                     Some((len, bytes)) => (len as usize, bytes),
                     None => return Ok(()),
                 };
                 offset += token_len_bytes;
                 
                 // Skip Token field
-                if datagram_buf.len() < offset + token_len {
+                if packet_buf.len() < offset + token_len {
                     return Ok(());
                 }
                 offset += token_len;
             }
             
             // Parse Length field (variable-length integer) - present in all long header packets
-            if datagram_buf.len() < offset {
+            if packet_buf.len() < offset {
                 return Ok(());
             }
-            let (length_field, length_bytes) = match crate::types::VarIntCodec::decode(&datagram_buf[offset..]) {
+            let (length_field, length_bytes) = match crate::types::VarIntCodec::decode(&packet_buf[offset..]) {
                 Some((len, bytes)) => (len, bytes),
                 None => return Ok(()),
             };
@@ -1873,17 +1878,17 @@ impl Connection for QuicConnection {
             // Payload length = Length field - PN length
             let payload_len = length_field.checked_sub(pn_len).unwrap_or(0);
             let payload_offset = pn_offset + pn_len;
-            if datagram_buf.len() < payload_offset + payload_len {
+            if packet_buf.len() < payload_offset + payload_len {
                 return Ok(());
             }
-            &datagram_buf[payload_offset..payload_offset + payload_len]
+            &packet_buf[payload_offset..payload_offset + payload_len]
         } else {
             // Short header: payload extends to end of packet
             let payload_offset = pn_offset + pn_len;
-            if datagram_buf.len() <= payload_offset {
+            if packet_buf.len() <= payload_offset {
                 return Ok(());
             }
-            &datagram_buf[payload_offset..]
+            &packet_buf[payload_offset..]
         };
         
         // Payload offset for AAD construction (header + PN)
@@ -1896,9 +1901,9 @@ impl Connection for QuicConnection {
         
         // Build header for AEAD AAD (RFC 9001 Section 5.3)
         // AAD is the header up to and including the unprotected packet number
-        // Since we modified datagram_buf in-place during header protection removal,
+        // Since we modified packet_buf in-place during header protection removal,
         // we can now use it directly for the AAD
-        let header = &datagram_buf[..payload_offset];
+        let header = &packet_buf[..payload_offset];
         eprintln!("DEBUG: AEAD AAD: aad_len={}, pn_len={}, pn={}, payload_offset={}, pn_offset={}", 
                  header.len(), pn_len, packet_number, payload_offset, pn_offset);
         eprintln!("DEBUG: AAD first 20 bytes: {:02x?}", &header[..header.len().min(20)]);
@@ -2054,30 +2059,29 @@ impl Connection for QuicConnection {
                         let end = start + frame_data.len();
                         buffer[start..end].copy_from_slice(frame_data);
                         
-                        // Try to provide contiguous data to TLS
-                        // TLS expects data starting from next_expected_offset
-                        // For simplicity, provide all data from next_offset to the highest received offset
-                        // In a full implementation, we'd track gaps and only provide contiguous data
-                        if *next_offset < buffer.len() as VarInt {
-                            // Find the highest offset we've received data for
-                            // For now, provide all data from next_offset to buffer.len()
-                            // This works if frames arrive in order (which they should for Initial/Handshake)
-                            let contiguous_end = buffer.len();
+                        // RFC 9000 §19.6: CRYPTO frames MUST be processed in order by offset.
+                        // Only provide data to TLS if it's contiguous starting from next_offset.
+                        // Check if this frame fills the gap at next_offset
+                        if frame_offset <= *next_offset && frame_end > *next_offset {
+                            // This frame contains data starting at or before next_offset
+                            // Provide contiguous data from next_offset onwards
+                            let start_provide = *next_offset as usize;
+                            let end_provide = frame_end as usize;
                             
-                            // Provide contiguous data to TLS
-                            if contiguous_end > *next_offset as usize {
-                                let data_to_provide = &buffer[*next_offset as usize..contiguous_end];
+                            if end_provide > start_provide {
+                                let data_to_provide = &buffer[start_provide..end_provide];
                                 if let Some(ref mut tls) = self.tls_session {
-                                    eprintln!("DEBUG: Processing CRYPTO frame: level={:?}, offset={}, data_len={}, providing_len={}", 
-                                             encryption_level, frame_offset, frame_data.len(), data_to_provide.len());
+                                    eprintln!("DEBUG: Processing CRYPTO frame: level={:?}, frame_offset={}, frame_len={}, providing from offset {} len {}", 
+                                             encryption_level, frame_offset, frame_data.len(), start_provide, data_to_provide.len());
                                     if let Err(e) = tls.process_input(data_to_provide, encryption_level) {
                                         eprintln!("DEBUG: TLS process_input error: {:?}", e);
                                         // TLS error - close connection
                                         self.state = ConnectionState::Closing;
                                         return Ok(());
                                     }
-                                    // Update next expected offset to end of provided data
-                                    *next_offset = contiguous_end as VarInt;
+                                    // Update next expected offset
+                                    *next_offset = end_provide as VarInt;
+                                    eprintln!("DEBUG: Updated next_offset to {}", *next_offset);
                                     
                                     // Process TLS output events
                                     let mut event_count = 0;
@@ -2162,17 +2166,20 @@ impl Connection for QuicConnection {
                                         }
                                     }
                                     eprintln!("DEBUG: Processed {} TLS events", event_count);
+                                } else {
+                                    eprintln!("DEBUG: No TLS session available!");
                                 }
                             }
-                            } else {
-                                eprintln!("DEBUG: No TLS session available!");
-                            }
+                        } else {
+                            eprintln!("DEBUG: Buffering out-of-order CRYPTO frame: frame_offset={}, next_offset={}, frame_len={}", 
+                                     frame_offset, *next_offset, frame_data.len());
+                        }
                         }
                     } else {
                         eprintln!("DEBUG: Non-CRYPTO frame: {:?}", std::mem::discriminant(&frame));
                     }
                     
-                    self.process_frame(frame, datagram.recv_time)?;
+                    self.process_frame(frame, recv_time)?;
                     offset += consumed;
                     
                     if consumed == 0 {
@@ -2186,6 +2193,145 @@ impl Connection for QuicConnection {
                 }
             }
         }
+
+        Ok(())
+    }
+}
+
+// Stub implementations for missing components
+struct StubCryptoBackend;
+
+impl CryptoBackend for StubCryptoBackend {
+    fn create_aead(&self, _cipher_suite: u16) -> Result<Box<dyn crate::crypto::AeadProvider>> {
+        Err(Error::Transport(crate::error::TransportError::InternalError))
+    }
+    
+    fn create_header_protection(&self, _cipher_suite: u16) -> Result<Box<dyn crate::crypto::HeaderProtectionProvider>> {
+        Err(Error::Transport(crate::error::TransportError::InternalError))
+    }
+    
+    fn create_key_schedule(&self) -> Box<dyn crate::crypto::KeySchedule> {
+        panic!("stub not implemented")
+    }
+    
+    fn create_tls_session(
+        &self,
+        _side: Side,
+        _server_name: Option<&str>,
+        _alpn_protocols: &[&[u8]],
+        _cert_data: Option<&[u8]>,
+        _key_data: Option<&[u8]>,
+    ) -> Result<Box<dyn TlsSession>> {
+        Err(Error::Transport(crate::error::TransportError::InternalError))
+    }
+}
+
+struct StubLossDetector;
+
+impl LossDetector for StubLossDetector {
+    fn on_packet_sent(
+        &mut self,
+        _space: crate::types::PacketNumberSpace,
+        _packet_number: PacketNumber,
+        _size: usize,
+        _is_retransmittable: bool,
+        _send_time: Instant,
+    ) {}
+    
+    fn on_ack_received(
+        &mut self,
+        _space: crate::types::PacketNumberSpace,
+        _largest_acked: PacketNumber,
+        _ack_delay: Duration,
+        _ack_ranges: &[(PacketNumber, PacketNumber)],
+        _recv_time: Instant,
+    ) -> crate::error::Result<(alloc::vec::Vec<PacketNumber>, alloc::vec::Vec<PacketNumber>)> {
+        Ok((alloc::vec::Vec::new(), alloc::vec::Vec::new()))
+    }
+    
+    fn detect_lost_packets(
+        &mut self,
+        _space: crate::types::PacketNumberSpace,
+        _now: Instant,
+    ) -> alloc::vec::Vec<PacketNumber> {
+        alloc::vec::Vec::new()
+    }
+    
+    fn get_loss_detection_timer(&self) -> Option<Instant> {
+        None
+    }
+    
+    fn on_loss_detection_timeout(&mut self, _now: Instant) -> crate::recovery::LossDetectionAction {
+        crate::recovery::LossDetectionAction::None
+    }
+    
+    fn pto_count(&self) -> u32 {
+        0
+    }
+    
+    fn discard_pn_space(&mut self, _space: crate::types::PacketNumberSpace) {}
+}
+
+impl Connection for QuicConnection {
+    fn process_datagram(&mut self, datagram: DatagramInput) -> Result<()> {
+        self.last_activity = Some(datagram.recv_time);
+        self.stats.bytes_received += datagram.data.len() as u64;
+
+        // RFC 9000 §12.2: Process coalesced packets
+        // A sender can coalesce multiple QUIC packets into a single UDP datagram.
+        // Each packet is complete and can be processed independently.
+        let mut datagram_offset = 0usize;
+        let datagram_bytes = datagram.data.as_ref();
+        
+        eprintln!("DEBUG: process_datagram: total_len={}, processing coalesced packets", datagram_bytes.len());
+        
+        let mut packet_count = 0;
+        while datagram_offset < datagram_bytes.len() {
+            let remaining = &datagram_bytes[datagram_offset..];
+            
+            eprintln!("DEBUG: Coalesced loop: offset={}, remaining={}, first_byte=0x{:02x}", 
+                     datagram_offset, remaining.len(), remaining[0]);
+            
+            // Calculate packet length to determine boundaries
+            let (packet_len, is_short_header) = match self.calculate_packet_length(remaining) {
+                Some(result) => result,
+                None => {
+                    eprintln!("DEBUG: Coalesced loop: failed to calculate packet length, breaking");
+                    // Can't parse packet header - drop remaining datagram
+                    break;
+                }
+            };
+            
+            eprintln!("DEBUG: Coalesced loop: packet_len={}, is_short_header={}", packet_len, is_short_header);
+            
+            if packet_len > remaining.len() {
+                eprintln!("DEBUG: Coalesced loop: packet_len > remaining, breaking");
+                // Invalid packet length - drop remaining datagram
+                break;
+            }
+            
+            // Extract this packet's data
+            let packet_data = Bytes::copy_from_slice(&remaining[..packet_len]);
+            
+            // Update stats for each packet
+            self.stats.packets_received += 1;
+            packet_count += 1;
+            
+            eprintln!("DEBUG: Coalesced loop: processing packet #{}, len={}", packet_count, packet_len);
+            
+            // Process this single packet (errors/drops just continue to next packet)
+            let _ = self.process_single_packet(packet_data, datagram.recv_time);
+            
+            // Short header packets must be last (they extend to end of datagram)
+            if is_short_header {
+                eprintln!("DEBUG: Coalesced loop: short header, breaking after this packet");
+                break;
+            }
+            
+            datagram_offset += packet_len;
+        }
+        
+        eprintln!("DEBUG: process_datagram complete: processed {} packets", packet_count);
 
         Ok(())
     }
@@ -2303,8 +2449,10 @@ impl Connection for QuicConnection {
                 
                 if use_short_header {
                     // Short header for 1-RTT
+                    // RFC 9000 §17.3: Short header includes DCID
                     let first_byte = 0x40 | ((pn_len - 1) as u8);
                     buf.put_u8(first_byte);
+                    buf.put_slice(self.dcid.as_bytes());
                     buf.put_slice(&pn_bytes);
                 } else {
                     // Long header for handshake
@@ -2923,6 +3071,14 @@ impl Connection for QuicConnection {
             let dcid_bytes = self.dcid.as_bytes();
             let scid_bytes = self.scid.as_bytes();
             
+            eprintln!("DEBUG: Building {} packet: dcid={:?} ({} bytes), scid={:?} ({} bytes)", 
+                     match level {
+                         CryptoLevel::Initial => "Initial",
+                         CryptoLevel::Handshake => "Handshake",
+                         _ => "Other"
+                     },
+                     self.dcid, dcid_bytes.len(), self.scid, scid_bytes.len());
+            
             // Increment packet number
             let pn = write_keys.packet_number;
             write_keys.packet_number += 1;
@@ -2984,6 +3140,7 @@ impl Connection for QuicConnection {
             }
             
             // Build CRYPTO frame with proper offset
+            eprintln!("DEBUG: Building outgoing CRYPTO frame: level={:?}, offset={}, data_len={}", level, offset, data_to_send.len());
             let crypto_frame = Frame::Crypto(crate::frames::CryptoFrame {
                 offset: offset,
                 data: data_to_send,
@@ -3420,8 +3577,9 @@ impl Connection for QuicConnection {
                     let first_byte = 0x40 | ((pn_len - 1) as u8);
                     buf.put_u8(first_byte);
                     
-                    // DCID (0 bytes for short header in this implementation)
-                    // buf.put_slice(dcid_bytes);
+                    // DCID (destination connection ID - the peer's CID)
+                    // RFC 9000 §17.3: Short header packets MUST include the DCID
+                    buf.put_slice(dcid_bytes);
                     
                     // Packet number
                     buf.put_slice(&pn_bytes);
@@ -3531,6 +3689,9 @@ impl Connection for QuicConnection {
                         // First byte: 0x40 (short header)
                         let first_byte = 0x40 | ((pn_len - 1) as u8);
                         buf.put_u8(first_byte);
+
+                        // DCID (RFC 9000 §17.3: Short header includes DCID)
+                        buf.put_slice(self.dcid.as_bytes());
 
                         // Packet number
                         buf.put_slice(&pn_bytes);

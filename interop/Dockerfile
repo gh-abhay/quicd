@@ -32,7 +32,6 @@ COPY --from=build \
      /build/target/release/quicd \
      ./
 COPY interop/quicd.toml ./
-COPY interop/server-cert/ ./server-cert/
 COPY interop/run_endpoint.sh ./
 
 RUN chmod +x run_endpoint.sh

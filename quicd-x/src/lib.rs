@@ -744,14 +744,21 @@ impl<'a> AsyncWrite for QuicStream<'a> {
         let data = Bytes::copy_from_slice(buf);
         let len = data.len();
         
+        eprintln!("QuicStream::poll_write: stream_id={:?}, len={}, conn_id={:?}", 
+                  self.stream_id, len, self.conn_id);
+        
         match self.egress_tx.send(Command::WriteStreamData {
             conn_id: self.conn_id,
             stream_id: self.stream_id,
             data,
             fin: false,
         }) {
-            Ok(_) => Poll::Ready(Ok(len)),
-            Err(_) => {
+            Ok(_) => {
+                eprintln!("QuicStream::poll_write: Command sent successfully");
+                Poll::Ready(Ok(len))
+            }
+            Err(e) => {
+                eprintln!("QuicStream::poll_write: Failed to send command: {:?}", e);
                 Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "connection closed"

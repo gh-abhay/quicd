@@ -47,12 +47,13 @@ reuse_addr = true
 [global.tls]
 # Path to TLS certificate file (.crt file with PEM encoding)
 # Default: None (REQUIRED - must be provided)
-cert_path = "/server-cert/cert.crt"
+# The interop test framework mounts certificates at /certs
+cert_path = "/certs/cert.pem"
 
 # Path to TLS private key file (.key file with PEM encoding)
 # Required if cert_path is specified
 # Default: None (REQUIRED - must be provided)
-key_path = "/server-cert/key.key"
+key_path = "/certs/priv.key"
 
 # Enable TLS 1.3 early data (0-RTT)
 # WARNING: 0-RTT data is not forward secret and can be replayed
