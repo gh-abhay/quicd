@@ -21,6 +21,7 @@ COPY quicd-quic/ ./quicd-quic/
 COPY quicd-x/ ./quicd-x/
 COPY quicd-qpack/ ./quicd-qpack/
 COPY quicd-h3/ ./quicd-h3/
+COPY quicd-hq-interop/ ./quicd-hq-interop/
 
 RUN cargo build --release
 

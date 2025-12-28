@@ -2,7 +2,6 @@
 
 use bytes::{Bytes, BytesMut};
 use quicd_h3::frame::*;
-use quicd_h3::varint;
 
 #[test]
 fn test_all_frame_types_roundtrip() {

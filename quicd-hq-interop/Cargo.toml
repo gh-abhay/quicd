@@ -1,0 +1,15 @@
+[package]
+name = "quicd-hq-interop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quicd-x = { path = "../quicd-x" }
+tokio = { workspace = true, features = ["fs"] }
+bytes = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+percent-encoding = "2.3.1"
+mime_guess = "2.0.5"

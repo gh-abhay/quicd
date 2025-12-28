@@ -1,6 +1,6 @@
 //! Unit tests for HTTP message framing and pseudo-header processing.
 
-use bytes::{Bytes, Buf};
+use bytes::Bytes;
 use http::{Method, StatusCode, Uri};
 use quicd_h3::message::*;
 use quicd_qpack::FieldLine;

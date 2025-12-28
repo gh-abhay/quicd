@@ -18,6 +18,7 @@ quicd-quic = { path = "../quicd-quic" }
 # Async runtime
 tokio = { version = "1.48", features = ["rt", "sync", "time", "io-util", "macros", "fs"] }
 async-trait = "0.1"
+futures = "0.3"
 
 # Data structures and zero-copy buffers
 bytes = "1.11"

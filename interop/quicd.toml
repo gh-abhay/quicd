@@ -276,11 +276,27 @@ enable_per_connection_metrics = false
 # - 'config': subsection for type-specific configuration
 
 # ----------------------------------------------------------------------------
+# HQ-Interop Application (HTTP/0.9 over QUIC)
+# ----------------------------------------------------------------------------
+[applications.hq-interop]
+type = "builtin:hq-interop"
+alpn = ["hq-interop", "hq-29"]  # HTTP/0.9 over QUIC for interop testing
+enabled = true
+
+# Handler Configuration
+[applications.hq-interop.config.handler]
+# Root directory for serving files
+file_root = "/www"
+
+# Index files to try for directory requests
+index_files = ["index.html", "index.htm"]
+
+# ----------------------------------------------------------------------------
 # HTTP/3 Application
 # ----------------------------------------------------------------------------
 [applications.http3]
 type = "builtin:http3"
-alpn = ["hq-interop", "hq-29", "h3", "h3-29"]  # hq-interop for HTTP/0.9, h3 for HTTP/3
+alpn = ["h3", "h3-29"]  # HTTP/3 only
 enabled = true
 
 # QPACK Configuration (RFC 9204)

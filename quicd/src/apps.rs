@@ -152,6 +152,36 @@ pub fn build_registry(app_configs: &HashMap<String, ApplicationConfig>) -> Resul
                 }
             }
 
+            ApplicationType::HqInterop => {
+                let hq_config = match &app_config.config {
+                    ApplicationTypeConfig::HqInterop(cfg) => cfg.clone(),
+                    _ => anyhow::bail!("Type mismatch: expected HqInterop config for application '{}'", app_name),
+                };
+
+                // Register all ALPN identifiers for this application
+                for alpn in &app_config.alpn {
+                    // Create HqInterop application factory for each ALPN
+                    let factory: AppFactory = {
+                        let hq_cfg = hq_config.clone();
+                        Arc::new(move || {
+                            // Convert our config to quicd-hq-interop config
+                            let hq_lib_config = quicd_hq_interop::HqInteropConfig {
+                                handler: quicd_hq_interop::HandlerConfig {
+                                    file_root: hq_cfg.handler.file_root.clone().into(),
+                                    index_files: hq_cfg.handler.index_files.clone(),
+                                },
+                            };
+                            Arc::new(quicd_hq_interop::HqInteropApplication::new(hq_lib_config))
+                        })
+                    };
+
+                    registry = registry.register(alpn, factory)
+                        .with_context(|| format!("Failed to register HQ-Interop for ALPN '{}' in application '{}'", alpn, app_name))?;
+
+                    tracing::info!("Registered HQ-Interop application '{}' for ALPN '{}'", app_name, alpn);
+                }
+            }
+
             ApplicationType::Moq => {
                 tracing::warn!(
                     "MOQ application type not yet implemented for application '{}', skipping",
