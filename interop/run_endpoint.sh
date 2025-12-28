@@ -30,6 +30,17 @@ elif [ "$ROLE" == "server" ]; then
     if [ -n "${WWW:-}" ]; then
         echo "## Using WWW directory: $WWW"
         export QUICD_APPLICATIONS__HTTP3__CONFIG__HANDLER__FILE_ROOT="$WWW"
+        export QUICD_APPLICATIONS__HQ_INTEROP__CONFIG__HANDLER__FILE_ROOT="$WWW"
+    fi
+    
+    # Use the certificates provided by the interop test framework
+    # The CERTS directory is mounted at /certs by docker-compose
+    if [ -f "/certs/cert.pem" ] && [ -f "/certs/priv.key" ]; then
+        echo "## Using certificates from /certs directory"
+        export QUICD_GLOBAL__TLS__CERT_PATH="/certs/cert.pem"
+        export QUICD_GLOBAL__TLS__KEY_PATH="/certs/priv.key"
+    else
+        echo "## WARNING: Using default certificates (may cause trust issues)"
     fi
     
     /quicd -c /quicd.toml $SERVER_PARAMS

@@ -636,40 +636,104 @@ impl NetworkWorker {
                     }
                 }
                 
-                // Send all long header packets together (coalesced)
+                // Send all long header packets together (coalesced), respecting MTU
+                // RFC 9000 §14: Server MUST NOT send datagrams larger than 1200 bytes initially
+                const MAX_DATAGRAM_SIZE: usize = 1200;
+                
                 if !long_header_packets.is_empty() {
-                    let buffers: Vec<WorkerBuffer> = long_header_packets.into_iter()
-                        .map(|data| WorkerBuffer::from_vec(data, &buffer_pool))
-                        .collect();
+                    // Split into datagrams respecting MTU limit
+                    let mut current_datagram: Vec<WorkerBuffer> = Vec::new();
+                    let mut current_size = 0usize;
                     
-                    eprintln!("worker: Sending {} coalesced long header packets", buffers.len());
-                    
-                    match submit_send_op(
-                        &mut ring,
-                        socket_fd,
-                        dest,
-                        buffers,
-                        &mut send_in_flight,
-                        &mut next_send_id,
-                        &mut send_op_pool,
-                    ) {
-                        Ok(()) => {
-                            eprintln!("worker: Successfully submitted coalesced long header packets");
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::Other
-                            && e.to_string().contains("submission queue full") =>
-                        {
-                            send_sq_full = true;
-                            warn!(
-                                worker_id,
-                                peer = %dest,
-                                "Submission queue full - dropping outgoing packet (QUIC will retransmit)"
+                    for data in long_header_packets {
+                        let packet_len = data.len();
+                        
+                        // If single packet exceeds MTU, send it alone (shouldn't happen with proper packet construction)
+                        if packet_len > MAX_DATAGRAM_SIZE {
+                            // First, send any accumulated packets
+                            if !current_datagram.is_empty() {
+                                eprintln!("worker: Sending {} coalesced long header packets ({} bytes)", 
+                                         current_datagram.len(), current_size);
+                                let _ = submit_send_op(
+                                    &mut ring,
+                                    socket_fd,
+                                    dest,
+                                    std::mem::take(&mut current_datagram),
+                                    &mut send_in_flight,
+                                    &mut next_send_id,
+                                    &mut send_op_pool,
+                                );
+                                current_size = 0;
+                            }
+                            // Send the oversized packet alone
+                            eprintln!("worker: Sending 1 oversized long header packet ({} bytes)", packet_len);
+                            let buffer = WorkerBuffer::from_vec(data, &buffer_pool);
+                            let _ = submit_send_op(
+                                &mut ring,
+                                socket_fd,
+                                dest,
+                                vec![buffer],
+                                &mut send_in_flight,
+                                &mut next_send_id,
+                                &mut send_op_pool,
                             );
-                            record_metric(MetricsEvent::NetworkSendError);
+                            continue;
                         }
-                        Err(e) => {
-                            error!(worker_id, peer = %dest, error = ?e, "Failed to submit send op");
-                            record_metric(MetricsEvent::NetworkSendError);
+                        
+                        // Check if adding this packet would exceed MTU
+                        if current_size + packet_len > MAX_DATAGRAM_SIZE && !current_datagram.is_empty() {
+                            // Send current datagram and start a new one
+                            eprintln!("worker: Sending {} coalesced long header packets ({} bytes)", 
+                                     current_datagram.len(), current_size);
+                            let _ = submit_send_op(
+                                &mut ring,
+                                socket_fd,
+                                dest,
+                                std::mem::take(&mut current_datagram),
+                                &mut send_in_flight,
+                                &mut next_send_id,
+                                &mut send_op_pool,
+                            );
+                            current_size = 0;
+                        }
+                        
+                        // Add packet to current datagram
+                        let buffer = WorkerBuffer::from_vec(data, &buffer_pool);
+                        current_datagram.push(buffer);
+                        current_size += packet_len;
+                    }
+                    
+                    // Send remaining packets
+                    if !current_datagram.is_empty() {
+                        eprintln!("worker: Sending {} coalesced long header packets ({} bytes)", 
+                                 current_datagram.len(), current_size);
+                        match submit_send_op(
+                            &mut ring,
+                            socket_fd,
+                            dest,
+                            current_datagram,
+                            &mut send_in_flight,
+                            &mut next_send_id,
+                            &mut send_op_pool,
+                        ) {
+                            Ok(()) => {
+                                eprintln!("worker: Successfully submitted coalesced long header packets");
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::Other
+                                && e.to_string().contains("submission queue full") =>
+                            {
+                                send_sq_full = true;
+                                warn!(
+                                    worker_id,
+                                    peer = %dest,
+                                    "Submission queue full - dropping outgoing packet (QUIC will retransmit)"
+                                );
+                                record_metric(MetricsEvent::NetworkSendError);
+                            }
+                            Err(e) => {
+                                error!(worker_id, peer = %dest, error = ?e, "Failed to submit send op");
+                                record_metric(MetricsEvent::NetworkSendError);
+                            }
                         }
                     }
                 }

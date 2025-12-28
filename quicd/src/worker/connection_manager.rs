@@ -191,8 +191,14 @@ impl ConnectionManager {
     }
     
     /// Insert a new connection into the Slab and register all CID mappings.
+    /// 
+    /// Registers 3 CIDs to handle all routing scenarios:
+    /// 1. original_dcid: Client's Initial packet DCID (for Initial retransmissions)
+    /// 2. dcid: Client's SCID (where client wants to receive packets)
+    /// 3. scid: Server's SCID (for subsequent client packets)
     fn insert_connection(
         &mut self,
+        original_dcid: ConnectionId,
         dcid: ConnectionId,
         scid: ConnectionId,
         state: ConnectionState,
@@ -211,12 +217,23 @@ impl ConnectionManager {
         // Insert into Slab
         let slab_idx = self.connections.insert(state);
         
-        // Register DCID mapping (client-chosen CID)
-        self.dcid_to_slab.insert(dcid, slab_idx);
+        // RFC 9000 §7.2: Register all 3 CIDs for proper routing:
         
-        // Register SCID mapping (server-chosen CID)
-        // RFC 9000 Section 5.1: The server's SCID is what the client will use as DCID
-        // in subsequent packets. We must be able to route those packets to this connection.
+        // 1. Original DCID from client's Initial packet
+        //    Allows client to retransmit Initial packets (before receiving server response)
+        if !original_dcid.as_bytes().is_empty() {
+            self.dcid_to_slab.insert(original_dcid, slab_idx);
+        }
+        
+        // 2. Client's SCID (where client wants to receive packets)
+        //    This is what server uses as DCID when sending to client
+        //    Skip if zero-length (RFC 9000 §5.1 allows zero-length CIDs)
+        if !dcid.as_bytes().is_empty() {
+            self.dcid_to_slab.insert(dcid, slab_idx);
+        }
+        
+        // 3. Server's SCID (where server wants to receive packets)
+        //    Client will use this as DCID in subsequent packets after receiving server response
         self.dcid_to_slab.insert(scid.clone(), slab_idx);
         
         // Also register SCID mapping for egress command routing
@@ -354,6 +371,7 @@ impl ConnectionManager {
         
         // Check if existing connection
         if let Some(slab_idx) = self.find_by_dcid(&dcid) {
+            eprintln!("DEBUG: Found existing connection by DCID: dcid={:?}, slab_idx={}", dcid, slab_idx);
             if let Some(state) = self.get_connection_mut(slab_idx) {
                 // RFC 9001 Section 5.4: Remove header protection BEFORE decryption
                 // Determine encryption level from packet type
@@ -408,6 +426,7 @@ impl ConnectionManager {
         
         // New connection with supported version
         if packet.header.ty == PacketType::Initial {
+            eprintln!("DEBUG: No existing connection found for DCID: {:?}", dcid);
             eprintln!("DEBUG: Received Initial packet: version=0x{:08X}, dcid={:?}, size={}", 
                      packet.header.version, packet.header.dcid, datagram_size);
             // RFC 9000 Section 14.1: Validate minimum datagram size for Initial packets
@@ -422,14 +441,25 @@ impl ConnectionManager {
             // RFC 9000: Server chooses its own CID length (1-20 bytes).
             // Use 20 bytes for maximum entropy, routing cookie, and SipHash protection.
             let scid = self.cid_generator.generate(20);
-            let dcid = packet.header.dcid.clone();
             
-            eprintln!("DEBUG: Creating new connection: scid={:?}, dcid={:?}", scid, dcid);
+            // RFC 9000 §7.2: Server MUST use client's SCID as DCID for sending packets
+            // RFC 9000 §17.2: SCID can be zero-length (Some implementations use this)
+            let dcid = packet.header.scid.clone().unwrap_or_else(|| 
+                ConnectionId::from_slice(&[]).expect("Empty CID should always be valid")
+            );
+            
+            // RFC 9000 §18.2: original_destination_connection_id is the DCID from client's Initial
+            let original_dcid = packet.header.dcid.clone();
+            
+            eprintln!("DEBUG: Creating new connection: scid={:?}, dcid={:?} (client's SCID), original_dcid={:?} (client's DCID)", 
+                     scid, dcid, original_dcid);
             // Create QUIC connection state machine
+            // Clone original_dcid before moving into QuicConnection
             let conn = QuicConnection::new(
                 Side::Server,
                 scid.clone(),
                 dcid.clone(),
+                Some(original_dcid.clone()),
                 self.config.clone(),
             );
             
@@ -452,7 +482,8 @@ impl ConnectionManager {
             
             // INSERT INTO SLAB IMMEDIATELY - before processing packet
             // This allows Short packets arriving during processing to find the connection
-            let slab_idx = match self.insert_connection(dcid.clone(), scid.clone(), state) {
+            // Register all 3 CIDs: original_dcid, dcid (client's SCID), and scid (server's SCID)
+            let slab_idx = match self.insert_connection(original_dcid.clone(), dcid.clone(), scid.clone(), state) {
                 Some(idx) => idx,
                 None => {
                     error!("Failed to insert connection - Slab at capacity");

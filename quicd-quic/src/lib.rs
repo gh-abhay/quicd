@@ -108,6 +108,7 @@
 //!     Side::Client,
 //!     source_cid,
 //!     dest_cid,
+//!     None,  // original_dcid only used by servers
 //!     config,
 //! );
 //!

@@ -259,7 +259,8 @@ impl QuicServer for DefaultQuicServer {
             alpn_protocols: Vec::new(), // Server skeleton - not used in production
         };
 
-        let conn = QuicConnection::new(Side::Server, scid, dcid, conn_config);
+        // Note: This is skeleton code - original_dcid should be provided in production
+        let conn = QuicConnection::new(Side::Server, scid, dcid, None, conn_config);
         Ok(Box::new(conn))
     }
 
