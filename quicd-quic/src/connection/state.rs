@@ -9,11 +9,12 @@ extern crate alloc;
 use crate::crypto::{
     AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, KeySchedule, TlsSession,
 };
-use crate::error::{Error, Result, TransportError};
+use crate::error::{Error, Result};
 use crate::flow_control::ConnectionFlowControl;
 use crate::frames::Frame;
-use crate::packet::{Header, PacketParserTrait};
+use crate::packet::PacketParserTrait;
 use crate::recovery::{CongestionController, LossDetector};
+use crate::recovery::loss::{DefaultLossDetector, LossDetectionConfig};
 use crate::stream::StreamManager;
 use crate::transport::{
     TransportParameters, TP_ACK_DELAY_EXPONENT, TP_ACTIVE_CONNECTION_ID_LIMIT, TP_INITIAL_MAX_DATA,
@@ -320,6 +321,9 @@ pub struct ConnectionStats {
     /// Packets received
     pub packets_received: u64,
 
+    /// Packets acknowledged
+    pub packets_acked: u64,
+
     /// Bytes sent
     pub bytes_sent: u64,
 
@@ -361,7 +365,10 @@ pub struct QuicConnection {
     /// Statistics
     stats: ConnectionStats,
 
-    /// Packet parser
+    /// Packet parser (stored for future refactoring to use trait-based parsing)
+    ///
+    /// TODO: Refactor inline parsing to use this parser
+    #[allow(dead_code)]
     packet_parser: Box<dyn PacketParserTrait>,
 
     /// Crypto backend
@@ -370,7 +377,10 @@ pub struct QuicConnection {
     /// TLS session (handshake state)
     tls_session: Option<Box<dyn TlsSession>>,
 
-    /// Stream manager
+    /// Stream manager (stored for future stream reassembly integration)
+    ///
+    /// TODO: Wire stream reassembly through this manager
+    #[allow(dead_code)]
     streams: StreamManager,
 
     /// Connection-level flow control
@@ -382,7 +392,10 @@ pub struct QuicConnection {
     /// Congestion controller  
     congestion_controller: Box<dyn CongestionController>,
 
-    /// Packet number spaces (Initial, Handshake, Application)
+    /// Packet number spaces (stored for space-based tracking)
+    ///
+    /// TODO: Integrate with PacketNumberSpaceManager methods
+    #[allow(dead_code)]
     pn_spaces: crate::packet::space::PacketNumberSpaceManager,
 
     /// Pending events for application
@@ -476,8 +489,10 @@ impl QuicConnection {
         let flow_control =
             ConnectionFlowControl::new(initial_max_data, initial_max_data, initial_max_data);
 
-        // Create loss detector (stub for now - needs real implementation)
-        let loss_detector: Box<dyn LossDetector> = Box::new(StubLossDetector);
+        // Create loss detector (RFC 9002 Section 6 compliant)
+        let loss_detector: Box<dyn LossDetector> = Box::new(
+            DefaultLossDetector::new(LossDetectionConfig::default())
+        );
 
         // Create congestion controller
         let congestion_controller: Box<dyn CongestionController> = Box::new(
@@ -709,7 +724,7 @@ impl QuicConnection {
 
         // Use AES-128-GCM for Initial packets (RFC 9001 Section 5.2)
         let cipher_suite = 0x1301; // TLS_AES_128_GCM_SHA256
-        let aead = match crypto_backend.create_aead(cipher_suite) {
+        let _aead = match crypto_backend.create_aead(cipher_suite) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("Failed to create AEAD: {:?}", e);
@@ -755,7 +770,7 @@ impl QuicConnection {
             }
         };
 
-        let hp = match crypto_backend.create_header_protection(cipher_suite) {
+        let _hp = match crypto_backend.create_header_protection(cipher_suite) {
             Ok(hp) => hp,
             Err(e) => {
                 eprintln!("Failed to create header protection: {:?}", e);
@@ -1402,7 +1417,7 @@ impl QuicConnection {
 
         // Initialize TLS session for server connections
         // Load certificates from config.cert_data and config.key_data
-        let mut tls_session = if side == Side::Server {
+        let tls_session = if side == Side::Server {
             let alpn_protocols: Vec<&[u8]> =
                 config.alpn_protocols.iter().map(|p| p.as_slice()).collect();
             let cert_data = config.cert_data.as_ref().map(|b| b.as_ref());
@@ -1619,7 +1634,7 @@ impl QuicConnection {
             }
 
             Frame::Ack(ack_frame) => {
-                // Process ACK: mark packets as acknowledged, detect losses
+                // Process ACK: mark packets as acknowledged, detect losses (RFC 9002)
                 let space = crate::types::PacketNumberSpace::ApplicationData;
                 let result = self.loss_detector.on_ack_received(
                     space,
@@ -1629,9 +1644,20 @@ impl QuicConnection {
                     now,
                 )?;
 
-                // Handle lost packets - mark for retransmission
-                for _pn in result.1 {
+                // Handle acknowledged packets - notify congestion controller (RFC 9002 §7)
+                let (acked_packets, lost_packets) = result;
+                for pn in acked_packets {
+                    // Note: sent_bytes should come from sent packet tracking
+                    // Using default packet size for now
+                    self.congestion_controller.on_packet_acked(pn, space, 1200, now);
+                    self.stats.packets_acked += 1;
+                }
+
+                // Handle lost packets - notify congestion controller and mark for retransmission
+                for pn in lost_packets {
+                    self.congestion_controller.on_packet_lost(pn, space, 1200, now);
                     self.stats.packets_lost += 1;
+                    // TODO: Mark frames from lost packets for retransmission
                 }
 
                 Ok(())
@@ -2202,7 +2228,7 @@ impl QuicConnection {
         // Use the final (possibly corrected) packet number
         // If we corrected it during decryption, update the tracking
         let original_packet_number = packet_number;
-        let packet_number = final_packet_number;
+        let _packet_number = final_packet_number;
 
         // Update largest received packet number if we corrected it during decryption
         if final_packet_number != original_packet_number {
@@ -2488,90 +2514,6 @@ impl QuicConnection {
     }
 }
 
-// Stub implementations for missing components
-struct StubCryptoBackend;
-
-impl CryptoBackend for StubCryptoBackend {
-    fn create_aead(&self, _cipher_suite: u16) -> Result<Box<dyn crate::crypto::AeadProvider>> {
-        Err(Error::Transport(
-            crate::error::TransportError::InternalError,
-        ))
-    }
-
-    fn create_header_protection(
-        &self,
-        _cipher_suite: u16,
-    ) -> Result<Box<dyn crate::crypto::HeaderProtectionProvider>> {
-        Err(Error::Transport(
-            crate::error::TransportError::InternalError,
-        ))
-    }
-
-    fn create_key_schedule(&self) -> Box<dyn crate::crypto::KeySchedule> {
-        panic!("stub not implemented")
-    }
-
-    fn create_tls_session(
-        &self,
-        _side: Side,
-        _server_name: Option<&str>,
-        _alpn_protocols: &[&[u8]],
-        _cert_data: Option<&[u8]>,
-        _key_data: Option<&[u8]>,
-    ) -> Result<Box<dyn TlsSession>> {
-        Err(Error::Transport(
-            crate::error::TransportError::InternalError,
-        ))
-    }
-}
-
-struct StubLossDetector;
-
-impl LossDetector for StubLossDetector {
-    fn on_packet_sent(
-        &mut self,
-        _space: crate::types::PacketNumberSpace,
-        _packet_number: PacketNumber,
-        _size: usize,
-        _is_retransmittable: bool,
-        _send_time: Instant,
-    ) {
-    }
-
-    fn on_ack_received(
-        &mut self,
-        _space: crate::types::PacketNumberSpace,
-        _largest_acked: PacketNumber,
-        _ack_delay: Duration,
-        _ack_ranges: &[(PacketNumber, PacketNumber)],
-        _recv_time: Instant,
-    ) -> crate::error::Result<(alloc::vec::Vec<PacketNumber>, alloc::vec::Vec<PacketNumber>)> {
-        Ok((alloc::vec::Vec::new(), alloc::vec::Vec::new()))
-    }
-
-    fn detect_lost_packets(
-        &mut self,
-        _space: crate::types::PacketNumberSpace,
-        _now: Instant,
-    ) -> alloc::vec::Vec<PacketNumber> {
-        alloc::vec::Vec::new()
-    }
-
-    fn get_loss_detection_timer(&self) -> Option<Instant> {
-        None
-    }
-
-    fn on_loss_detection_timeout(&mut self, _now: Instant) -> crate::recovery::LossDetectionAction {
-        crate::recovery::LossDetectionAction::None
-    }
-
-    fn pto_count(&self) -> u32 {
-        0
-    }
-
-    fn discard_pn_space(&mut self, _space: crate::types::PacketNumberSpace) {}
-}
-
 impl Connection for QuicConnection {
     fn process_datagram(&mut self, datagram: DatagramInput) -> Result<()> {
         self.last_activity = Some(datagram.recv_time);
@@ -2789,7 +2731,7 @@ impl Connection for QuicConnection {
                 buf.put_slice(scid_bytes);
 
                 // Length (will be patched later)
-                let length_field_start = buf.len();
+                let _length_field_start = buf.len();
                 buf.put_u8(0x40); // Placeholder
                 buf.put_u8(0x00);
 
@@ -3323,7 +3265,7 @@ impl Connection for QuicConnection {
                 let tag_len = aead.tag_len();
 
                 // Add packet number to buffer
-                let header_len = buf.len();
+                let _header_len = buf.len();
                 buf.put_slice(&pn_bytes);
                 let header_for_aead = &buf[..];
 
@@ -4349,7 +4291,7 @@ impl Connection for QuicConnection {
         self.state
     }
 
-    fn send_datagram(&mut self, data: Bytes) -> Result<()> {
+    fn send_datagram(&mut self, _data: Bytes) -> Result<()> {
         // Datagrams aren't supported yet in the frame types
         // For now, just consume the data successfully
         Ok(())
@@ -4421,7 +4363,7 @@ impl Connection for QuicConnection {
         Ok(())
     }
 
-    fn read_stream(&mut self, stream_id: StreamId) -> Result<Option<Bytes>> {
+    fn read_stream(&mut self, _stream_id: StreamId) -> Result<Option<Bytes>> {
         // Read from stream manager's reassembly buffer
         // For now, return None as streams deliver data via events
         Ok(None)

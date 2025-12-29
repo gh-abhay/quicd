@@ -4,8 +4,7 @@
 
 extern crate alloc;
 
-use crate::error::*;
-use crate::types::*;
+use crate::types::{ConnectionId, Instant, PacketNumber, PacketNumberSpace, VarInt};
 use bytes::Bytes;
 
 /// QUIC Protocol Version (RFC 9000 Section 15)

@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use crate::error::{Error, Result, TransportError};
-use crate::types::{StreamId, StreamOffset, VarInt};
+use crate::types::StreamId;
 
 /// Flow Controller (Connection or Stream Level)
 ///
@@ -29,6 +29,9 @@ pub struct FlowController {
     local_max_data: u64,
 
     /// Auto-tuning enabled (dynamically adjust window)
+    ///
+    /// TODO: Implement auto-tuning based on RTT and throughput
+    #[allow(dead_code)]
     auto_tune: bool,
 }
 
@@ -154,3 +157,253 @@ impl StreamFlowControl {
 // Unit Tests
 // ============================================================================
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::stream_id_helpers;
+
+    // ==========================================================================
+    // FlowController Tests - RFC 9000 Section 4
+    // ==========================================================================
+
+    #[test]
+    fn test_flow_controller_new() {
+        let fc = FlowController::new(10000, 10000);
+        assert_eq!(fc.max_data, 10000);
+        assert_eq!(fc.consumed, 0);
+        assert_eq!(fc.available, 0);
+        assert_eq!(fc.local_max_data, 10000);
+    }
+
+    #[test]
+    fn test_flow_controller_can_receive_within_limit() {
+        let fc = FlowController::new(10000, 10000);
+        assert!(fc.can_receive(5000).is_ok());
+    }
+
+    #[test]
+    fn test_flow_controller_can_receive_at_limit() {
+        let fc = FlowController::new(10000, 10000);
+        assert!(fc.can_receive(10000).is_ok());
+    }
+
+    #[test]
+    fn test_flow_controller_can_receive_exceeds_limit() {
+        let fc = FlowController::new(10000, 10000);
+        let result = fc.can_receive(10001);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Transport(TransportError::FlowControlError) => {}
+            other => panic!("Expected FlowControlError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_flow_controller_on_data_received() {
+        let mut fc = FlowController::new(10000, 10000);
+        
+        fc.on_data_received(1000).unwrap();
+        assert_eq!(fc.available, 1000);
+        
+        fc.on_data_received(500).unwrap();
+        assert_eq!(fc.available, 1500);
+    }
+
+    #[test]
+    fn test_flow_controller_on_data_received_exceeds_limit() {
+        let mut fc = FlowController::new(1000, 1000);
+        
+        fc.on_data_received(500).unwrap();
+        let result = fc.on_data_received(600);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_flow_controller_consume() {
+        let mut fc = FlowController::new(10000, 10000);
+        
+        fc.on_data_received(1000).unwrap();
+        fc.consume(400);
+        
+        assert_eq!(fc.consumed, 400);
+        assert_eq!(fc.available, 600);
+    }
+
+    #[test]
+    fn test_flow_controller_consume_more_than_available() {
+        let mut fc = FlowController::new(10000, 10000);
+        
+        fc.on_data_received(100).unwrap();
+        fc.consume(200); // Uses saturating_sub
+        
+        assert_eq!(fc.consumed, 200);
+        assert_eq!(fc.available, 0); // Saturated to 0
+    }
+
+    #[test]
+    fn test_flow_controller_update_max_data_increase() {
+        let mut fc = FlowController::new(10000, 10000);
+        
+        fc.update_max_data(20000);
+        assert_eq!(fc.max_data, 20000);
+    }
+
+    #[test]
+    fn test_flow_controller_update_max_data_decrease_ignored() {
+        let mut fc = FlowController::new(10000, 10000);
+        
+        fc.update_max_data(5000);
+        // Should NOT decrease
+        assert_eq!(fc.max_data, 10000);
+    }
+
+    #[test]
+    fn test_flow_controller_should_send_max_data_update() {
+        let mut fc = FlowController::new(10000, 10000);
+        
+        // Initially no update needed
+        assert!(!fc.should_send_max_data_update());
+        
+        // Consume 40% - still no update
+        fc.on_data_received(4000).unwrap();
+        fc.consume(4000);
+        assert!(!fc.should_send_max_data_update());
+        
+        // Consume 60% - now need update
+        fc.on_data_received(2000).unwrap();
+        fc.consume(2000);
+        // consumed = 6000 >= threshold = 5000
+        assert!(fc.should_send_max_data_update());
+    }
+
+    #[test]
+    fn test_flow_controller_new_max_data() {
+        let mut fc = FlowController::new(10000, 10000);
+        
+        fc.on_data_received(5000).unwrap();
+        fc.consume(5000);
+        
+        let new_max = fc.new_max_data();
+        
+        // new_max = local_max_data + consumed = 10000 + 5000 = 15000
+        assert_eq!(new_max, 15000);
+        assert_eq!(fc.local_max_data, 15000);
+        assert_eq!(fc.consumed, 0); // Reset after new_max_data
+    }
+
+    #[test]
+    fn test_flow_controller_available_credit() {
+        let mut fc = FlowController::new(10000, 10000);
+        
+        // Initially, all credit available
+        assert_eq!(fc.available_credit(), 10000);
+        
+        fc.on_data_received(3000).unwrap();
+        assert_eq!(fc.available_credit(), 7000);
+        
+        fc.consume(1000);
+        // credit = max_data - (consumed + available) = 10000 - (1000 + 2000) = 7000
+        assert_eq!(fc.available_credit(), 7000);
+    }
+
+    // ==========================================================================
+    // ConnectionFlowControl Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_connection_flow_control_new() {
+        let cfc = ConnectionFlowControl::new(100000, 100000, 50000);
+        
+        assert_eq!(cfc.send.max_data, 100000);
+        assert_eq!(cfc.recv.max_data, 100000);
+        assert_eq!(cfc.recv.local_max_data, 50000);
+    }
+
+    #[test]
+    fn test_connection_flow_control_send() {
+        let mut cfc = ConnectionFlowControl::new(100000, 100000, 50000);
+        
+        // Record some data sent
+        cfc.send.on_data_received(5000).unwrap();
+        assert_eq!(cfc.send.available, 5000);
+    }
+
+    #[test]
+    fn test_connection_flow_control_recv() {
+        let mut cfc = ConnectionFlowControl::new(100000, 100000, 50000);
+        
+        cfc.recv.on_data_received(3000).unwrap();
+        cfc.recv.consume(1500);
+        
+        assert_eq!(cfc.recv.consumed, 1500);
+        assert_eq!(cfc.recv.available, 1500);
+    }
+
+    // ==========================================================================
+    // StreamFlowControl Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_stream_flow_control_new() {
+        let stream_id = stream_id_helpers::from_raw(0);
+        let sfc = StreamFlowControl::new(stream_id, 50000, 50000, 25000);
+        
+        assert_eq!(sfc.stream_id, stream_id);
+        assert_eq!(sfc.send.max_data, 50000);
+        assert_eq!(sfc.recv.max_data, 50000);
+        assert_eq!(sfc.recv.local_max_data, 25000);
+    }
+
+    #[test]
+    fn test_stream_flow_control_send() {
+        let stream_id = stream_id_helpers::from_raw(4);
+        let mut sfc = StreamFlowControl::new(stream_id, 50000, 50000, 25000);
+        
+        sfc.send.on_data_received(10000).unwrap();
+        sfc.send.consume(5000);
+        
+        assert_eq!(sfc.send.consumed, 5000);
+    }
+
+    #[test]
+    fn test_stream_flow_control_recv() {
+        let stream_id = stream_id_helpers::from_raw(8);
+        let mut sfc = StreamFlowControl::new(stream_id, 50000, 50000, 25000);
+        
+        sfc.recv.on_data_received(20000).unwrap();
+        assert!(sfc.recv.can_receive(30000).is_ok());
+        
+        let result = sfc.recv.can_receive(30001);
+        assert!(result.is_err());
+    }
+
+    // ==========================================================================
+    // Edge Cases
+    // ==========================================================================
+
+    #[test]
+    fn test_flow_controller_zero_limit() {
+        let fc = FlowController::new(0, 0);
+        
+        assert_eq!(fc.available_credit(), 0);
+        assert!(fc.can_receive(1).is_err());
+    }
+
+    #[test]
+    fn test_flow_controller_large_values() {
+        let max = u64::MAX / 2; // Avoid overflow
+        let mut fc = FlowController::new(max, max);
+        
+        fc.on_data_received(1_000_000_000).unwrap();
+        assert!(fc.available_credit() > 0);
+    }
+
+    #[test]
+    fn test_flow_controller_exact_limit() {
+        let mut fc = FlowController::new(100, 100);
+        
+        fc.on_data_received(100).unwrap();
+        assert_eq!(fc.available_credit(), 0);
+        assert!(fc.can_receive(1).is_err());
+    }
+}

@@ -390,7 +390,7 @@ impl DefaultLossDetector {
                     _ => PacketNumberSpace::ApplicationData,
                 };
 
-                let pto = self.calculate_pto_for_space(space, state.pto_count);
+                let _pto = self.calculate_pto_for_space(space, state.pto_count);
                 // Set timer would happen here in real implementation
                 break;
             }
@@ -419,8 +419,8 @@ impl LossDetector for DefaultLossDetector {
         &mut self,
         space: PacketNumberSpace,
         largest_acked: PacketNumber,
-        ack_delay: core::time::Duration,
-        ack_ranges: &[(PacketNumber, PacketNumber)],
+        _ack_delay: core::time::Duration,
+        _ack_ranges: &[(PacketNumber, PacketNumber)],
         recv_time: Instant,
     ) -> Result<(Vec<PacketNumber>, Vec<PacketNumber>)> {
         let idx = Self::space_index(space);

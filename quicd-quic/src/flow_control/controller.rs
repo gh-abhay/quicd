@@ -336,3 +336,342 @@ pub trait FlowControlManager: Send {
     /// Check if connection needs MAX_DATA update
     fn connection_needs_update(&self) -> bool;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::stream_id_helpers;
+
+    // ==========================================================================
+    // FlowController Trait Default Implementation Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_send_capacity_calculation() {
+        let ctrl = ConnectionFlowController::new(10000, 5000);
+        assert_eq!(ctrl.send_capacity(), 5000); // send_limit - send_offset
+    }
+
+    #[test]
+    fn test_receive_capacity_calculation() {
+        let ctrl = ConnectionFlowController::new(10000, 5000);
+        assert_eq!(ctrl.receive_capacity(), 10000); // receive_limit - receive_offset
+    }
+
+    #[test]
+    fn test_is_send_blocked_when_equal() {
+        let mut ctrl = ConnectionFlowController::new(10000, 100);
+        ctrl.record_sent(0, 100).unwrap();
+        assert!(ctrl.is_send_blocked());
+    }
+
+    #[test]
+    fn test_is_send_blocked_when_less() {
+        let mut ctrl = ConnectionFlowController::new(10000, 100);
+        ctrl.record_sent(0, 50).unwrap();
+        assert!(!ctrl.is_send_blocked());
+    }
+
+    // ==========================================================================
+    // ConnectionFlowController Tests - RFC 9000 Section 4
+    // ==========================================================================
+
+    #[test]
+    fn test_connection_fc_new() {
+        let ctrl = ConnectionFlowController::new(10000, 5000);
+        assert_eq!(ctrl.send_limit(), 5000); // Peer's limit
+        assert_eq!(ctrl.receive_limit(), 10000); // Our limit
+        assert_eq!(ctrl.send_offset(), 0);
+        assert_eq!(ctrl.receive_offset(), 0);
+    }
+
+    #[test]
+    fn test_connection_fc_record_sent() {
+        let mut ctrl = ConnectionFlowController::new(10000, 5000);
+        
+        ctrl.record_sent(0, 100).unwrap();
+        assert_eq!(ctrl.send_offset(), 100);
+        
+        ctrl.record_sent(100, 200).unwrap();
+        assert_eq!(ctrl.send_offset(), 300);
+    }
+
+    #[test]
+    fn test_connection_fc_record_sent_exceeds_limit() {
+        let mut ctrl = ConnectionFlowController::new(10000, 100);
+        
+        let result = ctrl.record_sent(0, 200);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Transport(TransportError::FlowControlError) => {}
+            other => panic!("Expected FlowControlError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connection_fc_record_received() {
+        let mut ctrl = ConnectionFlowController::new(10000, 5000);
+        
+        ctrl.record_received(0, 100).unwrap();
+        assert_eq!(ctrl.receive_offset(), 100);
+        
+        ctrl.record_received(100, 200).unwrap();
+        assert_eq!(ctrl.receive_offset(), 300);
+    }
+
+    #[test]
+    fn test_connection_fc_record_received_exceeds_limit() {
+        let mut ctrl = ConnectionFlowController::new(100, 5000);
+        
+        let result = ctrl.record_received(0, 200);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Transport(TransportError::FlowControlError) => {}
+            other => panic!("Expected FlowControlError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connection_fc_update_send_limit_increase() {
+        let mut ctrl = ConnectionFlowController::new(10000, 5000);
+        
+        ctrl.update_send_limit(10000).unwrap();
+        assert_eq!(ctrl.send_limit(), 10000);
+    }
+
+    #[test]
+    fn test_connection_fc_update_send_limit_decrease_error() {
+        let mut ctrl = ConnectionFlowController::new(10000, 5000);
+        
+        let result = ctrl.update_send_limit(1000);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Transport(TransportError::FlowControlError) => {}
+            other => panic!("Expected FlowControlError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_connection_fc_update_receive_limit() {
+        let mut ctrl = ConnectionFlowController::new(10000, 5000);
+        
+        ctrl.update_receive_limit(20000).unwrap();
+        assert_eq!(ctrl.receive_limit(), 20000);
+    }
+
+    #[test]
+    fn test_connection_fc_record_consumed() {
+        let mut ctrl = ConnectionFlowController::new(10000, 5000);
+        
+        ctrl.record_consumed(500);
+        assert_eq!(ctrl.consumed_offset, 500);
+        
+        ctrl.record_consumed(300);
+        assert_eq!(ctrl.consumed_offset, 800);
+    }
+
+    #[test]
+    fn test_connection_fc_new_receive_limit() {
+        let mut ctrl = ConnectionFlowController::new(10000, 5000);
+        
+        ctrl.record_consumed(5000);
+        let new_limit = ctrl.new_receive_limit();
+        
+        // Should be consumed + window = 5000 + 10000 = 15000
+        assert_eq!(new_limit, 15000);
+    }
+
+    #[test]
+    fn test_connection_fc_should_send_update() {
+        let mut ctrl = ConnectionFlowController::new(10000, 5000);
+        
+        // Initially no update needed
+        assert!(!ctrl.should_send_update());
+        
+        // After consuming more than threshold
+        ctrl.record_consumed(6000);
+        // Now should need update (consumed > 50% of window)
+        assert!(ctrl.should_send_update());
+    }
+
+    // ==========================================================================
+    // StreamFlowController Tests - RFC 9000 Section 4
+    // ==========================================================================
+
+    #[test]
+    fn test_stream_fc_new() {
+        let stream_id = stream_id_helpers::from_raw(0);
+        let ctrl = StreamFlowController::new(stream_id, 10000, 5000);
+        
+        assert_eq!(ctrl.stream_id(), stream_id);
+        assert_eq!(ctrl.send_limit(), 5000);
+        assert_eq!(ctrl.receive_limit(), 10000);
+    }
+
+    #[test]
+    fn test_stream_fc_record_sent() {
+        let stream_id = stream_id_helpers::from_raw(4);
+        let mut ctrl = StreamFlowController::new(stream_id, 10000, 5000);
+        
+        ctrl.record_sent(0, 100).unwrap();
+        assert_eq!(ctrl.send_offset(), 100);
+    }
+
+    #[test]
+    fn test_stream_fc_record_sent_exceeds_limit() {
+        let stream_id = stream_id_helpers::from_raw(8);
+        let mut ctrl = StreamFlowController::new(stream_id, 10000, 100);
+        
+        let result = ctrl.record_sent(0, 200);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stream_fc_record_received() {
+        let stream_id = stream_id_helpers::from_raw(12);
+        let mut ctrl = StreamFlowController::new(stream_id, 10000, 5000);
+        
+        ctrl.record_received(0, 500).unwrap();
+        assert_eq!(ctrl.receive_offset(), 500);
+    }
+
+    #[test]
+    fn test_stream_fc_record_received_exceeds_limit() {
+        let stream_id = stream_id_helpers::from_raw(16);
+        let mut ctrl = StreamFlowController::new(stream_id, 100, 5000);
+        
+        let result = ctrl.record_received(0, 200);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stream_fc_update_send_limit() {
+        let stream_id = stream_id_helpers::from_raw(20);
+        let mut ctrl = StreamFlowController::new(stream_id, 10000, 5000);
+        
+        ctrl.update_send_limit(10000).unwrap();
+        assert_eq!(ctrl.send_limit(), 10000);
+    }
+
+    #[test]
+    fn test_stream_fc_update_send_limit_decrease_error() {
+        let stream_id = stream_id_helpers::from_raw(24);
+        let mut ctrl = StreamFlowController::new(stream_id, 10000, 5000);
+        
+        let result = ctrl.update_send_limit(1000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stream_fc_record_read() {
+        let stream_id = stream_id_helpers::from_raw(28);
+        let mut ctrl = StreamFlowController::new(stream_id, 10000, 5000);
+        
+        ctrl.record_read(1000);
+        assert_eq!(ctrl.read_offset, 1000);
+    }
+
+    #[test]
+    fn test_stream_fc_new_receive_limit() {
+        let stream_id = stream_id_helpers::from_raw(32);
+        let mut ctrl = StreamFlowController::new(stream_id, 10000, 5000);
+        
+        ctrl.record_read(5000);
+        let new_limit = ctrl.new_receive_limit();
+        
+        // read + window = 5000 + 10000 = 15000
+        assert_eq!(new_limit, 15000);
+    }
+
+    #[test]
+    fn test_stream_fc_should_send_update() {
+        let stream_id = stream_id_helpers::from_raw(36);
+        let mut ctrl = StreamFlowController::new(stream_id, 10000, 5000);
+        
+        assert!(!ctrl.should_send_update());
+        
+        ctrl.record_read(6000);
+        // Now should need update
+        assert!(ctrl.should_send_update());
+    }
+
+    // ==========================================================================
+    // Out-of-Order Data Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_connection_fc_out_of_order_data() {
+        let mut ctrl = ConnectionFlowController::new(10000, 5000);
+        
+        // Receive data at offset 100 first
+        ctrl.record_received(100, 50).unwrap();
+        assert_eq!(ctrl.receive_offset(), 150);
+        
+        // Then receive earlier data at offset 0
+        ctrl.record_received(0, 100).unwrap();
+        // receive_offset should be max of all offsets
+        assert_eq!(ctrl.receive_offset(), 150);
+    }
+
+    #[test]
+    fn test_stream_fc_out_of_order_data() {
+        let stream_id = stream_id_helpers::from_raw(40);
+        let mut ctrl = StreamFlowController::new(stream_id, 10000, 5000);
+        
+        // Send later chunk first
+        ctrl.record_sent(500, 100).unwrap();
+        assert_eq!(ctrl.send_offset(), 600);
+        
+        // Send earlier chunk
+        ctrl.record_sent(0, 100).unwrap();
+        // send_offset should be max
+        assert_eq!(ctrl.send_offset(), 600);
+    }
+
+    // ==========================================================================
+    // Edge Cases
+    // ==========================================================================
+
+    #[test]
+    fn test_connection_fc_exactly_at_limit() {
+        let mut ctrl = ConnectionFlowController::new(10000, 100);
+        
+        // Send exactly at limit should succeed
+        ctrl.record_sent(0, 100).unwrap();
+        assert_eq!(ctrl.send_offset(), 100);
+        assert!(ctrl.is_send_blocked());
+    }
+
+    #[test]
+    fn test_stream_fc_zero_length() {
+        let stream_id = stream_id_helpers::from_raw(44);
+        let mut ctrl = StreamFlowController::new(stream_id, 10000, 5000);
+        
+        // Zero-length send should succeed
+        ctrl.record_sent(0, 0).unwrap();
+        assert_eq!(ctrl.send_offset(), 0);
+    }
+
+    #[test]
+    fn test_send_capacity_after_sending() {
+        let mut ctrl = ConnectionFlowController::new(10000, 1000);
+        
+        assert_eq!(ctrl.send_capacity(), 1000);
+        
+        ctrl.record_sent(0, 400).unwrap();
+        assert_eq!(ctrl.send_capacity(), 600);
+        
+        ctrl.record_sent(400, 600).unwrap();
+        assert_eq!(ctrl.send_capacity(), 0);
+    }
+
+    #[test]
+    fn test_receive_capacity_after_receiving() {
+        let mut ctrl = ConnectionFlowController::new(1000, 10000);
+        
+        assert_eq!(ctrl.receive_capacity(), 1000);
+        
+        ctrl.record_received(0, 400).unwrap();
+        assert_eq!(ctrl.receive_capacity(), 600);
+    }
+}

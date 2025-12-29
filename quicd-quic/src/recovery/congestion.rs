@@ -4,9 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::error::{Error, Result};
 use crate::types::{Instant, PacketNumber, PacketNumberSpace};
-use core::time::Duration;
 
 /// Congestion Controller Trait
 ///
@@ -331,3 +329,208 @@ impl CongestionControllerFactory for NewRenoFactory {
 // Unit Tests
 // ============================================================================
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // NewReno Congestion Controller Tests (RFC 9002 Appendix B)
+    // ========================================================================
+
+    mod newreno_tests {
+        use super::*;
+
+        fn create_controller() -> NewRenoCongestionController {
+            // Initial window = 14720 (10 * 1472 MTU), min = 2944, max = 2^30
+            NewRenoCongestionController::new(14720, 2944, 1 << 30, 1472)
+        }
+
+        #[test]
+        fn test_initial_state() {
+            let cc = create_controller();
+
+            assert_eq!(cc.congestion_window(), 14720);
+            assert_eq!(cc.bytes_in_flight(), 0);
+            assert!(cc.can_send(1000));
+        }
+
+        #[test]
+        fn test_can_send_within_window() {
+            let cc = create_controller();
+
+            // Should be able to send up to congestion window
+            assert!(cc.can_send(14720));
+            assert!(!cc.can_send(14721)); // Over by 1
+        }
+
+        #[test]
+        fn test_slow_start_growth() {
+            // RFC 9002 B.2: In slow start, cwnd += acked_bytes
+            let mut cc = create_controller();
+            let now = Instant::from_nanos(0);
+
+            // Send a packet
+            cc.on_packet_sent(0, PacketNumberSpace::ApplicationData, 1000, true, now);
+            assert_eq!(cc.bytes_in_flight(), 1000);
+
+            // ACK the packet
+            let ack_time = Instant::from_nanos(100_000_000);
+            cc.on_packet_acked(0, PacketNumberSpace::ApplicationData, 1000, ack_time);
+
+            // Bytes in flight should decrease
+            assert_eq!(cc.bytes_in_flight(), 0);
+
+            // Congestion window should increase by acked_bytes in slow start
+            assert!(cc.congestion_window() > 14720);
+        }
+
+        #[test]
+        fn test_bytes_in_flight_tracking() {
+            let mut cc = create_controller();
+            let now = Instant::from_nanos(0);
+
+            // Send multiple packets
+            cc.on_packet_sent(0, PacketNumberSpace::ApplicationData, 1000, true, now);
+            cc.on_packet_sent(1, PacketNumberSpace::ApplicationData, 1500, true, now);
+            cc.on_packet_sent(2, PacketNumberSpace::ApplicationData, 500, true, now);
+
+            assert_eq!(cc.bytes_in_flight(), 3000);
+
+            // ACK one packet
+            cc.on_packet_acked(1, PacketNumberSpace::ApplicationData, 1500, now);
+            assert_eq!(cc.bytes_in_flight(), 1500); // 3000 - 1500
+        }
+
+        #[test]
+        fn test_loss_reduces_window() {
+            // RFC 9002 B.3: On loss, ssthresh = cwnd / 2, cwnd = ssthresh
+            let mut cc = create_controller();
+            let now = Instant::from_nanos(0);
+
+            // Get initial window
+            let initial_cwnd = cc.congestion_window();
+
+            // Send and lose a packet
+            cc.on_packet_sent(0, PacketNumberSpace::ApplicationData, 1000, true, now);
+            let loss_time = Instant::from_nanos(100_000_000);
+            cc.on_packet_lost(0, PacketNumberSpace::ApplicationData, 1000, loss_time);
+
+            // Window should be halved
+            let new_cwnd = cc.congestion_window();
+            assert!(new_cwnd < initial_cwnd);
+            assert_eq!(new_cwnd, initial_cwnd / 2);
+        }
+
+        #[test]
+        fn test_minimum_window() {
+            // RFC 9002: cwnd should not go below min_window
+            let mut cc = NewRenoCongestionController::new(3000, 2944, 1 << 30, 1472);
+            let now = Instant::from_nanos(0);
+
+            // Trigger multiple losses
+            for i in 0..10 {
+                cc.on_packet_sent(
+                    i,
+                    PacketNumberSpace::ApplicationData,
+                    1000,
+                    true,
+                    now,
+                );
+                let loss_time = Instant::from_nanos((i + 1) * 100_000_000);
+                cc.on_packet_lost(
+                    i,
+                    PacketNumberSpace::ApplicationData,
+                    1000,
+                    loss_time,
+                );
+            }
+
+            // Window should not go below minimum
+            assert!(cc.congestion_window() >= 2944);
+        }
+
+        #[test]
+        fn test_non_ack_eliciting_not_tracked() {
+            let mut cc = create_controller();
+            let now = Instant::from_nanos(0);
+
+            // Send non-ACK-eliciting packet (is_ack_eliciting = false)
+            cc.on_packet_sent(0, PacketNumberSpace::ApplicationData, 1000, false, now);
+
+            // Should not be in bytes_in_flight
+            assert_eq!(cc.bytes_in_flight(), 0);
+        }
+
+        #[test]
+        fn test_pacing_rate_none() {
+            // NewReno doesn't implement pacing
+            let cc = create_controller();
+            assert!(cc.pacing_rate().is_none());
+        }
+    }
+
+    // ========================================================================
+    // Congestion Event Tests
+    // ========================================================================
+
+    mod congestion_event_tests {
+        use super::*;
+
+        #[test]
+        fn test_congestion_event_values() {
+            let now = Instant::from_nanos(1_000_000_000);
+
+            let acked = CongestionEvent::PacketAcked {
+                sent_time: now,
+                bytes: 1000,
+            };
+
+            let lost = CongestionEvent::PacketLost {
+                sent_time: now,
+                bytes: 500,
+            };
+
+            let ecn = CongestionEvent::EcnCe { now };
+
+            // Just verify the enum variants exist and can be constructed
+            assert!(matches!(acked, CongestionEvent::PacketAcked { .. }));
+            assert!(matches!(lost, CongestionEvent::PacketLost { .. }));
+            assert!(matches!(ecn, CongestionEvent::EcnCe { .. }));
+        }
+    }
+
+    // ========================================================================
+    // CongestionState Tests
+    // ========================================================================
+
+    mod congestion_state_tests {
+        use super::*;
+
+        #[test]
+        fn test_congestion_states() {
+            assert_eq!(CongestionState::SlowStart, CongestionState::SlowStart);
+            assert_ne!(CongestionState::SlowStart, CongestionState::Recovery);
+            assert_ne!(CongestionState::CongestionAvoidance, CongestionState::Recovery);
+        }
+    }
+
+    // ========================================================================
+    // Factory Tests
+    // ========================================================================
+
+    mod factory_tests {
+        use super::*;
+
+        #[test]
+        fn test_newreno_factory() {
+            let factory = NewRenoFactory {
+                max_datagram_size: 1472,
+            };
+
+            assert_eq!(factory.name(), "reno");
+
+            let cc = factory.create(14720, 2944, 1 << 30);
+            assert_eq!(cc.congestion_window(), 14720);
+        }
+    }
+}

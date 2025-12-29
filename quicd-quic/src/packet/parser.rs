@@ -184,6 +184,9 @@ pub trait PacketCoalescer {
 /// Default packet parser implementation
 pub struct DefaultPacketParser {
     /// Maximum packet size to accept
+    ///
+    /// TODO: Use this field when implementing parse_packet()
+    #[allow(dead_code)]
     max_packet_size: usize,
 }
 

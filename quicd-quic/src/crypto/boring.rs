@@ -1,10 +1,9 @@
 use crate::crypto::backend::{
-    AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, KeySchedule, TlsSession,
+    AeadProvider, CryptoBackend, HeaderProtectionProvider, KeySchedule, TlsSession,
 };
 use crate::error::{CryptoError, Error, Result};
 use crate::types::{ConnectionId, PacketNumber, Side};
 use boring_sys as ffi;
-use std::ffi::c_int;
 use std::ptr;
 
 pub struct BoringCryptoBackend;
@@ -350,6 +349,11 @@ fn hkdf_extract_with_hash(ikm: &[u8], salt: &[u8], md: *const ffi::EVP_MD) -> Re
     }
 }
 
+/// HKDF-Expand with SHA-256 (RFC 9001 Section 5.1)
+///
+/// This is a convenience wrapper for direct HKDF expansion.
+/// Currently unused but retained for RFC completeness.
+#[allow(dead_code)]
 fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>> {
     unsafe { hkdf_expand_with_hash(prk, info, len, ffi::EVP_sha256()) }
 }

@@ -21,7 +21,6 @@ use crate::error::{Error, Result};
 use crate::types::{ConnectionId, StatelessResetToken};
 use alloc::collections::BTreeMap as HashMap;
 use alloc::vec::Vec;
-use bytes::Bytes;
 
 /// Connection ID Generator Trait
 ///

@@ -27,6 +27,10 @@ struct ExData<'a> {
 pub struct BoringTlsSession {
     ssl: Ssl,
     events: VecDeque<TlsEvent>,
+    /// Tracks server vs client mode for session state
+    ///
+    /// TODO: Use for session ticket and 0-RTT handling
+    #[allow(dead_code)]
     is_server: bool,
 }
 
@@ -263,8 +267,8 @@ impl TlsSession for BoringTlsSession {
             let provide_result =
                 ffi::SSL_provide_quic_data(self.ssl.as_ptr(), level_int, data.as_ptr(), data.len());
             if provide_result != 1 {
-                let ssl_error = unsafe { ffi::SSL_get_error(self.ssl.as_ptr(), provide_result) };
-                let error_code = unsafe { ffi::ERR_get_error() };
+                let ssl_error = ffi::SSL_get_error(self.ssl.as_ptr(), provide_result);
+                let error_code = ffi::ERR_get_error();
                 ffi::SSL_set_ex_data(self.ssl.as_ptr(), get_ex_data_index(), ptr::null_mut());
                 eprintln!("DEBUG: SSL_provide_quic_data failed: result={}, ssl_error={:?}, error_code={:x}, level={:?}, data_len={}", 
                          provide_result, ssl_error, error_code, level, data.len());
@@ -295,7 +299,7 @@ impl TlsSession for BoringTlsSession {
                     ffi::SSL_ERROR_SYSCALL => {
                         // For QUIC, SSL_ERROR_SYSCALL with error_code=0 means "would block"
                         // (no actual system call is made since QUIC doesn't use socket I/O)
-                        let error_code = unsafe { ffi::ERR_get_error() };
+                        let error_code = ffi::ERR_get_error();
                         if error_code == 0 {
                             // Normal - need more data (QUIC non-blocking mode)
                             return Ok(());
@@ -306,17 +310,15 @@ impl TlsSession for BoringTlsSession {
                 }
 
                 // Error occurred - get details
-                let error_code = unsafe { ffi::ERR_get_error() };
+                let error_code = ffi::ERR_get_error();
 
                 // Get error string from BoringSSL
                 let mut err_buf = [0u8; 256];
-                unsafe {
-                    ffi::ERR_error_string_n(
-                        error_code,
-                        err_buf.as_mut_ptr() as *mut i8,
-                        err_buf.len(),
-                    );
-                }
+                ffi::ERR_error_string_n(
+                    error_code,
+                    err_buf.as_mut_ptr() as *mut i8,
+                    err_buf.len(),
+                );
                 let err_str = std::ffi::CStr::from_bytes_until_nul(&err_buf)
                     .ok()
                     .and_then(|c| c.to_str().ok())

@@ -5,15 +5,9 @@
 extern crate alloc;
 
 use crate::error::{Error, Result, TransportError};
-use crate::packet::header::{DefaultHeaderParser, HeaderForm};
-use crate::packet::number::{
-    DefaultPacketNumberDecoder, DefaultPacketNumberEncoder, PacketNumberLen,
-};
-use crate::packet::parser::PacketParser;
-use crate::packet::types::{
-    PacketHeader, PacketType, ParsedPacket, Token, VERSION_1, VERSION_NEGOTIATION,
-};
-use crate::types::{ConnectionId, Instant, PacketNumber};
+use crate::packet::header::DefaultHeaderParser;
+use crate::packet::types::{PacketType, VERSION_1, VERSION_NEGOTIATION};
+use crate::types::{ConnectionId, PacketNumber};
 use bytes::{BufMut, Bytes, BytesMut};
 
 /// Parse context for packet parsing
@@ -80,7 +74,7 @@ pub struct PacketHeaderWrapper {
 impl Packet {
     /// Parse a QUIC packet from bytes with optional context
     pub fn parse_with_context(bytes: Bytes, ctx: ParseContext) -> Result<Self> {
-        let parser = DefaultHeaderParser;
+        let _parser = DefaultHeaderParser;
 
         // Parse the first byte to check header form
         if bytes.is_empty() {
@@ -318,7 +312,7 @@ impl Packet {
     pub fn create_version_negotiation(
         dcid: ConnectionId,
         scid: ConnectionId,
-        supported_versions: Vec<u32>,
+        _supported_versions: Vec<u32>,
     ) -> Self {
         Self {
             header: PacketHeaderWrapper {

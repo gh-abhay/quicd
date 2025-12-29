@@ -8,7 +8,6 @@
 extern crate alloc;
 use crate::types::Instant;
 use alloc::collections::BTreeMap as HashMap;
-use alloc::vec::Vec;
 
 /// Address identifier (simplified - real impl would use SocketAddr)
 pub type AddressKey = [u8; 16];
@@ -114,9 +113,10 @@ impl AmplificationLimiter {
     /// Periodic cleanup of old address entries
     pub fn cleanup(&mut self, now: Instant) {
         if let Some(last) = self.last_cleanup {
-            let elapsed = now.duration_since(last);
-            if elapsed.is_some() && elapsed.unwrap() < self.cleanup_interval {
-                return;
+            if let Some(elapsed) = now.duration_since(last) {
+                if elapsed < self.cleanup_interval {
+                    return;
+                }
             }
         }
 

@@ -282,3 +282,305 @@ impl StreamManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==========================================================================
+    // StreamState Tests - RFC 9000 Section 3
+    // ==========================================================================
+
+    #[test]
+    fn test_stream_state_can_send_bidirectional() {
+        // Bidirectional stream send states
+        assert!(StreamState::Open.can_send());
+        assert!(StreamState::HalfClosedRemote.can_send());
+        assert!(!StreamState::HalfClosedLocal.can_send()); // Sent FIN
+        assert!(!StreamState::Closed.can_send());
+    }
+
+    #[test]
+    fn test_stream_state_can_send_unidirectional() {
+        // Unidirectional send-only stream states
+        assert!(StreamState::Ready.can_send());
+        assert!(StreamState::Send.can_send());
+        assert!(!StreamState::DataSent.can_send()); // Data sent, waiting for ACK
+        assert!(!StreamState::ResetSent.can_send());
+    }
+
+    #[test]
+    fn test_stream_state_can_receive_bidirectional() {
+        // Bidirectional stream receive states
+        assert!(StreamState::Open.can_receive());
+        assert!(StreamState::HalfClosedLocal.can_receive()); // Sent FIN, can still receive
+        assert!(!StreamState::HalfClosedRemote.can_receive()); // Received FIN
+        assert!(!StreamState::Closed.can_receive());
+    }
+
+    #[test]
+    fn test_stream_state_can_receive_unidirectional() {
+        // Unidirectional receive-only stream states
+        assert!(StreamState::Recv.can_receive());
+        assert!(StreamState::SizeKnown.can_receive()); // FIN received but data still coming
+        assert!(!StreamState::DataRecvd.can_receive());
+        assert!(!StreamState::DataRead.can_receive());
+    }
+
+    #[test]
+    fn test_stream_state_is_finished() {
+        // Terminal states
+        assert!(StreamState::Closed.is_finished());
+        assert!(StreamState::ResetRecvd.is_finished());
+        assert!(StreamState::DataRead.is_finished());
+
+        // Non-terminal states
+        assert!(!StreamState::Open.is_finished());
+        assert!(!StreamState::HalfClosedLocal.is_finished());
+        assert!(!StreamState::HalfClosedRemote.is_finished());
+        assert!(!StreamState::Recv.is_finished());
+        assert!(!StreamState::Send.is_finished());
+    }
+
+    #[test]
+    fn test_stream_state_idle() {
+        // Idle state - not yet opened
+        assert!(!StreamState::Idle.can_send());
+        assert!(!StreamState::Idle.can_receive());
+        assert!(!StreamState::Idle.is_finished());
+    }
+
+    // ==========================================================================
+    // StreamManager Tests - RFC 9000 Section 2.1 (Stream IDs)
+    // ==========================================================================
+
+    #[test]
+    fn test_stream_manager_new_client() {
+        let mgr = StreamManager::new(Side::Client);
+        assert_eq!(mgr.side, Side::Client);
+        assert_eq!(mgr.next_bidi_client, 0);
+        assert_eq!(mgr.next_uni_client, 2);
+    }
+
+    #[test]
+    fn test_stream_manager_new_server() {
+        let mgr = StreamManager::new(Side::Server);
+        assert_eq!(mgr.side, Side::Server);
+        assert_eq!(mgr.next_bidi_server, 1);
+        assert_eq!(mgr.next_uni_server, 3);
+    }
+
+    #[test]
+    fn test_stream_id_allocation_client_bidi() {
+        let mut mgr = StreamManager::new(Side::Client);
+
+        // Client-initiated bidirectional: 0, 4, 8, 12, ...
+        let id1 = mgr.allocate_stream_id(StreamDirection::Bidirectional).unwrap();
+        let id2 = mgr.allocate_stream_id(StreamDirection::Bidirectional).unwrap();
+        let id3 = mgr.allocate_stream_id(StreamDirection::Bidirectional).unwrap();
+
+        assert_eq!(id1.value(), 0);
+        assert_eq!(id2.value(), 4);
+        assert_eq!(id3.value(), 8);
+    }
+
+    #[test]
+    fn test_stream_id_allocation_client_uni() {
+        let mut mgr = StreamManager::new(Side::Client);
+
+        // Client-initiated unidirectional: 2, 6, 10, ...
+        let id1 = mgr.allocate_stream_id(StreamDirection::Unidirectional).unwrap();
+        let id2 = mgr.allocate_stream_id(StreamDirection::Unidirectional).unwrap();
+
+        assert_eq!(id1.value(), 2);
+        assert_eq!(id2.value(), 6);
+    }
+
+    #[test]
+    fn test_stream_id_allocation_server_bidi() {
+        let mut mgr = StreamManager::new(Side::Server);
+
+        // Server-initiated bidirectional: 1, 5, 9, ...
+        let id1 = mgr.allocate_stream_id(StreamDirection::Bidirectional).unwrap();
+        let id2 = mgr.allocate_stream_id(StreamDirection::Bidirectional).unwrap();
+
+        assert_eq!(id1.value(), 1);
+        assert_eq!(id2.value(), 5);
+    }
+
+    #[test]
+    fn test_stream_id_allocation_server_uni() {
+        let mut mgr = StreamManager::new(Side::Server);
+
+        // Server-initiated unidirectional: 3, 7, 11, ...
+        let id1 = mgr.allocate_stream_id(StreamDirection::Unidirectional).unwrap();
+        let id2 = mgr.allocate_stream_id(StreamDirection::Unidirectional).unwrap();
+
+        assert_eq!(id1.value(), 3);
+        assert_eq!(id2.value(), 7);
+    }
+
+    #[test]
+    fn test_stream_id_types_from_rfc() {
+        // RFC 9000 Section 2.1:
+        // 0x00 = Client-Initiated, Bidirectional
+        // 0x01 = Server-Initiated, Bidirectional
+        // 0x02 = Client-Initiated, Unidirectional
+        // 0x03 = Server-Initiated, Unidirectional
+
+        let id0 = stream_id_helpers::from_raw(0);
+        assert_eq!(stream_id_helpers::initiator(id0), StreamInitiator::Client);
+        assert_eq!(
+            stream_id_helpers::direction(id0),
+            StreamDirection::Bidirectional
+        );
+
+        let id1 = stream_id_helpers::from_raw(1);
+        assert_eq!(stream_id_helpers::initiator(id1), StreamInitiator::Server);
+        assert_eq!(
+            stream_id_helpers::direction(id1),
+            StreamDirection::Bidirectional
+        );
+
+        let id2 = stream_id_helpers::from_raw(2);
+        assert_eq!(stream_id_helpers::initiator(id2), StreamInitiator::Client);
+        assert_eq!(
+            stream_id_helpers::direction(id2),
+            StreamDirection::Unidirectional
+        );
+
+        let id3 = stream_id_helpers::from_raw(3);
+        assert_eq!(stream_id_helpers::initiator(id3), StreamInitiator::Server);
+        assert_eq!(
+            stream_id_helpers::direction(id3),
+            StreamDirection::Unidirectional
+        );
+    }
+
+    #[test]
+    fn test_validate_stream_id_within_limit() {
+        let mut mgr = StreamManager::new(Side::Client);
+        mgr.max_streams_bidi_local = 10;
+        mgr.max_streams_uni_local = 5;
+        mgr.max_streams_bidi_remote = 10;
+        mgr.max_streams_uni_remote = 5;
+
+        // Client validates server-initiated stream (remote)
+        // Server bidi stream 1 (stream count = 1/4 = 0)
+        let id = stream_id_helpers::from_raw(1);
+        assert!(mgr.validate_stream_id(id).is_ok());
+
+        // Server bidi stream 5 (stream count = 5/4 = 1)
+        let id = stream_id_helpers::from_raw(5);
+        assert!(mgr.validate_stream_id(id).is_ok());
+    }
+
+    #[test]
+    fn test_validate_stream_id_exceeds_limit() {
+        let mut mgr = StreamManager::new(Side::Client);
+        mgr.max_streams_bidi_remote = 1; // Only allow stream 1
+
+        // Stream ID 5 would be stream count 5/4 = 1 >= limit 1
+        let id = stream_id_helpers::from_raw(5);
+        let result = mgr.validate_stream_id(id);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            Error::Transport(TransportError::StreamLimitError) => {}
+            other => panic!("Expected StreamLimitError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_update_peer_max_streams_bidi() {
+        let mut mgr = StreamManager::new(Side::Client);
+        assert_eq!(mgr.max_streams_bidi_remote, 0);
+
+        mgr.update_peer_max_streams(StreamDirection::Bidirectional, 100);
+        assert_eq!(mgr.max_streams_bidi_remote, 100);
+    }
+
+    #[test]
+    fn test_update_peer_max_streams_uni() {
+        let mut mgr = StreamManager::new(Side::Server);
+        assert_eq!(mgr.max_streams_uni_remote, 0);
+
+        mgr.update_peer_max_streams(StreamDirection::Unidirectional, 50);
+        assert_eq!(mgr.max_streams_uni_remote, 50);
+    }
+
+    // ==========================================================================
+    // StreamEvent Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_stream_event_opened() {
+        let event = StreamEvent::Opened { stream_id: stream_id_helpers::from_raw(0) };
+        match event {
+            StreamEvent::Opened { stream_id } => {
+                assert_eq!(stream_id.value(), 0);
+            }
+            _ => panic!("Wrong event variant"),
+        }
+    }
+
+    #[test]
+    fn test_stream_event_data_available() {
+        let event = StreamEvent::DataAvailable {
+            stream_id: stream_id_helpers::from_raw(4),
+            offset: 100,
+            length: 256,
+        };
+        match event {
+            StreamEvent::DataAvailable {
+                stream_id,
+                offset,
+                length,
+            } => {
+                assert_eq!(stream_id.value(), 4);
+                assert_eq!(offset, 100);
+                assert_eq!(length, 256);
+            }
+            _ => panic!("Wrong event variant"),
+        }
+    }
+
+    #[test]
+    fn test_stream_event_reset() {
+        let event = StreamEvent::Reset {
+            stream_id: stream_id_helpers::from_raw(8),
+            error_code: 0x0A,
+            final_size: 1000,
+        };
+        match event {
+            StreamEvent::Reset {
+                stream_id,
+                error_code,
+                final_size,
+            } => {
+                assert_eq!(stream_id.value(), 8);
+                assert_eq!(error_code, 0x0A);
+                assert_eq!(final_size, 1000);
+            }
+            _ => panic!("Wrong event variant"),
+        }
+    }
+
+    #[test]
+    fn test_stream_event_stopped() {
+        let event = StreamEvent::Stopped {
+            stream_id: stream_id_helpers::from_raw(12),
+            error_code: 0x0B,
+        };
+        match event {
+            StreamEvent::Stopped {
+                stream_id,
+                error_code,
+            } => {
+                assert_eq!(stream_id.value(), 12);
+                assert_eq!(error_code, 0x0B);
+            }
+            _ => panic!("Wrong event variant"),
+        }
+    }
+}

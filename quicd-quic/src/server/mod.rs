@@ -14,7 +14,7 @@ use crate::connection::{
 };
 use crate::crypto::CryptoBackend;
 use crate::error::{Error, Result, TransportError};
-use crate::packet::{Header, PacketParserTrait, PacketType};
+use crate::packet::PacketParserTrait;
 use crate::transport::TransportParameters;
 use crate::types::{ConnectionId, Instant, Side, Token};
 use crate::version::{VERSION_1, VERSION_NEGOTIATION};
@@ -170,10 +170,12 @@ pub struct DefaultQuicServer {
     /// Active connections (keyed by DCID)
     connections: HashMap<ConnectionId, Box<dyn Connection>>,
 
-    /// Packet parser
+    /// Packet parser (stored for future trait-based parsing)
+    #[allow(dead_code)]
     packet_parser: Box<dyn PacketParserTrait>,
 
-    /// Crypto backend factory
+    /// Crypto backend factory (stored for connection creation)
+    #[allow(dead_code)]
     crypto_backend: Box<dyn CryptoBackend>,
 
     /// Static secret for token generation (HMAC key)
@@ -184,8 +186,9 @@ pub struct DefaultQuicServer {
     /// RFC 9000 Section 10.3.2: Used to derive reset tokens from connection IDs
     reset_secret: [u8; 32],
 
-    /// Anti-amplification limiter
+    /// Anti-amplification limiter (stored for future enforcement)
     /// RFC 9000 Section 8.1: Enforces 3x sending limit to unvalidated addresses
+    #[allow(dead_code)]
     amp_limiter: AmplificationLimiter,
 
     /// Connection ID managers (per connection)
@@ -218,7 +221,10 @@ impl DefaultQuicServer {
         }
     }
 
-    /// Check if version is supported
+    /// Check if version is supported (RFC 9000 Section 6)
+    ///
+    /// TODO: Used during version negotiation processing
+    #[allow(dead_code)]
     fn is_version_supported(&self, version: u32) -> bool {
         self.config.supported_versions.contains(&version)
     }
@@ -241,8 +247,8 @@ impl DefaultQuicServer {
 impl QuicServer for DefaultQuicServer {
     fn process_initial_datagram(
         &mut self,
-        data: Bytes,
-        recv_time: Instant,
+        _data: Bytes,
+        _recv_time: Instant,
     ) -> Result<Option<ConnectionId>> {
         unimplemented!("Skeleton - no implementation required")
     }
@@ -251,7 +257,7 @@ impl QuicServer for DefaultQuicServer {
         &mut self,
         dcid: ConnectionId,
         scid: ConnectionId,
-        remote_address: &[u8],
+        _remote_address: &[u8],
     ) -> Result<Box<dyn Connection>> {
         let conn_config = ConnectionConfig {
             local_params: self.config.transport_params.clone(),
@@ -494,7 +500,10 @@ impl QuicServer for DefaultQuicServer {
         if data.len() < offset + 8 {
             return Err(Error::Transport(TransportError::InvalidToken));
         }
-        let timestamp = u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap());
+        let timestamp_bytes: [u8; 8] = data[offset..offset + 8]
+            .try_into()
+            .map_err(|_| Error::Transport(TransportError::InvalidToken))?;
+        let _timestamp = u64::from_be_bytes(timestamp_bytes);
         offset += 8;
 
         // TODO: Check timestamp freshness (e.g., within 30 seconds)

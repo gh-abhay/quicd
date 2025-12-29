@@ -5,7 +5,6 @@
 
 #![forbid(unsafe_code)]
 
-use crate::error::{Error, Result};
 use crate::types::{Instant, PacketNumber, PacketNumberSpace};
 use core::time::Duration;
 

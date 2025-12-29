@@ -1,6 +1,5 @@
 use crate::error::Result;
 use crate::types::{ConnectionId, PacketNumber, Side};
-use bytes::Bytes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CryptoLevel {
