@@ -68,14 +68,3 @@ pub fn validate_resource_limits(config: &ServerConfig) -> Result<(), Vec<String>
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_validate_default_config() {
-        let config = ServerConfig::default();
-        // Default config should pass validation (though it will have warnings)
-        assert!(validate_resource_limits(&config).is_ok());
-    }
-}

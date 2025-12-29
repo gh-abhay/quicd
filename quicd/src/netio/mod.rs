@@ -13,6 +13,9 @@ pub mod config;
 pub mod numa;
 pub(crate) mod socket;
 
+#[cfg(test)]
+mod tests;
+
 #[allow(unused_imports)]
 pub use buffer::{create_worker_pool, ConsumeBuffer, Reuse, WorkerBufPool, WorkerBuffer};
 pub use config::NetIoConfig;

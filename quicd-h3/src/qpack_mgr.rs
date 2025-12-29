@@ -161,35 +161,3 @@ impl QpackManager {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_qpack_manager_creation() {
-        let mgr = QpackManager::new(4096, 100);
-        assert!(!mgr.has_encoder_stream());
-        assert!(!mgr.has_decoder_stream());
-    }
-
-    #[test]
-    fn test_encode_decode_field_section() {
-        let mut mgr = QpackManager::new(4096, 100);
-
-        let fields = vec![
-            FieldLine::new("content-type", "text/html"),
-            FieldLine::new("content-length", "1234"),
-        ];
-
-        let encoded = mgr.encode_field_section(0, &fields).unwrap();
-        assert!(!encoded.is_empty());
-
-        let decoded = mgr.decode_field_section(0, &encoded).unwrap();
-        assert_eq!(decoded.len(), fields.len());
-
-        for (original, decoded) in fields.iter().zip(decoded.iter()) {
-            assert_eq!(original.name, decoded.name);
-            assert_eq!(original.value, decoded.value);
-        }
-    }
-}

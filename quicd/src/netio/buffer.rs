@@ -41,9 +41,19 @@ use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-/// Maximum UDP payload size (IPv6 jumbo frame)
-/// This is the absolute maximum for a single UDP datagram
-pub const MAX_UDP_PAYLOAD: usize = 65536;
+/// RFC 9000 Section 14.1: Minimum Initial datagram size.
+/// "A client MUST expand the payload of all UDP datagrams carrying
+/// Initial packets to at least the smallest allowed maximum datagram
+/// size of 1200 bytes"
+pub const MIN_INITIAL_DATAGRAM_SIZE: usize = 1200;
+
+/// RFC 9000 Section 18.2: Maximum UDP payload size for QUIC.
+/// "The default for this parameter is the maximum permitted UDP payload of 65527."
+///
+/// Note: This is the QUIC-layer maximum from RFC 9000, not the theoretical
+/// UDP maximum (65535 - 8 byte header = 65527). Values above this are
+/// protocol violations.
+pub const MAX_UDP_PAYLOAD: usize = 65527;
 
 /// Trait for preparing items to be returned to the pool.
 ///
@@ -120,14 +130,24 @@ impl ConsumeBuffer {
         self.head += count;
     }
 
-    /// Expand buffer capacity and set length
+    /// Expand buffer capacity and set length for I/O operations.
     ///
     /// # Safety
     ///
-    /// Caller must ensure expanded bytes are initialized before reading
+    /// The expanded bytes are NOT initialized. Caller MUST write to all bytes
+    /// in range `[0..count)` before reading them. This is typically used for
+    /// kernel I/O where the kernel writes before userspace reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics if count is 0 (pointless expansion).
     pub fn expand(&mut self, count: usize) {
+        debug_assert!(count > 0, "expand with count=0 is pointless");
         self.inner.reserve_exact(count);
-        // SAFETY: u8 is always initialized and we reserved the capacity.
+        // SAFETY: Caller guarantees all bytes will be written before reading.
+        // This pattern is used for kernel I/O (recvmsg) where the kernel
+        // initializes the buffer before we read it.
+        // INVARIANT: Reading unwritten bytes is UB.
         unsafe { self.inner.set_len(count) };
     }
 
@@ -475,9 +495,11 @@ impl WorkerBuffer {
         let inner = &mut *self.inner;
 
         // Ensure buffer has capacity for max UDP datagram
+        // reserve() adds to the current len, but we need total capacity >= MAX_UDP_PAYLOAD
         if inner.capacity() < MAX_UDP_PAYLOAD {
-            // Reserve the difference to reach MAX_UDP_PAYLOAD capacity
-            inner.reserve(MAX_UDP_PAYLOAD - inner.capacity());
+            // Clear first to ensure reserve works from len=0
+            inner.clear();
+            inner.reserve(MAX_UDP_PAYLOAD);
         }
 
         // Get the actual capacity and use that as the length
@@ -488,6 +510,7 @@ impl WorkerBuffer {
         // SAFETY: We are passing this buffer to the kernel to fill via recvmsg.
         // We do not read the uninitialized bytes before the kernel writes to them.
         // Using set_len avoids the expensive zero-initialization of the buffer.
+        // INVARIANT: Caller MUST NOT read beyond the received length after I/O.
         unsafe {
             inner.set_len(actual_capacity);
         }
@@ -532,121 +555,3 @@ impl Deref for WorkerBuffer {
 
 // No DerefMut to prevent accidental modification of the length tracking
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_reuse_trait_vec() {
-        let mut vec = vec![1, 2, 3, 4, 5];
-        assert!(vec.reuse(128));
-        assert_eq!(vec.len(), 0);
-        assert!(vec.capacity() > 0);
-        assert!(vec.capacity() <= 128);
-
-        // Zero-capacity buffers should not be pooled
-        let mut empty = Vec::new();
-        assert!(!empty.reuse(128));
-    }
-
-    #[test]
-    fn test_consume_buffer_pop_front() {
-        let mut buf = ConsumeBuffer::from_vec(vec![1, 2, 3, 4, 5]);
-        assert_eq!(&buf[..], &[1, 2, 3, 4, 5]);
-
-        buf.pop_front(2);
-        assert_eq!(&buf[..], &[3, 4, 5]);
-
-        buf.pop_front(3);
-        assert_eq!(&buf[..], &[] as &[u8]);
-    }
-
-    #[test]
-    fn test_consume_buffer_add_prefix() {
-        let mut buf = ConsumeBuffer::from_vec(vec![0, 0, 3, 4, 5]);
-        buf.pop_front(2); // Creates space at head
-        assert_eq!(&buf[..], &[3, 4, 5]);
-
-        assert!(buf.add_prefix(&[1, 2]));
-        assert_eq!(&buf[..], &[1, 2, 3, 4, 5]);
-
-        // Not enough space for larger prefix
-        assert!(!buf.add_prefix(&[9, 8, 7]));
-    }
-
-    #[test]
-    fn test_buffer_pool_lifo() {
-        let config = BufferPoolConfig {
-            max_buffers_per_worker: 4,
-            datagram_size: 128,
-        };
-        let pool = create_worker_pool(&config);
-
-        // Get 3 buffers
-        let buf1 = pool.take();
-        let buf2 = pool.take();
-        let buf3 = pool.take();
-
-        let ptr1 = buf1.as_ptr();
-        let ptr2 = buf2.as_ptr();
-        let ptr3 = buf3.as_ptr();
-
-        // Return them
-        pool.put(buf1);
-        pool.put(buf2);
-        pool.put(buf3);
-
-        // Get them back - should be in LIFO order (3, 2, 1)
-        let buf_a = pool.take();
-        let buf_b = pool.take();
-        let buf_c = pool.take();
-
-        assert_eq!(buf_a.as_ptr(), ptr3);
-        assert_eq!(buf_b.as_ptr(), ptr2);
-        assert_eq!(buf_c.as_ptr(), ptr1);
-    }
-
-    #[test]
-    fn test_pool_max_capacity() {
-        let config = BufferPoolConfig {
-            max_buffers_per_worker: 2,
-            datagram_size: 128,
-        };
-        let pool = create_worker_pool(&config);
-
-        let mut buffers = vec![];
-        for _ in 0..10 {
-            let mut buf = pool.take();
-            buf.extend_from_slice(&[1, 2, 3]); // Give it capacity
-            buffers.push(buf);
-        }
-
-        // Return all 10
-        for buf in buffers {
-            pool.put(buf);
-        }
-
-        // Pool should only keep 2 (max_buffers_per_worker)
-        assert_eq!(pool.len(), 2);
-    }
-
-    #[test]
-    fn test_pool_rejects_empty_buffers() {
-        let config = BufferPoolConfig {
-            max_buffers_per_worker: 10,
-            datagram_size: 128,
-        };
-        let pool = create_worker_pool(&config);
-
-        // Empty buffer should not be pooled
-        let empty = Vec::new();
-        pool.put(empty);
-        assert_eq!(pool.len(), 0);
-
-        // Buffer with capacity should be pooled
-        let mut with_capacity = Vec::with_capacity(64);
-        with_capacity.push(1);
-        pool.put(with_capacity);
-        assert_eq!(pool.len(), 1);
-    }
-}

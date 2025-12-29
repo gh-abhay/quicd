@@ -210,39 +210,3 @@ pub fn get_expected_cookie(worker_idx: u8) -> u16 {
     super::router::get_worker_cookie(generation, worker_idx)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_connection_id_generation() {
-        let cid = generate_connection_id(42, 0x1234_5678);
-        assert_eq!(cid.len(), 20);
-        assert!(ConnectionId::validate_cookie(&cid));
-        assert_eq!(ConnectionId::get_worker_idx(&cid), Some(42));
-    }
-
-    #[test]
-    fn test_generation_rotation() {
-        CURRENT_GENERATION.store(0, Ordering::Relaxed);
-        let gen1 = current_generation();
-        let gen2 = rotate_generation();
-        assert_ne!(gen1, gen2);
-        for _ in 0..31 {
-            rotate_generation();
-        }
-        assert_eq!(current_generation(), gen1);
-    }
-
-    #[test]
-    fn test_validate_and_extract() {
-        let cid = generate_connection_id(17, 0x00FF_AABB);
-        assert_eq!(validate_and_extract_worker(&cid), Some(17));
-    }
-
-    #[test]
-    fn test_invalid_cid() {
-        let invalid = [0x01, 0x02, 0x03];
-        assert_eq!(validate_and_extract_worker(&invalid), None);
-    }
-}

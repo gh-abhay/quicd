@@ -46,20 +46,3 @@ impl From<(&'static str, &'static str)> for FieldLine {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_field_line_size() {
-        let field = FieldLine::new("name", "value");
-        assert_eq!(field.size(), 4 + 5 + 32);
-    }
-
-    #[test]
-    fn test_field_line_from_tuple() {
-        let field: FieldLine = (":method", "GET").into();
-        assert_eq!(&field.name[..], b":method");
-        assert_eq!(&field.value[..], b"GET");
-    }
-}

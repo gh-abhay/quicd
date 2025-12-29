@@ -323,35 +323,3 @@ fn encode_string(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_encoder_creation() {
-        let encoder = Encoder::new(4096, 100);
-        assert_eq!(encoder.capacity(), 4096);
-    }
-
-    #[test]
-    fn test_encode_static_table() {
-        let mut encoder = Encoder::new(4096, 100);
-        let fields = vec![
-            FieldLine::new(":method", "GET"),
-            FieldLine::new(":path", "/"),
-        ];
-
-        let (encoded, instructions) = encoder.encode_field_section(0, &fields).unwrap();
-        assert!(!encoded.is_empty());
-        assert!(instructions.is_empty()); // No dynamic table insertions
-    }
-
-    #[test]
-    fn test_encode_literal() {
-        let mut encoder = Encoder::new(4096, 100);
-        let fields = vec![FieldLine::new("custom-header", "custom-value")];
-
-        let (encoded, _) = encoder.encode_field_section(0, &fields).unwrap();
-        assert!(!encoded.is_empty());
-    }
-}

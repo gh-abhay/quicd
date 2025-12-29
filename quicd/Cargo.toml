@@ -54,6 +54,13 @@ log = "0.4"
 ebpf = { path = "../ebpf" }
 rand = "0.9.2"
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "netio_buffer"
+harness = false
+
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

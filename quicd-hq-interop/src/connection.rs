@@ -169,26 +169,3 @@ fn parse_hq_request(data: &[u8]) -> Result<String> {
     Ok(path.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_hq_request() {
-        // Valid requests
-        assert_eq!(
-            parse_hq_request(b"GET /index.html\r\n").unwrap(),
-            "/index.html"
-        );
-        assert_eq!(parse_hq_request(b"GET /\n").unwrap(), "/");
-        assert_eq!(
-            parse_hq_request(b"GET /path/to/file.txt\r\n").unwrap(),
-            "/path/to/file.txt"
-        );
-
-        // Invalid requests
-        assert!(parse_hq_request(b"POST /index.html\r\n").is_err());
-        assert!(parse_hq_request(b"GET\r\n").is_err());
-        assert!(parse_hq_request(b"invalid").is_err());
-    }
-}

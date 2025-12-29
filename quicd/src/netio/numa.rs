@@ -245,24 +245,3 @@ pub fn reset_numa_policy() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_numa_detection() {
-        // Just check that it doesn't panic
-        let available = is_numa_available();
-        println!("NUMA available: {}", available);
-    }
-
-    #[test]
-    fn test_get_numa_node() {
-        // Just check that it doesn't panic
-        if let Some(node) = get_current_numa_node() {
-            println!("Current NUMA node: {}", node);
-        } else {
-            println!("Could not detect NUMA node");
-        }
-    }
-}

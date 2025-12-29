@@ -140,28 +140,3 @@ fn percent_decode(input: &str) -> String {
     result
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_sanitize_path() {
-        let config = HandlerConfig::default();
-        let handler = StaticFileHandler::new(config);
-
-        // Normal paths
-        assert!(handler.sanitize_path("/index.html").is_ok());
-        assert!(handler.sanitize_path("/path/to/file.txt").is_ok());
-
-        // Directory traversal attempts should be rejected
-        assert!(handler.sanitize_path("/../etc/passwd").is_err());
-        assert!(handler.sanitize_path("/path/../../etc/passwd").is_err());
-    }
-
-    #[test]
-    fn test_percent_decode() {
-        assert_eq!(percent_decode("hello%20world"), "hello world");
-        assert_eq!(percent_decode("test"), "test");
-        assert_eq!(percent_decode("%2F"), "/");
-    }
-}

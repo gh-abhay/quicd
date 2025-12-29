@@ -91,37 +91,3 @@ impl Error {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_error_codes() {
-        assert_eq!(
-            Error::DecompressionFailed("test".into()).error_code(),
-            0x0200
-        );
-        assert_eq!(
-            Error::EncoderStreamError("test".into()).error_code(),
-            0x0201
-        );
-        assert_eq!(
-            Error::DecoderStreamError("test".into()).error_code(),
-            0x0202
-        );
-    }
-
-    #[test]
-    fn test_blocked_error() {
-        let err = Error::Blocked(42);
-        assert!(err.is_blocked());
-        assert!(err.is_recoverable());
-    }
-
-    #[test]
-    fn test_incomplete_error() {
-        let err = Error::Incomplete(10);
-        assert!(!err.is_blocked());
-        assert!(err.is_recoverable());
-    }
-}

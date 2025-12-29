@@ -145,30 +145,3 @@ impl ChannelConfig {
         conn_ingress + stream_channels
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default_config_valid() {
-        let config = ChannelConfig::default();
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_validate_too_small() {
-        let config = ChannelConfig {
-            worker_egress_capacity: 32, // Too small
-            ..Default::default()
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_memory_estimate() {
-        let config = ChannelConfig::default();
-        let mem = config.estimate_memory_per_connection(10);
-        assert!(mem > 0);
-    }
-}

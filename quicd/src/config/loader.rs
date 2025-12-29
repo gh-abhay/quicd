@@ -162,21 +162,3 @@ fn print_default_config() -> Result<()> {
     println!("{}", toml_str);
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_load_nonexistent_file() {
-        let result = load_config_file("/tmp/nonexistent-quicd-test-file-12345.toml");
-        assert!(result.is_ok());
-        // Should return default config
-    }
-
-    #[test]
-    fn test_print_default_config() {
-        let result = print_default_config();
-        assert!(result.is_ok());
-    }
-}

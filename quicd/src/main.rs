@@ -1,11 +1,10 @@
-mod apps;
-mod channel_config;
-mod config;
-mod netio;
-mod routing;
-mod runtime;
-mod telemetry;
-mod worker;
+use quicd::apps;
+use quicd::config;
+use quicd::netio;
+use quicd::routing;
+use quicd::runtime;
+use quicd::telemetry;
+use quicd::worker;
 
 use anyhow::Context;
 use std::net::SocketAddr;

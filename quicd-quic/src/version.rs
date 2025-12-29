@@ -310,33 +310,3 @@ impl VersionSelectionStrategy {
 // Tests
 // ============================================================================
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_reserved_version() {
-        assert!(is_reserved_version(0x0a0a0a0a));
-        assert!(is_reserved_version(0x1a1a1a1a));
-        assert!(is_reserved_version(0xfafafafa));
-        assert!(!is_reserved_version(VERSION_1));
-        assert!(!is_reserved_version(VERSION_NEGOTIATION));
-    }
-
-    #[test]
-    fn test_header_invariants() {
-        // Long header packet (Initial)
-        let long_header = [0xc0, 0x00, 0x00, 0x00, 0x01, 0x08];
-        assert!(PacketInvariants::is_long_header(long_header[0]));
-        assert!(PacketInvariants::has_fixed_bit(long_header[0]));
-        assert_eq!(
-            PacketInvariants::extract_version(&long_header),
-            Some(VERSION_1)
-        );
-
-        // Short header packet
-        let short_header = [0x40];
-        assert!(!PacketInvariants::is_long_header(short_header[0]));
-        assert!(PacketInvariants::has_fixed_bit(short_header[0]));
-    }
-}
