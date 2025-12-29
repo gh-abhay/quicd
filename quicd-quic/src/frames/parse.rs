@@ -211,7 +211,35 @@ impl FrameParser for DefaultFrameParser {
 
             FRAME_TYPE_HANDSHAKE_DONE => (Frame::HandshakeDone, 0),
 
-            _ => return Err(Error::Transport(TransportError::FrameEncodingError)),
+            // RFC 9221: DATAGRAM frames (types 0x30-0x31)
+            // These are used for unreliable datagrams - ignore for now
+            0x30 | 0x31 => {
+                eprintln!("DEBUG: Received DATAGRAM frame type 0x{:x} - ignoring", frame_type);
+                // Skip the datagram content
+                // Type 0x30: no Length field, data extends to end of packet
+                // Type 0x31: has Length field
+                if frame_type == 0x31 {
+                    // Has length field
+                    let (length, len_consumed) = VarIntCodec::decode(frame_buf)
+                        .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+                    let total_consumed = len_consumed + length as usize;
+                    if total_consumed > frame_buf.len() {
+                        return Err(Error::Transport(TransportError::FrameEncodingError));
+                    }
+                    (Frame::Padding, total_consumed) // Treat as no-op
+                } else {
+                    // No length field - extends to end of packet
+                    (Frame::Padding, frame_buf.len())
+                }
+            }
+
+            // Unknown frame type - per RFC 9000 Section 19.21, unknown frames
+            // require prior negotiation. We skip with a warning.
+            other => {
+                eprintln!("DEBUG: Unknown frame type 0x{:x} at offset - skipping to end of packet", other);
+                // Cannot parse unknown frame structure, consume rest of packet
+                (Frame::Padding, frame_buf.len())
+            }
         };
 
         Ok((frame, consumed + frame_consumed))

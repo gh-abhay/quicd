@@ -69,6 +69,8 @@ pub struct PacketHeaderWrapper {
     pub version: u32,
     pub packet_number: Option<PacketNumber>,
     pub packet_number_len: Option<usize>, // Store actual packet number length after HP removal
+    /// Key phase bit for 1-RTT packets (RFC 9001 Section 6)
+    pub key_phase: bool,
 }
 
 impl Packet {
@@ -154,6 +156,16 @@ impl Packet {
 
         let payload = bytes.slice(header_len.min(bytes.len())..);
 
+        // Extract key_phase for short headers (RFC 9001 Section 6)
+        // For short headers, key_phase is bit 2 (0x04) of first byte
+        // Note: This is before header protection removal, so actual value may differ
+        // It will be updated after header protection is removed
+        let key_phase = if !is_long {
+            (first_byte & 0x04) != 0
+        } else {
+            false
+        };
+
         Ok(Self {
             header: PacketHeaderWrapper {
                 ty,
@@ -162,6 +174,7 @@ impl Packet {
                 version,
                 packet_number: None,     // Not yet decoded
                 packet_number_len: None, // Not yet decoded
+                key_phase,
             },
             payload,
             header_len,
@@ -301,6 +314,13 @@ impl Packet {
         // Store unmasked packet number and length in header
         self.header.packet_number = Some(pn_value);
         self.header.packet_number_len = Some(actual_pn_length);
+        
+        // Update key_phase for short headers after HP removal (RFC 9001 Section 5.4.1)
+        // The key phase bit (bit 2, 0x04) is now unmasked
+        if !is_long {
+            self.header.key_phase = (buf[0] & 0x04) != 0;
+        }
+        
         self.hp_removed = true;
 
         Ok(())
@@ -322,6 +342,7 @@ impl Packet {
                 version: VERSION_NEGOTIATION,
                 packet_number: None,
                 packet_number_len: None,
+                key_phase: false,
             },
             payload: Bytes::new(), // Will be filled during serialization
             header_len: 0,

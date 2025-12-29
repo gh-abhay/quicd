@@ -73,6 +73,12 @@ pub trait KeySchedule: Send + Sync {
         len: usize,
         cipher_suite: u16,
     ) -> Result<Vec<u8>>;
+
+    /// Derive the next application traffic secret for key update (RFC 9001 Section 6.1)
+    ///
+    /// application_traffic_secret_N+1 =
+    ///     HKDF-Expand-Label(application_traffic_secret_N, "quic ku", "", Hash.length)
+    fn derive_next_secret(&self, current_secret: &[u8], cipher_suite: u16) -> Result<Vec<u8>>;
 }
 
 pub enum TlsEvent {

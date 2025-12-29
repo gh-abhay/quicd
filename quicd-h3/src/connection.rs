@@ -245,6 +245,12 @@ impl H3Connection {
                                                 StreamType::Push => {
                                                     Self::process_push_stream(&mut stream).await
                                                 }
+                                                StreamType::Unknown(type_id) => {
+                                                    // RFC 9114 Section 6.2.3: Unknown stream types
+                                                    // (including grease values) MUST be ignored.
+                                                    debug!("Ignoring unknown stream type: 0x{:x}", type_id);
+                                                    Ok(())
+                                                }
                                             };
 
                                             if let Err(e) = result {

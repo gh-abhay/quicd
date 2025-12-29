@@ -486,4 +486,19 @@ impl KeySchedule for BoringKeySchedule {
         };
         hkdf_expand_label_with_hash(secret, "quic hp", &[], len, md)
     }
+
+    fn derive_next_secret(&self, current_secret: &[u8], cipher_suite: u16) -> Result<Vec<u8>> {
+        // RFC 9001 Section 6.1: Key Update
+        // application_traffic_secret_N+1 =
+        //     HKDF-Expand-Label(application_traffic_secret_N, "quic ku", "", Hash.length)
+        //
+        // Hash.length is 32 for SHA-256 and 48 for SHA-384
+        let (md, hash_len) = unsafe {
+            match cipher_suite {
+                0x1302 => (ffi::EVP_sha384(), 48),
+                _ => (ffi::EVP_sha256(), 32),
+            }
+        };
+        hkdf_expand_label_with_hash(current_secret, "quic ku", &[], hash_len, md)
+    }
 }

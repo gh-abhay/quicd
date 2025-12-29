@@ -7,6 +7,74 @@
 
 use crate::types::{Instant, PacketNumber, PacketNumberSpace};
 use core::time::Duration;
+use std::collections::BTreeSet;
+
+/// Tracks received packet numbers for ACK generation
+/// Uses a compact representation for efficient storage
+#[derive(Debug, Clone, Default)]
+pub struct ReceivedPacketTracker {
+    /// Set of received packet numbers (we use BTreeSet for ordered traversal)
+    /// For production, this should use a more efficient range-based representation
+    received: BTreeSet<PacketNumber>,
+    /// Maximum number of packet numbers to track (to bound memory usage)
+    max_tracked: usize,
+}
+
+impl ReceivedPacketTracker {
+    pub fn new(max_tracked: usize) -> Self {
+        Self {
+            received: BTreeSet::new(),
+            max_tracked,
+        }
+    }
+
+    /// Record a received packet
+    pub fn on_received(&mut self, pn: PacketNumber) {
+        self.received.insert(pn);
+        
+        // If we exceed max, remove the smallest entries
+        while self.received.len() > self.max_tracked {
+            if let Some(&smallest) = self.received.iter().next() {
+                self.received.remove(&smallest);
+            }
+        }
+    }
+
+    /// Get the largest received packet number
+    pub fn largest(&self) -> Option<PacketNumber> {
+        self.received.iter().next_back().copied()
+    }
+
+    /// Compute first_ack_range: number of contiguous packets preceding largest
+    /// that have been received
+    pub fn first_ack_range(&self) -> u64 {
+        let largest = match self.largest() {
+            Some(l) => l,
+            None => return 0,
+        };
+
+        // Count backwards from largest to find the first gap
+        let mut count = 0u64;
+        for pn in (0..=largest).rev() {
+            if self.received.contains(&pn) {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        // first_ack_range is the count minus 1 (since it's packets PRECEDING largest)
+        // Actually, first_ack_range = number of packets in range, minus 1
+        // If only largest is received, first_ack_range = 0
+        // If largest and largest-1 are received, first_ack_range = 1
+        count.saturating_sub(1)
+    }
+
+    /// Clear packets up to and including the given packet number
+    /// (called after we've sent an ACK and confirmed the peer received it)
+    pub fn clear_up_to(&mut self, pn: PacketNumber) {
+        self.received.retain(|&p| p > pn);
+    }
+}
 
 /// Packet Number Space State
 ///
@@ -48,6 +116,9 @@ pub struct PacketNumberSpaceState {
 
     /// Time when we should send an ACK (or None if no ACK pending)
     pub ack_deadline: Option<Instant>,
+    
+    /// Tracker for received packet numbers (for proper ACK generation)
+    pub received_tracker: ReceivedPacketTracker,
 }
 
 impl PacketNumberSpaceState {
@@ -63,6 +134,7 @@ impl PacketNumberSpaceState {
             is_discarded: false,
             ack_eliciting_received: 0,
             ack_deadline: None,
+            received_tracker: ReceivedPacketTracker::new(1024), // Track up to 1024 packets
         }
     }
 
@@ -79,6 +151,9 @@ impl PacketNumberSpaceState {
     ///
     /// Updates largest received packet number and timestamp.
     pub fn on_packet_received(&mut self, pn: PacketNumber, now: Instant, is_ack_eliciting: bool) {
+        // Track this packet for ACK generation
+        self.received_tracker.on_received(pn);
+        
         if let Some(largest) = self.largest_pn_received {
             if pn > largest {
                 self.largest_pn_received = Some(pn);

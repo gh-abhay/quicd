@@ -435,6 +435,24 @@ pub struct QuicConnection {
     one_rtt_read_keys: EncryptionKeys,
     one_rtt_write_keys: EncryptionKeys,
 
+    /// Key update state (RFC 9001 Section 6)
+    /// Current 1-RTT read secret (needed to derive next read keys on key update)
+    one_rtt_read_secret: Option<Vec<u8>>,
+    /// Current 1-RTT write secret (needed to derive next write keys on key update)
+    one_rtt_write_secret: Option<Vec<u8>>,
+    /// Cipher suite used for 1-RTT encryption (needed for key derivation)
+    one_rtt_cipher_suite: u16,
+    /// Current key phase bit we expect for incoming packets (starts at 0)
+    current_read_key_phase: bool,
+    /// Current key phase bit we use for outgoing packets (starts at 0)
+    current_write_key_phase: bool,
+    /// Next set of read keys (for pending key update, before confirmation)
+    next_one_rtt_read_keys: Option<EncryptionKeys>,
+    /// Next read secret (for deriving further updates)
+    next_one_rtt_read_secret: Option<Vec<u8>>,
+    /// Previous set of read keys (RFC 9001 §6.1: retain old keys for decrypting reordered packets)
+    prev_one_rtt_read_keys: Option<EncryptionKeys>,
+
     /// Pending CRYPTO data to send (level, data)
     pending_crypto: alloc::vec::Vec<(CryptoLevel, Bytes)>,
 
@@ -465,6 +483,26 @@ pub struct QuicConnection {
     /// Tracks the next byte offset to use when sending data on each stream.
     /// This is required for segmenting large writes into MTU-sized STREAM frames.
     stream_send_offsets: BTreeMap<StreamId, u64>,
+
+    /// Per-stream MAX_STREAM_DATA limits (RFC 9000 §4.2)
+    ///
+    /// Tracks the maximum data we are allowed to send on each stream.
+    /// Initialized from peer's transport parameters and updated via MAX_STREAM_DATA frames.
+    stream_send_max_data: BTreeMap<StreamId, u64>,
+
+    /// Initial max stream data for bidirectional streams (from peer's transport params)
+    peer_initial_max_stream_data_bidi: u64,
+
+    /// Initial max stream data for unidirectional streams (from peer's transport params)
+    peer_initial_max_stream_data_uni: u64,
+
+    /// Next local bidirectional stream ID to allocate.
+    /// Server: 1, 5, 9, ... | Client: 0, 4, 8, ...
+    next_local_bidi_stream_id: u64,
+
+    /// Next local unidirectional stream ID to allocate.
+    /// Server: 3, 7, 11, ... | Client: 2, 6, 10, ...
+    next_local_uni_stream_id: u64,
 }
 
 impl QuicConnection {
@@ -576,6 +614,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -583,6 +629,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 };
             }
             (Side::Client, _) => &dcid,
@@ -626,6 +677,14 @@ impl QuicConnection {
                         handshake_write_keys: EncryptionKeys::empty(),
                         one_rtt_read_keys: EncryptionKeys::empty(),
                         one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                         pending_crypto: alloc::vec::Vec::new(),
                         crypto_send_offsets: BTreeMap::new(),
                         crypto_buffers: BTreeMap::new(),
@@ -633,6 +692,11 @@ impl QuicConnection {
                         opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                     };
                 }
             };
@@ -673,6 +737,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -680,6 +752,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 };
             }
         };
@@ -718,6 +795,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -725,6 +810,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 };
             }
         };
@@ -764,6 +854,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -771,6 +869,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 };
             }
         };
@@ -808,6 +911,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -815,6 +926,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 };
             }
         };
@@ -854,6 +970,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -861,6 +985,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 }
             }
         };
@@ -897,6 +1026,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -904,6 +1041,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 }
             }
         };
@@ -951,6 +1093,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -958,6 +1108,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 }
             }
         };
@@ -998,6 +1153,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -1005,6 +1168,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 }
             }
         };
@@ -1044,6 +1212,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -1051,6 +1227,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 }
             }
         };
@@ -1091,6 +1272,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -1098,6 +1287,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 }
             }
         };
@@ -1137,6 +1331,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -1144,6 +1346,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 }
             }
         };
@@ -1183,6 +1390,14 @@ impl QuicConnection {
                     handshake_write_keys: EncryptionKeys::empty(),
                     one_rtt_read_keys: EncryptionKeys::empty(),
                     one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
@@ -1190,6 +1405,11 @@ impl QuicConnection {
                     opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                 }
             }
         };
@@ -1229,6 +1449,14 @@ impl QuicConnection {
                         handshake_write_keys: EncryptionKeys::empty(),
                         one_rtt_read_keys: EncryptionKeys::empty(),
                         one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                         pending_crypto: alloc::vec::Vec::new(),
                         crypto_send_offsets: BTreeMap::new(),
                         crypto_buffers: BTreeMap::new(),
@@ -1236,6 +1464,11 @@ impl QuicConnection {
                         opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                     }
                 }
             };
@@ -1271,6 +1504,14 @@ impl QuicConnection {
                         handshake_write_keys: EncryptionKeys::empty(),
                         one_rtt_read_keys: EncryptionKeys::empty(),
                         one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                         pending_crypto: alloc::vec::Vec::new(),
                         crypto_send_offsets: BTreeMap::new(),
                         crypto_buffers: BTreeMap::new(),
@@ -1278,6 +1519,11 @@ impl QuicConnection {
                         opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                     }
                 }
             };
@@ -1324,6 +1570,14 @@ impl QuicConnection {
                         handshake_write_keys: EncryptionKeys::empty(),
                         one_rtt_read_keys: EncryptionKeys::empty(),
                         one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                         pending_crypto: alloc::vec::Vec::new(),
                         crypto_send_offsets: BTreeMap::new(),
                         crypto_buffers: BTreeMap::new(),
@@ -1331,6 +1585,11 @@ impl QuicConnection {
                         opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                     }
                 }
             };
@@ -1366,6 +1625,14 @@ impl QuicConnection {
                         handshake_write_keys: EncryptionKeys::empty(),
                         one_rtt_read_keys: EncryptionKeys::empty(),
                         one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                         pending_crypto: alloc::vec::Vec::new(),
                         crypto_send_offsets: BTreeMap::new(),
                         crypto_buffers: BTreeMap::new(),
@@ -1373,6 +1640,11 @@ impl QuicConnection {
                         opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                     }
                 }
             };
@@ -1450,6 +1722,14 @@ impl QuicConnection {
                             handshake_write_keys: EncryptionKeys::empty(),
                             one_rtt_read_keys: EncryptionKeys::empty(),
                             one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                             pending_crypto: alloc::vec::Vec::new(),
                             crypto_send_offsets: BTreeMap::new(),
                             crypto_buffers: BTreeMap::new(),
@@ -1457,6 +1737,11 @@ impl QuicConnection {
                             opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                         };
                     }
                     // Set transport parameters on TLS session
@@ -1491,6 +1776,14 @@ impl QuicConnection {
                             handshake_write_keys: EncryptionKeys::empty(),
                             one_rtt_read_keys: EncryptionKeys::empty(),
                             one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
                             pending_crypto: alloc::vec::Vec::new(),
                             crypto_send_offsets: BTreeMap::new(),
                             crypto_buffers: BTreeMap::new(),
@@ -1498,6 +1791,11 @@ impl QuicConnection {
                             opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
                         };
                     }
                     Some(session)
@@ -1544,6 +1842,14 @@ impl QuicConnection {
             handshake_write_keys: EncryptionKeys::empty(),
             one_rtt_read_keys: EncryptionKeys::empty(),
             one_rtt_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_secret: None,
+                    one_rtt_write_secret: None,
+                    one_rtt_cipher_suite: 0,
+                    current_read_key_phase: false,
+                    current_write_key_phase: false,
+                    next_one_rtt_read_keys: None,
+                    next_one_rtt_read_secret: None,
+                    prev_one_rtt_read_keys: None,
             pending_crypto: alloc::vec::Vec::new(),
             crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
@@ -1551,6 +1857,11 @@ impl QuicConnection {
             opened_streams: alloc::collections::BTreeSet::new(),
                     stream_recv_buffers: BTreeMap::new(),
                     stream_send_offsets: BTreeMap::new(),
+                    stream_send_max_data: BTreeMap::new(),
+                    peer_initial_max_stream_data_bidi: 6 * 1024 * 1024,
+                    peer_initial_max_stream_data_uni: 6 * 1024 * 1024,
+                    next_local_bidi_stream_id: if side == Side::Server { 1 } else { 0 },
+                    next_local_uni_stream_id: if side == Side::Server { 3 } else { 2 },
         }
     }
 
@@ -1562,7 +1873,7 @@ impl QuicConnection {
     }
 
     /// Process a single frame from decrypted packet
-    fn process_frame(&mut self, frame: Frame, now: Instant) -> Result<()> {
+    fn process_frame(&mut self, frame: Frame, now: Instant, pn_space: crate::types::PacketNumberSpace) -> Result<()> {
         use crate::frames::Frame;
 
         match frame {
@@ -1665,9 +1976,9 @@ impl QuicConnection {
 
             Frame::Ack(ack_frame) => {
                 // Process ACK: mark packets as acknowledged, detect losses (RFC 9002)
-                let space = crate::types::PacketNumberSpace::ApplicationData;
+                // Use the packet number space from the packet that contained this ACK
                 let result = self.loss_detector.on_ack_received(
-                    space,
+                    pn_space,
                     ack_frame.largest_acked,
                     Duration::from_micros(ack_frame.ack_delay as u64),
                     &[], // ACK ranges - simplified
@@ -1679,13 +1990,13 @@ impl QuicConnection {
                 for pn in acked_packets {
                     // Note: sent_bytes should come from sent packet tracking
                     // Using default packet size for now
-                    self.congestion_controller.on_packet_acked(pn, space, 1200, now);
+                    self.congestion_controller.on_packet_acked(pn, pn_space, 1200, now);
                     self.stats.packets_acked += 1;
                 }
 
                 // Handle lost packets - notify congestion controller and mark for retransmission
                 for pn in lost_packets {
-                    self.congestion_controller.on_packet_lost(pn, space, 1200, now);
+                    self.congestion_controller.on_packet_lost(pn, pn_space, 1200, now);
                     self.stats.packets_lost += 1;
                     // TODO: Mark frames from lost packets for retransmission
                 }
@@ -1701,9 +2012,22 @@ impl QuicConnection {
                 Ok(())
             }
 
-            Frame::MaxStreamData(_max_stream_data) => {
-                // Update stream send flow control window
-                // TODO: forward to stream manager
+            Frame::MaxStreamData(max_stream_data) => {
+                // Update stream send flow control window (RFC 9000 §4.2)
+                // The MAX_STREAM_DATA frame informs the peer of the maximum amount of data
+                // that can be sent on a stream, increasing the flow control limit.
+                let stream_id = max_stream_data.stream_id;
+                let new_limit = max_stream_data.maximum_stream_data;
+                
+                // Only update if the new limit is higher than the current limit
+                let current_limit = self.stream_send_max_data.get(&stream_id).copied().unwrap_or(0);
+                if new_limit > current_limit {
+                    eprintln!(
+                        "DEBUG: MAX_STREAM_DATA received: stream={:?}, new_limit={}, old_limit={}",
+                        stream_id, new_limit, current_limit
+                    );
+                    self.stream_send_max_data.insert(stream_id, new_limit);
+                }
                 Ok(())
             }
 
@@ -1899,6 +2223,192 @@ impl QuicConnection {
         Some((total_length, false))
     }
 
+    /// Derive and install next-generation read keys for key update (RFC 9001 Section 6)
+    ///
+    /// Returns true if keys were successfully derived and installed.
+    fn derive_next_read_keys(&mut self) -> bool {
+        let current_secret = match &self.one_rtt_read_secret {
+            Some(s) => s.clone(),
+            None => {
+                eprintln!("DEBUG: Key update failed - no current read secret");
+                return false;
+            }
+        };
+
+        let key_schedule = self.crypto_backend.create_key_schedule();
+        
+        // Derive next secret
+        let next_secret = match key_schedule.derive_next_secret(&current_secret, self.one_rtt_cipher_suite) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("DEBUG: Key update failed - derive_next_secret error: {:?}", e);
+                return false;
+            }
+        };
+
+        // RFC 9001 §5.4: HP keys don't change during key updates - only AEAD keys change
+        // Derive only packet key and IV from next secret, preserve existing HP key
+        let key_len = match self.one_rtt_cipher_suite {
+            0x1301 => 16, // TLS_AES_128_GCM_SHA256
+            0x1302 => 32, // TLS_AES_256_GCM_SHA384
+            0x1303 => 32, // TLS_CHACHA20_POLY1305_SHA256
+            _ => 16,
+        };
+        let iv_len = 12;
+
+        let packet_key = match key_schedule.derive_packet_key(&next_secret, key_len, self.one_rtt_cipher_suite) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("DEBUG: Key update failed - derive_packet_key error: {:?}", e);
+                return false;
+            }
+        };
+        let packet_iv = match key_schedule.derive_packet_iv(&next_secret, iv_len, self.one_rtt_cipher_suite) {
+            Ok(iv) => iv,
+            Err(e) => {
+                eprintln!("DEBUG: Key update failed - derive_packet_iv error: {:?}", e);
+                return false;
+            }
+        };
+
+        // Create new AEAD with updated keys
+        let aead = match self.crypto_backend.create_aead(self.one_rtt_cipher_suite) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("DEBUG: Key update failed - create_aead error: {:?}", e);
+                return false;
+            }
+        };
+
+        // Create new HP provider (HP keys don't change, but we need a new provider instance)
+        let hp = match self.crypto_backend.create_header_protection(self.one_rtt_cipher_suite) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("DEBUG: Key update failed - create_header_protection error: {:?}", e);
+                return false;
+            }
+        };
+
+        // Create new EncryptionKeys preserving the original HP key
+        // HP keys are derived from the initial traffic secret and don't change during key updates
+        let new_keys = EncryptionKeys {
+            key: packet_key,
+            iv: packet_iv,
+            hp_key: self.one_rtt_read_keys.hp_key.clone(),  // Preserve original HP key
+            aead: Some(aead),
+            hp: Some(hp),  // New provider instance, but using same HP key
+            packet_number: 0,  // Packet number for next keys (will be set during use)
+        };
+
+        eprintln!("DEBUG: ✓ Key update: derived next read keys (HP key preserved, phase will flip)");
+        
+        // Store for later adoption once decryption succeeds
+        self.next_one_rtt_read_keys = Some(new_keys);
+        self.next_one_rtt_read_secret = Some(next_secret);
+        
+        true
+    }
+
+    /// Commit key update after successful decryption with new keys (RFC 9001 Section 6.2)
+    fn commit_key_update(&mut self) {
+        if let Some(new_read_keys) = self.next_one_rtt_read_keys.take() {
+            // RFC 9001 §6.1: Retain old keys for decrypting reordered packets
+            // Save current keys as previous before adopting new ones
+            self.prev_one_rtt_read_keys = Some(core::mem::replace(&mut self.one_rtt_read_keys, new_read_keys));
+            self.one_rtt_read_secret = self.next_one_rtt_read_secret.take();
+            
+            // Flip expected read key phase
+            self.current_read_key_phase = !self.current_read_key_phase;
+            
+            // Also update write keys and write phase to match (RFC 9001 Section 6.2)
+            // "An endpoint MUST NOT initiate a key update prior to having confirmed the previous key update"
+            // For simplicity, we update write keys immediately when we receive a key update
+            if let Some(write_secret) = &self.one_rtt_write_secret {
+                let key_schedule = self.crypto_backend.create_key_schedule();
+                
+                if let Ok(next_write_secret) = key_schedule.derive_next_secret(write_secret, self.one_rtt_cipher_suite) {
+                    // RFC 9001 §5.4: HP keys don't change during key updates - only AEAD keys change
+                    // Derive only packet key and IV from next secret, preserve existing HP key
+                    let key_len = match self.one_rtt_cipher_suite {
+                        0x1301 => 16, // TLS_AES_128_GCM_SHA256
+                        0x1302 => 32, // TLS_AES_256_GCM_SHA384
+                        0x1303 => 32, // TLS_CHACHA20_POLY1305_SHA256
+                        _ => 16,
+                    };
+                    let iv_len = 12;
+
+                    if let (Ok(packet_key), Ok(packet_iv), Ok(aead), Ok(hp)) = (
+                        key_schedule.derive_packet_key(&next_write_secret, key_len, self.one_rtt_cipher_suite),
+                        key_schedule.derive_packet_iv(&next_write_secret, iv_len, self.one_rtt_cipher_suite),
+                        self.crypto_backend.create_aead(self.one_rtt_cipher_suite),
+                        self.crypto_backend.create_header_protection(self.one_rtt_cipher_suite),
+                    ) {
+                        // Create new write keys preserving the original HP key
+                        let new_write_keys = EncryptionKeys {
+                            key: packet_key,
+                            iv: packet_iv,
+                            hp_key: self.one_rtt_write_keys.hp_key.clone(),  // Preserve original HP key
+                            aead: Some(aead),
+                            hp: Some(hp),  // New provider instance, but using same HP key
+                            packet_number: self.one_rtt_write_keys.packet_number,  // Preserve packet number
+                        };
+                        self.one_rtt_write_keys = new_write_keys;
+                        self.one_rtt_write_secret = Some(next_write_secret);
+                        self.current_write_key_phase = !self.current_write_key_phase;
+                        eprintln!("DEBUG: ✓ Key update committed: read and write keys updated, phases flipped (HP preserved)");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Try decryption with next keys for key update (RFC 9001 Section 6)
+    /// Returns Ok((decrypted_len, packet_number)) on success, or returns Err to drop packet
+    fn try_key_update_decryption(
+        &mut self, 
+        packet_number: u64,
+        header: &[u8],
+        encrypted_payload: &[u8],
+        decrypted: &mut [u8],
+    ) -> Result<(usize, u64)> {
+        // Derive next keys if not already done
+        if self.next_one_rtt_read_keys.is_none() && !self.derive_next_read_keys() {
+            eprintln!("DEBUG: Failed to derive next read keys for key update");
+            return Err(crate::error::Error::Crypto(crate::error::CryptoError { code: 0 }));
+        }
+        
+        // Try decryption with next keys
+        if let Some(ref next_keys) = self.next_one_rtt_read_keys {
+            if let Some(ref next_aead) = next_keys.aead {
+                match next_aead.open(
+                    &next_keys.key,
+                    &next_keys.iv,
+                    packet_number,
+                    header,
+                    encrypted_payload,
+                    decrypted,
+                ) {
+                    Ok(len) => {
+                        eprintln!("DEBUG: ✓ Key update: decryption successful with next keys");
+                        // Commit the key update
+                        self.commit_key_update();
+                        return Ok((len, packet_number));
+                    }
+                    Err(e2) => {
+                        eprintln!("DEBUG: Key update decryption also failed: {:?}", e2);
+                        return Err(crate::error::Error::Crypto(crate::error::CryptoError { code: 0 }));
+                    }
+                }
+            } else {
+                eprintln!("DEBUG: Next keys incomplete");
+                return Err(crate::error::Error::Crypto(crate::error::CryptoError { code: 0 }));
+            }
+        } else {
+            eprintln!("DEBUG: No next keys available");
+            return Err(crate::error::Error::Crypto(crate::error::CryptoError { code: 0 }));
+        }
+    }
+
     /// Process a single QUIC packet from within a datagram.
     ///
     /// This method handles one complete QUIC packet: header parsing, decryption,
@@ -1987,6 +2497,12 @@ impl QuicConnection {
             return Ok(());
         }
 
+        // Debug: Check key_phase after HP removal for 1-RTT packets
+        if encryption_level == CryptoLevel::OneRTT {
+            eprintln!("DEBUG: 1-RTT packet key_phase={}, expected={}, first_byte_after_hp=0x{:02x}",
+                     packet.header.key_phase, self.current_read_key_phase, packet_buf[0]);
+        }
+
         // Packet number should now be available after header protection removal
         // However, it's truncated - we need to reconstruct the full packet number
         // RFC 9000 Appendix A.3: Packet number reconstruction
@@ -2027,13 +2543,10 @@ impl QuicConnection {
             }
         };
 
-        // Track largest received packet number for ACK generation (RFC 9000 §13.2.3)
-        // Using PacketNumberSpaceManager for proper per-space tracking
-        self.pn_spaces.get_mut(pn_space).on_packet_received(
-            packet_number,
-            recv_time,
-            true, // Assume ACK-eliciting for now; refine later based on frame types
-        );
+        // NOTE: Do NOT call on_packet_received() here! The packet_number is unverified
+        // and may be wrong. We must wait until AFTER successful decryption to update
+        // the largest received packet number. Otherwise, failed decryption attempts
+        // corrupt the packet number space and cause cascading decryption failures.
 
         // Calculate payload offset (needed for decryption)
         // We need to find where the Packet Number is, then add its length to get payload start
@@ -2236,14 +2749,117 @@ impl QuicConnection {
                                 candidates.len(),
                                 e
                             );
-                            // Decryption failed - drop packet
-                            return Ok(());
+                            // For 1-RTT packets, try key update as last resort
+                            if encryption_level == CryptoLevel::OneRTT {
+                                let incoming_key_phase = packet.header.key_phase;
+                                if incoming_key_phase != self.current_read_key_phase {
+                                    eprintln!("DEBUG: Key phase mismatch (first packet), attempting key update");
+                                    
+                                    if self.next_one_rtt_read_keys.is_none() && !self.derive_next_read_keys() {
+                                        eprintln!("DEBUG: Failed to derive next read keys");
+                                        return Ok(());
+                                    }
+                                    
+                                    // Try with next keys and each candidate PN
+                                    if let Some(ref next_keys) = self.next_one_rtt_read_keys {
+                                        if let Some(ref next_aead) = next_keys.aead {
+                                            let mut ku_found = None;
+                                            for candidate_pn in candidates.iter() {
+                                                if let Ok(len) = next_aead.open(
+                                                    &next_keys.key,
+                                                    &next_keys.iv,
+                                                    *candidate_pn,
+                                                    header,
+                                                    encrypted_payload,
+                                                    &mut decrypted,
+                                                ) {
+                                                    eprintln!("DEBUG: ✓ Key update (first packet): successful with pn={}", candidate_pn);
+                                                    ku_found = Some((len, *candidate_pn));
+                                                    break;
+                                                }
+                                            }
+                                            if let Some((len, pn)) = ku_found {
+                                                self.commit_key_update();
+                                                (len, pn)
+                                            } else {
+                                                return Ok(());
+                                            }
+                                        } else {
+                                            return Ok(());
+                                        }
+                                    } else {
+                                        return Ok(());
+                                    }
+                                } else {
+                                    // Decryption failed - drop packet
+                                    return Ok(());
+                                }
+                            } else {
+                                // Decryption failed - drop packet
+                                return Ok(());
+                            }
                         }
                     }
                 } else {
-                    eprintln!("DEBUG: Decryption failed: {:?}", e);
-                    // Decryption failed - drop packet
-                    return Ok(());
+                    // We have prior packets and decryption still failed
+                    // For 1-RTT packets, check if this might be a key update (RFC 9001 Section 6)
+                    if encryption_level == CryptoLevel::OneRTT {
+                        let incoming_key_phase = packet.header.key_phase;
+                        if incoming_key_phase != self.current_read_key_phase {
+                            eprintln!("DEBUG: Key phase mismatch (got {}, expected {})", 
+                                     incoming_key_phase, self.current_read_key_phase);
+                            
+                            // RFC 9001 §6.1: First try previous keys for reordered packets
+                            if let Some(ref prev_keys) = self.prev_one_rtt_read_keys {
+                                if let Some(ref prev_aead) = prev_keys.aead {
+                                    eprintln!("DEBUG: Trying previous keys for reordered packet");
+                                    match prev_aead.open(
+                                        &prev_keys.key,
+                                        &prev_keys.iv,
+                                        packet_number,
+                                        header,
+                                        encrypted_payload,
+                                        &mut decrypted,
+                                    ) {
+                                        Ok(len) => {
+                                            eprintln!("DEBUG: ✓ Decryption successful with previous keys (reordered packet)");
+                                            (len, packet_number)
+                                        }
+                                        Err(e_prev) => {
+                                            eprintln!("DEBUG: Previous keys decryption failed: {:?}, trying key update", e_prev);
+                                            // Fall through to try next keys (key update)
+                                            match self.try_key_update_decryption(packet_number, header, encrypted_payload, &mut decrypted) {
+                                                Ok(result) => result,
+                                                Err(_) => return Ok(()),
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // No previous AEAD, try key update directly
+                                    eprintln!("DEBUG: No previous AEAD, attempting key update");
+                                    match self.try_key_update_decryption(packet_number, header, encrypted_payload, &mut decrypted) {
+                                        Ok(result) => result,
+                                        Err(_) => return Ok(()),
+                                    }
+                                }
+                            } else {
+                                // No previous keys (first key update), try key update directly
+                                eprintln!("DEBUG: No previous keys, attempting key update");
+                                match self.try_key_update_decryption(packet_number, header, encrypted_payload, &mut decrypted) {
+                                    Ok(result) => result,
+                                    Err(_) => return Ok(()),
+                                }
+                            }
+                        } else {
+                            eprintln!("DEBUG: Decryption failed: {:?}", e);
+                            // Decryption failed - drop packet
+                            return Ok(());
+                        }
+                    } else {
+                        eprintln!("DEBUG: Decryption failed: {:?}", e);
+                        // Decryption failed - drop packet
+                        return Ok(());
+                    }
                 }
             }
         };
@@ -2253,15 +2869,18 @@ impl QuicConnection {
         let original_packet_number = packet_number;
         let _packet_number = final_packet_number;
 
-        // Update largest received packet number if we corrected it during decryption
-        // PacketNumberSpaceState.on_packet_received() already handles max tracking
+        // Track largest received packet number for ACK generation (RFC 9000 §13.2.3)
+        // CRITICAL: Only update after successful decryption to avoid corrupting the
+        // packet number space with wrong values from failed decryption attempts.
+        self.pn_spaces.get_mut(pn_space).on_packet_received(
+            final_packet_number,
+            recv_time,
+            true, // Assume ACK-eliciting for now; refine later based on frame types
+        );
+        
+        // Log if we corrected the packet number
         if final_packet_number != original_packet_number {
-            // Re-call on_packet_received with corrected packet number
-            self.pn_spaces.get_mut(pn_space).on_packet_received(
-                final_packet_number,
-                recv_time,
-                true,
-            );
+            eprintln!("DEBUG: Corrected packet number from {} to {}", original_packet_number, final_packet_number);
         }
 
         // Parse frames from decrypted payload
@@ -2437,6 +3056,11 @@ impl QuicConnection {
                                                         return Err(e);
                                                     } else {
                                                         eprintln!("DEBUG: ✓ Successfully installed READ keys for level={:?}", level);
+                                                        // Store 1-RTT secret for key update (RFC 9001 Section 6)
+                                                        if level == CryptoLevel::OneRTT {
+                                                            self.one_rtt_read_secret = Some(secret);
+                                                            self.one_rtt_cipher_suite = cipher_suite;
+                                                        }
                                                     }
                                                 }
                                                 crate::crypto::TlsEvent::WriteSecret(
@@ -2474,6 +3098,11 @@ impl QuicConnection {
                                                         return Err(e);
                                                     } else {
                                                         eprintln!("DEBUG: ✓ Successfully installed WRITE keys for level={:?}", level);
+                                                        // Store 1-RTT secret for key update (RFC 9001 Section 6)
+                                                        if level == CryptoLevel::OneRTT {
+                                                            self.one_rtt_write_secret = Some(secret);
+                                                            // cipher_suite is already set by ReadSecret
+                                                        }
                                                     }
                                                 }
                                                 _ => {}
@@ -2496,7 +3125,7 @@ impl QuicConnection {
                         );
                     }
 
-                    self.process_frame(frame, recv_time)?;
+                    self.process_frame(frame, recv_time, pn_space)?;
                     offset += consumed;
 
                     if consumed == 0 {
@@ -2713,7 +3342,10 @@ impl Connection for QuicConnection {
             if use_short_header {
                 // Short header for 1-RTT
                 // RFC 9000 §17.3: Short header includes DCID
-                let first_byte = 0x40 | ((pn_len - 1) as u8);
+                // RFC 9001 §6: Key Phase bit (bit 2, 0x04) indicates current key phase
+                let key_phase_bit = if self.current_write_key_phase { 0x04 } else { 0 };
+                let first_byte = 0x40 | key_phase_bit | ((pn_len - 1) as u8);
+                eprintln!("DEBUG: CONNECTION_CLOSE: Sending with key_phase={}, first_byte=0x{:02x}", self.current_write_key_phase, first_byte);
                 buf.put_u8(first_byte);
                 buf.put_slice(self.dcid.as_bytes());
                 buf.put_slice(&pn_bytes);
@@ -2819,11 +3451,13 @@ impl Connection for QuicConnection {
                         use crate::frames::Frame;
                         let serializer = DefaultFrameSerializer;
                         let mut frame_buf = BytesMut::new();
+                        // Use proper first_ack_range from received packet tracker
+                        let first_ack_range = hs_space.received_tracker.first_ack_range();
                         let ack_frame = Frame::Ack(crate::frames::AckFrame {
                             largest_acked,
                             ack_delay: 0,
                             ack_range_count: 0,
-                            first_ack_range: 0,
+                            first_ack_range,
                             ack_ranges: &[],
                         });
 
@@ -2994,9 +3628,12 @@ impl Connection for QuicConnection {
                     let pn = write_keys.packet_number;
                     write_keys.packet_number += 1;
 
-                    // Short header first byte: Fixed bit set (0x40), key phase 0, PN len 1
+                    // Short header first byte: Fixed bit set (0x40), key phase bit, PN len
+                    // RFC 9001 §6: Key Phase bit (bit 2, 0x04) indicates current key phase
+                    let key_phase_bit: u8 = if self.current_write_key_phase { 0x04 } else { 0 };
                     let pn_len: usize = 1;
-                    let first_byte: u8 = 0x40 | ((pn_len - 1) as u8 & 0x03);
+                    let first_byte: u8 = 0x40 | key_phase_bit | ((pn_len - 1) as u8 & 0x03);
+                    eprintln!("DEBUG: HANDSHAKE ACK: Sending packet {} with key_phase={}, first_byte=0x{:02x}", pn, self.current_write_key_phase, first_byte);
                     let pn_bytes: Vec<u8> = vec![(pn & 0xff) as u8];
 
                     let dcid_bytes = self.dcid.as_bytes();
@@ -3516,14 +4153,16 @@ impl Connection for QuicConnection {
             if level == CryptoLevel::Initial && self.side == Side::Server {
                 let init_space = self.pn_spaces.get(crate::types::PacketNumberSpace::Initial);
                 if let Some(largest_acked) = init_space.largest_pn_received {
+                    // Use proper first_ack_range from received packet tracker
+                    let first_ack_range = init_space.received_tracker.first_ack_range();
                     // RFC 9000 Section 19.3: ACK frame format
                     // largest_acked, ack_delay, ack_range_count, first_ack_range
                     let ack_frame = Frame::Ack(crate::frames::AckFrame {
                         largest_acked,
                         ack_delay: 0, // ACK delay in microseconds (0 for immediate)
                         ack_range_count: 0, // No additional ranges
-                        first_ack_range: 0, // All packets up to largest_acked are acknowledged
-                        ack_ranges: &[], // Empty - no gaps
+                        first_ack_range,
+                        ack_ranges: &[], // Empty - no gaps beyond the first range
                     });
                     if let Err(_) = serializer.serialize_frame(&ack_frame, &mut frame_buf) {
                         // If ACK serialization fails, continue without it
@@ -3537,11 +4176,13 @@ impl Connection for QuicConnection {
                 if let Some(largest_acked) = hs_space.largest_pn_received {
                     let already_acked = hs_space.largest_pn_acked_by_us.unwrap_or(0);
                     if largest_acked > already_acked {
+                        // Use proper first_ack_range from received packet tracker
+                        let first_ack_range = hs_space.received_tracker.first_ack_range();
                         let ack_frame = Frame::Ack(crate::frames::AckFrame {
                             largest_acked,
                             ack_delay: 0,
                             ack_range_count: 0,
-                            first_ack_range: 0,
+                            first_ack_range,
                             ack_ranges: &[],
                         });
                         if serializer
@@ -3825,11 +4466,13 @@ impl Connection for QuicConnection {
                         use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
                         let serializer = DefaultFrameSerializer;
                         let mut frame_buf = BytesMut::new();
+                        // Use proper first_ack_range from received packet tracker
+                        let first_ack_range = hs_space.received_tracker.first_ack_range();
                         let ack_frame = Frame::Ack(crate::frames::AckFrame {
                             largest_acked,
                             ack_delay: 0,
                             ack_range_count: 0,
-                            first_ack_range: 0,
+                            first_ack_range,
                             ack_ranges: &[],
                         });
 
@@ -4103,20 +4746,55 @@ impl Connection for QuicConnection {
                 // Get the current send offset for this stream
                 let current_offset = *self.stream_send_offsets.get(&stream_id).unwrap_or(&0);
 
+                // Get the per-stream flow control limit (RFC 9000 §4.1)
+                // If no limit is explicitly set via MAX_STREAM_DATA, use initial limit based on stream type
+                let max_stream_data = *self.stream_send_max_data.get(&stream_id).unwrap_or_else(|| {
+                    // For new streams, initialize with peer's initial max stream data
+                    // Bidirectional stream IDs: 0, 1, 4, 5, 8, 9... (bits 0-1 encode direction)
+                    // Unidirectional stream IDs: 2, 3, 6, 7, 10, 11...
+                    let is_uni = (stream_id.0 & 0x02) != 0;
+                    if is_uni {
+                        &self.peer_initial_max_stream_data_uni
+                    } else {
+                        &self.peer_initial_max_stream_data_bidi
+                    }
+                });
+
+                // Check if we have flow control credit to send (RFC 9000 §4.1)
+                if current_offset >= max_stream_data {
+                    // Flow control blocked - put the data back and return
+                    eprintln!(
+                        "DEBUG: Stream {:?} flow control blocked: offset={}, limit={}",
+                        stream_id, current_offset, max_stream_data
+                    );
+                    self.pending_stream_writes.insert(0, (stream_id, data, fin));
+                    return None;
+                }
+
                 // Calculate max payload size for this segment
                 // Overhead: short header (1) + DCID (8) + PN (1-4) + AEAD tag (16) = ~26 bytes
                 // STREAM frame header: type (1) + stream_id (8) + offset (8) + length (2) = ~19 bytes
                 // Total overhead: ~45 bytes. Use conservative limit of 1100 bytes for payload.
                 const MAX_STREAM_PAYLOAD: usize = 1100;
 
-                let chunk_size = core::cmp::min(data.len(), MAX_STREAM_PAYLOAD);
+                // Limit chunk size by flow control credit
+                let flow_control_credit = max_stream_data.saturating_sub(current_offset) as usize;
+                let max_chunk = core::cmp::min(MAX_STREAM_PAYLOAD, flow_control_credit);
+                
+                let chunk_size = core::cmp::min(data.len(), max_chunk);
+                if chunk_size == 0 {
+                    // No credit available, put data back
+                    self.pending_stream_writes.insert(0, (stream_id, data, fin));
+                    return None;
+                }
+                
                 let chunk = data.slice(0..chunk_size);
                 let is_last_chunk = chunk_size == data.len();
                 let chunk_fin = fin && is_last_chunk;
 
                 eprintln!(
-                    "DEBUG: Sending stream {:?} chunk: offset={}, len={}, fin={}, remaining={}",
-                    stream_id, current_offset, chunk_size, chunk_fin, data.len() - chunk_size
+                    "DEBUG: Sending stream {:?} chunk: offset={}, len={}, fin={}, remaining={}, limit={}",
+                    stream_id, current_offset, chunk_size, chunk_fin, data.len() - chunk_size, max_stream_data
                 );
 
                 // If there's more data, push remaining back to queue (front, to maintain order)
@@ -4162,8 +4840,11 @@ impl Connection for QuicConnection {
                     buf.clear();
                     buf.reserve(1500);
 
-                    // First byte: 0x40 (short header) | pn_len encoding
-                    let first_byte = 0x40 | ((pn_len - 1) as u8);
+                    // First byte: 0x40 (short header) | key_phase_bit | pn_len encoding
+                    // RFC 9001 §6: Key Phase bit (bit 2, 0x04) indicates current key phase
+                    let key_phase_bit = if self.current_write_key_phase { 0x04 } else { 0 };
+                    let first_byte = 0x40 | key_phase_bit | ((pn_len - 1) as u8);
+                    eprintln!("DEBUG: STREAM: Sending packet {} with key_phase={}, first_byte=0x{:02x}", pn, self.current_write_key_phase, first_byte);
                     buf.put_u8(first_byte);
 
                     // DCID (destination connection ID - the peer's CID)
@@ -4258,6 +4939,12 @@ impl Connection for QuicConnection {
                 let already_acked = app_space.largest_pn_acked_by_us.unwrap_or(0);
                 if largest_acked > already_acked {
                     eprintln!("DEBUG: Need to send 1-RTT ACK for PN {}", largest_acked);
+                    
+                    // Use proper first_ack_range from received packet tracker
+                    let first_ack_range = app_space.received_tracker.first_ack_range();
+                    eprintln!("DEBUG: ACK first_ack_range={} (acknowledging {} through {})", 
+                             first_ack_range, largest_acked - first_ack_range, largest_acked);
+                    
                     // Build ACK frame
                     use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
                     let serializer = DefaultFrameSerializer;
@@ -4266,7 +4953,7 @@ impl Connection for QuicConnection {
                         largest_acked,
                         ack_delay: 0,
                         ack_range_count: 0,
-                        first_ack_range: largest_acked - already_acked,
+                        first_ack_range,
                         ack_ranges: &[],
                     });
 
@@ -4448,32 +5135,27 @@ impl Connection for QuicConnection {
     }
 
     fn open_stream(&mut self, direction: crate::types::StreamDirection) -> Result<StreamId> {
-        // Phase 7: Use stream manager to allocate stream ID
-        let initiator = match self.side {
-            Side::Client => crate::types::StreamInitiator::Client,
-            Side::Server => crate::types::StreamInitiator::Server,
-        };
+        // RFC 9000 Section 2.1: Stream IDs
+        // Client-initiated: 0, 1, 2, 3, ... (mod 4 determines type)
+        // Server-initiated: 1, 3, 5, 7, ... (mod 4 determines type)
+        //
+        // Bits 0: 0=client-initiated, 1=server-initiated
+        // Bits 1: 0=bidirectional, 1=unidirectional
+        //
+        // Client bidi: 0, 4, 8, ...   | Server bidi: 1, 5, 9, ...
+        // Client uni:  2, 6, 10, ...  | Server uni:  3, 7, 11, ...
 
-        // Stream IDs are allocated based on initiator and type
-        // Client: 0, 4, 8, ... (bidi), 2, 6, 10, ... (uni)
-        // Server: 1, 5, 9, ... (bidi), 3, 7, 11, ... (uni)
-        let stream_id = match (initiator, direction) {
-            (
-                crate::types::StreamInitiator::Client,
-                crate::types::StreamDirection::Bidirectional,
-            ) => StreamId::new(0),
-            (
-                crate::types::StreamInitiator::Client,
-                crate::types::StreamDirection::Unidirectional,
-            ) => StreamId::new(2),
-            (
-                crate::types::StreamInitiator::Server,
-                crate::types::StreamDirection::Bidirectional,
-            ) => StreamId::new(1),
-            (
-                crate::types::StreamInitiator::Server,
-                crate::types::StreamDirection::Unidirectional,
-            ) => StreamId::new(3),
+        let stream_id = match direction {
+            crate::types::StreamDirection::Bidirectional => {
+                let id = self.next_local_bidi_stream_id;
+                self.next_local_bidi_stream_id += 4; // Increment by 4 for next stream of same type
+                StreamId::new(id)
+            }
+            crate::types::StreamDirection::Unidirectional => {
+                let id = self.next_local_uni_stream_id;
+                self.next_local_uni_stream_id += 4; // Increment by 4 for next stream of same type
+                StreamId::new(id)
+            }
         };
 
         Ok(stream_id)

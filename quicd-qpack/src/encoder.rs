@@ -213,6 +213,12 @@ impl Encoder {
     }
 
     /// Encodes the field section prefix.
+    ///
+    /// Per RFC 9204 Section 4.5.1.2:
+    /// - When required_insert_count is 0 (no dynamic table references), Base should be 0.
+    /// - "A field section that was encoded without references to the dynamic table
+    ///    can use any value for the Base; setting Delta Base to zero is one of the
+    ///    most efficient encodings."
     fn encode_prefix(
         &self,
         required_insert_count: u64,
@@ -239,12 +245,16 @@ impl Encoder {
         buf.extend_from_slice(&temp[..n]);
 
         // Encode Base (S bit + Delta Base)
-        if base >= required_insert_count {
-            let delta = base - required_insert_count;
+        // Per RFC 9204: When required_insert_count is 0, Base must be 0.
+        // This is the most efficient encoding and expected by decoders.
+        let effective_base = if required_insert_count == 0 { 0 } else { base };
+
+        if effective_base >= required_insert_count {
+            let delta = effective_base - required_insert_count;
             let m = integer::encode(delta, 7, 0x00, &mut temp);
             buf.extend_from_slice(&temp[..m]);
         } else {
-            let delta = required_insert_count - base - 1;
+            let delta = required_insert_count - effective_base - 1;
             let m = integer::encode(delta, 7, 0x80, &mut temp);
             buf.extend_from_slice(&temp[..m]);
         }
