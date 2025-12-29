@@ -18,7 +18,7 @@ pub type AppFactory = Arc<dyn Fn() -> Arc<dyn QuicdApplication> + Send + Sync>;
 /// The registry is built during server initialization based on
 /// configuration and is used to route connections to the appropriate
 /// application based on ALPN negotiation.
-/// 
+///
 /// Uses Vec to maintain ALPN order for deterministic TLS negotiation.
 pub struct AppRegistry {
     factories: Vec<(String, AppFactory)>,
@@ -35,11 +35,7 @@ impl AppRegistry {
     /// Register an application factory for a given ALPN.
     ///
     /// Returns an error if the ALPN is already registered.
-    pub fn register(
-        mut self,
-        alpn: impl Into<String>,
-        factory: AppFactory,
-    ) -> Result<Self> {
+    pub fn register(mut self, alpn: impl Into<String>, factory: AppFactory) -> Result<Self> {
         let alpn = alpn.into();
         if self.factories.iter().any(|(a, _)| a == &alpn) {
             anyhow::bail!("ALPN '{}' is already registered", alpn);
@@ -50,7 +46,10 @@ impl AppRegistry {
 
     /// Get the application factory for a given ALPN.
     pub fn get(&self, alpn: &str) -> Option<&AppFactory> {
-        self.factories.iter().find(|(a, _)| a == alpn).map(|(_, f)| f)
+        self.factories
+            .iter()
+            .find(|(a, _)| a == alpn)
+            .map(|(_, f)| f)
     }
 
     /// List all registered ALPNs.
@@ -85,9 +84,9 @@ impl Default for AppRegistry {
 ///
 /// This function processes the application configurations and creates
 /// the appropriate application instances (HTTP/3, plugins, etc.).
-/// 
+///
 /// Each application can register multiple ALPN identifiers.
-/// 
+///
 /// Applications are sorted to ensure HTTP/3 ALPNs are registered before
 /// hq-interop for proper ALPN negotiation priority.
 pub fn build_registry(app_configs: &HashMap<String, ApplicationConfig>) -> Result<AppRegistry> {
@@ -115,19 +114,27 @@ pub fn build_registry(app_configs: &HashMap<String, ApplicationConfig>) -> Resul
         }
 
         // Validate configuration
-        app_config
-            .validate()
-            .map_err(|errs| anyhow::anyhow!("Invalid config for application '{}': {}", app_name, errs.join("; ")))?;
+        app_config.validate().map_err(|errs| {
+            anyhow::anyhow!(
+                "Invalid config for application '{}': {}",
+                app_name,
+                errs.join("; ")
+            )
+        })?;
 
         // Parse application type
-        let app_type = app_config.parse_type()
-            .map_err(|e| anyhow::anyhow!("Failed to parse type for application '{}': {}", app_name, e))?;
+        let app_type = app_config.parse_type().map_err(|e| {
+            anyhow::anyhow!("Failed to parse type for application '{}': {}", app_name, e)
+        })?;
 
         match app_type {
             ApplicationType::Http3 => {
                 let h3_config = match &app_config.config {
                     ApplicationTypeConfig::Http3(cfg) => cfg.clone(),
-                    _ => anyhow::bail!("Type mismatch: expected Http3 config for application '{}'", app_name),
+                    _ => anyhow::bail!(
+                        "Type mismatch: expected Http3 config for application '{}'",
+                        app_name
+                    ),
                 };
 
                 // Register all ALPN identifiers for this application
@@ -152,12 +159,17 @@ pub fn build_registry(app_configs: &HashMap<String, ApplicationConfig>) -> Resul
                                     file_root: h3_cfg.handler.file_root.clone().into(),
                                     directory_listing: h3_cfg.handler.directory_listing,
                                     compression_enabled: h3_cfg.handler.compression_enabled,
-                                    compression_algorithms: h3_cfg.handler.compression_algorithms.clone(),
+                                    compression_algorithms: h3_cfg
+                                        .handler
+                                        .compression_algorithms
+                                        .clone(),
                                     index_files: h3_cfg.handler.index_files.clone(),
                                 },
                                 limits: quicd_h3::LimitsConfig {
-                                    max_field_section_size: h3_cfg.limits.max_field_section_size as u64,
-                                    max_concurrent_streams: h3_cfg.limits.max_concurrent_streams as u64,
+                                    max_field_section_size: h3_cfg.limits.max_field_section_size
+                                        as u64,
+                                    max_concurrent_streams: h3_cfg.limits.max_concurrent_streams
+                                        as u64,
                                     idle_timeout_secs: h3_cfg.limits.idle_timeout_secs,
                                 },
                             };
@@ -165,17 +177,28 @@ pub fn build_registry(app_configs: &HashMap<String, ApplicationConfig>) -> Resul
                         })
                     };
 
-                    registry = registry.register(alpn, factory)
-                        .with_context(|| format!("Failed to register HTTP/3 for ALPN '{}' in application '{}'", alpn, app_name))?;
+                    registry = registry.register(alpn, factory).with_context(|| {
+                        format!(
+                            "Failed to register HTTP/3 for ALPN '{}' in application '{}'",
+                            alpn, app_name
+                        )
+                    })?;
 
-                    tracing::info!("Registered HTTP/3 application '{}' for ALPN '{}'", app_name, alpn);
+                    tracing::info!(
+                        "Registered HTTP/3 application '{}' for ALPN '{}'",
+                        app_name,
+                        alpn
+                    );
                 }
             }
 
             ApplicationType::HqInterop => {
                 let hq_config = match &app_config.config {
                     ApplicationTypeConfig::HqInterop(cfg) => cfg.clone(),
-                    _ => anyhow::bail!("Type mismatch: expected HqInterop config for application '{}'", app_name),
+                    _ => anyhow::bail!(
+                        "Type mismatch: expected HqInterop config for application '{}'",
+                        app_name
+                    ),
                 };
 
                 // Register all ALPN identifiers for this application
@@ -195,10 +218,18 @@ pub fn build_registry(app_configs: &HashMap<String, ApplicationConfig>) -> Resul
                         })
                     };
 
-                    registry = registry.register(alpn, factory)
-                        .with_context(|| format!("Failed to register HQ-Interop for ALPN '{}' in application '{}'", alpn, app_name))?;
+                    registry = registry.register(alpn, factory).with_context(|| {
+                        format!(
+                            "Failed to register HQ-Interop for ALPN '{}' in application '{}'",
+                            alpn, app_name
+                        )
+                    })?;
 
-                    tracing::info!("Registered HQ-Interop application '{}' for ALPN '{}'", app_name, alpn);
+                    tracing::info!(
+                        "Registered HQ-Interop application '{}' for ALPN '{}'",
+                        app_name,
+                        alpn
+                    );
                 }
             }
 
@@ -238,9 +269,8 @@ mod tests {
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
 
-        let factory: AppFactory = Arc::new(|| {
-            Arc::new(quicd_h3::H3Application::new(quicd_h3::H3Config::default()))
-        });
+        let factory: AppFactory =
+            Arc::new(|| Arc::new(quicd_h3::H3Application::new(quicd_h3::H3Config::default())));
 
         let registry = registry.register("h3", factory).unwrap();
         assert_eq!(registry.len(), 1);

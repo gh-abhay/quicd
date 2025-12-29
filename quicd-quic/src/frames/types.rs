@@ -5,9 +5,7 @@
 #![forbid(unsafe_code)]
 
 use crate::error::{ApplicationError, TransportError};
-use crate::types::{
-    PacketNumber, StatelessResetToken, StreamId, StreamOffset, VarInt,
-};
+use crate::types::{PacketNumber, StatelessResetToken, StreamId, StreamOffset, VarInt};
 
 // ============================================================================
 // Frame Type Constants (RFC 9000 Section 19)
@@ -131,7 +129,14 @@ impl<'a> Frame<'a> {
     ///
     /// ACK-eliciting frames require the peer to send an ACK.
     pub fn is_ack_eliciting(&self) -> bool {
-        !matches!(self, Frame::Padding | Frame::Ack(_) | Frame::AckEcn(_) | Frame::ConnectionCloseTransport(_) | Frame::ConnectionCloseApplication(_))
+        !matches!(
+            self,
+            Frame::Padding
+                | Frame::Ack(_)
+                | Frame::AckEcn(_)
+                | Frame::ConnectionCloseTransport(_)
+                | Frame::ConnectionCloseApplication(_)
+        )
     }
 
     /// Returns the frame type code
@@ -148,7 +153,11 @@ impl<'a> Frame<'a> {
             Frame::Stream(s) => {
                 FRAME_TYPE_STREAM
                     | (if s.fin { STREAM_FRAME_BIT_FIN } else { 0 })
-                    | (if s.offset > 0 { STREAM_FRAME_BIT_OFF } else { 0 })
+                    | (if s.offset > 0 {
+                        STREAM_FRAME_BIT_OFF
+                    } else {
+                        0
+                    })
                     | STREAM_FRAME_BIT_LEN // Always include length
             }
             Frame::MaxData(_) => FRAME_TYPE_MAX_DATA,
@@ -164,9 +173,7 @@ impl<'a> Frame<'a> {
             Frame::PathChallenge(_) => FRAME_TYPE_PATH_CHALLENGE,
             Frame::PathResponse(_) => FRAME_TYPE_PATH_RESPONSE,
             Frame::ConnectionCloseTransport(_) => FRAME_TYPE_CONNECTION_CLOSE_TRANSPORT,
-            Frame::ConnectionCloseApplication(_) => {
-                FRAME_TYPE_CONNECTION_CLOSE_APPLICATION
-            }
+            Frame::ConnectionCloseApplication(_) => FRAME_TYPE_CONNECTION_CLOSE_APPLICATION,
             Frame::HandshakeDone => FRAME_TYPE_HANDSHAKE_DONE,
         }
     }

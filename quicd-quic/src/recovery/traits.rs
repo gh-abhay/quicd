@@ -58,11 +58,7 @@ pub trait LossDetector: Send {
     /// Check for loss by timeout (PTO)
     ///
     /// Called when PTO timer expires. Returns lost packets.
-    fn detect_lost_packets(
-        &mut self,
-        space: PacketNumberSpace,
-        now: Instant,
-    ) -> Vec<PacketNumber>;
+    fn detect_lost_packets(&mut self, space: PacketNumberSpace, now: Instant) -> Vec<PacketNumber>;
 
     /// Get next timeout (PTO or loss detection timer)
     fn loss_detection_timer(&self) -> Option<Instant>;

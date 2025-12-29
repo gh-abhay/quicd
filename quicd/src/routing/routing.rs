@@ -13,8 +13,8 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 
-use anyhow::{anyhow, Context, Result};
 use super::router::{ConnectionId, Cookie, Router};
+use anyhow::{anyhow, Context, Result};
 use tracing::{debug, info, warn};
 
 /// Shared router state used by all workers.

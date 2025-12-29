@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn test_flow_controller_initial_state() {
         let fc = FlowController::new(1000, 2000);
-        
+
         assert_eq!(fc.max_data, 1000);
         assert_eq!(fc.consumed, 0);
         assert_eq!(fc.available, 0);
@@ -171,7 +171,7 @@ mod tests {
     #[test]
     fn test_flow_controller_can_receive() {
         let fc = FlowController::new(1000, 2000);
-        
+
         assert!(fc.can_receive(500).is_ok());
         assert!(fc.can_receive(1000).is_ok());
         assert!(fc.can_receive(1001).is_err());
@@ -180,12 +180,12 @@ mod tests {
     #[test]
     fn test_flow_controller_on_data_received() {
         let mut fc = FlowController::new(1000, 2000);
-        
+
         fc.on_data_received(300).unwrap();
         assert_eq!(fc.available, 300);
         assert_eq!(fc.consumed, 0);
         assert_eq!(fc.available_credit(), 700);
-        
+
         fc.on_data_received(400).unwrap();
         assert_eq!(fc.available, 700);
         assert_eq!(fc.available_credit(), 300);
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn test_flow_controller_exceed_limit() {
         let mut fc = FlowController::new(1000, 2000);
-        
+
         fc.on_data_received(900).unwrap();
         // Exceeding limit should fail
         assert!(fc.on_data_received(101).is_err());
@@ -203,14 +203,14 @@ mod tests {
     #[test]
     fn test_flow_controller_consume() {
         let mut fc = FlowController::new(1000, 2000);
-        
+
         fc.on_data_received(500).unwrap();
         assert_eq!(fc.available, 500);
-        
+
         fc.consume(200);
         assert_eq!(fc.consumed, 200);
         assert_eq!(fc.available, 300);
-        
+
         fc.consume(300);
         assert_eq!(fc.consumed, 500);
         assert_eq!(fc.available, 0);
@@ -219,10 +219,10 @@ mod tests {
     #[test]
     fn test_flow_controller_consume_beyond_available() {
         let mut fc = FlowController::new(1000, 2000);
-        
+
         fc.on_data_received(500).unwrap();
         fc.consume(1000); // Consume more than available
-        
+
         // Should saturate at 0
         assert_eq!(fc.available, 0);
         assert_eq!(fc.consumed, 1000);
@@ -231,11 +231,11 @@ mod tests {
     #[test]
     fn test_flow_controller_update_max_data() {
         let mut fc = FlowController::new(1000, 2000);
-        
+
         fc.update_max_data(1500);
         assert_eq!(fc.max_data, 1500);
         assert_eq!(fc.available_credit(), 1500);
-        
+
         // Should not decrease
         fc.update_max_data(1200);
         assert_eq!(fc.max_data, 1500);
@@ -244,20 +244,20 @@ mod tests {
     #[test]
     fn test_flow_controller_should_send_max_data_update() {
         let mut fc = FlowController::new(5000, 2000);
-        
+
         // Initially should not send update
         assert!(!fc.should_send_max_data_update());
-        
+
         // Consume past threshold (50% of local_max_data = 1000 bytes)
         fc.on_data_received(600).unwrap();
         fc.consume(600);
-        
+
         // Still not past threshold
         assert!(!fc.should_send_max_data_update());
-        
+
         fc.on_data_received(500).unwrap();
         fc.consume(500);
-        
+
         // Now past threshold (consumed = 1100)
         assert!(fc.should_send_max_data_update());
     }
@@ -265,19 +265,19 @@ mod tests {
     #[test]
     fn test_flow_controller_new_max_data() {
         let mut fc = FlowController::new(1000, 2000);
-        
+
         fc.on_data_received(800).unwrap();
         fc.consume(800);
-        
+
         // Get new MAX_DATA value
         let new_max = fc.new_max_data();
-        
+
         // Should be local_max_data + consumed = 2000 + 800 = 2800
         assert_eq!(new_max, 2800);
-        
+
         // Consumed should be reset
         assert_eq!(fc.consumed, 0);
-        
+
         // Local max should be updated
         assert_eq!(fc.local_max_data, 2800);
     }
@@ -285,12 +285,12 @@ mod tests {
     #[test]
     fn test_flow_controller_available_credit() {
         let mut fc = FlowController::new(1000, 2000);
-        
+
         assert_eq!(fc.available_credit(), 1000);
-        
+
         fc.on_data_received(300).unwrap();
         assert_eq!(fc.available_credit(), 700);
-        
+
         fc.consume(100);
         // After consuming, credit should remain the same since consumed doesn't increase max_data
         assert_eq!(fc.available_credit(), 700);
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn test_connection_flow_control() {
         let conn_fc = ConnectionFlowControl::new(10000, 20000, 30000);
-        
+
         assert_eq!(conn_fc.send.max_data, 10000);
         assert_eq!(conn_fc.recv.max_data, 20000);
         assert_eq!(conn_fc.recv.local_max_data, 30000);
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn test_stream_flow_control() {
         let stream_fc = StreamFlowControl::new(StreamId::new(4), 5000, 6000, 7000);
-        
+
         assert_eq!(stream_fc.stream_id, StreamId::new(4));
         assert_eq!(stream_fc.send.max_data, 5000);
         assert_eq!(stream_fc.recv.max_data, 6000);
@@ -318,23 +318,23 @@ mod tests {
     #[test]
     fn test_flow_controller_window_exhaustion_and_recovery() {
         let mut fc = FlowController::new(1000, 2000);
-        
+
         // Fill the window
         fc.on_data_received(1000).unwrap();
         assert_eq!(fc.available_credit(), 0);
-        
+
         // Cannot receive more
         assert!(fc.on_data_received(1).is_err());
-        
+
         // Consume some data
         fc.consume(500);
-        
+
         // Still cannot receive (consumed doesn't free credit)
         assert!(fc.on_data_received(1).is_err());
-        
+
         // Update max_data to provide more credit
         fc.update_max_data(2000);
-        
+
         // Now can receive again
         assert!(fc.on_data_received(500).is_ok());
     }
@@ -342,13 +342,13 @@ mod tests {
     #[test]
     fn test_flow_controller_progressive_consumption() {
         let mut fc = FlowController::new(1000, 2000);
-        
+
         // Receive and consume in chunks
         for _ in 0..5 {
             fc.on_data_received(100).unwrap();
             fc.consume(100);
         }
-        
+
         assert_eq!(fc.consumed, 500);
         assert_eq!(fc.available, 0);
         assert_eq!(fc.available_credit(), 500);
@@ -357,16 +357,16 @@ mod tests {
     #[test]
     fn test_flow_controller_multiple_updates() {
         let mut fc = FlowController::new(1000, 2000);
-        
+
         fc.on_data_received(500).unwrap();
         fc.consume(500);
-        
+
         let max1 = fc.new_max_data();
         assert_eq!(max1, 2500);
-        
+
         fc.on_data_received(600).unwrap();
         fc.consume(600);
-        
+
         let max2 = fc.new_max_data();
         assert_eq!(max2, 3100);
     }

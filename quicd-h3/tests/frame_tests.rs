@@ -183,9 +183,7 @@ fn test_frame_type_validation_on_streams() {
     assert!(!data_frame.is_valid_on_control_stream());
 
     // SETTINGS frame is valid on control streams only
-    let settings_frame = Frame::Settings(SettingsFrame {
-        settings: vec![],
-    });
+    let settings_frame = Frame::Settings(SettingsFrame { settings: vec![] });
     assert!(!settings_frame.is_valid_on_request_stream());
     assert!(settings_frame.is_valid_on_control_stream());
 

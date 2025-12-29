@@ -45,7 +45,6 @@ pub const PACKET_NUMBER_LENGTH_MASK: u8 = 0x03;
 
 pub use crate::packet::types::PacketType;
 
-
 // ============================================================================
 // Header Structures (Zero-Copy, Lifetime-Bound)
 // ============================================================================
@@ -181,11 +180,7 @@ pub trait PacketParser: Send + Sync {
     /// Extract destination CID without full parsing
     ///
     /// Used for connection demultiplexing. Faster than full parse.
-    fn extract_dcid<'a>(
-        &self,
-        packet: &'a [u8],
-        dcid_len: Option<usize>,
-    ) -> Result<&'a [u8]>;
+    fn extract_dcid<'a>(&self, packet: &'a [u8], dcid_len: Option<usize>) -> Result<&'a [u8]>;
 }
 
 /// Header Form (Long vs Short)
@@ -239,11 +234,7 @@ impl PacketParser for DefaultHeaderParser {
         }
     }
 
-    fn extract_dcid<'a>(
-        &self,
-        packet: &'a [u8],
-        dcid_len: Option<usize>,
-    ) -> Result<&'a [u8]> {
+    fn extract_dcid<'a>(&self, packet: &'a [u8], dcid_len: Option<usize>) -> Result<&'a [u8]> {
         if packet.is_empty() {
             return Err(Error::Transport(TransportError::FrameEncodingError));
         }
@@ -511,7 +502,7 @@ mod tests {
     fn test_peek_header_form_long() {
         let parser = DefaultHeaderParser;
         let packet = [0xc0, 0x00, 0x00, 0x00, 0x01]; // Long header (Initial)
-        
+
         let form = parser.peek_header_form(&packet).unwrap();
         assert_eq!(form, HeaderForm::Long);
     }
@@ -520,7 +511,7 @@ mod tests {
     fn test_peek_header_form_short() {
         let parser = DefaultHeaderParser;
         let packet = [0x40, 0x01]; // Short header
-        
+
         let form = parser.peek_header_form(&packet).unwrap();
         assert_eq!(form, HeaderForm::Short);
     }
@@ -534,7 +525,7 @@ mod tests {
     #[test]
     fn test_parse_long_header_initial() {
         let parser = DefaultHeaderParser;
-        
+
         // Construct Initial packet header
         let mut packet = vec![
             0xc0, // Long header, Initial, pn_len=1
@@ -547,9 +538,9 @@ mod tests {
             0x03, // Length = 3
             0xaa, // Packet number (1 byte)
         ];
-        
+
         let (header, offset) = parser.parse_header(&packet).unwrap();
-        
+
         match header {
             Header::Long(h) => {
                 assert_eq!(h.packet_type, PacketType::Initial);
@@ -562,14 +553,14 @@ mod tests {
             }
             _ => panic!("Expected Long header"),
         }
-        
+
         assert_eq!(offset, packet.len());
     }
 
     #[test]
     fn test_parse_long_header_with_token() {
         let parser = DefaultHeaderParser;
-        
+
         let mut packet = vec![
             0xc0, // Long header, Initial
             0x00, 0x00, 0x00, 0x01, // Version 1
@@ -579,9 +570,9 @@ mod tests {
             0x02, // Length = 2
             0xff, // Packet number
         ];
-        
+
         let (header, _) = parser.parse_header(&packet).unwrap();
-        
+
         match header {
             Header::Long(h) => {
                 assert_eq!(h.token, Some(&[0x11, 0x22, 0x33][..]));
@@ -593,7 +584,7 @@ mod tests {
     #[test]
     fn test_parse_long_header_handshake() {
         let parser = DefaultHeaderParser;
-        
+
         let packet = vec![
             0xe0, // Long header, Handshake
             0x00, 0x00, 0x00, 0x01, // Version 1
@@ -602,9 +593,9 @@ mod tests {
             0x02, // Length = 2
             0xab, // Packet number
         ];
-        
+
         let (header, _) = parser.parse_header(&packet).unwrap();
-        
+
         match header {
             Header::Long(h) => {
                 assert_eq!(h.packet_type, PacketType::Handshake);
@@ -619,7 +610,7 @@ mod tests {
     #[test]
     fn test_parse_version_negotiation() {
         let parser = DefaultHeaderParser;
-        
+
         let packet = vec![
             0xc0, // Long header
             0x00, 0x00, 0x00, 0x00, // Version = 0 (Version Negotiation)
@@ -628,9 +619,9 @@ mod tests {
             // Supported versions follow
             0x00, 0x00, 0x00, 0x01,
         ];
-        
+
         let (header, offset) = parser.parse_header(&packet).unwrap();
-        
+
         match header {
             Header::Long(h) => {
                 assert_eq!(h.packet_type, PacketType::VersionNegotiation);
@@ -645,47 +636,47 @@ mod tests {
     #[test]
     fn test_parse_header_invalid_fixed_bit() {
         let parser = DefaultHeaderParser;
-        
+
         // Header with Fixed Bit = 0 (invalid)
         let packet = [0x80, 0x00, 0x00, 0x00, 0x01];
-        
+
         assert!(parser.parse_header(&packet).is_err());
     }
 
     #[test]
     fn test_parse_header_buffer_too_short() {
         let parser = DefaultHeaderParser;
-        
+
         // Incomplete header
         let packet = [0xc0, 0x00];
-        
+
         assert!(parser.parse_header(&packet).is_err());
     }
 
     #[test]
     fn test_parse_header_dcid_too_long() {
         let parser = DefaultHeaderParser;
-        
+
         let mut packet = vec![
             0xc0, // Long header
             0x00, 0x00, 0x00, 0x01, // Version
-            21, // DCID length = 21 (exceeds max of 20)
+            21,   // DCID length = 21 (exceeds max of 20)
         ];
-        
+
         assert!(parser.parse_header(&packet).is_err());
     }
 
     #[test]
     fn test_extract_dcid_long_header() {
         let parser = DefaultHeaderParser;
-        
+
         let packet = vec![
             0xc0, // Long header
             0x00, 0x00, 0x00, 0x01, // Version
             0x04, // DCID length = 4
             0xaa, 0xbb, 0xcc, 0xdd, // DCID
         ];
-        
+
         let dcid = parser.extract_dcid(&packet, None).unwrap();
         assert_eq!(dcid, &[0xaa, 0xbb, 0xcc, 0xdd]);
     }
@@ -693,12 +684,12 @@ mod tests {
     #[test]
     fn test_extract_dcid_short_header() {
         let parser = DefaultHeaderParser;
-        
+
         let packet = vec![
             0x40, // Short header
             0xaa, 0xbb, 0xcc, 0xdd, // DCID (4 bytes)
         ];
-        
+
         let dcid = parser.extract_dcid(&packet, Some(4)).unwrap();
         assert_eq!(dcid, &[0xaa, 0xbb, 0xcc, 0xdd]);
     }
@@ -708,7 +699,7 @@ mod tests {
         assert!(PacketType::Initial.is_long_header());
         assert!(PacketType::Handshake.is_long_header());
         assert!(!PacketType::OneRtt.is_long_header());
-        
+
         assert!(PacketType::Initial.is_ack_eliciting_type());
         assert!(!PacketType::Retry.is_ack_eliciting_type());
         assert!(!PacketType::VersionNegotiation.is_ack_eliciting_type());
@@ -717,7 +708,7 @@ mod tests {
     #[test]
     fn test_packet_type_packet_number_space() {
         use crate::types::PacketNumberSpace;
-        
+
         assert_eq!(
             PacketType::Initial.packet_number_space(),
             Some(PacketNumberSpace::Initial)
@@ -744,9 +735,9 @@ mod tests {
             length: Some(10),
             packet_number: Some(&[0xaa]),
         };
-        
+
         let header = Header::Long(long_header);
-        
+
         assert_eq!(header.packet_type(), PacketType::Initial);
         assert_eq!(header.dcid(), &[0x01, 0x02]);
         assert_eq!(header.scid(), Some(&[0x03, 0x04][..]));
@@ -757,22 +748,22 @@ mod tests {
     #[test]
     fn test_parse_retry_packet() {
         let parser = DefaultHeaderParser;
-        
+
         let mut packet = vec![
             0xf0, // Long header, Retry
             0x00, 0x00, 0x00, 0x01, // Version 1
             0x02, 0xaa, 0xbb, // DCID
             0x02, 0xcc, 0xdd, // SCID
         ];
-        
+
         // Retry token (variable length)
         packet.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
-        
+
         // Integrity tag (16 bytes)
         packet.extend_from_slice(&[0u8; 16]);
-        
+
         let (header, offset) = parser.parse_header(&packet).unwrap();
-        
+
         match header {
             Header::Long(h) => {
                 assert_eq!(h.packet_type, PacketType::Retry);
@@ -782,7 +773,7 @@ mod tests {
             }
             _ => panic!("Expected Long header"),
         }
-        
+
         assert_eq!(offset, packet.len());
     }
 }

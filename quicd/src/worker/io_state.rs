@@ -124,9 +124,9 @@ impl RecvOpState {
         let buf_slice = buffer.as_mut_slice_for_io();
         self.iov.iov_base = buf_slice.as_mut_ptr() as *mut libc::c_void;
         self.iov.iov_len = buf_slice.len();
-        
+
         self.buffer = Some(buffer);
-        
+
         // Reset msghdr fields that might have been modified or need refresh
         // msg_name and msg_namelen should be preserved/reset
         self.msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
@@ -134,7 +134,7 @@ impl RecvOpState {
         // msg_control and msg_controllen are 0/null
         self.msg.msg_flags = 0;
     }
-    
+
     /// Take the buffer from the state.
     pub fn take_buffer(&mut self) -> Option<WorkerBuffer> {
         self.buffer.take()
@@ -179,10 +179,13 @@ impl SendOpState {
         }
 
         // Create iovecs on heap (in Vec)
-        let mut iovs: Vec<libc::iovec> = data.iter().map(|buf| libc::iovec {
-            iov_base: buf.as_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        }).collect();
+        let mut iovs: Vec<libc::iovec> = data
+            .iter()
+            .map(|buf| libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            })
+            .collect();
 
         // SAFETY: Zero-initialization is safe for msghdr as we set all required
         // fields below before use
@@ -207,9 +210,9 @@ impl SendOpState {
     /// Reset the state for reuse with new data.
     pub fn reset(&mut self, data: Vec<WorkerBuffer>, to: SocketAddr) {
         use socket2::SockAddr;
-        
+
         self.data = data;
-        
+
         // Update address
         let sock_addr = SockAddr::from(to);
         unsafe {
@@ -219,7 +222,7 @@ impl SendOpState {
                 1,
             );
         }
-        
+
         // Update iovecs
         self.iovs.clear();
         for buf in &self.data {
@@ -228,7 +231,7 @@ impl SendOpState {
                 iov_len: buf.len(),
             });
         }
-        
+
         // Update msghdr
         self.msg.msg_name = &*self.addr_storage as *const _ as *mut libc::c_void;
         self.msg.msg_namelen = sock_addr.len();

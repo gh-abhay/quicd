@@ -67,12 +67,12 @@ pub fn is_reserved_version(version: u32) -> bool {
 pub trait QuicVersion {
     /// Get the version number
     fn version(&self) -> u32;
-    
+
     /// Get the Initial salt for key derivation (RFC 9001 Section 5.2)
     ///
     /// Different versions may use different salts for Initial packet protection.
     fn initial_salt(&self) -> &'static [u8];
-    
+
     /// Check if this version supports a specific feature
     fn supports_feature(&self, feature: VersionFeature) -> bool;
 }
@@ -84,13 +84,13 @@ pub trait QuicVersion {
 pub enum VersionFeature {
     /// Support for DATAGRAM frames (RFC 9221)
     Datagrams,
-    
+
     /// Support for Greasing (RFC 9287)
     Greasing,
-    
+
     /// Support for Version Negotiation (RFC 9368)
     CompatibleVersionNegotiation,
-    
+
     /// Support for Acknowledgment Frequency (draft-ietf-quic-ack-frequency)
     AckFrequency,
 }
@@ -116,12 +116,8 @@ pub trait VersionNegotiator {
     /// **RFC 9000 Section 6.2**: The client must validate that:
     /// 1. The original version is not in the supported list
     /// 2. A reserved version is in the list (greasing check)
-    fn negotiate_version(
-        &self,
-        supported_versions: &[u32],
-        original_version: u32,
-    ) -> Option<u32>;
-    
+    fn negotiate_version(&self, supported_versions: &[u32], original_version: u32) -> Option<u32>;
+
     /// Generate a Version Negotiation packet
     ///
     /// # Arguments
@@ -174,7 +170,7 @@ impl PacketInvariants {
     pub fn is_long_header(first_byte: u8) -> bool {
         (first_byte & 0x80) == 0x80
     }
-    
+
     /// Check if a packet has the fixed bit set
     ///
     /// **Invariant (RFC 9000 Section 17.2)**: The second bit (0x40) is the
@@ -186,7 +182,7 @@ impl PacketInvariants {
     pub fn has_fixed_bit(first_byte: u8) -> bool {
         (first_byte & 0x40) == 0x40
     }
-    
+
     /// Extract the version field from a long header packet
     ///
     /// **Invariant**: The version field is at bytes 1-4 (big-endian u32)
@@ -197,15 +193,12 @@ impl PacketInvariants {
         if packet.len() < 5 || !Self::is_long_header(packet[0]) {
             return None;
         }
-        
+
         Some(u32::from_be_bytes([
-            packet[1],
-            packet[2],
-            packet[3],
-            packet[4],
+            packet[1], packet[2], packet[3], packet[4],
         ]))
     }
-    
+
     /// Extract destination connection ID length from a long header
     ///
     /// **Invariant**: The DCID length field is at byte 5 for long headers.
@@ -213,10 +206,10 @@ impl PacketInvariants {
         if packet.len() < 6 || !Self::is_long_header(packet[0]) {
             return None;
         }
-        
+
         Some(packet[5] as usize)
     }
-    
+
     /// Extract destination connection ID from a packet
     ///
     /// **Invariant**: For long headers, DCID follows the length field.
@@ -236,7 +229,7 @@ impl PacketInvariants {
             Some(&packet[1..1 + dcid_len])
         }
     }
-    
+
     /// Validate packet against version-independent properties
     ///
     /// Returns `Ok(())` if the packet adheres to invariants, otherwise an error.
@@ -244,9 +237,9 @@ impl PacketInvariants {
         if packet.is_empty() {
             return Err(Error::InvalidPacket);
         }
-        
+
         let first_byte = packet[0];
-        
+
         // Check fixed bit (except for Version Negotiation packets)
         if Self::is_long_header(first_byte) {
             if let Some(version) = Self::extract_version(packet) {
@@ -260,7 +253,7 @@ impl PacketInvariants {
                 return Err(Error::InvalidPacket);
             }
         }
-        
+
         Ok(())
     }
 }
@@ -276,10 +269,10 @@ impl PacketInvariants {
 pub enum VersionSelectionStrategy {
     /// Prefer the highest mutually supported version
     PreferLatest,
-    
+
     /// Prefer Version 1 (most widely deployed)
     PreferV1,
-    
+
     /// Use a specific version (for testing)
     UseSpecific(u32),
 }
@@ -294,9 +287,7 @@ impl VersionSelectionStrategy {
     /// The selected version, or `None` if no compatible version exists.
     pub fn select(&self, available: &[u32]) -> Option<u32> {
         match self {
-            VersionSelectionStrategy::PreferLatest => {
-                available.iter().copied().max()
-            }
+            VersionSelectionStrategy::PreferLatest => available.iter().copied().max(),
             VersionSelectionStrategy::PreferV1 => {
                 if available.contains(&VERSION_1) {
                     Some(VERSION_1)
@@ -322,7 +313,7 @@ impl VersionSelectionStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_reserved_version() {
         assert!(is_reserved_version(0x0a0a0a0a));
@@ -331,15 +322,18 @@ mod tests {
         assert!(!is_reserved_version(VERSION_1));
         assert!(!is_reserved_version(VERSION_NEGOTIATION));
     }
-    
+
     #[test]
     fn test_header_invariants() {
         // Long header packet (Initial)
         let long_header = [0xc0, 0x00, 0x00, 0x00, 0x01, 0x08];
         assert!(PacketInvariants::is_long_header(long_header[0]));
         assert!(PacketInvariants::has_fixed_bit(long_header[0]));
-        assert_eq!(PacketInvariants::extract_version(&long_header), Some(VERSION_1));
-        
+        assert_eq!(
+            PacketInvariants::extract_version(&long_header),
+            Some(VERSION_1)
+        );
+
         // Short header packet
         let short_header = [0x40];
         assert!(!PacketInvariants::is_long_header(short_header[0]));

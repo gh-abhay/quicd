@@ -291,7 +291,11 @@ impl FrameParser {
     ///
     /// Returns error if frame format is invalid.
     pub fn parse(&mut self, data: Bytes) -> Result<Vec<Frame>> {
-        eprintln!("FrameParser::parse: received {} bytes, current buffer: {} bytes", data.len(), self.buffer.len());
+        eprintln!(
+            "FrameParser::parse: received {} bytes, current buffer: {} bytes",
+            data.len(),
+            self.buffer.len()
+        );
         self.buffer.extend_from_slice(&data);
         let mut frames = Vec::new();
 
@@ -310,7 +314,10 @@ impl FrameParser {
 
                 ParserState::ReadingLength { frame_type } => {
                     if let Some(length) = try_read_varint(&mut self.buffer)? {
-                        eprintln!("FrameParser: Read frame length: {} for type 0x{:x}", length, frame_type);
+                        eprintln!(
+                            "FrameParser: Read frame length: {} for type 0x{:x}",
+                            length, frame_type
+                        );
                         if length > u64::MAX {
                             return Err(Error::protocol(
                                 ErrorCode::FrameError,
@@ -327,13 +334,21 @@ impl FrameParser {
                 }
 
                 ParserState::ReadingPayload { frame_type, length } => {
-                    eprintln!("FrameParser: ReadingPayload, need {} bytes, have {}", length, self.buffer.len());
+                    eprintln!(
+                        "FrameParser: ReadingPayload, need {} bytes, have {}",
+                        length,
+                        self.buffer.len()
+                    );
                     if self.buffer.len() < length {
                         break; // Need more data
                     }
 
                     let payload = self.buffer.split_to(length).freeze();
-                    eprintln!("FrameParser: Parsing frame type 0x{:x} with {} byte payload", frame_type, payload.len());
+                    eprintln!(
+                        "FrameParser: Parsing frame type 0x{:x} with {} byte payload",
+                        frame_type,
+                        payload.len()
+                    );
                     let frame = parse_frame_payload(frame_type, payload)?;
                     frames.push(frame);
 
@@ -350,7 +365,11 @@ impl FrameParser {
             }
         }
 
-        eprintln!("FrameParser::parse: returning {} frames, {} bytes buffered", frames.len(), self.buffer.len());
+        eprintln!(
+            "FrameParser::parse: returning {} frames, {} bytes buffered",
+            frames.len(),
+            self.buffer.len()
+        );
         Ok(frames)
     }
 
@@ -531,7 +550,10 @@ pub fn write_frame(frame: &Frame, buf: &mut BytesMut) -> Result<()> {
             varint::encode_buf(f.push_id, buf)?;
         }
 
-        Frame::Unknown { frame_type, payload } => {
+        Frame::Unknown {
+            frame_type,
+            payload,
+        } => {
             varint::encode_buf(*frame_type, buf)?;
             varint::encode_buf(payload.len() as u64, buf)?;
             buf.put_slice(payload);
@@ -651,9 +673,7 @@ mod tests {
         assert!(data_frame.is_valid_on_request_stream());
         assert!(!data_frame.is_valid_on_control_stream());
 
-        let settings_frame = Frame::Settings(SettingsFrame {
-            settings: vec![],
-        });
+        let settings_frame = Frame::Settings(SettingsFrame { settings: vec![] });
         assert!(!settings_frame.is_valid_on_request_stream());
         assert!(settings_frame.is_valid_on_control_stream());
     }

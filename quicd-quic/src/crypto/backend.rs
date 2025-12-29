@@ -12,7 +12,10 @@ pub enum CryptoLevel {
 
 pub trait CryptoBackend: Send + Sync {
     fn create_aead(&self, cipher_suite: u16) -> Result<Box<dyn AeadProvider>>;
-    fn create_header_protection(&self, cipher_suite: u16) -> Result<Box<dyn HeaderProtectionProvider>>;
+    fn create_header_protection(
+        &self,
+        cipher_suite: u16,
+    ) -> Result<Box<dyn HeaderProtectionProvider>>;
     fn create_key_schedule(&self) -> Box<dyn KeySchedule>;
     fn create_tls_session(
         &self,
@@ -65,7 +68,12 @@ pub trait KeySchedule: Send + Sync {
     // Handshake and OneRTT keys use hash function matching cipher suite
     fn derive_packet_key(&self, secret: &[u8], len: usize, cipher_suite: u16) -> Result<Vec<u8>>;
     fn derive_packet_iv(&self, secret: &[u8], len: usize, cipher_suite: u16) -> Result<Vec<u8>>;
-    fn derive_header_protection_key(&self, secret: &[u8], len: usize, cipher_suite: u16) -> Result<Vec<u8>>;
+    fn derive_header_protection_key(
+        &self,
+        secret: &[u8],
+        len: usize,
+        cipher_suite: u16,
+    ) -> Result<Vec<u8>>;
 }
 
 pub enum TlsEvent {

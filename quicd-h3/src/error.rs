@@ -167,10 +167,7 @@ pub enum Error {
 
     /// Protocol violation error with specific HTTP/3 error code.
     #[error("Protocol error ({code}): {message}")]
-    Protocol {
-        code: ErrorCode,
-        message: String,
-    },
+    Protocol { code: ErrorCode, message: String },
 
     /// QPACK compression/decompression error.
     #[error("QPACK error: {0}")]
@@ -220,12 +217,8 @@ impl Error {
             Self::Qpack(qpack_err) => {
                 // Map QPACK errors to appropriate H3 error codes
                 match qpack_err {
-                    quicd_qpack::Error::DecoderStreamError(_) => {
-                        ErrorCode::QpackDecoderStreamError
-                    }
-                    quicd_qpack::Error::EncoderStreamError(_) => {
-                        ErrorCode::QpackEncoderStreamError
-                    }
+                    quicd_qpack::Error::DecoderStreamError(_) => ErrorCode::QpackDecoderStreamError,
+                    quicd_qpack::Error::EncoderStreamError(_) => ErrorCode::QpackEncoderStreamError,
                     _ => ErrorCode::QpackDecompressionFailed,
                 }
             }

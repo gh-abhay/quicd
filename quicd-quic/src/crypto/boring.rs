@@ -1,9 +1,11 @@
-use crate::crypto::backend::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, KeySchedule, TlsSession};
+use crate::crypto::backend::{
+    AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, KeySchedule, TlsSession,
+};
 use crate::error::{CryptoError, Error, Result};
 use crate::types::{ConnectionId, PacketNumber, Side};
 use boring_sys as ffi;
-use std::ptr;
 use std::ffi::c_int;
+use std::ptr;
 
 pub struct BoringCryptoBackend;
 
@@ -20,19 +22,22 @@ impl CryptoBackend for BoringCryptoBackend {
         }
     }
 
-    fn create_header_protection(&self, cipher_suite: u16) -> Result<Box<dyn HeaderProtectionProvider>> {
+    fn create_header_protection(
+        &self,
+        cipher_suite: u16,
+    ) -> Result<Box<dyn HeaderProtectionProvider>> {
         unsafe {
             let (cipher, is_chacha) = match cipher_suite {
                 0x1301 => (ffi::EVP_aes_128_ecb(), false),
                 0x1302 => (ffi::EVP_aes_256_ecb(), false),
                 0x1303 => (
                     ffi::EVP_get_cipherbyname(b"chacha20\0".as_ptr() as *const i8),
-                    true
+                    true,
                 ),
                 _ => return Err(Error::Crypto(CryptoError { code: 0x0150 })),
             };
             if cipher.is_null() {
-                 return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+                return Err(Error::Crypto(CryptoError { code: 0x0150 }));
             }
             Ok(Box::new(BoringHeaderProtection { cipher, is_chacha }))
         }
@@ -51,8 +56,14 @@ impl CryptoBackend for BoringCryptoBackend {
         key_data: Option<&[u8]>,
     ) -> Result<Box<dyn TlsSession>> {
         match side {
-            Side::Client => crate::tls::boringssl::BoringTlsSession::new_client(server_name, alpn_protocols),
-            Side::Server => crate::tls::boringssl::BoringTlsSession::new_server(alpn_protocols, cert_data, key_data),
+            Side::Client => {
+                crate::tls::boringssl::BoringTlsSession::new_client(server_name, alpn_protocols)
+            }
+            Side::Server => crate::tls::boringssl::BoringTlsSession::new_server(
+                alpn_protocols,
+                cert_data,
+                key_data,
+            ),
         }
     }
 }
@@ -93,7 +104,7 @@ impl AeadProvider for BoringAead {
             let iv_len = iv.len();
             let mut nonce = vec![0u8; iv_len];
             nonce.copy_from_slice(iv);
-            
+
             // Packet number in network byte order (big-endian), left-padded with zeros
             let pn_bytes = packet_number.to_be_bytes();
             // XOR the last bytes of nonce with packet number bytes
@@ -102,7 +113,7 @@ impl AeadProvider for BoringAead {
             for i in 0..8.min(iv_len - pn_start) {
                 nonce[pn_start + i] ^= pn_bytes[i];
             }
-            
+
             let mut ctx: ffi::EVP_AEAD_CTX = std::mem::zeroed();
             if ffi::EVP_AEAD_CTX_init(
                 &mut ctx,
@@ -111,7 +122,8 @@ impl AeadProvider for BoringAead {
                 key.len(),
                 ffi::EVP_AEAD_DEFAULT_TAG_LENGTH as usize,
                 ptr::null_mut(),
-            ) != 1 {
+            ) != 1
+            {
                 return Err(Error::Crypto(CryptoError { code: 0x0150 }));
             }
 
@@ -135,7 +147,8 @@ impl AeadProvider for BoringAead {
                 payload.len(),
                 header.as_ptr(),
                 header.len(),
-            ) != 1 {
+            ) != 1
+            {
                 return Err(Error::Crypto(CryptoError { code: 0x0150 }));
             }
             Ok(out_len)
@@ -156,7 +169,7 @@ impl AeadProvider for BoringAead {
             let iv_len = iv.len();
             let mut nonce = vec![0u8; iv_len];
             nonce.copy_from_slice(iv);
-            
+
             // Packet number in network byte order (big-endian), left-padded with zeros
             // RFC 9001 Section 5.3: "The 62 bits of the reconstructed QUIC packet number
             // in network byte order are left-padded with zeros to the size of the IV.
@@ -170,7 +183,7 @@ impl AeadProvider for BoringAead {
             for i in 0..bytes_to_xor {
                 nonce[start_idx + i] ^= pn_bytes[i];
             }
-            
+
             let mut ctx: ffi::EVP_AEAD_CTX = std::mem::zeroed();
             if ffi::EVP_AEAD_CTX_init(
                 &mut ctx,
@@ -179,7 +192,8 @@ impl AeadProvider for BoringAead {
                 key.len(),
                 ffi::EVP_AEAD_DEFAULT_TAG_LENGTH as usize,
                 ptr::null_mut(),
-            ) != 1 {
+            ) != 1
+            {
                 return Err(Error::Crypto(CryptoError { code: 0x0150 }));
             }
 
@@ -203,7 +217,8 @@ impl AeadProvider for BoringAead {
                 payload.len(),
                 header.as_ptr(),
                 header.len(),
-            ) != 1 {
+            ) != 1
+            {
                 return Err(Error::Crypto(CryptoError { code: 0x0150 }));
             }
             Ok(out_len)
@@ -238,7 +253,7 @@ impl HeaderProtectionProvider for BoringHeaderProtection {
             if ctx.is_null() {
                 return Err(Error::Crypto(CryptoError { code: 0x0150 }));
             }
-            
+
             struct CipherCtx(*mut ffi::EVP_CIPHER_CTX);
             impl Drop for CipherCtx {
                 fn drop(&mut self) {
@@ -251,24 +266,52 @@ impl HeaderProtectionProvider for BoringHeaderProtection {
             let mut out_len = 0;
 
             if self.is_chacha {
-                 let zeros = [0u8; 5];
-                 if ffi::EVP_EncryptInit_ex(ctx, self.cipher, ptr::null_mut(), key.as_ptr(), sample.as_ptr()) != 1 {
-                     return Err(Error::Crypto(CryptoError { code: 0x0150 }));
-                 }
-                 if ffi::EVP_EncryptUpdate(ctx, mask.as_mut_ptr(), &mut out_len, zeros.as_ptr(), zeros.len() as i32) != 1 {
-                     return Err(Error::Crypto(CryptoError { code: 0x0150 }));
-                 }
+                let zeros = [0u8; 5];
+                if ffi::EVP_EncryptInit_ex(
+                    ctx,
+                    self.cipher,
+                    ptr::null_mut(),
+                    key.as_ptr(),
+                    sample.as_ptr(),
+                ) != 1
+                {
+                    return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+                }
+                if ffi::EVP_EncryptUpdate(
+                    ctx,
+                    mask.as_mut_ptr(),
+                    &mut out_len,
+                    zeros.as_ptr(),
+                    zeros.len() as i32,
+                ) != 1
+                {
+                    return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+                }
             } else {
-                 if ffi::EVP_EncryptInit_ex(ctx, self.cipher, ptr::null_mut(), key.as_ptr(), ptr::null_mut()) != 1 {
-                     return Err(Error::Crypto(CryptoError { code: 0x0150 }));
-                 }
-                 let mut out = [0u8; 32];
-                 if ffi::EVP_EncryptUpdate(ctx, out.as_mut_ptr(), &mut out_len, sample.as_ptr(), sample.len() as i32) != 1 {
-                     return Err(Error::Crypto(CryptoError { code: 0x0150 }));
-                 }
-                 mask.copy_from_slice(&out[0..5]);
+                if ffi::EVP_EncryptInit_ex(
+                    ctx,
+                    self.cipher,
+                    ptr::null_mut(),
+                    key.as_ptr(),
+                    ptr::null_mut(),
+                ) != 1
+                {
+                    return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+                }
+                let mut out = [0u8; 32];
+                if ffi::EVP_EncryptUpdate(
+                    ctx,
+                    out.as_mut_ptr(),
+                    &mut out_len,
+                    sample.as_ptr(),
+                    sample.len() as i32,
+                ) != 1
+                {
+                    return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+                }
+                mask.copy_from_slice(&out[0..5]);
             }
-            
+
             if output.len() >= 5 {
                 output[0..5].copy_from_slice(&mask);
             }
@@ -283,9 +326,7 @@ impl HeaderProtectionProvider for BoringHeaderProtection {
 // RFC 9001: HKDF-Extract(salt, IKM) -> PRK
 // So we call: HKDF_extract(..., IKM, salt)
 fn hkdf_extract(ikm: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
-    unsafe {
-        hkdf_extract_with_hash(ikm, salt, ffi::EVP_sha256())
-    }
+    unsafe { hkdf_extract_with_hash(ikm, salt, ffi::EVP_sha256()) }
 }
 
 fn hkdf_extract_with_hash(ikm: &[u8], salt: &[u8], md: *const ffi::EVP_MD) -> Result<Vec<u8>> {
@@ -296,12 +337,13 @@ fn hkdf_extract_with_hash(ikm: &[u8], salt: &[u8], md: *const ffi::EVP_MD) -> Re
             out.as_mut_ptr(),
             &mut out_len,
             md,
-            ikm.as_ptr(),      // IKM (Input Keying Material)
+            ikm.as_ptr(), // IKM (Input Keying Material)
             ikm.len(),
-            salt.as_ptr(),     // Salt
+            salt.as_ptr(), // Salt
             salt.len(),
-        ) != 1 {
-             return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+        ) != 1
+        {
+            return Err(Error::Crypto(CryptoError { code: 0x0150 }));
         }
         out.truncate(out_len);
         Ok(out)
@@ -309,12 +351,15 @@ fn hkdf_extract_with_hash(ikm: &[u8], salt: &[u8], md: *const ffi::EVP_MD) -> Re
 }
 
 fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>> {
-    unsafe {
-        hkdf_expand_with_hash(prk, info, len, ffi::EVP_sha256())
-    }
+    unsafe { hkdf_expand_with_hash(prk, info, len, ffi::EVP_sha256()) }
 }
 
-fn hkdf_expand_with_hash(prk: &[u8], info: &[u8], len: usize, md: *const ffi::EVP_MD) -> Result<Vec<u8>> {
+fn hkdf_expand_with_hash(
+    prk: &[u8],
+    info: &[u8],
+    len: usize,
+    md: *const ffi::EVP_MD,
+) -> Result<Vec<u8>> {
     unsafe {
         let mut out = vec![0u8; len];
         if ffi::HKDF_expand(
@@ -325,26 +370,31 @@ fn hkdf_expand_with_hash(prk: &[u8], info: &[u8], len: usize, md: *const ffi::EV
             prk.len(),
             info.as_ptr(),
             info.len(),
-        ) != 1 {
-             return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+        ) != 1
+        {
+            return Err(Error::Crypto(CryptoError { code: 0x0150 }));
         }
         Ok(out)
     }
 }
 
 fn hkdf_expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> Result<Vec<u8>> {
-    unsafe {
-        hkdf_expand_label_with_hash(secret, label, context, len, ffi::EVP_sha256())
-    }
+    unsafe { hkdf_expand_label_with_hash(secret, label, context, len, ffi::EVP_sha256()) }
 }
 
-fn hkdf_expand_label_with_hash(secret: &[u8], label: &str, context: &[u8], len: usize, md: *const ffi::EVP_MD) -> Result<Vec<u8>> {
+fn hkdf_expand_label_with_hash(
+    secret: &[u8],
+    label: &str,
+    context: &[u8],
+    len: usize,
+    md: *const ffi::EVP_MD,
+) -> Result<Vec<u8>> {
     // RFC 8446 Section 7.1: HKDF-Expand-Label structure
     // Info = OutputLength (2 bytes) || LabelLength (1 byte) || Label (variable) || ContextLength (1 byte) || Context (variable)
     // Label = "tls13 " || label
     const LABEL_PREFIX: &[u8] = b"tls13 ";
     let label_bytes = label.as_bytes();
-    
+
     let mut info = Vec::new();
     // OutputLength (2 bytes, big-endian u16)
     info.extend_from_slice(&(len as u16).to_be_bytes());
@@ -357,7 +407,7 @@ fn hkdf_expand_label_with_hash(secret: &[u8], label: &str, context: &[u8], len: 
     info.push(context.len() as u8);
     // Context
     info.extend_from_slice(context);
-    
+
     hkdf_expand_with_hash(secret, &info, len, md)
 }
 
@@ -366,7 +416,8 @@ struct BoringKeySchedule;
 impl KeySchedule for BoringKeySchedule {
     fn derive_initial_secret(&self, dcid: &ConnectionId, _version: u32) -> Result<[u8; 32]> {
         let initial_salt = [
-            0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a
+            0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8,
+            0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
         ];
         // RFC 9001 Section 5.2: initial_secret = HKDF-Extract(initial_salt, client_dst_connection_id)
         // In BoringSSL HKDF_extract: (out, md, secret, salt) where secret is IKM and salt is salt
@@ -374,7 +425,7 @@ impl KeySchedule for BoringKeySchedule {
         let secret = hkdf_extract(dcid.as_bytes(), &initial_salt)?;
         let mut out = [0u8; 32];
         if secret.len() != 32 {
-             return Err(Error::Crypto(CryptoError { code: 0x0150 }));
+            return Err(Error::Crypto(CryptoError { code: 0x0150 }));
         }
         out.copy_from_slice(&secret);
         Ok(out)
@@ -417,7 +468,12 @@ impl KeySchedule for BoringKeySchedule {
         hkdf_expand_label_with_hash(secret, "quic iv", &[], len, md)
     }
 
-    fn derive_header_protection_key(&self, secret: &[u8], len: usize, cipher_suite: u16) -> Result<Vec<u8>> {
+    fn derive_header_protection_key(
+        &self,
+        secret: &[u8],
+        len: usize,
+        cipher_suite: u16,
+    ) -> Result<Vec<u8>> {
         let md = unsafe {
             match cipher_suite {
                 0x1302 => ffi::EVP_sha384(),

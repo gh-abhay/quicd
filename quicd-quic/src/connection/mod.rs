@@ -7,5 +7,9 @@ pub mod cid_manager;
 // pub mod facade;
 pub mod state;
 
-pub use cid_manager::{ConnectionIdGenerator, ConnectionIdManager, NewConnectionIdData, RandomConnectionIdGenerator};
-pub use state::{Connection, ConnectionConfig, ConnectionEvent, ConnectionState, DatagramInput, DatagramOutput};
+pub use cid_manager::{
+    ConnectionIdGenerator, ConnectionIdManager, NewConnectionIdData, RandomConnectionIdGenerator,
+};
+pub use state::{
+    Connection, ConnectionConfig, ConnectionEvent, ConnectionState, DatagramInput, DatagramOutput,
+};

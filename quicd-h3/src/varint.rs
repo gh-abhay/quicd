@@ -27,7 +27,7 @@ pub fn decode(data: &[u8]) -> Result<(u64, usize)> {
 
     let first = data[0];
     let prefix = first >> 6;
-    
+
     match prefix {
         0 => {
             // 1 byte, 6-bit value
@@ -186,7 +186,11 @@ pub fn decode_buf<B: Buf>(buf: &mut B) -> Result<u64> {
     if buf.remaining() < len {
         return Err(Error::protocol(
             ErrorCode::FrameError,
-            format!("incomplete varint: need {} bytes, have {}", len, buf.remaining()),
+            format!(
+                "incomplete varint: need {} bytes, have {}",
+                len,
+                buf.remaining()
+            ),
         ));
     }
 

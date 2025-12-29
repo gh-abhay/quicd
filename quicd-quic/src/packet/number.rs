@@ -63,12 +63,7 @@ pub trait PacketNumberDecoder {
     /// - `pn_nbits`: Number of bits in truncated packet number (8, 16, 24, or 32)
     ///
     /// **Returns**: Reconstructed full 62-bit packet number
-    fn decode(
-        &self,
-        largest_pn: PacketNumber,
-        truncated_pn: u32,
-        pn_nbits: usize,
-    ) -> PacketNumber;
+    fn decode(&self, largest_pn: PacketNumber, truncated_pn: u32, pn_nbits: usize) -> PacketNumber;
 
     /// Parse packet number bytes from buffer
     ///
@@ -80,12 +75,7 @@ pub trait PacketNumberDecoder {
 pub struct DefaultPacketNumberDecoder;
 
 impl PacketNumberDecoder for DefaultPacketNumberDecoder {
-    fn decode(
-        &self,
-        largest_pn: PacketNumber,
-        truncated_pn: u32,
-        pn_nbits: usize,
-    ) -> PacketNumber {
+    fn decode(&self, largest_pn: PacketNumber, truncated_pn: u32, pn_nbits: usize) -> PacketNumber {
         // RFC 9000 Appendix A.3 algorithm
         let expected_pn = largest_pn + 1;
         let pn_win = 1u64 << pn_nbits;
@@ -153,21 +143,13 @@ pub trait PacketNumberEncoder {
     /// - `largest_acked`: Largest acknowledged packet number
     ///
     /// **Returns**: Minimum packet number length required
-    fn compute_length(
-        &self,
-        full_pn: PacketNumber,
-        largest_acked: PacketNumber,
-    ) -> PacketNumberLen;
+    fn compute_length(&self, full_pn: PacketNumber, largest_acked: PacketNumber)
+        -> PacketNumberLen;
 
     /// Encode packet number into buffer
     ///
     /// Writes truncated packet number as big-endian bytes.
-    fn encode(
-        &self,
-        full_pn: PacketNumber,
-        len: PacketNumberLen,
-        buf: &mut [u8],
-    ) -> Result<()>;
+    fn encode(&self, full_pn: PacketNumber, len: PacketNumberLen, buf: &mut [u8]) -> Result<()>;
 }
 
 /// Default Packet Number Encoder
@@ -192,12 +174,7 @@ impl PacketNumberEncoder for DefaultPacketNumberEncoder {
         }
     }
 
-    fn encode(
-        &self,
-        full_pn: PacketNumber,
-        len: PacketNumberLen,
-        buf: &mut [u8],
-    ) -> Result<()> {
+    fn encode(&self, full_pn: PacketNumber, len: PacketNumberLen, buf: &mut [u8]) -> Result<()> {
         match len {
             PacketNumberLen::One => {
                 if buf.is_empty() {
@@ -276,28 +253,16 @@ mod tests {
         let encoder = DefaultPacketNumberEncoder;
 
         // Small gap - 1 byte
-        assert_eq!(
-            encoder.compute_length(100, 50),
-            PacketNumberLen::One
-        );
+        assert_eq!(encoder.compute_length(100, 50), PacketNumberLen::One);
 
         // Medium gap - 2 bytes
-        assert_eq!(
-            encoder.compute_length(1000, 500),
-            PacketNumberLen::Two
-        );
+        assert_eq!(encoder.compute_length(1000, 500), PacketNumberLen::Two);
 
         // Large gap - 3 bytes
-        assert_eq!(
-            encoder.compute_length(100000, 0),
-            PacketNumberLen::Three
-        );
+        assert_eq!(encoder.compute_length(100000, 0), PacketNumberLen::Three);
 
         // Very large gap - 4 bytes
-        assert_eq!(
-            encoder.compute_length(10000000, 0),
-            PacketNumberLen::Four
-        );
+        assert_eq!(encoder.compute_length(10000000, 0), PacketNumberLen::Four);
     }
 
     #[test]
@@ -305,7 +270,9 @@ mod tests {
         let encoder = DefaultPacketNumberEncoder;
         let mut buf = [0u8; 4];
 
-        encoder.encode(0xAB, PacketNumberLen::One, &mut buf).unwrap();
+        encoder
+            .encode(0xAB, PacketNumberLen::One, &mut buf)
+            .unwrap();
         assert_eq!(buf[0], 0xAB);
     }
 
@@ -314,7 +281,9 @@ mod tests {
         let encoder = DefaultPacketNumberEncoder;
         let mut buf = [0u8; 4];
 
-        encoder.encode(0x1234, PacketNumberLen::Two, &mut buf).unwrap();
+        encoder
+            .encode(0x1234, PacketNumberLen::Two, &mut buf)
+            .unwrap();
         assert_eq!(buf[0], 0x12);
         assert_eq!(buf[1], 0x34);
     }
@@ -324,7 +293,9 @@ mod tests {
         let encoder = DefaultPacketNumberEncoder;
         let mut buf = [0u8; 4];
 
-        encoder.encode(0x123456, PacketNumberLen::Three, &mut buf).unwrap();
+        encoder
+            .encode(0x123456, PacketNumberLen::Three, &mut buf)
+            .unwrap();
         assert_eq!(buf[0], 0x12);
         assert_eq!(buf[1], 0x34);
         assert_eq!(buf[2], 0x56);
@@ -335,7 +306,9 @@ mod tests {
         let encoder = DefaultPacketNumberEncoder;
         let mut buf = [0u8; 4];
 
-        encoder.encode(0x12345678, PacketNumberLen::Four, &mut buf).unwrap();
+        encoder
+            .encode(0x12345678, PacketNumberLen::Four, &mut buf)
+            .unwrap();
         assert_eq!(buf[0], 0x12);
         assert_eq!(buf[1], 0x34);
         assert_eq!(buf[2], 0x56);
@@ -348,23 +321,32 @@ mod tests {
         let decoder = DefaultPacketNumberDecoder;
 
         // 1 byte
-        assert_eq!(decoder.parse_bytes(&[0xAB], PacketNumberLen::One).unwrap(), 0xAB);
+        assert_eq!(
+            decoder.parse_bytes(&[0xAB], PacketNumberLen::One).unwrap(),
+            0xAB
+        );
 
         // 2 bytes
         assert_eq!(
-            decoder.parse_bytes(&[0x12, 0x34], PacketNumberLen::Two).unwrap(),
+            decoder
+                .parse_bytes(&[0x12, 0x34], PacketNumberLen::Two)
+                .unwrap(),
             0x1234
         );
 
         // 3 bytes
         assert_eq!(
-            decoder.parse_bytes(&[0x12, 0x34, 0x56], PacketNumberLen::Three).unwrap(),
+            decoder
+                .parse_bytes(&[0x12, 0x34, 0x56], PacketNumberLen::Three)
+                .unwrap(),
             0x123456
         );
 
         // 4 bytes
         assert_eq!(
-            decoder.parse_bytes(&[0x12, 0x34, 0x56, 0x78], PacketNumberLen::Four).unwrap(),
+            decoder
+                .parse_bytes(&[0x12, 0x34, 0x56, 0x78], PacketNumberLen::Four)
+                .unwrap(),
             0x12345678
         );
     }
@@ -375,8 +357,12 @@ mod tests {
 
         assert!(decoder.parse_bytes(&[], PacketNumberLen::One).is_err());
         assert!(decoder.parse_bytes(&[0x00], PacketNumberLen::Two).is_err());
-        assert!(decoder.parse_bytes(&[0x00, 0x00], PacketNumberLen::Three).is_err());
-        assert!(decoder.parse_bytes(&[0x00, 0x00, 0x00], PacketNumberLen::Four).is_err());
+        assert!(decoder
+            .parse_bytes(&[0x00, 0x00], PacketNumberLen::Three)
+            .is_err());
+        assert!(decoder
+            .parse_bytes(&[0x00, 0x00, 0x00], PacketNumberLen::Four)
+            .is_err());
     }
 
     #[test]
@@ -425,12 +411,7 @@ mod tests {
         let decoder = DefaultPacketNumberDecoder;
 
         // Test roundtrip encoding and decoding
-        let test_cases = vec![
-            (100, 50),
-            (1000, 900),
-            (65536, 65000),
-            (1000000, 999000),
-        ];
+        let test_cases = vec![(100, 50), (1000, 900), (65536, 65000), (1000000, 999000)];
 
         for (full_pn, largest_acked) in test_cases {
             let len = encoder.compute_length(full_pn, largest_acked);
@@ -440,7 +421,11 @@ mod tests {
             let truncated_pn = decoder.parse_bytes(&buf, len).unwrap();
             let decoded_pn = decoder.decode(largest_acked, truncated_pn, len.len() * 8);
 
-            assert_eq!(decoded_pn, full_pn, "Failed for full_pn={}, largest_acked={}", full_pn, largest_acked);
+            assert_eq!(
+                decoded_pn, full_pn,
+                "Failed for full_pn={}, largest_acked={}",
+                full_pn, largest_acked
+            );
         }
     }
 

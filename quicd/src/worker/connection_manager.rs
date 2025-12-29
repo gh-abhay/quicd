@@ -11,17 +11,21 @@
 //! - Connection IDs map to SlabIndex for routing
 //! - Predictable memory footprint
 
-use bytes::{Bytes, BytesMut};
 use crate::netio::buffer::WorkerBuffer;
-use crate::routing::{RoutingConnectionIdGenerator, current_generation};
+use crate::routing::{current_generation, RoutingConnectionIdGenerator};
+use bytes::{Bytes, BytesMut};
 use crossbeam_channel::Sender as CrossbeamSender;
-use quicd_quic::{ConnectionConfig, Packet, PacketType, VERSION_1, Side, QuicConnection, DatagramInput};
-use quicd_quic::{Connection, ConnectionEvent, ConnectionState as QuicConnectionState, StreamId as QuicStreamId};
-use quicd_quic::cid::{ConnectionIdGenerator, ConnectionId};
+use quicd_quic::cid::{ConnectionId, ConnectionIdGenerator};
 use quicd_quic::crypto::CryptoLevel;
 use quicd_quic::types::{Instant as QuicInstant, StreamDirection};
-use quicd_x::{ConnectionHandle, Event, Command, StreamId as XStreamId};
+use quicd_quic::{
+    Connection, ConnectionEvent, ConnectionState as QuicConnectionState, StreamId as QuicStreamId,
+};
+use quicd_quic::{
+    ConnectionConfig, DatagramInput, Packet, PacketType, QuicConnection, Side, VERSION_1,
+};
 use quicd_x::ConnectionId as XConnectionId;
+use quicd_x::{Command, ConnectionHandle, Event, StreamId as XStreamId};
 use slab::Slab;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -29,7 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn, debug, trace};
+use tracing::{debug, error, info, trace, warn};
 
 /// Default maximum concurrent connections per worker.
 /// This provides predictable memory usage: ~100MB per worker for 100k connections.
@@ -43,31 +47,31 @@ pub struct ConnectionManager {
     /// Pre-allocated Slab for connection storage.
     /// Zero allocation on hot path - connections reuse slots.
     connections: Slab<ConnectionState>,
-    
+
     /// Mapping from DCID to Slab index for packet routing.
     /// Multiple DCIDs can map to same connection (CID rotation).
     dcid_to_slab: HashMap<ConnectionId, SlabIndex>,
-    
+
     /// Mapping from SCID to Slab index for egress command routing.
     scid_to_slab: HashMap<ConnectionId, SlabIndex>,
-    
+
     /// Configuration for new connections.
     config: ConnectionConfig,
 
     /// Tokio runtime handle for spawning application tasks.
     tokio_handle: TokioHandle,
-    
+
     /// Worker egress channel sender (unbounded, cloned for each connection).
     egress_tx: CrossbeamSender<Command>,
-    
+
     /// CID generator for this worker (with routing cookie).
     cid_generator: Arc<dyn ConnectionIdGenerator>,
-    
+
     worker_id: u8,
-    
+
     /// Application registry for ALPN-based routing.
     app_registry: Arc<crate::apps::AppRegistry>,
-    
+
     /// DDoS protection: Rate limiting for Version Negotiation packets.
     /// Maps source address to (count, window_start_time).
     /// RFC 9000 Section 5.2.2: "A server MAY limit the number of Version Negotiation packets it sends."
@@ -78,31 +82,31 @@ pub struct ConnectionManager {
 struct ConnectionState {
     /// The QUIC connection state machine.
     conn: QuicConnection,
-    
+
     /// Remote peer address.
     peer_addr: SocketAddr,
-    
+
     /// Ingress channel sender for events to application task (bounded tokio::mpsc).
     ingress_tx: mpsc::Sender<Event>,
-    
+
     /// Ingress channel receiver (stored until app spawned).
     ingress_rx: Option<mpsc::Receiver<Event>>,
-    
+
     /// Has the application task been spawned?
     app_spawned: bool,
-    
+
     /// Set of streams for which we've sent StreamOpened events.
     notified_streams: HashSet<QuicStreamId>,
-    
+
     /// Length of the server's local Connection ID (DCID for incoming packets).
     /// Used for parsing Short header packets which don't include DCID length.
     dcid_len: usize,
-    
+
     /// Buffer for 1-RTT packets that arrive before OneRtt keys are available.
     /// RFC 9001 Section 4.1.1: Implementations SHOULD buffer these packets.
     /// Store original bytes so we can apply header protection removal later.
     buffered_1rtt_packets: Vec<(Bytes, usize, Instant)>, // (packet_bytes, datagram_size, arrival_time)
-    
+
     /// Backpressure flag: true when ingress channel is full.
     /// When true, QUIC flow control should stop reading data.
     /// This implements asymmetric backpressure: bounded ingress for memory safety.
@@ -121,17 +125,17 @@ impl ConnectionManager {
             worker_id,
             current_generation(),
         ));
-        
+
         // Pre-allocate Slab with capacity for predictable memory usage.
         // This avoids reallocation on hot path.
         let connections = Slab::with_capacity(DEFAULT_MAX_CONNECTIONS_PER_WORKER);
-        
+
         info!(
             worker_id,
             max_connections = DEFAULT_MAX_CONNECTIONS_PER_WORKER,
             "Initialized ConnectionManager with Slab storage"
         );
-        
+
         Self {
             connections,
             dcid_to_slab: HashMap::new(),
@@ -145,43 +149,43 @@ impl ConnectionManager {
             vn_rate_limiter: HashMap::new(),
         }
     }
-    
+
     /// Get a connection by Slab index.
     fn get_connection(&self, slab_idx: SlabIndex) -> Option<&ConnectionState> {
         self.connections.get(slab_idx)
     }
-    
+
     /// Get a mutable connection by Slab index.
     fn get_connection_mut(&mut self, slab_idx: SlabIndex) -> Option<&mut ConnectionState> {
         self.connections.get_mut(slab_idx)
     }
-    
+
     /// Find Slab index by DCID (for incoming packets).
     fn find_by_dcid(&self, dcid: &ConnectionId) -> Option<SlabIndex> {
         self.dcid_to_slab.get(dcid).copied()
     }
-    
+
     /// Find Slab index by SCID (for egress commands).
     fn find_by_scid(&self, scid: &ConnectionId) -> Option<SlabIndex> {
         self.scid_to_slab.get(scid).copied()
     }
-    
+
     /// Remove a connection from the Slab and clean up all mappings.
     fn remove_connection(&mut self, slab_idx: SlabIndex) {
         if let Some(state) = self.connections.get(slab_idx) {
             // Get the SCID before removing
             let scid = state.conn.source_cid().clone();
-            
+
             // Remove all DCID mappings for this connection
             self.dcid_to_slab.retain(|_, &mut idx| idx != slab_idx);
-            
+
             // Remove SCID mapping
             self.scid_to_slab.remove(&scid);
         }
-        
+
         // Remove from Slab (slot will be reused)
         self.connections.remove(slab_idx);
-        
+
         debug!(
             worker_id = self.worker_id,
             slab_idx,
@@ -189,9 +193,9 @@ impl ConnectionManager {
             "Removed connection from Slab"
         );
     }
-    
+
     /// Insert a new connection into the Slab and register all CID mappings.
-    /// 
+    ///
     /// Registers 3 CIDs to handle all routing scenarios:
     /// 1. original_dcid: Client's Initial packet DCID (for Initial retransmissions)
     /// 2. dcid: Client's SCID (where client wants to receive packets)
@@ -213,48 +217,48 @@ impl ConnectionManager {
             );
             return None;
         }
-        
+
         // Insert into Slab
         let slab_idx = self.connections.insert(state);
-        
+
         // RFC 9000 §7.2: Register all 3 CIDs for proper routing:
-        
+
         // 1. Original DCID from client's Initial packet
         //    Allows client to retransmit Initial packets (before receiving server response)
         if !original_dcid.as_bytes().is_empty() {
             self.dcid_to_slab.insert(original_dcid, slab_idx);
         }
-        
+
         // 2. Client's SCID (where client wants to receive packets)
         //    This is what server uses as DCID when sending to client
         //    Skip if zero-length (RFC 9000 §5.1 allows zero-length CIDs)
         if !dcid.as_bytes().is_empty() {
             self.dcid_to_slab.insert(dcid, slab_idx);
         }
-        
+
         // 3. Server's SCID (where server wants to receive packets)
         //    Client will use this as DCID in subsequent packets after receiving server response
         self.dcid_to_slab.insert(scid.clone(), slab_idx);
-        
+
         // Also register SCID mapping for egress command routing
         self.scid_to_slab.insert(scid, slab_idx);
-        
+
         debug!(
             worker_id = self.worker_id,
             slab_idx,
             active_connections = self.connections.len(),
             "Inserted new connection into Slab"
         );
-        
+
         Some(slab_idx)
     }
-    
+
     /// Convert std::time::Instant to quicd_quic::types::Instant
     fn to_quic_instant(instant: Instant) -> QuicInstant {
         let nanos = instant.elapsed().as_nanos() as u64;
         QuicInstant::from_nanos(nanos)
     }
-    
+
     /// Helper to match ConnectionId from quicd-x to QUIC ConnectionId
     fn matches_conn_id(scid: &ConnectionId, conn_id: XConnectionId) -> bool {
         // Convert first 8 bytes of ConnectionId to u64 for comparison
@@ -265,28 +269,33 @@ impl ConnectionManager {
         let scid_u64 = u64::from_le_bytes(bytes);
         scid_u64 == conn_id.0
     }
-    
-    pub fn handle_packet(&mut self, buffer: WorkerBuffer, peer_addr: SocketAddr, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+
+    pub fn handle_packet(
+        &mut self,
+        buffer: WorkerBuffer,
+        peer_addr: SocketAddr,
+        now: Instant,
+    ) -> Vec<(SocketAddr, Vec<u8>)> {
         let datagram_size = buffer.len();
-        
+
         // Parse packet from buffer
         let bytes = Bytes::copy_from_slice(&buffer);
-        
+
         // Try to determine DCID length for Short packets
         // Short packets don't encode DCID length, so we need to extract it from the first byte
         let first_byte = bytes[0];
         let is_long_header = (first_byte & 0x80) != 0;
-        
+
         // For Short packets, we need to find the connection first to get DCID length
         let mut parse_context = quicd_quic::packet::ParseContext::default();
-        
+
         if !is_long_header {
             // Short packet - need to find connection by trying different DCID lengths
             // Start with common lengths: 20 bytes (our default), then 8 bytes
             let possible_lens = [20, 8, 16, 12, 4];
             for &len in &possible_lens {
                 if bytes.len() > 1 + len {
-                    if let Some(dcid) = ConnectionId::from_slice(&bytes[1..1+len]) {
+                    if let Some(dcid) = ConnectionId::from_slice(&bytes[1..1 + len]) {
                         if let Some(slab_idx) = self.find_by_dcid(&dcid) {
                             parse_context = quicd_quic::packet::ParseContext::with_dcid_len(len);
                             break;
@@ -295,21 +304,21 @@ impl ConnectionManager {
                 }
             }
         }
-        
+
         let packet = match quicd_quic::Packet::parse_with_context(bytes.clone(), parse_context) {
-             Ok(p) => p,
-             Err(e) => {
-                 error!("Failed to parse packet: {}", e);
-                 return vec![];
-             }
+            Ok(p) => p,
+            Err(e) => {
+                error!("Failed to parse packet: {}", e);
+                return vec![];
+            }
         };
 
         let dcid = packet.header.dcid.clone();
-        
+
         // ========================================================================
         // RFC 8999 Section 6 + RFC 9000 Section 5.2.2: Version Negotiation
         // ========================================================================
-        // 
+        //
         // "If a server receives a packet that indicates an unsupported version
         // and if the packet is large enough to initiate a new connection for
         // any supported version, the server SHOULD send a Version Negotiation
@@ -320,45 +329,56 @@ impl ConnectionManager {
         // - Short header packets do not have version field (RFC 8999 Section 5.2)
         // - Version Negotiation packets MUST NOT trigger VN response (prevent loops)
         //
-        if matches!(packet.header.ty, PacketType::Initial | PacketType::ZeroRtt | 
-                    PacketType::Handshake | PacketType::Retry) {
-            
+        if matches!(
+            packet.header.ty,
+            PacketType::Initial | PacketType::ZeroRtt | PacketType::Handshake | PacketType::Retry
+        ) {
             // Check if version is supported
             if packet.header.version != VERSION_1 {
-                debug!("Received packet with unsupported version: 0x{:08X} from {}", 
-                       packet.header.version, peer_addr);
-                
-                // RFC 9000 Section 14.1: "A server MUST discard an Initial packet that 
-                // is carried in a UDP datagram with a payload that is smaller than the 
+                debug!(
+                    "Received packet with unsupported version: 0x{:08X} from {}",
+                    packet.header.version, peer_addr
+                );
+
+                // RFC 9000 Section 14.1: "A server MUST discard an Initial packet that
+                // is carried in a UDP datagram with a payload that is smaller than the
                 // smallest allowed maximum datagram size of 1200 bytes."
                 //
                 // "Servers MUST drop smaller packets that specify unsupported versions."
                 if datagram_size < 1200 {
-                    debug!("Dropping undersized packet ({} bytes) with unsupported version from {}", 
-                           datagram_size, peer_addr);
+                    debug!(
+                        "Dropping undersized packet ({} bytes) with unsupported version from {}",
+                        datagram_size, peer_addr
+                    );
                     return vec![];
                 }
-                
+
                 // DDoS protection: Rate limit Version Negotiation packets
-                // RFC 9000 Section 5.2.2: "A server MAY limit the number of Version 
+                // RFC 9000 Section 5.2.2: "A server MAY limit the number of Version
                 // Negotiation packets it sends."
                 if !self.should_send_version_negotiation(peer_addr, now) {
                     warn!("Rate limiting Version Negotiation packet to {}", peer_addr);
                     return vec![];
                 }
-                
+
                 // Generate and send Version Negotiation packet
                 // RFC 9000 Section 17.2.1: Echo CIDs correctly
                 let vn_packet = Packet::create_version_negotiation(
                     packet.header.dcid.clone(),
-                    packet.header.scid.clone().unwrap_or_else(ConnectionId::empty),
+                    packet
+                        .header
+                        .scid
+                        .clone()
+                        .unwrap_or_else(ConnectionId::empty),
                     vec![VERSION_1], // List of supported versions
                 );
-                
+
                 match vn_packet.serialize() {
                     Ok(serialized) => {
-                        info!("Sent Version Negotiation packet to {} (unsupported version 0x{:08X})", 
-                              peer_addr, packet.header.version);
+                        info!(
+                            "Sent Version Negotiation packet to {} (unsupported version 0x{:08X})",
+                            peer_addr, packet.header.version
+                        );
                         return vec![(peer_addr, serialized.to_vec())];
                     }
                     Err(e) => {
@@ -368,10 +388,13 @@ impl ConnectionManager {
                 }
             }
         }
-        
+
         // Check if existing connection
         if let Some(slab_idx) = self.find_by_dcid(&dcid) {
-            eprintln!("DEBUG: Found existing connection by DCID: dcid={:?}, slab_idx={}", dcid, slab_idx);
+            eprintln!(
+                "DEBUG: Found existing connection by DCID: dcid={:?}, slab_idx={}",
+                dcid, slab_idx
+            );
             if let Some(state) = self.get_connection_mut(slab_idx) {
                 // RFC 9001 Section 5.4: Remove header protection BEFORE decryption
                 // Determine encryption level from packet type
@@ -380,29 +403,41 @@ impl ConnectionManager {
                     PacketType::Handshake => quicd_quic::crypto::CryptoLevel::Handshake,
                     PacketType::OneRtt => quicd_quic::crypto::CryptoLevel::OneRTT,
                     _ => {
-                        error!("Unsupported packet type for existing connection: {:?}", packet.header.ty);
+                        error!(
+                            "Unsupported packet type for existing connection: {:?}",
+                            packet.header.ty
+                        );
                         return vec![];
                     }
                 };
-                
+
                 // RFC 9001 Section 5.7: Server MUST NOT process 1-RTT packets before handshake complete
                 // Even if 1-RTT keys are available, buffer until handshake completes
-                if encryption_level == quicd_quic::crypto::CryptoLevel::OneRTT && state.conn.state() == QuicConnectionState::Handshaking {
+                if encryption_level == quicd_quic::crypto::CryptoLevel::OneRTT
+                    && state.conn.state() == QuicConnectionState::Handshaking
+                {
                     const MAX_BUFFERED_PACKETS: usize = 10;
                     if state.buffered_1rtt_packets.len() < MAX_BUFFERED_PACKETS {
-                        debug!("Buffering 1-RTT packet (handshake not complete): buffer_size={}",
-                               state.buffered_1rtt_packets.len() + 1);
-                        state.buffered_1rtt_packets.push((bytes.clone(), datagram_size, now));
+                        debug!(
+                            "Buffering 1-RTT packet (handshake not complete): buffer_size={}",
+                            state.buffered_1rtt_packets.len() + 1
+                        );
+                        state
+                            .buffered_1rtt_packets
+                            .push((bytes.clone(), datagram_size, now));
                     } else {
-                        warn!("Dropping 1-RTT packet - buffer full ({} packets)", MAX_BUFFERED_PACKETS);
+                        warn!(
+                            "Dropping 1-RTT packet - buffer full ({} packets)",
+                            MAX_BUFFERED_PACKETS
+                        );
                     }
                     return vec![];
                 }
-                
+
                 // Get HP key from the connection's TLS session
                 // Header protection removal is handled internally by QuicConnection
                 // during process_datagram() - it parses, decrypts, and processes frames
-                
+
                 // Process packet using Connection trait with DatagramInput
                 let datagram_input = DatagramInput {
                     data: bytes.clone(),
@@ -411,46 +446,52 @@ impl ConnectionManager {
                 if let Err(e) = state.conn.process_datagram(datagram_input) {
                     error!("Connection error: {}", e);
                 }
-                
+
                 self.flush_events_to_app(slab_idx);
-                
+
                 let mut packets = self.generate_packets(slab_idx, now);
                 self.check_handshake_complete(slab_idx);
-                
+
                 // Process buffered 1-RTT packets if keys are now available
                 packets.extend(self.process_buffered_packets(slab_idx, now));
-                
+
                 return packets;
             }
         }
-        
+
         // New connection with supported version
         if packet.header.ty == PacketType::Initial {
             eprintln!("DEBUG: No existing connection found for DCID: {:?}", dcid);
-            eprintln!("DEBUG: Received Initial packet: version=0x{:08X}, dcid={:?}, size={}", 
-                     packet.header.version, packet.header.dcid, datagram_size);
+            eprintln!(
+                "DEBUG: Received Initial packet: version=0x{:08X}, dcid={:?}, size={}",
+                packet.header.version, packet.header.dcid, datagram_size
+            );
             // RFC 9000 Section 14.1: Validate minimum datagram size for Initial packets
             if datagram_size < 1200 {
-                eprintln!("DEBUG: Dropping undersized Initial packet ({} bytes) from {}", 
-                       datagram_size, peer_addr);
-                debug!("Dropping undersized Initial packet ({} bytes) from {}", 
-                       datagram_size, peer_addr);
+                eprintln!(
+                    "DEBUG: Dropping undersized Initial packet ({} bytes) from {}",
+                    datagram_size, peer_addr
+                );
+                debug!(
+                    "Dropping undersized Initial packet ({} bytes) from {}",
+                    datagram_size, peer_addr
+                );
                 return vec![];
             }
-            
+
             // RFC 9000: Server chooses its own CID length (1-20 bytes).
             // Use 20 bytes for maximum entropy, routing cookie, and SipHash protection.
             let scid = self.cid_generator.generate(20);
-            
+
             // RFC 9000 §7.2: Server MUST use client's SCID as DCID for sending packets
             // RFC 9000 §17.2: SCID can be zero-length (Some implementations use this)
-            let dcid = packet.header.scid.clone().unwrap_or_else(|| 
+            let dcid = packet.header.scid.clone().unwrap_or_else(|| {
                 ConnectionId::from_slice(&[]).expect("Empty CID should always be valid")
-            );
-            
+            });
+
             // RFC 9000 §18.2: original_destination_connection_id is the DCID from client's Initial
             let original_dcid = packet.header.dcid.clone();
-            
+
             eprintln!("DEBUG: Creating new connection: scid={:?}, dcid={:?} (client's SCID), original_dcid={:?} (client's DCID)", 
                      scid, dcid, original_dcid);
             // Create QUIC connection state machine
@@ -462,12 +503,12 @@ impl ConnectionManager {
                 Some(original_dcid.clone()),
                 self.config.clone(),
             );
-            
+
             // Create bounded tokio::mpsc channel for ingress (Worker → App)
             // Capacity of 64 provides backpressure when app is slow
             let (ingress_tx, ingress_rx) = mpsc::channel(64);
             let dcid_len = scid.len();
-            
+
             let state = ConnectionState {
                 conn,
                 peer_addr,
@@ -479,18 +520,23 @@ impl ConnectionManager {
                 buffered_1rtt_packets: Vec::new(),
                 ingress_backpressure: false,
             };
-            
+
             // INSERT INTO SLAB IMMEDIATELY - before processing packet
             // This allows Short packets arriving during processing to find the connection
             // Register all 3 CIDs: original_dcid, dcid (client's SCID), and scid (server's SCID)
-            let slab_idx = match self.insert_connection(original_dcid.clone(), dcid.clone(), scid.clone(), state) {
+            let slab_idx = match self.insert_connection(
+                original_dcid.clone(),
+                dcid.clone(),
+                scid.clone(),
+                state,
+            ) {
                 Some(idx) => idx,
                 None => {
                     error!("Failed to insert connection - Slab at capacity");
                     return vec![];
                 }
             };
-            
+
             // Now process the Initial packet
             if let Some(state) = self.get_connection_mut(slab_idx) {
                 eprintln!("DEBUG: Processing Initial packet");
@@ -507,91 +553,103 @@ impl ConnectionManager {
                 }
                 eprintln!("DEBUG: Initial packet processed successfully");
             }
-            
+
             eprintln!("DEBUG: Generating response packets");
             let packets = self.generate_packets(slab_idx, now);
             eprintln!("DEBUG: Generated {} response packets", packets.len());
             self.check_handshake_complete(slab_idx);
-            
+
             return packets;
         }
-        
+
         // Unknown connection - log and drop
-        warn!("Dropping packet for unknown connection: dcid={:?}, packet_type={:?}, from {}", 
-              dcid, packet.header.ty, peer_addr);
+        warn!(
+            "Dropping packet for unknown connection: dcid={:?}, packet_type={:?}, from {}",
+            dcid, packet.header.ty, peer_addr
+        );
         vec![]
     }
-    
+
     fn check_handshake_complete(&mut self, slab_idx: SlabIndex) {
         let mut should_spawn = false;
-        
+
         if let Some(state) = self.get_connection(slab_idx) {
             let is_handshake_complete = matches!(
                 state.conn.state(),
-                QuicConnectionState::Active | QuicConnectionState::Closing | QuicConnectionState::Draining
+                QuicConnectionState::Active
+                    | QuicConnectionState::Closing
+                    | QuicConnectionState::Draining
             );
             if is_handshake_complete && !state.app_spawned {
                 should_spawn = true;
             }
         }
-        
+
         if should_spawn {
             self.spawn_app(slab_idx);
         }
     }
-    
+
     fn spawn_app(&mut self, slab_idx: SlabIndex) {
         // Flush any pending events before spawning
         self.flush_events_to_app(slab_idx);
-        
+
         // Clone shared resources before borrowing state
         let egress_tx = self.egress_tx.clone();
         let app_registry = self.app_registry.clone();
         let tokio_handle = self.tokio_handle.clone();
-        
+
         if let Some(state) = self.get_connection_mut(slab_idx) {
             let scid = state.conn.source_cid().clone();
             if let Some(rx) = state.ingress_rx.take() {
                 state.app_spawned = true;
-                
+
                 // Convert SCID to u64 (take first 8 bytes)
                 let mut bytes = [0u8; 8];
                 let scid_bytes = scid.as_bytes();
                 let len = std::cmp::min(scid_bytes.len(), 8);
                 bytes[..len].copy_from_slice(&scid_bytes[..len]);
                 let conn_id_u64 = u64::from_le_bytes(bytes);
-                
-                let handle = ConnectionHandle::new(
-                    XConnectionId(conn_id_u64),
-                    rx,
-                    egress_tx,
-                    &tokio_handle,
-                );
-                
+
+                let handle =
+                    ConnectionHandle::new(XConnectionId(conn_id_u64), rx, egress_tx, &tokio_handle);
+
                 // Get negotiated ALPN from connection wrapper
                 let alpn = state.conn.negotiated_alpn();
                 // negotiated_alpn() returns Option<&[u8]>
-                
+
                 match alpn {
                     Some(alpn_bytes) => {
                         // Convert &[u8] to &str for lookup and display
                         let alpn_str = std::str::from_utf8(&alpn_bytes).unwrap_or("<invalid-utf8>");
-                        
+
                         // Look up application factory in registry
                         match app_registry.get(alpn_str) {
                             Some(factory) => {
                                 let app = factory();
-                                info!("Spawning application task for connection {} with ALPN: {}", conn_id_u64, alpn_str);
-                                
+                                info!(
+                                    "Spawning application task for connection {} with ALPN: {}",
+                                    conn_id_u64, alpn_str
+                                );
+
                                 // Spawn exactly ONE tokio task per connection
                                 tokio_handle.spawn(async move {
-                                    info!("✓ Application task STARTED for connection {}", conn_id_u64);
+                                    info!(
+                                        "✓ Application task STARTED for connection {}",
+                                        conn_id_u64
+                                    );
                                     app.on_connection(handle).await;
-                                    info!("✓ Application task COMPLETED for connection {}", conn_id_u64);
+                                    info!(
+                                        "✓ Application task COMPLETED for connection {}",
+                                        conn_id_u64
+                                    );
                                 });
                             }
                             None => {
-                                warn!("No application registered for ALPN: {} (connection {})", alpn_str, conn_id_u64);
+                                warn!(
+                                    "No application registered for ALPN: {} (connection {})",
+                                    alpn_str, conn_id_u64
+                                );
                             }
                         }
                     }
@@ -602,12 +660,12 @@ impl ConnectionManager {
             }
         }
     }
-    
+
     /// Bridge quicd-quic ConnectionEvent to quicd-x Event and send to application.
     ///
     /// This is the critical integration point between the QUIC protocol state machine
     /// and application tasks.
-    /// 
+    ///
     /// # Backpressure Handling
     /// Uses try_send on bounded tokio::mpsc channel. If channel is full:
     /// - Sets ingress_backpressure flag for this connection
@@ -626,15 +684,17 @@ impl ConnectionManager {
                 // Handshake complete is handled separately by spawning application
                 return false;
             }
-            
-            ConnectionEvent::StreamData { stream_id, data, fin } => {
-                Event::StreamData {
-                    stream_id: XStreamId(stream_id.0),
-                    data,
-                    fin,
-                }
-            }
-            
+
+            ConnectionEvent::StreamData {
+                stream_id,
+                data,
+                fin,
+            } => Event::StreamData {
+                stream_id: XStreamId(stream_id.0),
+                data,
+                fin,
+            },
+
             ConnectionEvent::StreamOpened { stream_id } => {
                 let is_bidirectional = (stream_id.0 & 0x2) == 0;
                 Event::StreamOpened {
@@ -642,38 +702,31 @@ impl ConnectionManager {
                     is_bidirectional,
                 }
             }
-            
-            ConnectionEvent::StreamFinished { stream_id } => {
-                Event::StreamData {
-                    stream_id: XStreamId(stream_id.0),
-                    data: Bytes::new(),
-                    fin: true,
-                }
-            }
-            
-            ConnectionEvent::StreamReset { stream_id, error_code } => {
-                Event::StreamReset {
-                    stream_id: XStreamId(stream_id.0),
-                    error_code,
-                }
-            }
-            
-            ConnectionEvent::DatagramReceived { data } => {
-                Event::DatagramReceived { data }
-            }
-            
-            ConnectionEvent::ConnectionClosing { error_code, reason } => {
-                Event::ConnectionClosing {
-                    error_code,
-                    reason: String::from_utf8_lossy(&reason).to_string(),
-                }
-            }
-            
-            ConnectionEvent::ConnectionClosed => {
-                Event::ConnectionClosed
-            }
+
+            ConnectionEvent::StreamFinished { stream_id } => Event::StreamData {
+                stream_id: XStreamId(stream_id.0),
+                data: Bytes::new(),
+                fin: true,
+            },
+
+            ConnectionEvent::StreamReset {
+                stream_id,
+                error_code,
+            } => Event::StreamReset {
+                stream_id: XStreamId(stream_id.0),
+                error_code,
+            },
+
+            ConnectionEvent::DatagramReceived { data } => Event::DatagramReceived { data },
+
+            ConnectionEvent::ConnectionClosing { error_code, reason } => Event::ConnectionClosing {
+                error_code,
+                reason: String::from_utf8_lossy(&reason).to_string(),
+            },
+
+            ConnectionEvent::ConnectionClosed => Event::ConnectionClosed,
         };
-        
+
         // Send event to application task via bounded tokio::mpsc channel
         // try_send returns immediately, providing backpressure if channel is full
         match ingress_tx.try_send(x_event) {
@@ -686,7 +739,7 @@ impl ConnectionManager {
                     }
                 }
                 false
-            },
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 // ═══════════════════════════════════════════════════════════════════
                 // BACKPRESSURE HANDLING (Asymmetric Channel Strategy)
@@ -722,7 +775,10 @@ impl ConnectionManager {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // Application task has terminated - close connection
-                debug!("Ingress channel closed for slab_idx={} - application task ended", slab_idx);
+                debug!(
+                    "Ingress channel closed for slab_idx={} - application task ended",
+                    slab_idx
+                );
                 if let Some(state) = self.get_connection_mut(slab_idx) {
                     state.conn.close(0x00, b"application terminated");
                 }
@@ -730,67 +786,74 @@ impl ConnectionManager {
             }
         }
     }
-    
+
     fn flush_events_to_app(&mut self, slab_idx: SlabIndex) {
         // Check backpressure flag first
-        let under_backpressure = self.get_connection(slab_idx)
+        let under_backpressure = self
+            .get_connection(slab_idx)
             .map(|s| s.ingress_backpressure)
             .unwrap_or(false);
-        
+
         if under_backpressure {
             // Don't poll events when under backpressure
             // This allows QUIC flow control to naturally throttle the sender
-            trace!("Skipping event flush for slab_idx={} (backpressure active)", slab_idx);
+            trace!(
+                "Skipping event flush for slab_idx={} (backpressure active)",
+                slab_idx
+            );
             return;
         }
-        
+
         if let Some(state) = self.get_connection_mut(slab_idx) {
             // Collect events to avoid borrow checker issues
             let mut events = Vec::new();
-            
+
             // Poll all pending events from the connection
             while let Some(event) = state.conn.poll_event() {
                 events.push(event);
             }
-            
+
             // Drop the mutable borrow before calling bridge_event_to_app
             drop(state);
-            
+
             // Now send events (bridge_event_to_app takes &mut self)
             for event in events {
                 let backpressure_applied = self.bridge_event_to_app(event, slab_idx);
-                
+
                 // If backpressure was applied, stop flushing events
                 // This prevents filling the channel and wasting CPU
                 if backpressure_applied {
-                    debug!("Backpressure applied for slab_idx={} - stopping event flush", slab_idx);
+                    debug!(
+                        "Backpressure applied for slab_idx={} - stopping event flush",
+                        slab_idx
+                    );
                     break;
                 }
             }
         }
     }
-    
+
     /// DDoS protection: Rate limit Version Negotiation packets.
-    /// 
+    ///
     /// RFC 9000 Section 5.2.2: \"A server MAY limit the number of Version Negotiation packets it sends.\"
-    /// 
+    ///
     /// Implements a sliding window rate limiter to prevent amplification attacks.
     /// Allows max 10 VN packets per source address per 1-second window.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `peer_addr` - Source address of the packet
     /// * `now` - Current timestamp
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// `true` if VN packet should be sent, `false` if rate limit exceeded
     fn should_send_version_negotiation(&mut self, peer_addr: SocketAddr, now: Instant) -> bool {
         const MAX_VN_PER_WINDOW: u32 = 10;
         const WINDOW_DURATION: Duration = Duration::from_secs(1);
-        
+
         let entry = self.vn_rate_limiter.entry(peer_addr).or_insert((0, now));
-        
+
         // Check if window has expired
         if now.duration_since(entry.1) > WINDOW_DURATION {
             // Reset window
@@ -806,21 +869,34 @@ impl ConnectionManager {
             false
         }
     }
-    
+
     pub fn handle_command(&mut self, cmd: Command) -> (Vec<(SocketAddr, Vec<u8>)>, Option<usize>) {
         let now = Instant::now();
-        
+
         match cmd {
-            Command::WriteStreamData { conn_id, stream_id, data, fin } => {
-                eprintln!("HANDLE_COMMAND: WriteStreamData conn_id={:?}, stream_id={:?}, len={}, fin={}", 
-                          conn_id, stream_id, data.len(), fin);
+            Command::WriteStreamData {
+                conn_id,
+                stream_id,
+                data,
+                fin,
+            } => {
+                eprintln!(
+                    "HANDLE_COMMAND: WriteStreamData conn_id={:?}, stream_id={:?}, len={}, fin={}",
+                    conn_id,
+                    stream_id,
+                    data.len(),
+                    fin
+                );
                 // Find connection by ID and write data to stream
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
                     eprintln!("HANDLE_COMMAND: Found connection at slab_idx={}", slab_idx);
                     if let Some(state) = self.get_connection_mut(slab_idx) {
                         let quic_stream_id = QuicStreamId(stream_id.0);
                         let data_len = data.len();
-                        eprintln!("HANDLE_COMMAND: Calling write_stream, data_len={}", data_len);
+                        eprintln!(
+                            "HANDLE_COMMAND: Calling write_stream, data_len={}",
+                            data_len
+                        );
                         if let Err(e) = state.conn.write_stream(quic_stream_id, data, fin) {
                             error!("Failed to write to stream {:?}: {}", stream_id, e);
                         } else {
@@ -830,7 +906,10 @@ impl ConnectionManager {
                     // Return empty packets and slab_idx to defer packet generation
                     return (Vec::new(), Some(slab_idx));
                 } else {
-                    eprintln!("HANDLE_COMMAND: Connection not found for conn_id={:?}", conn_id);
+                    eprintln!(
+                        "HANDLE_COMMAND: Connection not found for conn_id={:?}",
+                        conn_id
+                    );
                 }
             }
             Command::OpenBiStream { conn_id } => {
@@ -885,7 +964,11 @@ impl ConnectionManager {
                     return (packets, None);
                 }
             }
-            Command::CloseConnection { conn_id, error_code, reason } => {
+            Command::CloseConnection {
+                conn_id,
+                error_code,
+                reason,
+            } => {
                 // Graceful connection close via Connection trait
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
                     if let Some(state) = self.get_connection_mut(slab_idx) {
@@ -895,7 +978,11 @@ impl ConnectionManager {
                     return (packets, None);
                 }
             }
-            Command::ResetStream { conn_id, stream_id, error_code } => {
+            Command::ResetStream {
+                conn_id,
+                stream_id,
+                error_code,
+            } => {
                 // Reset stream via Connection trait
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
                     if let Some(state) = self.get_connection_mut(slab_idx) {
@@ -908,16 +995,26 @@ impl ConnectionManager {
                     return (packets, None);
                 }
             }
-            Command::StopSending { conn_id, stream_id, error_code } => {
+            Command::StopSending {
+                conn_id,
+                stream_id,
+                error_code,
+            } => {
                 // Stop sending on stream - for now just generate packets
                 // TODO: Implement proper STOP_SENDING frame handling in quicd-quic
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
-                    debug!("STOP_SENDING requested for stream {:?} with error {}", stream_id, error_code);
+                    debug!(
+                        "STOP_SENDING requested for stream {:?} with error {}",
+                        stream_id, error_code
+                    );
                     let packets = self.generate_packets(slab_idx, now);
                     return (packets, None);
                 }
             }
-            Command::AbortConnection { conn_id, error_code } => {
+            Command::AbortConnection {
+                conn_id,
+                error_code,
+            } => {
                 // Immediate connection abort using close()
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
                     if let Some(state) = self.get_connection_mut(slab_idx) {
@@ -927,12 +1024,20 @@ impl ConnectionManager {
                     return (packets, None);
                 }
             }
-            Command::StreamDataRead { conn_id, stream_id, len } => {
+            Command::StreamDataRead {
+                conn_id,
+                stream_id,
+                len,
+            } => {
                 // Flow control update - application has consumed data
                 // For now, just generate packets to send any pending MAX_STREAM_DATA frames
                 // TODO: Implement explicit flow control update in quicd-quic
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
-                    trace!("Application consumed {} bytes from stream {:?}", len, stream_id);
+                    trace!(
+                        "Application consumed {} bytes from stream {:?}",
+                        len,
+                        stream_id
+                    );
                     let packets = self.generate_packets(slab_idx, now);
                     return (packets, None);
                 }
@@ -940,7 +1045,7 @@ impl ConnectionManager {
         }
         (vec![], None)
     }
-    
+
     /// Helper to find Slab index by quicd_x ConnectionId.
     fn find_slab_by_app_conn_id(&self, conn_id: XConnectionId) -> Option<SlabIndex> {
         // Search through all connections in the Slab
@@ -952,14 +1057,14 @@ impl ConnectionManager {
             let len = std::cmp::min(scid_bytes.len(), 8);
             bytes[..len].copy_from_slice(&scid_bytes[..len]);
             let conn_id_u64 = u64::from_le_bytes(bytes);
-            
+
             if conn_id_u64 == conn_id.0 {
                 return Some(slab_idx);
             }
         }
         None
     }
-    
+
     /// Calculate next timeout deadline across all connections.
     /// Returns the duration until the next connection needs timeout processing.
     /// Used to set io_uring wait timeout for precise timer handling.
@@ -969,7 +1074,7 @@ impl ConnectionManager {
     pub fn next_timeout(&self, now: Instant) -> Option<Duration> {
         let quic_now = Self::to_quic_instant(now);
         let mut earliest_deadline: Option<quicd_quic::types::Instant> = None;
-        
+
         for (_, state) in &self.connections {
             if let Some(timeout) = state.conn.next_timeout() {
                 earliest_deadline = Some(match earliest_deadline {
@@ -984,7 +1089,7 @@ impl ConnectionManager {
                 });
             }
         }
-        
+
         // Convert quicd_quic::types::Instant to Duration from now
         if let Some(deadline) = earliest_deadline {
             if deadline > quic_now {
@@ -999,17 +1104,17 @@ impl ConnectionManager {
                 return Some(Duration::ZERO);
             }
         }
-        
+
         None
     }
-    
+
     pub fn poll_timeouts(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
         let mut responses = Vec::new();
         let now = Instant::now();
         let quic_now = Self::to_quic_instant(now);
         let mut to_close = Vec::new();
         let mut need_packets = Vec::new(); // Collect Slab indices that need packet generation
-        
+
         // RFC 9002 Section 6: Loss Detection and Congestion Control
         // Check each connection for timeouts using Connection::next_timeout()
         for (slab_idx, state) in &mut self.connections {
@@ -1023,12 +1128,12 @@ impl ConnectionManager {
                         to_close.push(slab_idx);
                         continue;
                     }
-                    
+
                     // Timeout processing may generate packets to send
                     need_packets.push(slab_idx);
                 }
             }
-            
+
             // RFC 9000 Section 10.1: Idle Timeout
             // Check connection state for idle timeout or closing state
             use quicd_quic::connection::ConnectionState as QuicState;
@@ -1041,31 +1146,35 @@ impl ConnectionManager {
                 }
             }
         }
-        
+
         // Generate packets for connections that need it
         for slab_idx in need_packets {
             let pkts = self.generate_packets(slab_idx, now);
             responses.extend(pkts);
         }
-        
+
         // Remove closed connections and clean up resources
         for slab_idx in to_close {
             if let Some(state) = self.get_connection(slab_idx) {
                 // Notify application task that connection is closed
                 let _ = state.ingress_tx.try_send(Event::ConnectionClosed);
             }
-            
+
             // Remove from Slab (also cleans up CID mappings)
             self.remove_connection(slab_idx);
         }
-        
+
         responses
     }
-    
-    pub fn generate_packets(&mut self, slab_idx: SlabIndex, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+
+    pub fn generate_packets(
+        &mut self,
+        slab_idx: SlabIndex,
+        now: Instant,
+    ) -> Vec<(SocketAddr, Vec<u8>)> {
         if let Some(state) = self.get_connection_mut(slab_idx) {
             let mut out = Vec::new();
-            
+
             // Poll packets from the Connection trait using poll_send()
             // Connection internally manages packet generation and serialization
             loop {
@@ -1082,17 +1191,21 @@ impl ConnectionManager {
                     }
                 }
             }
-            
+
             return out;
         }
         vec![]
     }
-    
+
     /// Process buffered 1-RTT packets once keys become available.
     ///
     /// RFC 9001 Section 4.1.1: Implementations SHOULD buffer packets that might be
     /// reordered on the wire, and SHOULD process them once the necessary keys are available.
-    fn process_buffered_packets(&mut self, slab_idx: SlabIndex, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+    fn process_buffered_packets(
+        &mut self,
+        slab_idx: SlabIndex,
+        now: Instant,
+    ) -> Vec<(SocketAddr, Vec<u8>)> {
         // RFC 9001 Section 5.7: Process buffered 1-RTT packets only after handshake is COMPLETE
         // First, check if we need to process buffered packets
         let (should_process, buffered) = {
@@ -1100,40 +1213,46 @@ impl ConnectionManager {
                 // Check if handshake is complete (not just if keys are available)
                 let is_handshake_complete = matches!(
                     state.conn.state(),
-                    QuicConnectionState::Active | QuicConnectionState::Closing | QuicConnectionState::Draining
+                    QuicConnectionState::Active
+                        | QuicConnectionState::Closing
+                        | QuicConnectionState::Draining
                 );
                 if !is_handshake_complete {
                     return vec![];
                 }
-                
+
                 // Take buffered packets (move out of state)
                 let buffered = std::mem::take(&mut state.buffered_1rtt_packets);
-                
+
                 if buffered.is_empty() {
                     return vec![];
                 }
-                
-                info!("Processing {} buffered 1-RTT packets for connection slab_idx={}", buffered.len(), slab_idx);
+
+                info!(
+                    "Processing {} buffered 1-RTT packets for connection slab_idx={}",
+                    buffered.len(),
+                    slab_idx
+                );
                 (true, buffered)
             } else {
                 return vec![];
             }
         };
-        
+
         if !should_process {
             return vec![];
         }
-        
+
         // Now process each buffered packet (state borrow dropped)
         let mut all_outgoing = Vec::new();
-        
+
         for (packet_bytes, _datagram_size, arrival_time) in buffered {
             // Get state again for each packet (fresh borrow)
             let state = match self.get_connection_mut(slab_idx) {
                 Some(s) => s,
                 None => break,
             };
-            
+
             // Process the buffered datagram (convert arrival_time to quicd_quic::Instant)
             let quic_arrival_time = Self::to_quic_instant(arrival_time);
             let timeout_datagram = DatagramInput {
@@ -1144,16 +1263,16 @@ impl ConnectionManager {
                 error!("Error processing buffered packet: {}", e);
                 continue;
             }
-            
+
             // Drop state borrow before calling other self methods
             drop(state);
-            
+
             // Flush events and generate responses
             self.flush_events_to_app(slab_idx);
             let outgoing = self.generate_packets(slab_idx, now);
             all_outgoing.extend(outgoing);
         }
-        
+
         all_outgoing
     }
 }

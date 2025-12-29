@@ -17,52 +17,52 @@ use core::fmt;
 pub enum TransportError {
     /// No error (0x00) - Used for graceful shutdown
     NoError = 0x00,
-    
+
     /// Internal Error (0x01) - Implementation error
     InternalError = 0x01,
-    
+
     /// Connection Refused (0x02) - Server refuses connection
     ConnectionRefused = 0x02,
-    
+
     /// Flow Control Error (0x03) - Peer exceeded flow control limits
     FlowControlError = 0x03,
-    
+
     /// Stream Limit Error (0x04) - Stream limit exceeded
     StreamLimitError = 0x04,
-    
+
     /// Stream State Error (0x05) - Frame received in invalid stream state
     StreamStateError = 0x05,
-    
+
     /// Final Size Error (0x06) - Final size violation
     FinalSizeError = 0x06,
-    
+
     /// Frame Encoding Error (0x07) - Frame encoding error
     FrameEncodingError = 0x07,
-    
+
     /// Transport Parameter Error (0x08) - Invalid transport parameters
     TransportParameterError = 0x08,
-    
+
     /// Connection ID Limit Error (0x09) - Connection ID limit exceeded
     ConnectionIdLimitError = 0x09,
-    
+
     /// Protocol Violation (0x0a) - Generic protocol violation
     ProtocolViolation = 0x0a,
-    
+
     /// Invalid Token (0x0b) - Invalid stateless reset token
     InvalidToken = 0x0b,
-    
+
     /// Application Error (0x0c) - Application closed connection
     ApplicationError = 0x0c,
-    
+
     /// Crypto Buffer Exceeded (0x0d) - CRYPTO data buffer overflowed
     CryptoBufferExceeded = 0x0d,
-    
+
     /// Key Update Error (0x0e) - Key update error
     KeyUpdateError = 0x0e,
-    
+
     /// AEAD Limit Reached (0x0f) - AEAD usage limit reached
     AeadLimitReached = 0x0f,
-    
+
     /// No Viable Path (0x10) - No viable network path
     NoViablePath = 0x10,
 }
@@ -92,37 +92,37 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub enum Error {
     /// Transport-level protocol error
     Transport(TransportError),
-    
+
     /// Application-level error
     Application(ApplicationError),
-    
+
     /// Cryptographic error (TLS alert)
     Crypto(CryptoError),
-    
+
     /// Buffer too small for operation
     BufferTooSmall,
-    
+
     /// Invalid input data
     InvalidInput,
-    
+
     /// Operation would block (needs more data)
     WouldBlock,
-    
+
     /// Connection is closed
     ConnectionClosed,
-    
+
     /// Stream does not exist
     StreamNotFound,
-    
+
     /// Malformed packet
     MalformedPacket,
-    
+
     /// Unsupported QUIC version
     UnsupportedVersion,
-    
+
     /// Invalid packet (RFC 8999 invariants violated)
     InvalidPacket,
-    
+
     /// Invalid transport parameter
     InvalidTransportParameter,
 }

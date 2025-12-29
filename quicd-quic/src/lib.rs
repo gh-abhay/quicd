@@ -207,21 +207,21 @@
 extern crate alloc;
 
 // Core types and error handling
-pub mod types;
 pub mod error;
+pub mod types;
 pub mod version;
 
 // Protocol layers
+pub mod crypto;
 pub mod frames;
 pub mod packet;
-pub mod crypto;
 pub mod tls;
 
 // Transport subsystems
-pub mod stream;
 pub mod flow_control;
-pub mod transport;
 pub mod recovery;
+pub mod stream;
+pub mod transport;
 
 // Connection management
 pub mod connection;
@@ -229,8 +229,8 @@ pub mod server;
 
 // Re-export commonly used types
 pub use types::{
-    ConnectionId, Instant, PacketNumber, PacketNumberSpace, Side, StreamId,
-    StreamOffset, VarInt, VarIntCodec, VARINT_MAX, StatelessResetToken,
+    ConnectionId, Instant, PacketNumber, PacketNumberSpace, Side, StatelessResetToken, StreamId,
+    StreamOffset, VarInt, VarIntCodec, VARINT_MAX,
 };
 
 pub use error::{ApplicationError, CryptoError, Error, Result, TransportError};
@@ -238,15 +238,26 @@ pub use error::{ApplicationError, CryptoError, Error, Result, TransportError};
 pub use version::{QuicVersion, VERSION_1, VERSION_NEGOTIATION};
 
 // Re-export primary traits for library consumers
-pub use connection::state::{Connection, ConnectionConfig, ConnectionEvent, ConnectionState, ConnectionStats, DatagramInput, DatagramOutput, QuicConnection};
-pub use crypto::backend::{AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, TlsSession, TlsEvent, KeySchedule};
+pub use connection::state::{
+    Connection, ConnectionConfig, ConnectionEvent, ConnectionState, ConnectionStats, DatagramInput,
+    DatagramOutput, QuicConnection,
+};
+pub use crypto::backend::{
+    AeadProvider, CryptoBackend, CryptoLevel, HeaderProtectionProvider, KeySchedule, TlsEvent,
+    TlsSession,
+};
+pub use frames::parse::{DefaultFrameParser, DefaultFrameSerializer, FrameSerializer};
 pub use frames::{Frame, FrameParser};
-pub use frames::parse::{FrameSerializer, DefaultFrameParser, DefaultFrameSerializer};
-pub use packet::header::{Header, HeaderForm, PacketType, LongHeader, ShortHeader, DefaultHeaderParser};
-pub use packet::types::{Token, ParsedPacket};
-pub use packet::api::{Packet, ParseContext, PacketHeaderWrapper};
+pub use packet::api::{Packet, PacketHeaderWrapper, ParseContext};
+pub use packet::header::{
+    DefaultHeaderParser, Header, HeaderForm, LongHeader, PacketType, ShortHeader,
+};
+pub use packet::number::{
+    DefaultPacketNumberDecoder, DefaultPacketNumberEncoder, PacketNumberDecoder,
+    PacketNumberEncoder, PacketNumberLen,
+};
 pub use packet::parser::PacketParser as PacketParserTrait;
-pub use packet::number::{PacketNumberLen, PacketNumberEncoder, PacketNumberDecoder, DefaultPacketNumberEncoder, DefaultPacketNumberDecoder};
+pub use packet::types::{ParsedPacket, Token};
 pub use recovery::{CongestionController, LossDetector, RttEstimator};
 pub use stream::{StreamController, StreamManager};
 pub use transport::TransportParameters;

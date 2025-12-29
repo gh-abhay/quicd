@@ -5,7 +5,9 @@
 #![forbid(unsafe_code)]
 
 use crate::error::{Error, Result, TransportError};
-use crate::types::{stream_id_helpers, Side, StreamDirection, StreamId, StreamInitiator, StreamOffset};
+use crate::types::{
+    stream_id_helpers, Side, StreamDirection, StreamId, StreamInitiator, StreamOffset,
+};
 use bytes::Bytes;
 
 /// Stream State (RFC 9000 Section 3)
@@ -64,7 +66,10 @@ impl StreamState {
     pub fn can_send(&self) -> bool {
         matches!(
             self,
-            StreamState::Open | StreamState::HalfClosedRemote | StreamState::Ready | StreamState::Send
+            StreamState::Open
+                | StreamState::HalfClosedRemote
+                | StreamState::Ready
+                | StreamState::Send
         )
     }
 
@@ -95,7 +100,11 @@ pub enum StreamEvent {
     Opened { stream_id: StreamId },
 
     /// Data available to read
-    DataAvailable { stream_id: StreamId, offset: StreamOffset, length: usize },
+    DataAvailable {
+        stream_id: StreamId,
+        offset: StreamOffset,
+        length: usize,
+    },
 
     /// Stream finished (FIN received)
     Finished { stream_id: StreamId },
@@ -108,7 +117,10 @@ pub enum StreamEvent {
     },
 
     /// Stream stopped by peer (STOP_SENDING)
-    Stopped { stream_id: StreamId, error_code: u64 },
+    Stopped {
+        stream_id: StreamId,
+        error_code: u64,
+    },
 
     /// Send side finished (all data ACKed)
     SendFinished { stream_id: StreamId },
@@ -129,12 +141,7 @@ pub trait StreamController: Send {
     /// Write data to stream
     ///
     /// **Zero-copy**: Accepts Bytes (reference-counted buffer).
-    fn write_stream(
-        &mut self,
-        stream_id: StreamId,
-        data: Bytes,
-        fin: bool,
-    ) -> Result<usize>;
+    fn write_stream(&mut self, stream_id: StreamId, data: Bytes, fin: bool) -> Result<usize>;
 
     /// Read data from stream
     ///

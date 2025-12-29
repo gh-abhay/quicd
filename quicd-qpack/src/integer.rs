@@ -50,7 +50,10 @@ const MAX_INTEGER: u64 = (1u64 << 62) - 1;
 /// assert_eq!(buf[0], 0b001_01010);
 /// ```
 pub fn encode(value: u64, prefix_bits: u8, prefix_mask: u8, buf: &mut [u8]) -> usize {
-    assert!(prefix_bits >= 1 && prefix_bits <= 8, "prefix_bits must be 1-8");
+    assert!(
+        prefix_bits >= 1 && prefix_bits <= 8,
+        "prefix_bits must be 1-8"
+    );
     assert!(value <= MAX_INTEGER, "value exceeds maximum");
     assert!(!buf.is_empty(), "buffer is empty");
 
@@ -140,7 +143,7 @@ pub fn decode(prefix_bits: u8, data: &[u8]) -> Result<(u64, usize)> {
         pos += 1;
 
         let byte_value = (byte & 0x7F) as u64;
-        
+
         // Check for overflow
         if shift >= 56 {
             // At shift >= 56, we can only accept values that don't overflow
@@ -151,11 +154,14 @@ pub fn decode(prefix_bits: u8, data: &[u8]) -> Result<(u64, usize)> {
             }
         }
 
-        value = value.checked_add(byte_value << shift)
+        value = value
+            .checked_add(byte_value << shift)
             .ok_or_else(|| Error::IntegerError("integer overflow".into()))?;
 
         if value > MAX_INTEGER {
-            return Err(Error::IntegerError("value exceeds maximum (2^62 - 1)".into()));
+            return Err(Error::IntegerError(
+                "value exceeds maximum (2^62 - 1)".into(),
+            ));
         }
 
         // Check if this is the last byte
@@ -181,7 +187,7 @@ mod tests {
     #[test]
     fn test_encode_decode_small() {
         let mut buf = [0u8; 10];
-        
+
         // Test values that fit in various prefix sizes
         for prefix_bits in 1..=8 {
             let max_prefix = (1u64 << prefix_bits) - 1;
@@ -199,16 +205,30 @@ mod tests {
     fn test_encode_decode_large() {
         let mut buf = [0u8; 20];
         let test_values = vec![
-            127, 128, 255, 256, 1337, 65535, 65536,
-            1_000_000, 100_000_000, (1u64 << 32) - 1,
-            1u64 << 32, (1u64 << 48) - 1, (1u64 << 62) - 1,
+            127,
+            128,
+            255,
+            256,
+            1337,
+            65535,
+            65536,
+            1_000_000,
+            100_000_000,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            (1u64 << 48) - 1,
+            (1u64 << 62) - 1,
         ];
 
         for &value in &test_values {
             for prefix_bits in 1..=8 {
                 let n = encode(value, prefix_bits, 0, &mut buf);
                 let (decoded, consumed) = decode(prefix_bits, &buf[..n]).unwrap();
-                assert_eq!(decoded, value, "failed for value {} with {} prefix bits", value, prefix_bits);
+                assert_eq!(
+                    decoded, value,
+                    "failed for value {} with {} prefix bits",
+                    value, prefix_bits
+                );
                 assert_eq!(consumed, n);
             }
         }
@@ -217,7 +237,7 @@ mod tests {
     #[test]
     fn test_encode_with_prefix_mask() {
         let mut buf = [0u8; 10];
-        
+
         // RFC 9204 example: 5-bit prefix with top 3 bits as 001
         let n = encode(10, 5, 0b001_00000, &mut buf);
         assert_eq!(n, 1);
@@ -242,9 +262,9 @@ mod tests {
         let mut buf = [0u8; 10];
         let n = encode(1337, 5, 0, &mut buf);
         assert_eq!(n, 3);
-        assert_eq!(buf[0], 31);  // 0x1F
+        assert_eq!(buf[0], 31); // 0x1F
         assert_eq!(buf[1], 154); // 0x9A (0x1A | 0x80)
-        assert_eq!(buf[2], 10);  // 0x0A
+        assert_eq!(buf[2], 10); // 0x0A
 
         let (value, consumed) = decode(5, &buf[..n]).unwrap();
         assert_eq!(value, 1337);
@@ -271,9 +291,7 @@ mod tests {
     #[test]
     fn test_overflow_detection() {
         // Try to decode an integer that would overflow 62 bits
-        let data = &[
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        ];
+        let data = &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         let result = decode(8, data);
         assert!(result.is_err());
     }

@@ -1,7 +1,7 @@
 // Integration tests for end-to-end QPACK encoding/decoding
 
-use quicd_qpack::{Decoder, Encoder, FieldLine};
 use bytes::Bytes;
+use quicd_qpack::{Decoder, Encoder, FieldLine};
 
 #[test]
 fn test_simple_request_headers() {
@@ -69,7 +69,7 @@ fn test_multiple_requests_with_dynamic_table() {
     for instruction in enc_instr2 {
         decoder.process_encoder_instruction(&instruction).unwrap();
     }
-    
+
     // Second encoding should be smaller due to dynamic table reuse
     // (This is a heuristic - exact sizes depend on encoding strategy)
     println!("First request: {} bytes", encoded1.len());
@@ -89,7 +89,7 @@ fn test_capacity_change() {
         FieldLine::new(Bytes::from("custom-header-1"), Bytes::from("value1")),
         FieldLine::new(Bytes::from("custom-header-2"), Bytes::from("value2")),
     ];
-    
+
     let (encoded, enc_instr) = encoder.encode_field_section(0, &headers).unwrap();
     for instruction in enc_instr {
         decoder.process_encoder_instruction(&instruction).unwrap();
@@ -98,13 +98,16 @@ fn test_capacity_change() {
 
     // Change capacity to smaller value (causes eviction)
     let cap_instruction = encoder.set_capacity(512).unwrap();
-    decoder.process_encoder_instruction(&cap_instruction).unwrap();
-    
+    decoder
+        .process_encoder_instruction(&cap_instruction)
+        .unwrap();
+
     // Send more headers after capacity change
-    let headers2 = vec![
-        FieldLine::new(Bytes::from("another-header"), Bytes::from("another-value")),
-    ];
-    
+    let headers2 = vec![FieldLine::new(
+        Bytes::from("another-header"),
+        Bytes::from("another-value"),
+    )];
+
     let (encoded2, enc_instr2) = encoder.encode_field_section(1, &headers2).unwrap();
     for instruction in enc_instr2 {
         decoder.process_encoder_instruction(&instruction).unwrap();
@@ -155,15 +158,13 @@ fn test_huffman_encoding_benefit() {
     ];
 
     let (encoded, _) = encoder.encode_field_section(0, &headers).unwrap();
-    
+
     // Calculate uncompressed size (names + values)
-    let uncompressed: usize = headers.iter()
-        .map(|h| h.name.len() + h.value.len())
-        .sum();
+    let uncompressed: usize = headers.iter().map(|h| h.name.len() + h.value.len()).sum();
 
     println!("Uncompressed: {} bytes", uncompressed);
     println!("Encoded: {} bytes", encoded.len());
-    
+
     // Huffman + indexing should provide some compression
     assert!(encoded.len() < uncompressed);
 }
@@ -189,7 +190,10 @@ fn test_special_characters_in_values() {
     let headers = vec![
         FieldLine::new(Bytes::from("x-test-1"), Bytes::from("value with spaces")),
         FieldLine::new(Bytes::from("x-test-2"), Bytes::from("value,with,commas")),
-        FieldLine::new(Bytes::from("x-test-3"), Bytes::from("value;with;semicolons")),
+        FieldLine::new(
+            Bytes::from("x-test-3"),
+            Bytes::from("value;with;semicolons"),
+        ),
         FieldLine::new(Bytes::from("x-test-4"), Bytes::from("value=with=equals")),
         FieldLine::new(Bytes::from("x-test-5"), Bytes::from("value\"with\"quotes")),
     ];
@@ -213,7 +217,7 @@ fn test_stream_cancellation() {
 
     // Acknowledge and cancel stream
     decoder.cancel_stream(5);
-    
+
     // Should not panic or error - cancellation is just cleanup
 }
 
@@ -223,15 +227,18 @@ fn test_concurrent_stream_encoding() {
     let mut decoder = Decoder::new(4096, 100);
 
     // Encode multiple streams
-    let headers1 = vec![
-        FieldLine::new(Bytes::from(":path"), Bytes::from("/stream1")),
-    ];
-    let headers2 = vec![
-        FieldLine::new(Bytes::from(":path"), Bytes::from("/stream2")),
-    ];
-    let headers3 = vec![
-        FieldLine::new(Bytes::from(":path"), Bytes::from("/stream3")),
-    ];
+    let headers1 = vec![FieldLine::new(
+        Bytes::from(":path"),
+        Bytes::from("/stream1"),
+    )];
+    let headers2 = vec![FieldLine::new(
+        Bytes::from(":path"),
+        Bytes::from("/stream2"),
+    )];
+    let headers3 = vec![FieldLine::new(
+        Bytes::from(":path"),
+        Bytes::from("/stream3"),
+    )];
 
     let (encoded1, enc_instr1) = encoder.encode_field_section(0, &headers1).unwrap();
     let (encoded2, enc_instr2) = encoder.encode_field_section(4, &headers2).unwrap();

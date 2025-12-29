@@ -7,7 +7,7 @@ use crate::{
     error::{Error, Result},
     field_line::FieldLine,
     instructions::{DecoderInstruction, EncoderInstruction},
-    {integer, huffman, static_table},
+    {huffman, integer, static_table},
 };
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
@@ -60,17 +60,14 @@ impl Encoder {
     ) -> Result<(Bytes, Vec<EncoderInstruction>)> {
         let mut encoder_instructions = Vec::new();
         let mut field_section = Vec::new();
-        
+
         let base = self.dynamic_table.insert_count();
         let mut required_insert_count = 0u64;
 
         // Encode each field
         for field in fields {
-            let (repr_bytes, new_ric) = self.encode_field_line(
-                field,
-                base,
-                &mut encoder_instructions,
-            )?;
+            let (repr_bytes, new_ric) =
+                self.encode_field_line(field, base, &mut encoder_instructions)?;
             field_section.extend_from_slice(&repr_bytes);
             required_insert_count = required_insert_count.max(new_ric);
         }
@@ -92,7 +89,12 @@ impl Encoder {
                     self.max_blocked_streams,
                 ));
             }
-            self.blocked_streams.insert(stream_id, StreamRef { required_insert_count });
+            self.blocked_streams.insert(
+                stream_id,
+                StreamRef {
+                    required_insert_count,
+                },
+            );
         }
 
         Ok((result.freeze(), encoder_instructions))
@@ -123,7 +125,10 @@ impl Encoder {
         // Try dynamic table (only use acknowledged entries)
         if self.known_received_count > 0 {
             // Check if we can reference dynamic table entries
-            for abs_idx in 0..self.known_received_count.min(self.dynamic_table.insert_count()) {
+            for abs_idx in 0..self
+                .known_received_count
+                .min(self.dynamic_table.insert_count())
+            {
                 if let Some(entry) = self.dynamic_table.get_absolute(abs_idx) {
                     if entry.name == field.name && entry.value == field.value {
                         // Found exact match in acknowledged dynamic table
@@ -149,10 +154,9 @@ impl Encoder {
         }
 
         // Try static table name match
-        let static_name_matches: Vec<_> = static_table::find_by_name(
-            &String::from_utf8_lossy(&field.name)
-        ).collect();
-        
+        let static_name_matches: Vec<_> =
+            static_table::find_by_name(&String::from_utf8_lossy(&field.name)).collect();
+
         if let Some((static_idx, _)) = static_name_matches.first() {
             // Literal with static name reference (01NT with T=1, N=Huffman for value)
             let mut temp = [0u8; 16];
@@ -160,7 +164,7 @@ impl Encoder {
             let n = integer::encode(*static_idx as u64, 4, pattern, &mut temp);
             buf.extend_from_slice(&temp[..n]);
             encode_string(&field.value, self.use_huffman, 8, 0x00, &mut buf);
-            
+
             // Opportunistically insert into dynamic table for future use
             if field.size() <= self.dynamic_table.capacity() / 4 {
                 let _ = self.dynamic_table.insert(field.clone());
@@ -171,7 +175,7 @@ impl Encoder {
                     huffman_value: self.use_huffman,
                 });
             }
-            
+
             return Ok((buf, 0));
         }
 
@@ -190,7 +194,7 @@ impl Encoder {
             buf.extend_from_slice(&temp[..n]);
             buf.extend_from_slice(&field.name);
         }
-        
+
         // Value uses standard string encoding with H bit at position 7
         encode_string(&field.value, self.use_huffman, 8, 0x00, &mut buf);
 
@@ -209,7 +213,12 @@ impl Encoder {
     }
 
     /// Encodes the field section prefix.
-    fn encode_prefix(&self, required_insert_count: u64, base: u64, buf: &mut Vec<u8>) -> Result<()> {
+    fn encode_prefix(
+        &self,
+        required_insert_count: u64,
+        base: u64,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
         // Calculate max entries
         let max_entries = if self.dynamic_table.capacity() == 0 {
             0
@@ -261,7 +270,7 @@ impl Encoder {
                 self.known_received_count += increment;
                 if self.known_received_count > self.dynamic_table.insert_count() {
                     return Err(Error::DecoderStreamError(
-                        "known received count exceeds insert count".into()
+                        "known received count exceeds insert count".into(),
                     ));
                 }
             }
@@ -277,20 +286,33 @@ impl Encoder {
     /// Sets a new dynamic table capacity.
     pub fn set_capacity(&mut self, capacity: usize) -> Result<EncoderInstruction> {
         self.dynamic_table.set_capacity(capacity)?;
-        Ok(EncoderInstruction::SetCapacity { capacity: capacity as u64 })
+        Ok(EncoderInstruction::SetCapacity {
+            capacity: capacity as u64,
+        })
     }
 }
 
 /// Encodes a string literal with Huffman encoding option.
-fn encode_string(data: &[u8], use_huffman: bool, prefix_bits: u8, prefix_mask: u8, buf: &mut Vec<u8>) {
+fn encode_string(
+    data: &[u8],
+    use_huffman: bool,
+    prefix_bits: u8,
+    prefix_mask: u8,
+    buf: &mut Vec<u8>,
+) {
     let huffman = use_huffman && huffman::encoded_size(data) < data.len();
-    
+
     if huffman {
         let mut encoded = Vec::new();
         huffman::encode(data, &mut encoded);
-        
+
         let mut temp = [0u8; 16];
-        let n = integer::encode(encoded.len() as u64, prefix_bits - 1, prefix_mask | 0x80, &mut temp);
+        let n = integer::encode(
+            encoded.len() as u64,
+            prefix_bits - 1,
+            prefix_mask | 0x80,
+            &mut temp,
+        );
         buf.extend_from_slice(&temp[..n]);
         buf.extend_from_slice(&encoded);
     } else {
@@ -327,9 +349,7 @@ mod tests {
     #[test]
     fn test_encode_literal() {
         let mut encoder = Encoder::new(4096, 100);
-        let fields = vec![
-            FieldLine::new("custom-header", "custom-value"),
-        ];
+        let fields = vec![FieldLine::new("custom-header", "custom-value")];
 
         let (encoded, _) = encoder.encode_field_section(0, &fields).unwrap();
         assert!(!encoded.is_empty());

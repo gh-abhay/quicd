@@ -67,18 +67,18 @@
 //! - [`encoder`]: QPACK encoder implementation
 //! - [`decoder`]: QPACK decoder implementation
 
-pub mod error;
-pub mod integer;
-pub mod huffman;
-pub mod static_table;
-pub mod dynamic_table;
-pub mod instructions;
-pub mod field_line;
-pub mod encoder;
 pub mod decoder;
+pub mod dynamic_table;
+pub mod encoder;
+pub mod error;
+pub mod field_line;
+pub mod huffman;
+pub mod instructions;
+pub mod integer;
+pub mod static_table;
 
 // Re-export main types for convenience
-pub use error::{Error, Result};
-pub use encoder::Encoder;
 pub use decoder::Decoder;
+pub use encoder::Encoder;
+pub use error::{Error, Result};
 pub use field_line::FieldLine;

@@ -197,10 +197,12 @@ impl ConnectionId {
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
-    
+
     /// Create an empty (zero-length) connection ID
     pub fn empty() -> Self {
-        Self { bytes: Bytes::new() }
+        Self {
+            bytes: Bytes::new(),
+        }
     }
 }
 
@@ -262,7 +264,7 @@ impl StreamId {
     pub fn new(id: u64) -> Self {
         Self(id)
     }
-    
+
     /// Get the raw value
     pub fn value(&self) -> u64 {
         self.0
@@ -277,12 +279,12 @@ impl StreamId {
     pub fn into_inner(self) -> u64 {
         self.0
     }
-    
+
     /// Check if this stream is bidirectional
     pub fn is_bidirectional(&self) -> bool {
         (self.0 & 0x02) == 0
     }
-    
+
     /// Check if this stream is unidirectional
     pub fn is_unidirectional(&self) -> bool {
         (self.0 & 0x02) != 0
@@ -335,7 +337,10 @@ impl StreamType {
 
     /// Check if this stream type is bidirectional
     pub fn is_bidirectional(self) -> bool {
-        matches!(self, StreamType::ClientBidirectional | StreamType::ServerBidirectional)
+        matches!(
+            self,
+            StreamType::ClientBidirectional | StreamType::ServerBidirectional
+        )
     }
 
     /// Check if this stream type is unidirectional
@@ -345,7 +350,10 @@ impl StreamType {
 
     /// Check if client initiated this stream type
     pub fn is_client_initiated(self) -> bool {
-        matches!(self, StreamType::ClientBidirectional | StreamType::ClientUnidirectional)
+        matches!(
+            self,
+            StreamType::ClientBidirectional | StreamType::ClientUnidirectional
+        )
     }
 
     /// Check if server initiated this stream type
@@ -437,7 +445,9 @@ impl Instant {
         if nanos > u64::MAX as u128 {
             return None;
         }
-        self.nanos.checked_add(nanos as u64).map(|n| Instant { nanos: n })
+        self.nanos
+            .checked_add(nanos as u64)
+            .map(|n| Instant { nanos: n })
     }
 
     /// Subtract a duration from this instant
@@ -446,7 +456,9 @@ impl Instant {
         if nanos > u64::MAX as u128 {
             return None;
         }
-        self.nanos.checked_sub(nanos as u64).map(|n| Instant { nanos: n })
+        self.nanos
+            .checked_sub(nanos as u64)
+            .map(|n| Instant { nanos: n })
     }
 }
 
@@ -528,7 +540,6 @@ pub const DEFAULT_INITIAL_MAX_STREAM_DATA_BIDI: u64 = 6 * 1024 * 1024;
 
 /// Default initial maximum stream data for unidirectional streams (6 MB)
 pub const DEFAULT_INITIAL_MAX_STREAM_DATA_UNI: u64 = 6 * 1024 * 1024;
-
 
 // Additional types needed by the crate
 pub type StatelessResetToken = [u8; 16];
@@ -627,10 +638,10 @@ mod tests {
         // Test boundary values for 1-byte encoding (0 to 63)
         assert_eq!(VarIntCodec::encode(0, &mut buf), Some(1));
         assert_eq!(buf[0], 0x00);
-        
+
         assert_eq!(VarIntCodec::encode(37, &mut buf), Some(1));
         assert_eq!(buf[0], 37);
-        
+
         assert_eq!(VarIntCodec::encode(63, &mut buf), Some(1));
         assert_eq!(buf[0], 63);
     }
@@ -642,9 +653,12 @@ mod tests {
         assert_eq!(VarIntCodec::encode(64, &mut buf), Some(2));
         assert_eq!(buf[0], 0x40);
         assert_eq!(buf[1], 0x40);
-        
-        assert_eq!(VarIntCodec::encode(151_288_809_941_952_652, &mut buf), Some(8));
-        
+
+        assert_eq!(
+            VarIntCodec::encode(151_288_809_941_952_652, &mut buf),
+            Some(8)
+        );
+
         assert_eq!(VarIntCodec::encode(16383, &mut buf), Some(2));
         assert_eq!(buf[0], 0x7f);
         assert_eq!(buf[1], 0xff);
@@ -659,7 +673,7 @@ mod tests {
         assert_eq!(buf[1], 0x00);
         assert_eq!(buf[2], 0x40);
         assert_eq!(buf[3], 0x00);
-        
+
         assert_eq!(VarIntCodec::encode(1_073_741_823, &mut buf), Some(4));
         assert_eq!(buf[0], 0xbf);
         assert_eq!(buf[1], 0xff);
@@ -680,7 +694,7 @@ mod tests {
         assert_eq!(buf[5], 0x00);
         assert_eq!(buf[6], 0x00);
         assert_eq!(buf[7], 0x00);
-        
+
         // Test max value
         assert_eq!(VarIntCodec::encode(VARINT_MAX, &mut buf), Some(8));
         assert_eq!(buf[0], 0xff);
@@ -697,7 +711,7 @@ mod tests {
     fn test_varint_decode_1byte() {
         let buf = [0x25];
         assert_eq!(VarIntCodec::decode(&buf), Some((37, 1)));
-        
+
         let buf = [0x3f];
         assert_eq!(VarIntCodec::decode(&buf), Some((63, 1)));
     }
@@ -706,7 +720,7 @@ mod tests {
     fn test_varint_decode_2byte() {
         let buf = [0x7b, 0xbd];
         assert_eq!(VarIntCodec::decode(&buf), Some((15293, 2)));
-        
+
         let buf = [0x7f, 0xff];
         assert_eq!(VarIntCodec::decode(&buf), Some((16383, 2)));
     }
@@ -715,7 +729,7 @@ mod tests {
     fn test_varint_decode_4byte() {
         let buf = [0x9d, 0x7f, 0x3e, 0x7d];
         assert_eq!(VarIntCodec::decode(&buf), Some((494878333, 4)));
-        
+
         let buf = [0xbf, 0xff, 0xff, 0xff];
         assert_eq!(VarIntCodec::decode(&buf), Some((1_073_741_823, 4)));
     }
@@ -723,8 +737,11 @@ mod tests {
     #[test]
     fn test_varint_decode_8byte() {
         let buf = [0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c];
-        assert_eq!(VarIntCodec::decode(&buf), Some((151_288_809_941_952_652, 8)));
-        
+        assert_eq!(
+            VarIntCodec::decode(&buf),
+            Some((151_288_809_941_952_652, 8))
+        );
+
         let buf = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
         assert_eq!(VarIntCodec::decode(&buf), Some((VARINT_MAX, 8)));
     }
@@ -732,12 +749,21 @@ mod tests {
     #[test]
     fn test_varint_roundtrip() {
         let test_values = vec![
-            0u64, 1, 37, 63,
-            64, 151, 16383,
-            16384, 494878333, 1_073_741_823,
-            1_073_741_824, 151_288_809_941_952_652, VARINT_MAX,
+            0u64,
+            1,
+            37,
+            63,
+            64,
+            151,
+            16383,
+            16384,
+            494878333,
+            1_073_741_823,
+            1_073_741_824,
+            151_288_809_941_952_652,
+            VARINT_MAX,
         ];
-        
+
         for value in test_values {
             let mut buf = [0u8; 8];
             let encoded_len = VarIntCodec::encode(value, &mut buf).expect("encode failed");
@@ -751,15 +777,18 @@ mod tests {
     fn test_varint_buffer_too_short() {
         // Empty buffer
         assert_eq!(VarIntCodec::decode(&[]), None);
-        
+
         // 2-byte value with only 1 byte
         assert_eq!(VarIntCodec::decode(&[0x40]), None);
-        
+
         // 4-byte value with only 3 bytes
         assert_eq!(VarIntCodec::decode(&[0x80, 0x00, 0x40]), None);
-        
+
         // 8-byte value with only 7 bytes
-        assert_eq!(VarIntCodec::decode(&[0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), None);
+        assert_eq!(
+            VarIntCodec::decode(&[0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            None
+        );
     }
 
     #[test]
@@ -775,7 +804,7 @@ mod tests {
         let mut buf = [0u8; 1];
         // Try to encode 2-byte value into 1-byte buffer
         assert_eq!(VarIntCodec::encode(64, &mut buf), None);
-        
+
         let mut buf = [0u8; 3];
         // Try to encode 4-byte value into 3-byte buffer
         assert_eq!(VarIntCodec::encode(16384, &mut buf), None);
@@ -807,7 +836,7 @@ mod tests {
     fn test_connection_id_max_length() {
         let bytes = Bytes::from(vec![0xffu8; MAX_CID_LENGTH]);
         assert!(ConnectionId::new(bytes).is_some());
-        
+
         let bytes = Bytes::from(vec![0xffu8; MAX_CID_LENGTH + 1]);
         assert!(ConnectionId::new(bytes).is_none());
     }
@@ -824,10 +853,10 @@ mod tests {
     fn test_instant_duration_since() {
         let t1 = Instant::from_nanos(1_000_000_000);
         let t2 = Instant::from_nanos(2_000_000_000);
-        
+
         let duration = t2.duration_since(t1).unwrap();
         assert_eq!(duration.as_nanos(), 1_000_000_000);
-        
+
         assert!(t1.duration_since(t2).is_none());
     }
 
@@ -843,27 +872,47 @@ mod tests {
         let t = Instant::from_nanos(1_500_000_000);
         let t2 = t.checked_sub(Duration::from_nanos(500_000_000)).unwrap();
         assert_eq!(t2.as_nanos(), 1_000_000_000);
-        
+
         // Underflow
-        assert!(t2.checked_sub(Duration::from_nanos(2_000_000_000)).is_none());
+        assert!(t2
+            .checked_sub(Duration::from_nanos(2_000_000_000))
+            .is_none());
     }
 
     // StreamType Tests
     #[test]
     fn test_stream_type_from_id() {
-        assert_eq!(StreamType::from_stream_id(StreamId::new(0)), StreamType::ClientBidirectional);
-        assert_eq!(StreamType::from_stream_id(StreamId::new(1)), StreamType::ServerBidirectional);
-        assert_eq!(StreamType::from_stream_id(StreamId::new(2)), StreamType::ClientUnidirectional);
-        assert_eq!(StreamType::from_stream_id(StreamId::new(3)), StreamType::ServerUnidirectional);
-        assert_eq!(StreamType::from_stream_id(StreamId::new(4)), StreamType::ClientBidirectional);
-        assert_eq!(StreamType::from_stream_id(StreamId::new(7)), StreamType::ServerUnidirectional);
+        assert_eq!(
+            StreamType::from_stream_id(StreamId::new(0)),
+            StreamType::ClientBidirectional
+        );
+        assert_eq!(
+            StreamType::from_stream_id(StreamId::new(1)),
+            StreamType::ServerBidirectional
+        );
+        assert_eq!(
+            StreamType::from_stream_id(StreamId::new(2)),
+            StreamType::ClientUnidirectional
+        );
+        assert_eq!(
+            StreamType::from_stream_id(StreamId::new(3)),
+            StreamType::ServerUnidirectional
+        );
+        assert_eq!(
+            StreamType::from_stream_id(StreamId::new(4)),
+            StreamType::ClientBidirectional
+        );
+        assert_eq!(
+            StreamType::from_stream_id(StreamId::new(7)),
+            StreamType::ServerUnidirectional
+        );
     }
 
     #[test]
     fn test_stream_type_properties() {
         assert!(StreamType::ClientBidirectional.is_bidirectional());
         assert!(StreamType::ClientBidirectional.is_client_initiated());
-        
+
         assert!(StreamType::ServerUnidirectional.is_unidirectional());
         assert!(StreamType::ServerUnidirectional.is_server_initiated());
     }

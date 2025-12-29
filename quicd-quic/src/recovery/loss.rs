@@ -7,8 +7,8 @@
 
 extern crate alloc;
 
-use crate::types::*;
 use crate::error::*;
+use crate::types::*;
 use core::time::Duration;
 
 /// Loss Detection Algorithm Trait (RFC 9002 Section 6)
@@ -29,7 +29,7 @@ pub trait LossDetector: Send {
         ack_ranges: &[(PacketNumber, PacketNumber)],
         recv_time: Instant,
     ) -> Result<(alloc::vec::Vec<PacketNumber>, alloc::vec::Vec<PacketNumber>)>;
-    
+
     /// Check for loss due to time threshold
     ///
     /// Called periodically to detect packets that exceeded loss_time threshold.
@@ -38,19 +38,19 @@ pub trait LossDetector: Send {
         space: PacketNumberSpace,
         now: Instant,
     ) -> alloc::vec::Vec<PacketNumber>;
-    
+
     /// Get the next timer deadline
     ///
     /// Returns the earliest time when loss detection action is needed.
     /// This could be a loss timer or PTO timer.
     fn get_loss_detection_timer(&self) -> Option<Instant>;
-    
+
     /// Timer expired - take action
     ///
     /// Called when the loss detection timer fires.
     /// Returns whether probes should be sent.
     fn on_loss_detection_timeout(&mut self, now: Instant) -> LossDetectionAction;
-    
+
     /// Record a sent packet
     fn on_packet_sent(
         &mut self,
@@ -60,10 +60,10 @@ pub trait LossDetector: Send {
         is_retransmittable: bool,
         send_time: Instant,
     );
-    
+
     /// Get the number of PTO probes to send
     fn pto_count(&self) -> u32;
-    
+
     /// Discard state for a packet number space
     ///
     /// Called when keys are discarded (e.g., after handshake completes).
@@ -77,7 +77,7 @@ pub trait LossDetector: Send {
 pub enum LossDetectionAction {
     /// No action needed
     None,
-    
+
     /// Send probe packets
     SendProbe {
         /// Packet number space to probe
@@ -85,7 +85,7 @@ pub enum LossDetectionAction {
         /// Number of probe packets to send
         count: u32,
     },
-    
+
     /// Check for lost packets
     CheckLoss {
         /// Packet number space to check
@@ -104,30 +104,27 @@ pub trait SentPacketTracker: Send {
         packet_number: PacketNumber,
         info: SentPacketInfo,
     );
-    
+
     /// Mark packets as acknowledged
     fn on_packets_acked(
         &mut self,
         space: PacketNumberSpace,
         packet_numbers: &[PacketNumber],
     ) -> alloc::vec::Vec<SentPacketInfo>;
-    
+
     /// Mark packets as lost
     fn on_packets_lost(
         &mut self,
         space: PacketNumberSpace,
         packet_numbers: &[PacketNumber],
     ) -> alloc::vec::Vec<SentPacketInfo>;
-    
+
     /// Get the largest acknowledged packet number
     fn largest_acked(&self, space: PacketNumberSpace) -> Option<PacketNumber>;
-    
+
     /// Get all sent but not acknowledged packets
-    fn get_unacked_packets(
-        &self,
-        space: PacketNumberSpace,
-    ) -> alloc::vec::Vec<&SentPacketInfo>;
-    
+    fn get_unacked_packets(&self, space: PacketNumberSpace) -> alloc::vec::Vec<&SentPacketInfo>;
+
     /// Remove all tracking for a packet number space
     fn discard_space(&mut self, space: PacketNumberSpace);
 }
@@ -139,22 +136,22 @@ pub trait SentPacketTracker: Send {
 pub struct SentPacketInfo {
     /// Packet number
     pub packet_number: PacketNumber,
-    
+
     /// Packet number space
     pub pn_space: PacketNumberSpace,
-    
+
     /// Size in bytes
     pub size: usize,
-    
+
     /// Send timestamp
     pub send_time: Instant,
-    
+
     /// Whether this packet contains retransmittable frames
     pub is_retransmittable: bool,
-    
+
     /// Whether this packet has been acknowledged
     pub acked: bool,
-    
+
     /// Whether this packet has been declared lost
     pub lost: bool,
 }
@@ -167,19 +164,19 @@ pub struct LossDetectionConfig {
     /// A packet is declared lost if a packet sent later is acknowledged
     /// and at least time_threshold * max(smoothed_rtt, latest_rtt) has passed.
     pub time_threshold: f64,
-    
+
     /// Packet threshold for reordering (default: 3)
     ///
     /// A packet is declared lost if a packet sent at least packet_threshold
     /// packets later is acknowledged.
     pub packet_threshold: u64,
-    
+
     /// Initial RTT (default: 333ms)
     pub initial_rtt: Duration,
-    
+
     /// Maximum ACK delay (default: 25ms)
     pub max_ack_delay: Duration,
-    
+
     /// PTO multiplier (default: 2)
     ///
     /// Exponential backoff multiplier for PTO.
@@ -206,7 +203,7 @@ pub trait PtoCalculator: Send {
     ///
     /// PTO = smoothed_rtt + max(4*rttvar, 1ms) + max_ack_delay
     fn calculate_pto(&self, space: PacketNumberSpace, pto_count: u32) -> Duration;
-    
+
     /// Get the PTO backoff multiplier
     ///
     /// Exponentially backs off: 2^pto_count
@@ -220,16 +217,16 @@ pub trait PtoCalculator: Send {
 pub struct PacketNumberSpaceLossState {
     /// Largest acknowledged packet number
     pub largest_acked: Option<PacketNumber>,
-    
+
     /// Time the most recent packet was sent
     pub time_of_last_sent_packet: Option<Instant>,
-    
+
     /// Largest sent packet number
     pub largest_sent_packet: Option<PacketNumber>,
-    
+
     /// Loss time for this space (when to declare losses)
     pub loss_time: Option<Instant>,
-    
+
     /// Number of consecutive PTO timeouts
     pub pto_count: u32,
 }
@@ -250,24 +247,24 @@ impl Default for PacketNumberSpaceLossState {
 // Default Loss Detection Implementation
 // ============================================================================
 
+use crate::recovery::rtt::RttEstimator;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use crate::recovery::rtt::RttEstimator;
 
 /// Default Loss Detector Implementation (RFC 9002 Appendix A)
 pub struct DefaultLossDetector {
     /// Configuration
     config: LossDetectionConfig,
-    
+
     /// RTT estimator
     rtt_estimator: RttEstimator,
-    
+
     /// Sent packets tracking (per space)
     sent_packets: [BTreeMap<PacketNumber, SentPacketInfo>; 3],
-    
+
     /// Loss state per packet number space
     loss_state: [PacketNumberSpaceLossState; 3],
-    
+
     /// Time of last ACK-eliciting packet sent
     time_of_last_ack_eliciting_packet: Option<Instant>,
 }
@@ -287,7 +284,7 @@ impl DefaultLossDetector {
             time_of_last_ack_eliciting_packet: None,
         }
     }
-    
+
     /// Get space index
     fn space_index(space: PacketNumberSpace) -> usize {
         match space {
@@ -296,16 +293,19 @@ impl DefaultLossDetector {
             PacketNumberSpace::ApplicationData => 2,
         }
     }
-    
+
     /// Calculate loss delay threshold (RFC 9002 Section 6.1.2)
     fn loss_delay_threshold(&self) -> core::time::Duration {
-        let rtt = self.rtt_estimator.latest_rtt().max(self.rtt_estimator.smoothed_rtt());
+        let rtt = self
+            .rtt_estimator
+            .latest_rtt()
+            .max(self.rtt_estimator.smoothed_rtt());
         let threshold_multiplier = self.config.time_threshold;
-        
+
         // loss_delay = time_threshold * max(latest_rtt, smoothed_rtt)
         rtt.mul_f64(threshold_multiplier)
     }
-    
+
     /// Detect lost packets by packet threshold (RFC 9002 Section 6.1.1)
     fn detect_by_packet_threshold(
         &mut self,
@@ -314,25 +314,25 @@ impl DefaultLossDetector {
     ) -> Vec<PacketNumber> {
         let idx = Self::space_index(space);
         let mut lost = Vec::new();
-        
+
         let threshold = self.config.packet_threshold;
-        
+
         // Packets sent at least packet_threshold packets before largest_acked are lost
         for (&pn, info) in &self.sent_packets[idx] {
             if pn >= largest_acked {
                 break; // No more candidates
             }
-            
+
             if largest_acked - pn >= threshold {
                 if !info.acked && !info.lost {
                     lost.push(pn);
                 }
             }
         }
-        
+
         lost
     }
-    
+
     /// Detect lost packets by time threshold (RFC 9002 Section 6.1.2)
     fn detect_by_time_threshold(
         &mut self,
@@ -341,30 +341,30 @@ impl DefaultLossDetector {
     ) -> Vec<PacketNumber> {
         let idx = Self::space_index(space);
         let mut lost = Vec::new();
-        
+
         let loss_delay = self.loss_delay_threshold();
-        
+
         // Packets sent more than loss_delay ago are lost
         for (&pn, info) in &self.sent_packets[idx] {
             if info.acked || info.lost {
                 continue;
             }
-            
+
             if let Some(duration) = now.duration_since(info.send_time) {
                 if duration >= loss_delay {
                     lost.push(pn);
                 }
             }
         }
-        
+
         lost
     }
-    
+
     /// Set loss detection timer (RFC 9002 Section 6.2)
     fn set_loss_detection_timer(&mut self) {
         // Find earliest loss time across all spaces
         let mut earliest_loss_time: Option<Instant> = None;
-        
+
         for state in &self.loss_state {
             if let Some(loss_time) = state.loss_time {
                 earliest_loss_time = Some(match earliest_loss_time {
@@ -374,12 +374,12 @@ impl DefaultLossDetector {
                 });
             }
         }
-        
+
         // Loss timer takes precedence over PTO
         if earliest_loss_time.is_some() {
             return;
         }
-        
+
         // Calculate PTO timer
         // Find the first space with ACK-eliciting packets in flight
         for (idx, state) in self.loss_state.iter().enumerate() {
@@ -389,22 +389,26 @@ impl DefaultLossDetector {
                     1 => PacketNumberSpace::Handshake,
                     _ => PacketNumberSpace::ApplicationData,
                 };
-                
+
                 let pto = self.calculate_pto_for_space(space, state.pto_count);
                 // Set timer would happen here in real implementation
                 break;
             }
         }
     }
-    
+
     /// Calculate PTO for a specific space (RFC 9002 Section 6.2)
-    fn calculate_pto_for_space(&self, space: PacketNumberSpace, pto_count: u32) -> core::time::Duration {
+    fn calculate_pto_for_space(
+        &self,
+        space: PacketNumberSpace,
+        pto_count: u32,
+    ) -> core::time::Duration {
         let max_ack_delay = if space == PacketNumberSpace::ApplicationData {
             self.config.max_ack_delay
         } else {
             core::time::Duration::from_secs(0)
         };
-        
+
         let pto = self.rtt_estimator.pto(max_ack_delay, pto_count);
         pto
     }
@@ -420,25 +424,25 @@ impl LossDetector for DefaultLossDetector {
         recv_time: Instant,
     ) -> Result<(Vec<PacketNumber>, Vec<PacketNumber>)> {
         let idx = Self::space_index(space);
-        
+
         // Update largest acknowledged
         self.loss_state[idx].largest_acked = Some(largest_acked);
         self.loss_state[idx].pto_count = 0; // Reset PTO count on ACK
-        
+
         // Detect lost packets FIRST (before marking as acked)
         let mut newly_lost = Vec::new();
         newly_lost.extend(self.detect_by_packet_threshold(space, largest_acked));
-        
+
         // Find newly acknowledged packets
         let mut newly_acked = Vec::new();
-        
+
         // Simple implementation: just check largest_acked
         // Full implementation would process ack_ranges
         for (&pn, info) in &mut self.sent_packets[idx] {
             if pn <= largest_acked && !info.acked && !info.lost {
                 info.acked = true;
                 newly_acked.push(pn);
-                
+
                 // Update RTT if this is the largest acked
                 if pn == largest_acked && info.is_retransmittable {
                     if let Some(rtt_sample) = recv_time.duration_since(info.send_time) {
@@ -447,38 +451,34 @@ impl LossDetector for DefaultLossDetector {
                 }
             }
         }
-        
+
         // Mark packets as lost
         for &pn in &newly_lost {
             if let Some(info) = self.sent_packets[idx].get_mut(&pn) {
                 info.lost = true;
             }
         }
-        
+
         Ok((newly_acked, newly_lost))
     }
-    
-    fn detect_lost_packets(
-        &mut self,
-        space: PacketNumberSpace,
-        now: Instant,
-    ) -> Vec<PacketNumber> {
+
+    fn detect_lost_packets(&mut self, space: PacketNumberSpace, now: Instant) -> Vec<PacketNumber> {
         let lost = self.detect_by_time_threshold(space, now);
-        
+
         let idx = Self::space_index(space);
         for &pn in &lost {
             if let Some(info) = self.sent_packets[idx].get_mut(&pn) {
                 info.lost = true;
             }
         }
-        
+
         lost
     }
-    
+
     fn get_loss_detection_timer(&self) -> Option<Instant> {
         // Find earliest loss time or PTO time
         let mut earliest: Option<Instant> = None;
-        
+
         for state in &self.loss_state {
             if let Some(loss_time) = state.loss_time {
                 earliest = Some(match earliest {
@@ -488,10 +488,10 @@ impl LossDetector for DefaultLossDetector {
                 });
             }
         }
-        
+
         earliest
     }
-    
+
     fn on_loss_detection_timeout(&mut self, now: Instant) -> LossDetectionAction {
         // Check if any loss timers expired
         for (idx, state) in self.loss_state.iter_mut().enumerate() {
@@ -502,13 +502,13 @@ impl LossDetector for DefaultLossDetector {
                         1 => PacketNumberSpace::Handshake,
                         _ => PacketNumberSpace::ApplicationData,
                     };
-                    
+
                     state.loss_time = None;
                     return LossDetectionAction::CheckLoss { space };
                 }
             }
         }
-        
+
         // No loss timer - must be PTO
         // Send probe packets
         for (idx, state) in self.loss_state.iter_mut().enumerate() {
@@ -518,17 +518,17 @@ impl LossDetector for DefaultLossDetector {
                     1 => PacketNumberSpace::Handshake,
                     _ => PacketNumberSpace::ApplicationData,
                 };
-                
+
                 state.pto_count += 1;
                 let count = state.pto_count.min(2); // Send up to 2 probes
-                
+
                 return LossDetectionAction::SendProbe { space, count };
             }
         }
-        
+
         LossDetectionAction::None
     }
-    
+
     fn on_packet_sent(
         &mut self,
         space: PacketNumberSpace,
@@ -538,7 +538,7 @@ impl LossDetector for DefaultLossDetector {
         send_time: Instant,
     ) {
         let idx = Self::space_index(space);
-        
+
         let info = SentPacketInfo {
             packet_number,
             pn_space: space,
@@ -548,24 +548,28 @@ impl LossDetector for DefaultLossDetector {
             acked: false,
             lost: false,
         };
-        
+
         self.sent_packets[idx].insert(packet_number, info);
-        
+
         self.loss_state[idx].largest_sent_packet = Some(packet_number);
         self.loss_state[idx].time_of_last_sent_packet = Some(send_time);
-        
+
         if is_retransmittable {
             self.time_of_last_ack_eliciting_packet = Some(send_time);
         }
-        
+
         self.set_loss_detection_timer();
     }
-    
+
     fn pto_count(&self) -> u32 {
         // Return max PTO count across all spaces
-        self.loss_state.iter().map(|s| s.pto_count).max().unwrap_or(0)
+        self.loss_state
+            .iter()
+            .map(|s| s.pto_count)
+            .max()
+            .unwrap_or(0)
     }
-    
+
     fn discard_pn_space(&mut self, space: PacketNumberSpace) {
         let idx = Self::space_index(space);
         self.sent_packets[idx].clear();
@@ -595,15 +599,9 @@ mod tests {
     fn test_packet_sent_tracking() {
         let mut detector = create_detector();
         let now = Instant::from_nanos(0);
-        
-        detector.on_packet_sent(
-            PacketNumberSpace::Initial,
-            1,
-            1200,
-            true,
-            now,
-        );
-        
+
+        detector.on_packet_sent(PacketNumberSpace::Initial, 1, 1200, true, now);
+
         let idx = DefaultLossDetector::space_index(PacketNumberSpace::Initial);
         assert_eq!(detector.sent_packets[idx].len(), 1);
         assert_eq!(detector.loss_state[idx].largest_sent_packet, Some(1));
@@ -614,27 +612,29 @@ mod tests {
         let mut detector = create_detector();
         let now = Instant::from_nanos(0);
         let later = Instant::from_nanos(50_000_000); // 50ms later
-        
+
         // Send packets
         detector.on_packet_sent(PacketNumberSpace::Initial, 1, 1200, true, now);
         detector.on_packet_sent(PacketNumberSpace::Initial, 2, 1200, true, now);
         detector.on_packet_sent(PacketNumberSpace::Initial, 3, 1200, true, now);
-        
+
         // ACK packet 3
-        let (acked, lost) = detector.on_ack_received(
-            PacketNumberSpace::Initial,
-            3,
-            core::time::Duration::from_millis(0),
-            &[],
-            later,
-        ).unwrap();
-        
+        let (acked, lost) = detector
+            .on_ack_received(
+                PacketNumberSpace::Initial,
+                3,
+                core::time::Duration::from_millis(0),
+                &[],
+                later,
+            )
+            .unwrap();
+
         // All packets up to 3 should be acked
         assert!(acked.contains(&1));
         assert!(acked.contains(&2));
         assert!(acked.contains(&3));
         assert_eq!(acked.len(), 3);
-        
+
         // No packets lost yet (within threshold)
         assert_eq!(lost.len(), 0);
     }
@@ -643,21 +643,23 @@ mod tests {
     fn test_loss_by_packet_threshold() {
         let mut detector = create_detector();
         let now = Instant::from_nanos(0);
-        
+
         // Send 10 packets
         for i in 1..=10 {
             detector.on_packet_sent(PacketNumberSpace::Initial, i, 1200, true, now);
         }
-        
+
         // ACK packet 10
-        let (acked, lost) = detector.on_ack_received(
-            PacketNumberSpace::Initial,
-            10,
-            core::time::Duration::from_millis(0),
-            &[],
-            now,
-        ).unwrap();
-        
+        let (acked, lost) = detector
+            .on_ack_received(
+                PacketNumberSpace::Initial,
+                10,
+                core::time::Duration::from_millis(0),
+                &[],
+                now,
+            )
+            .unwrap();
+
         // Packets 1-7 should be declared lost (10 - 3 = 7, threshold is 3)
         // Packets sent at least 3 packets before largest acked
         assert!(lost.contains(&1));
@@ -672,22 +674,24 @@ mod tests {
     fn test_pto_count_reset_on_ack() {
         let mut detector = create_detector();
         let now = Instant::from_nanos(0);
-        
+
         detector.on_packet_sent(PacketNumberSpace::Initial, 1, 1200, true, now);
-        
+
         // Simulate PTO expiration
         let idx = DefaultLossDetector::space_index(PacketNumberSpace::Initial);
         detector.loss_state[idx].pto_count = 3;
-        
+
         // Receive ACK
-        detector.on_ack_received(
-            PacketNumberSpace::Initial,
-            1,
-            core::time::Duration::from_millis(0),
-            &[],
-            now,
-        ).unwrap();
-        
+        detector
+            .on_ack_received(
+                PacketNumberSpace::Initial,
+                1,
+                core::time::Duration::from_millis(0),
+                &[],
+                now,
+            )
+            .unwrap();
+
         // PTO count should reset
         assert_eq!(detector.loss_state[idx].pto_count, 0);
     }
@@ -696,15 +700,15 @@ mod tests {
     fn test_discard_pn_space() {
         let mut detector = create_detector();
         let now = Instant::from_nanos(0);
-        
+
         detector.on_packet_sent(PacketNumberSpace::Initial, 1, 1200, true, now);
         detector.on_packet_sent(PacketNumberSpace::Handshake, 1, 1200, true, now);
-        
+
         detector.discard_pn_space(PacketNumberSpace::Initial);
-        
+
         let idx_initial = DefaultLossDetector::space_index(PacketNumberSpace::Initial);
         let idx_handshake = DefaultLossDetector::space_index(PacketNumberSpace::Handshake);
-        
+
         assert_eq!(detector.sent_packets[idx_initial].len(), 0);
         assert_eq!(detector.sent_packets[idx_handshake].len(), 1);
     }

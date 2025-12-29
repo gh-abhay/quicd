@@ -74,12 +74,7 @@ impl PacketNumberSpaceState {
     /// Record receipt of a packet
     ///
     /// Updates largest received packet number and timestamp.
-    pub fn on_packet_received(
-        &mut self,
-        pn: PacketNumber,
-        now: Instant,
-        is_ack_eliciting: bool,
-    ) {
+    pub fn on_packet_received(&mut self, pn: PacketNumber, now: Instant, is_ack_eliciting: bool) {
         if let Some(largest) = self.largest_pn_received {
             if pn > largest {
                 self.largest_pn_received = Some(pn);
@@ -174,9 +169,7 @@ impl PacketNumberSpaceManager {
         Self {
             initial: PacketNumberSpaceState::new(PacketNumberSpace::Initial),
             handshake: PacketNumberSpaceState::new(PacketNumberSpace::Handshake),
-            application_data: PacketNumberSpaceState::new(
-                PacketNumberSpace::ApplicationData,
-            ),
+            application_data: PacketNumberSpaceState::new(PacketNumberSpace::ApplicationData),
         }
     }
 

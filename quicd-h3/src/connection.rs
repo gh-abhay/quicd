@@ -13,11 +13,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::H3Config;
 use crate::error::{Error, ErrorCode, Result};
-use crate::frame::{Frame, FrameParser, SettingsFrame, Setting, SettingId, write_frame};
+use crate::frame::{write_frame, Frame, FrameParser, Setting, SettingId, SettingsFrame};
 use crate::handler::FileHandler;
-use crate::message::{HttpRequest, HttpResponse, parse_request_pseudo_headers, response_to_field_lines};
+use crate::message::{
+    parse_request_pseudo_headers, response_to_field_lines, HttpRequest, HttpResponse,
+};
 use crate::qpack_mgr::QpackManager;
-use crate::stream_type::{StreamType, read_stream_type, write_stream_type};
+use crate::stream_type::{read_stream_type, write_stream_type, StreamType};
 
 /// HTTP/3 application implementing the QuicdApplication trait.
 ///
@@ -56,15 +58,15 @@ impl QuicdApplication for H3Application {
     /// It MUST NOT spawn additional tasks or threads.
     async fn on_connection(&self, conn: ConnectionHandle) {
         info!("HTTP/3 connection established");
-        
+
         // Create connection state machine
         let h3_conn = H3Connection::new(conn, self.config.clone());
-        
+
         // Run the RFC 9114 protocol state machine
         if let Err(e) = h3_conn.run().await {
             error!("HTTP/3 connection error: {}", e);
         }
-        
+
         info!("HTTP/3 connection closed");
     }
 }
@@ -80,18 +82,18 @@ struct H3Connection {
     config: Arc<H3Config>,
     qpack: QpackManager,
     handler: FileHandler,
-    
+
     // Control stream state
     control_stream_sent: bool,
     control_stream_received: bool,
     peer_settings: Option<PeerSettings>,
-    
+
     // QPACK stream IDs
     our_encoder_stream: Option<StreamId>,
     our_decoder_stream: Option<StreamId>,
     peer_encoder_stream: Option<StreamId>,
     peer_decoder_stream: Option<StreamId>,
-    
+
     // Incremental parsing buffers for unidirectional streams
     control_stream_buffer: BytesMut,
     control_stream_parser: FrameParser,
@@ -123,7 +125,7 @@ impl H3Connection {
             config.qpack.max_table_capacity,
             config.qpack.blocked_streams,
         );
-        
+
         let handler = FileHandler::new(config.handler.clone());
 
         Self {
@@ -169,7 +171,7 @@ impl H3Connection {
                         Ok(mut stream) => {
                             let stream_id = stream.stream_id();
                             debug!("Accepted bidirectional stream: {:?}", stream_id);
-                            
+
                             // Process request stream inline (avoids spawning tasks)
                             if let Err(e) = Self::process_request_stream(
                                 &mut stream,
@@ -194,7 +196,7 @@ impl H3Connection {
                     match stream_result {
                         Ok(mut stream) => {
                             debug!("Accepted unidirectional stream");
-                            
+
                             // Read stream type
                             let mut type_buffer = [0u8; 8];
                             match stream.read(&mut type_buffer).await {
@@ -207,7 +209,7 @@ impl H3Connection {
                                     match read_stream_type(&mut buf) {
                                         Ok(stream_type) => {
                                             debug!("Unidirectional stream type: {:?}", stream_type);
-                                            
+
                                             let stream_id = stream.stream_id();
                                             let result = match stream_type {
                                                 StreamType::Control => {
@@ -244,7 +246,7 @@ impl H3Connection {
                                                     Self::process_push_stream(&mut stream).await
                                                 }
                                             };
-                                            
+
                                             if let Err(e) = result {
                                                 error!("Error handling unidirectional stream: {}", e);
                                                 if e.is_connection_error() {
@@ -283,8 +285,7 @@ impl H3Connection {
 
     /// RFC 9114 Section 6.2.1: Open control stream and send SETTINGS as first frame.
     async fn open_control_stream(&mut self) -> Result<()> {
-        let mut stream = self.conn.open_uni_stream().await
-            .map_err(Error::Io)?;
+        let mut stream = self.conn.open_uni_stream().await.map_err(Error::Io)?;
 
         // Write stream type (0x00 = control)
         let mut buf = BytesMut::new();
@@ -322,8 +323,7 @@ impl H3Connection {
     /// RFC 9204 Section 4.2: Open QPACK encoder and decoder streams.
     async fn open_qpack_streams(&mut self) -> Result<()> {
         // Open encoder stream
-        let mut encoder_stream = self.conn.open_uni_stream().await
-            .map_err(Error::Io)?;
+        let mut encoder_stream = self.conn.open_uni_stream().await.map_err(Error::Io)?;
         let encoder_stream_id = encoder_stream.stream_id();
         let mut buf = BytesMut::new();
         write_stream_type(StreamType::QpackEncoder, &mut buf)?;
@@ -331,8 +331,7 @@ impl H3Connection {
         self.our_encoder_stream = Some(encoder_stream_id);
 
         // Open decoder stream
-        let mut decoder_stream = self.conn.open_uni_stream().await
-            .map_err(Error::Io)?;
+        let mut decoder_stream = self.conn.open_uni_stream().await.map_err(Error::Io)?;
         let decoder_stream_id = decoder_stream.stream_id();
         let mut buf = BytesMut::new();
         write_stream_type(StreamType::QpackDecoder, &mut buf)?;
@@ -373,7 +372,7 @@ impl H3Connection {
                 }
                 Ok(n) => {
                     debug!("Read {} bytes from stream {:?}", n, stream_id);
-                    
+
                     // Parse HTTP/3 frames
                     let frames = parser.parse(Bytes::copy_from_slice(&buffer[..n]))?;
 
@@ -419,7 +418,10 @@ impl H3Connection {
                             }
 
                             _ => {
-                                warn!("Unexpected frame type on request stream: {:?}", frame.frame_type());
+                                warn!(
+                                    "Unexpected frame type on request stream: {:?}",
+                                    frame.frame_type()
+                                );
                             }
                         }
                     }
@@ -507,9 +509,9 @@ impl H3Connection {
                 "duplicate control stream",
             ));
         }
-        
+
         control_stream_buffer.extend_from_slice(&remaining_data);
-        
+
         let mut buffer = vec![0u8; 16384];
         loop {
             match stream.read(&mut buffer).await {
@@ -601,7 +603,7 @@ impl H3Connection {
     ) -> Result<()> {
         *peer_encoder_stream = Some(stream_id);
         encoder_stream_buffer.extend_from_slice(&remaining_data);
-        
+
         let mut buffer = vec![0u8; 8192];
         loop {
             match stream.read(&mut buffer).await {
@@ -637,7 +639,7 @@ impl H3Connection {
     ) -> Result<()> {
         *peer_decoder_stream = Some(stream_id);
         decoder_stream_buffer.extend_from_slice(&remaining_data);
-        
+
         let mut buffer = vec![0u8; 8192];
         loop {
             match stream.read(&mut buffer).await {
