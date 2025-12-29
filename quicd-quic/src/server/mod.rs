@@ -186,10 +186,13 @@ pub struct DefaultQuicServer {
     /// RFC 9000 Section 10.3.2: Used to derive reset tokens from connection IDs
     reset_secret: [u8; 32],
 
-    /// Anti-amplification limiter (stored for future enforcement)
-    /// RFC 9000 Section 8.1: Enforces 3x sending limit to unvalidated addresses
-    #[allow(dead_code)]
-    amp_limiter: AmplificationLimiter,
+    /// Anti-amplification limiter for RFC 9000 Section 8.1 compliance
+    ///
+    /// Enforces 3x sending limit to unvalidated addresses.
+    /// Integration point: Call `record_received()` when receiving datagrams,
+    /// `check_send()` before sending, `record_sent()` after sending,
+    /// and `mark_validated()` when handshake completes.
+    pub amp_limiter: AmplificationLimiter,
 
     /// Connection ID managers (per connection)
     cid_managers: HashMap<ConnectionId, ConnectionIdManager>,

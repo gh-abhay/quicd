@@ -392,10 +392,10 @@ pub struct QuicConnection {
     /// Congestion controller  
     congestion_controller: Box<dyn CongestionController>,
 
-    /// Packet number spaces (stored for space-based tracking)
+    /// Packet number spaces for per-space tracking (RFC 9000 §12.3)
     ///
-    /// TODO: Integrate with PacketNumberSpaceManager methods
-    #[allow(dead_code)]
+    /// Tracks packet numbers received, ACK state, and discarded status
+    /// for Initial, Handshake, and ApplicationData spaces.
     pn_spaces: crate::packet::space::PacketNumberSpaceManager,
 
     /// Pending events for application
@@ -445,14 +445,6 @@ pub struct QuicConnection {
     /// Received CRYPTO data buffers per encryption level (for reassembly)
     /// Maps encryption level to (received_bytes, next_expected_offset)
     crypto_buffers: BTreeMap<CryptoLevel, (alloc::vec::Vec<u8>, VarInt)>,
-    /// Largest received packet number per packet number space (for ACK generation)
-    largest_received_pn_initial: Option<PacketNumber>,
-    largest_received_pn_handshake: Option<PacketNumber>,
-    largest_received_pn_appdata: Option<PacketNumber>,
-    /// Largest Handshake packet number we've ACKed
-    largest_acked_pn_handshake: Option<PacketNumber>,
-    /// Largest Application Data packet number we've ACKed
-    largest_acked_pn_appdata: Option<PacketNumber>,
 
     /// Whether we have sent HANDSHAKE_DONE (server side)
     handshake_done_sent: bool,
@@ -568,11 +560,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 };
@@ -621,11 +608,6 @@ impl QuicConnection {
                         pending_crypto: alloc::vec::Vec::new(),
                         crypto_send_offsets: BTreeMap::new(),
                         crypto_buffers: BTreeMap::new(),
-                        largest_received_pn_initial: None,
-                        largest_received_pn_handshake: None,
-                        largest_received_pn_appdata: None,
-                        largest_acked_pn_handshake: None,
-                        largest_acked_pn_appdata: None,
                         handshake_done_sent: false,
                         opened_streams: alloc::collections::BTreeSet::new(),
                     };
@@ -671,11 +653,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 };
@@ -719,11 +696,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 };
@@ -768,11 +740,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 };
@@ -815,11 +782,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 };
@@ -864,11 +826,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 }
@@ -910,11 +867,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 }
@@ -967,11 +919,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 }
@@ -1017,11 +964,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 }
@@ -1066,11 +1008,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 }
@@ -1116,11 +1053,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 }
@@ -1165,11 +1097,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 }
@@ -1214,11 +1141,6 @@ impl QuicConnection {
                     pending_crypto: alloc::vec::Vec::new(),
                     crypto_send_offsets: BTreeMap::new(),
                     crypto_buffers: BTreeMap::new(),
-                    largest_received_pn_initial: None,
-                    largest_received_pn_handshake: None,
-                    largest_received_pn_appdata: None,
-                    largest_acked_pn_handshake: None,
-                    largest_acked_pn_appdata: None,
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
                 }
@@ -1263,11 +1185,6 @@ impl QuicConnection {
                         pending_crypto: alloc::vec::Vec::new(),
                         crypto_send_offsets: BTreeMap::new(),
                         crypto_buffers: BTreeMap::new(),
-                        largest_received_pn_initial: None,
-                        largest_received_pn_handshake: None,
-                        largest_received_pn_appdata: None,
-                        largest_acked_pn_handshake: None,
-                        largest_acked_pn_appdata: None,
                         handshake_done_sent: false,
                         opened_streams: alloc::collections::BTreeSet::new(),
                     }
@@ -1308,11 +1225,6 @@ impl QuicConnection {
                         pending_crypto: alloc::vec::Vec::new(),
                         crypto_send_offsets: BTreeMap::new(),
                         crypto_buffers: BTreeMap::new(),
-                        largest_received_pn_initial: None,
-                        largest_received_pn_handshake: None,
-                        largest_received_pn_appdata: None,
-                        largest_acked_pn_handshake: None,
-                        largest_acked_pn_appdata: None,
                         handshake_done_sent: false,
                         opened_streams: alloc::collections::BTreeSet::new(),
                     }
@@ -1364,11 +1276,6 @@ impl QuicConnection {
                         pending_crypto: alloc::vec::Vec::new(),
                         crypto_send_offsets: BTreeMap::new(),
                         crypto_buffers: BTreeMap::new(),
-                        largest_received_pn_initial: None,
-                        largest_received_pn_handshake: None,
-                        largest_received_pn_appdata: None,
-                        largest_acked_pn_handshake: None,
-                        largest_acked_pn_appdata: None,
                         handshake_done_sent: false,
                         opened_streams: alloc::collections::BTreeSet::new(),
                     }
@@ -1409,11 +1316,6 @@ impl QuicConnection {
                         pending_crypto: alloc::vec::Vec::new(),
                         crypto_send_offsets: BTreeMap::new(),
                         crypto_buffers: BTreeMap::new(),
-                        largest_received_pn_initial: None,
-                        largest_received_pn_handshake: None,
-                        largest_received_pn_appdata: None,
-                        largest_acked_pn_handshake: None,
-                        largest_acked_pn_appdata: None,
                         handshake_done_sent: false,
                         opened_streams: alloc::collections::BTreeSet::new(),
                     }
@@ -1496,11 +1398,6 @@ impl QuicConnection {
                             pending_crypto: alloc::vec::Vec::new(),
                             crypto_send_offsets: BTreeMap::new(),
                             crypto_buffers: BTreeMap::new(),
-                            largest_received_pn_initial: None,
-                            largest_received_pn_handshake: None,
-                            largest_received_pn_appdata: None,
-                            largest_acked_pn_handshake: None,
-                            largest_acked_pn_appdata: None,
                             handshake_done_sent: false,
                             opened_streams: alloc::collections::BTreeSet::new(),
                         };
@@ -1540,11 +1437,6 @@ impl QuicConnection {
                             pending_crypto: alloc::vec::Vec::new(),
                             crypto_send_offsets: BTreeMap::new(),
                             crypto_buffers: BTreeMap::new(),
-                            largest_received_pn_initial: None,
-                            largest_received_pn_handshake: None,
-                            largest_received_pn_appdata: None,
-                            largest_acked_pn_handshake: None,
-                            largest_acked_pn_appdata: None,
                             handshake_done_sent: false,
                             opened_streams: alloc::collections::BTreeSet::new(),
                         };
@@ -1596,11 +1488,6 @@ impl QuicConnection {
             pending_crypto: alloc::vec::Vec::new(),
             crypto_send_offsets: BTreeMap::new(),
             crypto_buffers: BTreeMap::new(),
-            largest_received_pn_initial: None,
-            largest_received_pn_handshake: None,
-            largest_received_pn_appdata: None,
-            largest_acked_pn_handshake: None,
-            largest_acked_pn_appdata: None,
             handshake_done_sent: false,
             opened_streams: alloc::collections::BTreeSet::new(),
         }
@@ -1997,11 +1884,7 @@ impl QuicConnection {
         };
 
         // Get the largest received packet number for this packet number space
-        let largest_pn = match pn_space {
-            crate::types::PacketNumberSpace::Initial => self.largest_received_pn_initial,
-            crate::types::PacketNumberSpace::Handshake => self.largest_received_pn_handshake,
-            crate::types::PacketNumberSpace::ApplicationData => self.largest_received_pn_appdata,
-        };
+        let largest_pn = self.pn_spaces.get(pn_space).largest_pn_received;
 
         // Reconstruct full packet number from truncated value (RFC 9000 Appendix A.3)
         use crate::packet::number::{DefaultPacketNumberDecoder, PacketNumberDecoder};
@@ -2029,36 +1912,13 @@ impl QuicConnection {
             }
         };
 
-        // Track largest received packet number for ACK generation
-        match pn_space {
-            crate::types::PacketNumberSpace::Initial => {
-                if let Some(current) = self.largest_received_pn_initial {
-                    if packet_number > current {
-                        self.largest_received_pn_initial = Some(packet_number);
-                    }
-                } else {
-                    self.largest_received_pn_initial = Some(packet_number);
-                }
-            }
-            crate::types::PacketNumberSpace::Handshake => {
-                if let Some(current) = self.largest_received_pn_handshake {
-                    if packet_number > current {
-                        self.largest_received_pn_handshake = Some(packet_number);
-                    }
-                } else {
-                    self.largest_received_pn_handshake = Some(packet_number);
-                }
-            }
-            crate::types::PacketNumberSpace::ApplicationData => {
-                if let Some(current) = self.largest_received_pn_appdata {
-                    if packet_number > current {
-                        self.largest_received_pn_appdata = Some(packet_number);
-                    }
-                } else {
-                    self.largest_received_pn_appdata = Some(packet_number);
-                }
-            }
-        }
+        // Track largest received packet number for ACK generation (RFC 9000 §13.2.3)
+        // Using PacketNumberSpaceManager for proper per-space tracking
+        self.pn_spaces.get_mut(pn_space).on_packet_received(
+            packet_number,
+            recv_time,
+            true, // Assume ACK-eliciting for now; refine later based on frame types
+        );
 
         // Calculate payload offset (needed for decryption)
         // We need to find where the Packet Number is, then add its length to get payload start
@@ -2279,36 +2139,14 @@ impl QuicConnection {
         let _packet_number = final_packet_number;
 
         // Update largest received packet number if we corrected it during decryption
+        // PacketNumberSpaceState.on_packet_received() already handles max tracking
         if final_packet_number != original_packet_number {
-            match pn_space {
-                crate::types::PacketNumberSpace::Initial => {
-                    if let Some(current) = self.largest_received_pn_initial {
-                        if final_packet_number > current {
-                            self.largest_received_pn_initial = Some(final_packet_number);
-                        }
-                    } else {
-                        self.largest_received_pn_initial = Some(final_packet_number);
-                    }
-                }
-                crate::types::PacketNumberSpace::Handshake => {
-                    if let Some(current) = self.largest_received_pn_handshake {
-                        if final_packet_number > current {
-                            self.largest_received_pn_handshake = Some(final_packet_number);
-                        }
-                    } else {
-                        self.largest_received_pn_handshake = Some(final_packet_number);
-                    }
-                }
-                crate::types::PacketNumberSpace::ApplicationData => {
-                    if let Some(current) = self.largest_received_pn_appdata {
-                        if final_packet_number > current {
-                            self.largest_received_pn_appdata = Some(final_packet_number);
-                        }
-                    } else {
-                        self.largest_received_pn_appdata = Some(final_packet_number);
-                    }
-                }
-            }
+            // Re-call on_packet_received with corrected packet number
+            self.pn_spaces.get_mut(pn_space).on_packet_received(
+                final_packet_number,
+                recv_time,
+                true,
+            );
         }
 
         // Parse frames from decrypted payload
@@ -2855,10 +2693,11 @@ impl Connection for QuicConnection {
                 .iter()
                 .any(|(level, _)| *level == CryptoLevel::Handshake);
 
-            eprintln!("DEBUG: side=Server, largest_received_pn_handshake={:?}, largest_acked_pn_handshake={:?}, has_pending_hs_crypto={}", self.largest_received_pn_handshake, self.largest_acked_pn_handshake, has_pending_handshake_crypto);
+            let hs_space = self.pn_spaces.get(crate::types::PacketNumberSpace::Handshake);
+            eprintln!("DEBUG: side=Server, largest_received_pn_handshake={:?}, largest_acked_pn_handshake={:?}, has_pending_hs_crypto={}", hs_space.largest_pn_received, hs_space.largest_pn_acked_by_us, has_pending_handshake_crypto);
             if !has_pending_handshake_crypto {
-                if let Some(largest_acked) = self.largest_received_pn_handshake {
-                    let already_acked = self.largest_acked_pn_handshake.unwrap_or(0);
+                if let Some(largest_acked) = hs_space.largest_pn_received {
+                    let already_acked = hs_space.largest_pn_acked_by_us.unwrap_or(0);
                     eprintln!("DEBUG: Handshake ACK check: largest_acked={}, already_acked={}, need_send={}", largest_acked, already_acked, largest_acked > already_acked);
                     if largest_acked > already_acked && self.handshake_write_keys.aead.is_some() {
                         use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
@@ -3002,7 +2841,7 @@ impl Connection for QuicConnection {
                             self.stats.packets_sent += 1;
                             self.stats.bytes_sent += buf.len() as u64;
 
-                            self.largest_acked_pn_handshake = Some(largest_acked);
+                            self.pn_spaces.get_mut(pn_space).on_ack_sent(largest_acked);
                             eprintln!("DEBUG: ✓ SENT Handshake ACK packet, pn={}, largest_acked={}, packet_len={}", pn, largest_acked, buf.len());
 
                             let data = buf.split();
@@ -3560,7 +3399,8 @@ impl Connection for QuicConnection {
 
             // Add ACK frame for Initial packets if we've received any
             if level == CryptoLevel::Initial && self.side == Side::Server {
-                if let Some(largest_acked) = self.largest_received_pn_initial {
+                let init_space = self.pn_spaces.get(crate::types::PacketNumberSpace::Initial);
+                if let Some(largest_acked) = init_space.largest_pn_received {
                     // RFC 9000 Section 19.3: ACK frame format
                     // largest_acked, ack_delay, ack_range_count, first_ack_range
                     let ack_frame = Frame::Ack(crate::frames::AckFrame {
@@ -3578,8 +3418,9 @@ impl Connection for QuicConnection {
 
             // Add ACK frame for Handshake packets if we've received any and haven't ACKed yet
             if level == CryptoLevel::Handshake && self.side == Side::Server {
-                if let Some(largest_acked) = self.largest_received_pn_handshake {
-                    let already_acked = self.largest_acked_pn_handshake.unwrap_or(0);
+                let hs_space = self.pn_spaces.get(crate::types::PacketNumberSpace::Handshake);
+                if let Some(largest_acked) = hs_space.largest_pn_received {
+                    let already_acked = hs_space.largest_pn_acked_by_us.unwrap_or(0);
                     if largest_acked > already_acked {
                         let ack_frame = Frame::Ack(crate::frames::AckFrame {
                             largest_acked,
@@ -3592,7 +3433,7 @@ impl Connection for QuicConnection {
                             .serialize_frame(&ack_frame, &mut frame_buf)
                             .is_ok()
                         {
-                            self.largest_acked_pn_handshake = Some(largest_acked);
+                            self.pn_spaces.get_mut(crate::types::PacketNumberSpace::Handshake).on_ack_sent(largest_acked);
                         }
                     }
                 }
@@ -3860,8 +3701,9 @@ impl Connection for QuicConnection {
 
         // If no crypto data to send, consider sending an ACK-only Handshake packet
         if self.side == Side::Server {
-            if let Some(largest_acked) = self.largest_received_pn_handshake {
-                let already_acked = self.largest_acked_pn_handshake.unwrap_or(0);
+            let hs_space = self.pn_spaces.get(crate::types::PacketNumberSpace::Handshake);
+            if let Some(largest_acked) = hs_space.largest_pn_received {
+                let already_acked = hs_space.largest_pn_acked_by_us.unwrap_or(0);
                 if largest_acked > already_acked {
                     if self.handshake_write_keys.aead.is_some() {
                         // Build ACK frame
@@ -4010,7 +3852,7 @@ impl Connection for QuicConnection {
                             self.stats.packets_sent += 1;
                             self.stats.bytes_sent += buf.len() as u64;
 
-                            self.largest_acked_pn_handshake = Some(largest_acked);
+                            self.pn_spaces.get_mut(pn_space).on_ack_sent(largest_acked);
 
                             let data = buf.split();
                             return Some(DatagramOutput {
@@ -4265,8 +4107,9 @@ impl Connection for QuicConnection {
         // ═══════════════════════════════════════════════════════════════════
         // Send ACKs for received application data packets
         if self.handshake_complete && self.one_rtt_write_keys.aead.is_some() {
-            if let Some(largest_acked) = self.largest_received_pn_appdata {
-                let already_acked = self.largest_acked_pn_appdata.unwrap_or(0);
+            let app_space = self.pn_spaces.get(crate::types::PacketNumberSpace::ApplicationData);
+            if let Some(largest_acked) = app_space.largest_pn_received {
+                let already_acked = app_space.largest_pn_acked_by_us.unwrap_or(0);
                 if largest_acked > already_acked {
                     eprintln!("DEBUG: Need to send 1-RTT ACK for PN {}", largest_acked);
                     // Build ACK frame
@@ -4277,7 +4120,7 @@ impl Connection for QuicConnection {
                         largest_acked,
                         ack_delay: 0,
                         ack_range_count: 0,
-                        first_ack_range: largest_acked - self.largest_acked_pn_appdata.unwrap_or(0),
+                        first_ack_range: largest_acked - already_acked,
                         ack_ranges: &[],
                     });
 
@@ -4356,7 +4199,7 @@ impl Connection for QuicConnection {
                         );
 
                         // Mark as acknowledged
-                        self.largest_acked_pn_appdata = Some(largest_acked);
+                        self.pn_spaces.get_mut(crate::types::PacketNumberSpace::ApplicationData).on_ack_sent(largest_acked);
 
                         // Update stats
                         self.stats.packets_sent += 1;

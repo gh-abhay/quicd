@@ -35,6 +35,10 @@ pub struct PacketNumberSpaceState {
     /// Largest acknowledged packet number (from peer's ACK frames)
     pub largest_acked: Option<PacketNumber>,
 
+    /// Largest packet number we've acknowledged in an ACK frame we sent
+    /// Used to determine when we need to send new ACKs
+    pub largest_pn_acked_by_us: Option<PacketNumber>,
+
     /// Whether this packet number space has been discarded
     /// (RFC 9000 Section 4.9.1: Initial and Handshake spaces are discarded)
     pub is_discarded: bool,
@@ -55,6 +59,7 @@ impl PacketNumberSpaceState {
             largest_pn_received: None,
             largest_pn_received_time: None,
             largest_acked: None,
+            largest_pn_acked_by_us: None,
             is_discarded: false,
             ack_eliciting_received: 0,
             ack_deadline: None,
@@ -129,10 +134,35 @@ impl PacketNumberSpaceState {
         }
     }
 
+    /// Check if we have new packets to acknowledge
+    ///
+    /// Returns true if we've received packets that we haven't yet ACKed
+    pub fn has_pending_acks(&self) -> bool {
+        if self.is_discarded {
+            return false;
+        }
+        match (self.largest_pn_received, self.largest_pn_acked_by_us) {
+            (Some(received), Some(acked)) => received > acked,
+            (Some(_), None) => true, // Received packets but never sent ACK
+            (None, _) => false,      // No packets received
+        }
+    }
+
     /// Reset ACK state after sending an ACK frame
-    pub fn on_ack_sent(&mut self) {
+    ///
+    /// # Arguments
+    /// - `largest_acked`: The largest packet number included in the ACK we sent
+    pub fn on_ack_sent(&mut self, largest_acked: PacketNumber) {
         self.ack_eliciting_received = 0;
         self.ack_deadline = None;
+        // Track largest PN we've acknowledged
+        if let Some(current) = self.largest_pn_acked_by_us {
+            if largest_acked > current {
+                self.largest_pn_acked_by_us = Some(largest_acked);
+            }
+        } else {
+            self.largest_pn_acked_by_us = Some(largest_acked);
+        }
     }
 
     /// Update ACK deadline based on received packets
