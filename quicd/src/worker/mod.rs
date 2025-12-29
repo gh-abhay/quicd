@@ -20,6 +20,9 @@ pub mod connection_manager;
 pub mod context;
 pub mod io_state;
 
+#[cfg(test)]
+mod tests;
+
 use crate::netio::{
     buffer::{create_worker_pool, WorkerBufPool, WorkerBuffer},
     config::NetIoConfig,
@@ -40,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// User data for io_uring operations.
 /// Used to track which operation completed.
@@ -610,7 +613,7 @@ impl NetworkWorker {
             // Only coalesce long header packets (Initial, Handshake, 0-RTT)
             let mut send_sq_full = false;
             for (dest, packets) in by_dest {
-                eprintln!("worker: Sending {} packets to {}", packets.len(), dest);
+                trace!(worker_id, packet_count = packets.len(), %dest, "Sending packets");
 
                 // Separate long and short header packets
                 // Short header: bit 7 = 0, Long header: bit 7 = 1
@@ -628,10 +631,11 @@ impl NetworkWorker {
                         continue;
                     }
 
-                    eprintln!(
-                        "worker: Packet size: {} bytes, first byte: 0x{:02x}",
-                        data.len(),
-                        data[0]
+                    trace!(
+                        worker_id,
+                        packet_size = data.len(),
+                        first_byte = format!("0x{:02x}", data[0]),
+                        "Processing packet for send"
                     );
 
                     // Check bit 7 of first byte (0x80)
@@ -660,10 +664,11 @@ impl NetworkWorker {
                         if packet_len > MAX_DATAGRAM_SIZE {
                             // First, send any accumulated packets
                             if !current_datagram.is_empty() {
-                                eprintln!(
-                                    "worker: Sending {} coalesced long header packets ({} bytes)",
-                                    current_datagram.len(),
-                                    current_size
+                                trace!(
+                                    worker_id,
+                                    packet_count = current_datagram.len(),
+                                    total_bytes = current_size,
+                                    "Sending coalesced long header packets"
                                 );
                                 let _ = submit_send_op(
                                     &mut ring,
@@ -677,9 +682,10 @@ impl NetworkWorker {
                                 current_size = 0;
                             }
                             // Send the oversized packet alone
-                            eprintln!(
-                                "worker: Sending 1 oversized long header packet ({} bytes)",
-                                packet_len
+                            trace!(
+                                worker_id,
+                                packet_len,
+                                "Sending oversized long header packet"
                             );
                             let buffer = WorkerBuffer::from_vec(data, &buffer_pool);
                             let _ = submit_send_op(
@@ -699,10 +705,11 @@ impl NetworkWorker {
                             && !current_datagram.is_empty()
                         {
                             // Send current datagram and start a new one
-                            eprintln!(
-                                "worker: Sending {} coalesced long header packets ({} bytes)",
-                                current_datagram.len(),
-                                current_size
+                            trace!(
+                                worker_id,
+                                packet_count = current_datagram.len(),
+                                total_bytes = current_size,
+                                "Sending coalesced long header packets (MTU limit)"
                             );
                             let _ = submit_send_op(
                                 &mut ring,
@@ -724,10 +731,11 @@ impl NetworkWorker {
 
                     // Send remaining packets
                     if !current_datagram.is_empty() {
-                        eprintln!(
-                            "worker: Sending {} coalesced long header packets ({} bytes)",
-                            current_datagram.len(),
-                            current_size
+                        trace!(
+                            worker_id,
+                            packet_count = current_datagram.len(),
+                            total_bytes = current_size,
+                            "Sending remaining coalesced long header packets"
                         );
                         match submit_send_op(
                             &mut ring,
@@ -739,9 +747,7 @@ impl NetworkWorker {
                             &mut send_op_pool,
                         ) {
                             Ok(()) => {
-                                eprintln!(
-                                    "worker: Successfully submitted coalesced long header packets"
-                                );
+                                trace!(worker_id, "Successfully submitted coalesced long header packets");
                             }
                             Err(e)
                                 if e.kind() == io::ErrorKind::Other
@@ -768,7 +774,7 @@ impl NetworkWorker {
                     let buffer = WorkerBuffer::from_vec(data, &buffer_pool);
                     let buffers = vec![buffer];
 
-                    eprintln!("worker: Sending 1 short header packet (not coalesced)");
+                    trace!(worker_id, "Sending short header packet (not coalesced)");
 
                     match submit_send_op(
                         &mut ring,
@@ -780,7 +786,7 @@ impl NetworkWorker {
                         &mut send_op_pool,
                     ) {
                         Ok(()) => {
-                            eprintln!("worker: Successfully submitted short header packet");
+                            trace!(worker_id, "Successfully submitted short header packet");
                         }
                         Err(e)
                             if e.kind() == io::ErrorKind::Other

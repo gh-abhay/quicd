@@ -39,6 +39,10 @@ use tracing::{debug, error, info, trace, warn};
 /// This provides predictable memory usage: ~100MB per worker for 100k connections.
 const DEFAULT_MAX_CONNECTIONS_PER_WORKER: usize = 100_000;
 
+/// Maximum entries in the VN rate limiter LRU cache.
+/// Limits memory usage under DDoS attacks with spoofed source addresses.
+const VN_RATE_LIMITER_MAX_ENTRIES: usize = 10_000;
+
 /// Slab index for a connection (maps to Slab storage).
 type SlabIndex = usize;
 
@@ -54,6 +58,10 @@ pub struct ConnectionManager {
 
     /// Mapping from SCID to Slab index for egress command routing.
     scid_to_slab: HashMap<ConnectionId, SlabIndex>,
+
+    /// Mapping from application connection ID (u64) to Slab index.
+    /// Provides O(1) lookup for egress command routing.
+    app_conn_id_to_slab: HashMap<u64, SlabIndex>,
 
     /// Configuration for new connections.
     config: ConnectionConfig,
@@ -73,9 +81,9 @@ pub struct ConnectionManager {
     app_registry: Arc<crate::apps::AppRegistry>,
 
     /// DDoS protection: Rate limiting for Version Negotiation packets.
-    /// Maps source address to (count, window_start_time).
+    /// Uses bounded LRU cache to prevent memory exhaustion under attack.
     /// RFC 9000 Section 5.2.2: "A server MAY limit the number of Version Negotiation packets it sends."
-    vn_rate_limiter: HashMap<SocketAddr, (u32, Instant)>,
+    vn_rate_limiter: lru::LruCache<SocketAddr, (u32, Instant)>,
 }
 
 /// Per-connection state managed by the worker.
@@ -140,13 +148,17 @@ impl ConnectionManager {
             connections,
             dcid_to_slab: HashMap::new(),
             scid_to_slab: HashMap::new(),
+            app_conn_id_to_slab: HashMap::new(),
             config,
             tokio_handle,
             egress_tx,
             cid_generator,
             worker_id,
             app_registry,
-            vn_rate_limiter: HashMap::new(),
+            // Use LRU cache to prevent unbounded memory growth under DDoS
+            vn_rate_limiter: lru::LruCache::new(
+                std::num::NonZeroUsize::new(VN_RATE_LIMITER_MAX_ENTRIES).unwrap(),
+            ),
         }
     }
 
@@ -181,6 +193,10 @@ impl ConnectionManager {
 
             // Remove SCID mapping
             self.scid_to_slab.remove(&scid);
+
+            // Remove app connection ID mapping
+            let app_conn_id = Self::scid_to_app_conn_id(&scid);
+            self.app_conn_id_to_slab.remove(&app_conn_id);
         }
 
         // Remove from Slab (slot will be reused)
@@ -241,7 +257,11 @@ impl ConnectionManager {
         self.dcid_to_slab.insert(scid.clone(), slab_idx);
 
         // Also register SCID mapping for egress command routing
-        self.scid_to_slab.insert(scid, slab_idx);
+        self.scid_to_slab.insert(scid.clone(), slab_idx);
+
+        // Register app connection ID mapping for O(1) egress command routing
+        let app_conn_id = Self::scid_to_app_conn_id(&scid);
+        self.app_conn_id_to_slab.insert(app_conn_id, slab_idx);
 
         debug!(
             worker_id = self.worker_id,
@@ -391,9 +411,10 @@ impl ConnectionManager {
 
         // Check if existing connection
         if let Some(slab_idx) = self.find_by_dcid(&dcid) {
-            eprintln!(
-                "DEBUG: Found existing connection by DCID: dcid={:?}, slab_idx={}",
-                dcid, slab_idx
+            trace!(
+                ?dcid,
+                slab_idx,
+                "Found existing connection by DCID"
             );
             if let Some(state) = self.get_connection_mut(slab_idx) {
                 // RFC 9001 Section 5.4: Remove header protection BEFORE decryption
@@ -461,20 +482,19 @@ impl ConnectionManager {
 
         // New connection with supported version
         if packet.header.ty == PacketType::Initial {
-            eprintln!("DEBUG: No existing connection found for DCID: {:?}", dcid);
-            eprintln!(
-                "DEBUG: Received Initial packet: version=0x{:08X}, dcid={:?}, size={}",
-                packet.header.version, packet.header.dcid, datagram_size
+            trace!(?dcid, "No existing connection found for DCID");
+            trace!(
+                version = packet.header.version,
+                ?dcid,
+                datagram_size,
+                "Received Initial packet"
             );
             // RFC 9000 Section 14.1: Validate minimum datagram size for Initial packets
             if datagram_size < 1200 {
-                eprintln!(
-                    "DEBUG: Dropping undersized Initial packet ({} bytes) from {}",
-                    datagram_size, peer_addr
-                );
                 debug!(
-                    "Dropping undersized Initial packet ({} bytes) from {}",
-                    datagram_size, peer_addr
+                    datagram_size,
+                    %peer_addr,
+                    "Dropping undersized Initial packet"
                 );
                 return vec![];
             }
@@ -492,8 +512,12 @@ impl ConnectionManager {
             // RFC 9000 §18.2: original_destination_connection_id is the DCID from client's Initial
             let original_dcid = packet.header.dcid.clone();
 
-            eprintln!("DEBUG: Creating new connection: scid={:?}, dcid={:?} (client's SCID), original_dcid={:?} (client's DCID)", 
-                     scid, dcid, original_dcid);
+            trace!(
+                ?scid,
+                client_scid = ?dcid,
+                ?original_dcid,
+                "Creating new connection"
+            );
             // Create QUIC connection state machine
             // Clone original_dcid before moving into QuicConnection
             let conn = QuicConnection::new(
@@ -539,24 +563,22 @@ impl ConnectionManager {
 
             // Now process the Initial packet
             if let Some(state) = self.get_connection_mut(slab_idx) {
-                eprintln!("DEBUG: Processing Initial packet");
+                trace!(slab_idx, "Processing Initial packet");
                 let datagram_input = DatagramInput {
                     data: bytes,
                     recv_time: Self::to_quic_instant(now),
                 };
                 if let Err(e) = state.conn.process_datagram(datagram_input) {
-                    eprintln!("DEBUG: Failed to process initial packet: {}", e);
-                    error!("Failed to process initial packet: {}", e);
+                    error!(error = %e, "Failed to process initial packet");
                     // Remove the connection on failure
                     self.remove_connection(slab_idx);
                     return vec![];
                 }
-                eprintln!("DEBUG: Initial packet processed successfully");
+                trace!(slab_idx, "Initial packet processed successfully");
             }
 
-            eprintln!("DEBUG: Generating response packets");
             let packets = self.generate_packets(slab_idx, now);
-            eprintln!("DEBUG: Generated {} response packets", packets.len());
+            trace!(slab_idx, packet_count = packets.len(), "Generated response packets");
             self.check_handshake_complete(slab_idx);
 
             return packets;
@@ -813,8 +835,8 @@ impl ConnectionManager {
                 events.push(event);
             }
 
-            // Drop the mutable borrow before calling bridge_event_to_app
-            drop(state);
+            // Mutable borrow of `state` ends here (last use above)
+            // The borrow is released when we exit this scope
 
             // Now send events (bridge_event_to_app takes &mut self)
             for event in events {
@@ -852,21 +874,26 @@ impl ConnectionManager {
         const MAX_VN_PER_WINDOW: u32 = 10;
         const WINDOW_DURATION: Duration = Duration::from_secs(1);
 
-        let entry = self.vn_rate_limiter.entry(peer_addr).or_insert((0, now));
-
-        // Check if window has expired
-        if now.duration_since(entry.1) > WINDOW_DURATION {
-            // Reset window
-            entry.0 = 1;
-            entry.1 = now;
-            true
-        } else if entry.0 < MAX_VN_PER_WINDOW {
-            // Within limit
-            entry.0 += 1;
-            true
+        // Use LRU cache to bound memory usage
+        if let Some(entry) = self.vn_rate_limiter.get_mut(&peer_addr) {
+            // Check if window has expired
+            if now.duration_since(entry.1) > WINDOW_DURATION {
+                // Reset window
+                entry.0 = 1;
+                entry.1 = now;
+                true
+            } else if entry.0 < MAX_VN_PER_WINDOW {
+                // Within limit
+                entry.0 += 1;
+                true
+            } else {
+                // Rate limit exceeded
+                false
+            }
         } else {
-            // Rate limit exceeded
-            false
+            // New entry - insert into LRU cache
+            self.vn_rate_limiter.put(peer_addr, (1, now));
+            true
         }
     }
 
@@ -880,36 +907,28 @@ impl ConnectionManager {
                 data,
                 fin,
             } => {
-                eprintln!(
-                    "HANDLE_COMMAND: WriteStreamData conn_id={:?}, stream_id={:?}, len={}, fin={}",
-                    conn_id,
-                    stream_id,
-                    data.len(),
-                    fin
+                trace!(
+                    ?conn_id,
+                    ?stream_id,
+                    data_len = data.len(),
+                    fin,
+                    "Handling WriteStreamData command"
                 );
                 // Find connection by ID and write data to stream
                 if let Some(slab_idx) = self.find_slab_by_app_conn_id(conn_id) {
-                    eprintln!("HANDLE_COMMAND: Found connection at slab_idx={}", slab_idx);
+                    trace!(slab_idx, "Found connection for command");
                     if let Some(state) = self.get_connection_mut(slab_idx) {
                         let quic_stream_id = QuicStreamId(stream_id.0);
-                        let data_len = data.len();
-                        eprintln!(
-                            "HANDLE_COMMAND: Calling write_stream, data_len={}",
-                            data_len
-                        );
                         if let Err(e) = state.conn.write_stream(quic_stream_id, data, fin) {
-                            error!("Failed to write to stream {:?}: {}", stream_id, e);
+                            error!(?stream_id, error = %e, "Failed to write to stream");
                         } else {
-                            eprintln!("HANDLE_COMMAND: write_stream succeeded, deferring packet generation");
+                            trace!(slab_idx, "write_stream succeeded, deferring packet generation");
                         }
                     }
                     // Return empty packets and slab_idx to defer packet generation
                     return (Vec::new(), Some(slab_idx));
                 } else {
-                    eprintln!(
-                        "HANDLE_COMMAND: Connection not found for conn_id={:?}",
-                        conn_id
-                    );
+                    debug!(?conn_id, "Connection not found for command");
                 }
             }
             Command::OpenBiStream { conn_id } => {
@@ -1047,22 +1066,18 @@ impl ConnectionManager {
     }
 
     /// Helper to find Slab index by quicd_x ConnectionId.
+    /// O(1) lookup via app_conn_id_to_slab HashMap.
     fn find_slab_by_app_conn_id(&self, conn_id: XConnectionId) -> Option<SlabIndex> {
-        // Search through all connections in the Slab
-        for (slab_idx, state) in &self.connections {
-            let scid = state.conn.source_cid();
-            // Convert scid to u64 for comparison
-            let mut bytes = [0u8; 8];
-            let scid_bytes = scid.as_bytes();
-            let len = std::cmp::min(scid_bytes.len(), 8);
-            bytes[..len].copy_from_slice(&scid_bytes[..len]);
-            let conn_id_u64 = u64::from_le_bytes(bytes);
+        self.app_conn_id_to_slab.get(&conn_id.0).copied()
+    }
 
-            if conn_id_u64 == conn_id.0 {
-                return Some(slab_idx);
-            }
-        }
-        None
+    /// Convert SCID to application connection ID (u64).
+    fn scid_to_app_conn_id(scid: &ConnectionId) -> u64 {
+        let mut bytes = [0u8; 8];
+        let scid_bytes = scid.as_bytes();
+        let len = std::cmp::min(scid_bytes.len(), 8);
+        bytes[..len].copy_from_slice(&scid_bytes[..len]);
+        u64::from_le_bytes(bytes)
     }
 
     /// Calculate next timeout deadline across all connections.
@@ -1264,8 +1279,8 @@ impl ConnectionManager {
                 continue;
             }
 
-            // Drop state borrow before calling other self methods
-            drop(state);
+            // Mutable borrow of `state` ends here (last use above)
+            // The borrow is released when we exit this scope
 
             // Flush events and generate responses
             self.flush_events_to_app(slab_idx);
