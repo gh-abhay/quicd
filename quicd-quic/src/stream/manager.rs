@@ -270,16 +270,29 @@ impl StreamManager {
         Ok(())
     }
 
-    /// Update peer's stream limits (from MAX_STREAMS frames)
+    /// Update peer's stream limits (from MAX_STREAMS frames received from peer)
+    /// 
+    /// When we receive MAX_STREAMS from peer, it tells us how many streams
+    /// WE are allowed to initiate. This updates our local outgoing limit.
     pub fn update_peer_max_streams(&mut self, direction: StreamDirection, max_streams: u64) {
         match direction {
             StreamDirection::Bidirectional => {
-                self.max_streams_bidi_remote = max_streams;
+                self.max_streams_bidi_local = max_streams;
             }
             StreamDirection::Unidirectional => {
-                self.max_streams_uni_remote = max_streams;
+                self.max_streams_uni_local = max_streams;
             }
         }
+    }
+
+    /// Set local stream limits from our transport parameters (RFC 9000 §4.6)
+    /// 
+    /// These are the limits WE advertise to the peer in initial_max_streams_bidi/uni.
+    /// The peer is not allowed to exceed these limits when initiating streams to us.
+    /// We must enforce these limits on incoming streams.
+    pub fn set_local_max_streams(&mut self, max_bidi: u64, max_uni: u64) {
+        self.max_streams_bidi_remote = max_bidi;
+        self.max_streams_uni_remote = max_uni;
     }
 }
 
@@ -493,19 +506,36 @@ mod tests {
 
     #[test]
     fn test_update_peer_max_streams_bidi() {
+        // When we receive MAX_STREAMS from peer, it tells us how many streams
+        // WE can initiate. This updates max_streams_bidi_local.
         let mut mgr = StreamManager::new(Side::Client);
-        assert_eq!(mgr.max_streams_bidi_remote, 0);
+        assert_eq!(mgr.max_streams_bidi_local, 0);
 
         mgr.update_peer_max_streams(StreamDirection::Bidirectional, 100);
-        assert_eq!(mgr.max_streams_bidi_remote, 100);
+        assert_eq!(mgr.max_streams_bidi_local, 100);
     }
 
     #[test]
     fn test_update_peer_max_streams_uni() {
+        // When we receive MAX_STREAMS from peer, it tells us how many streams
+        // WE can initiate. This updates max_streams_uni_local.
         let mut mgr = StreamManager::new(Side::Server);
-        assert_eq!(mgr.max_streams_uni_remote, 0);
+        assert_eq!(mgr.max_streams_uni_local, 0);
 
         mgr.update_peer_max_streams(StreamDirection::Unidirectional, 50);
+        assert_eq!(mgr.max_streams_uni_local, 50);
+    }
+
+    #[test]
+    fn test_set_local_max_streams() {
+        // set_local_max_streams sets the limits we advertise to peer,
+        // which limits streams THEY can initiate (stored in _remote fields).
+        let mut mgr = StreamManager::new(Side::Server);
+        assert_eq!(mgr.max_streams_bidi_remote, 0);
+        assert_eq!(mgr.max_streams_uni_remote, 0);
+
+        mgr.set_local_max_streams(100, 50);
+        assert_eq!(mgr.max_streams_bidi_remote, 100);
         assert_eq!(mgr.max_streams_uni_remote, 50);
     }
 

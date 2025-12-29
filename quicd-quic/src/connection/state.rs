@@ -477,8 +477,13 @@ impl QuicConnection {
         let crypto_backend: Box<dyn CryptoBackend> =
             Box::new(crate::crypto::boring::BoringCryptoBackend);
 
-        // Create stream manager
-        let streams = StreamManager::new(side);
+        // Create stream manager and initialize with local transport parameters (RFC 9000 §4.6)
+        // These limits define how many streams the PEER can initiate toward us.
+        let mut streams = StreamManager::new(side);
+        streams.set_local_max_streams(
+            config.local_params.initial_max_streams_bidi,
+            config.local_params.initial_max_streams_uni,
+        );
 
         // Create flow control (using transport params from config)
         let initial_max_data = config.local_params.initial_max_data;
