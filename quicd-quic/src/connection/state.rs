@@ -513,12 +513,51 @@ impl QuicConnection {
         // CRITICAL FIX: When server creates connection, `dcid` parameter is the client's SCID (which might be empty).
         // But RFC 9001 says initial keys are derived from Destination Connection ID field from the first Initial packet sent by the client.
         // This is passed as `original_dcid` parameter for servers.
-        let initial_secret_dcid = if side == Side::Server {
-            original_dcid
-                .as_ref()
-                .expect("Server must have original_dcid")
-        } else {
-            &dcid
+        let initial_secret_dcid = match (side, original_dcid.as_ref()) {
+            (Side::Server, Some(dcid)) => dcid,
+            (Side::Server, None) => {
+                // Server MUST have original_dcid for key derivation (RFC 9001 §5.2)
+                return Self {
+                    side,
+                    state: ConnectionState::Closed,
+                    scid,
+                    dcid,
+                    config,
+                    stats: ConnectionStats::default(),
+                    packet_parser,
+                    crypto_backend,
+                    tls_session: None,
+                    streams,
+                    flow_control,
+                    loss_detector,
+                    congestion_controller,
+                    pn_spaces,
+                    pending_events: alloc::vec::Vec::new(),
+                    pending_stream_writes: alloc::vec::Vec::new(),
+                    pending_stream_resets: alloc::vec::Vec::new(),
+                    pending_close: None,
+                    handshake_complete: false,
+                    last_activity: None,
+                    closing_timeout: None,
+                    initial_read_keys: EncryptionKeys::empty(),
+                    initial_write_keys: EncryptionKeys::empty(),
+                    handshake_read_keys: EncryptionKeys::empty(),
+                    handshake_write_keys: EncryptionKeys::empty(),
+                    one_rtt_read_keys: EncryptionKeys::empty(),
+                    one_rtt_write_keys: EncryptionKeys::empty(),
+                    pending_crypto: alloc::vec::Vec::new(),
+                    crypto_send_offsets: BTreeMap::new(),
+                    crypto_buffers: BTreeMap::new(),
+                    largest_received_pn_initial: None,
+                    largest_received_pn_handshake: None,
+                    largest_received_pn_appdata: None,
+                    largest_acked_pn_handshake: None,
+                    largest_acked_pn_appdata: None,
+                    handshake_done_sent: false,
+                    opened_streams: alloc::collections::BTreeSet::new(),
+                };
+            }
+            (Side::Client, _) => &dcid,
         };
 
         eprintln!(
@@ -1832,17 +1871,20 @@ impl QuicConnection {
             }
         };
 
-        // Check if we have keys for this level
-        if read_keys.aead.is_none() || read_keys.hp.is_none() {
-            // Keys not available yet - buffer or drop
-            eprintln!(
-                "DEBUG: Keys not available for level={:?}, aead={}, hp={}",
-                encryption_level,
-                read_keys.aead.is_some(),
-                read_keys.hp.is_some()
-            );
-            return Ok(());
-        }
+        // Check if we have keys for this level - extract them if available
+        let (aead_ref, hp_ref) = match (read_keys.aead.as_ref(), read_keys.hp.as_ref()) {
+            (Some(aead), Some(hp)) => (aead, hp),
+            _ => {
+                // Keys not available yet - buffer or drop
+                eprintln!(
+                    "DEBUG: Keys not available for level={:?}, aead={}, hp={}",
+                    encryption_level,
+                    read_keys.aead.is_some(),
+                    read_keys.hp.is_some()
+                );
+                return Ok(());
+            }
+        };
         eprintln!(
             "DEBUG: ✓ Keys available for level={:?}, proceeding with decryption",
             encryption_level
@@ -1852,7 +1894,7 @@ impl QuicConnection {
         // This reveals the actual packet number
         // We need a mutable copy of the buffer to modify it in-place
         let mut packet_buf = packet_data.to_vec();
-        let hp = read_keys.hp.as_ref().unwrap();
+        let hp = hp_ref;
         let hp_key = &read_keys.hp_key;
 
         // For 1-RTT Short header packets, the DCID is the server's SCID
@@ -2039,8 +2081,8 @@ impl QuicConnection {
         // Payload offset for AAD construction (header + PN)
         let payload_offset = pn_offset + pn_len;
 
-        // Decrypt payload using AEAD
-        let aead = read_keys.aead.as_ref().unwrap();
+        // Decrypt payload using AEAD (aead_ref extracted above in guard check)
+        let aead = aead_ref;
         let key = &read_keys.key;
         let iv = &read_keys.iv;
 
@@ -2716,7 +2758,8 @@ impl Connection for QuicConnection {
             let pn_len: usize = 1;
             let pn_bytes: Vec<u8> = vec![(pn & 0xff) as u8];
 
-            let aead = write_keys.aead.as_ref().unwrap();
+            // Safety: guard check above ensures aead is Some
+            let Some(aead) = write_keys.aead.as_ref() else { return None };
             let key = &write_keys.key;
             let iv = &write_keys.iv;
             let tag_len = aead.tag_len();
@@ -2772,7 +2815,8 @@ impl Connection for QuicConnection {
             if buf.len() >= sample_offset + 16 {
                 let sample = &buf[sample_offset..sample_offset + 16];
                 let mut mask = vec![0u8; 5];
-                let hp = write_keys.hp.as_ref().unwrap();
+                // Safety: guard check above ensures hp is Some when aead is Some
+                let Some(hp) = write_keys.hp.as_ref() else { return None };
                 if hp.build_mask(hp_key, sample, &mut mask).is_ok() {
                     buf[0] ^= mask[0] & if use_short_header { 0x1f } else { 0x0f };
                     for i in 0..pn_len {
@@ -2856,7 +2900,7 @@ impl Connection for QuicConnection {
                             let scid_bytes = self.scid.as_bytes();
 
                             // Encrypt payload
-                            let aead = write_keys.aead.as_ref().unwrap();
+                            let Some(aead) = write_keys.aead.as_ref() else { return None };
                             let key = &write_keys.key;
                             let iv = &write_keys.iv;
                             let tag_len = aead.tag_len();
@@ -2936,7 +2980,7 @@ impl Connection for QuicConnection {
                             buf.put_slice(&pn_bytes);
                             buf.put_slice(&encrypted_buf[..encrypted_len]);
 
-                            let hp = write_keys.hp.as_ref().unwrap();
+                            let Some(hp) = write_keys.hp.as_ref() else { return None };
                             let hp_key = &write_keys.hp_key;
 
                             let pn_start = header_len - pn_len;
@@ -3014,7 +3058,7 @@ impl Connection for QuicConnection {
                     let dcid_bytes = self.dcid.as_bytes();
 
                     // AEAD encrypt
-                    let aead = write_keys.aead.as_ref().unwrap();
+                    let Some(aead) = write_keys.aead.as_ref() else { return None };
                     let key = &write_keys.key;
                     let iv = &write_keys.iv;
                     let tag_len = aead.tag_len();
@@ -3088,7 +3132,7 @@ impl Connection for QuicConnection {
                     eprintln!("Ciphertext+tag: {} bytes", encrypted_len);
 
                     // Header protection for short header (mask 5 bits)
-                    let hp = write_keys.hp.as_ref().unwrap();
+                    let Some(hp) = write_keys.hp.as_ref() else { return None };
                     let hp_key = &write_keys.hp_key;
                     let pn_start = 1 + dcid_bytes.len();
                     let sample_offset = pn_start + pn_len + 4 - pn_len; // pn_start + 4 but showing the math
@@ -3273,7 +3317,7 @@ impl Connection for QuicConnection {
 
                 // Now we need to encrypt the payload
                 let plaintext = frame_buf.freeze();
-                let aead = write_keys.aead.as_ref().unwrap();
+                let Some(aead) = write_keys.aead.as_ref() else { return None };
                 let key = &write_keys.key;
                 let iv = &write_keys.iv;
                 let tag_len = aead.tag_len();
@@ -3344,7 +3388,7 @@ impl Connection for QuicConnection {
                 eprintln!("HP sample (16 bytes): {:02x?}", sample);
 
                 let mut mask = vec![0u8; 5];
-                let hp = write_keys.hp.as_ref().unwrap();
+                let Some(hp) = write_keys.hp.as_ref() else { return None };
                 let hp_key = &write_keys.hp_key;
                 eprintln!("HP key: {:02x?}", hp_key);
                 if hp.build_mask(hp_key, sample, &mut mask).is_err() {
@@ -3584,7 +3628,7 @@ impl Connection for QuicConnection {
 
             // Encrypt payload - we'll estimate length first, then adjust if needed
             let plaintext = frame_buf.freeze();
-            let aead = write_keys.aead.as_ref().unwrap();
+            let Some(aead) = write_keys.aead.as_ref() else { return None };
             let key = &write_keys.key;
             let iv = &write_keys.iv;
             let tag_len = aead.tag_len();
@@ -3737,7 +3781,7 @@ impl Connection for QuicConnection {
             buf.put_slice(&encrypted_buf[..encrypted_len]);
 
             // Apply header protection (RFC 9001 Section 5.4)
-            let hp = write_keys.hp.as_ref().unwrap();
+            let Some(hp) = write_keys.hp.as_ref() else { return None };
             let hp_key = &write_keys.hp_key;
 
             // Sample is 16 bytes starting 4 bytes after the start of the packet number
@@ -3859,7 +3903,7 @@ impl Connection for QuicConnection {
                             let scid_bytes = self.scid.as_bytes();
 
                             // Encrypt payload
-                            let aead = write_keys.aead.as_ref().unwrap();
+                            let Some(aead) = write_keys.aead.as_ref() else { return None };
                             let key = &write_keys.key;
                             let iv = &write_keys.iv;
                             let tag_len = aead.tag_len();
@@ -3939,7 +3983,7 @@ impl Connection for QuicConnection {
                             buf.put_slice(&pn_bytes);
                             buf.put_slice(&encrypted_buf[..encrypted_len]);
 
-                            let hp = write_keys.hp.as_ref().unwrap();
+                            let Some(hp) = write_keys.hp.as_ref() else { return None };
                             let hp_key = &write_keys.hp_key;
 
                             let pn_start = header_len - pn_len;
@@ -4034,7 +4078,7 @@ impl Connection for QuicConnection {
                     let dcid_bytes = self.dcid.as_bytes();
 
                     // Encrypt payload
-                    let aead = write_keys.aead.as_ref().unwrap();
+                    let Some(aead) = write_keys.aead.as_ref() else { return None };
                     let key = &write_keys.key;
                     let iv = &write_keys.iv;
                     let tag_len = aead.tag_len();
@@ -4084,7 +4128,7 @@ impl Connection for QuicConnection {
                     if buf.len() >= sample_offset + 16 {
                         let sample = &buf[sample_offset..sample_offset + 16];
                         let mut mask = vec![0u8; 5];
-                        let hp = write_keys.hp.as_ref().unwrap();
+                        let Some(hp) = write_keys.hp.as_ref() else { return None };
                         if hp.build_mask(hp_key, sample, &mut mask).is_ok() {
                             // Protect first byte (only lowest 5 bits for short header)
                             buf[0] ^= mask[0] & 0x1f;
@@ -4163,7 +4207,7 @@ impl Connection for QuicConnection {
                         let pn_bytes: Vec<u8> = vec![(pn & 0xff) as u8];
 
                         // Encrypt payload
-                        let aead = write_keys.aead.as_ref().unwrap();
+                        let Some(aead) = write_keys.aead.as_ref() else { return None };
                         let key = &write_keys.key;
                         let iv = &write_keys.iv;
                         let tag_len = aead.tag_len();
@@ -4209,7 +4253,7 @@ impl Connection for QuicConnection {
                         if buf.len() >= sample_offset + 16 {
                             let sample = &buf[sample_offset..sample_offset + 16];
                             let mut mask = vec![0u8; 5];
-                            let hp = write_keys.hp.as_ref().unwrap();
+                            let Some(hp) = write_keys.hp.as_ref() else { return None };
                             if hp.build_mask(hp_key, sample, &mut mask).is_ok() {
                                 buf[0] ^= mask[0] & 0x1f;
                                 for i in 0..pn_len {

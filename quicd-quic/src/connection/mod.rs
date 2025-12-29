@@ -7,6 +7,9 @@ pub mod cid_manager;
 // pub mod facade;
 pub mod state;
 
+#[cfg(test)]
+mod tests;
+
 pub use cid_manager::{
     ConnectionIdGenerator, ConnectionIdManager, NewConnectionIdData, RandomConnectionIdGenerator,
 };
