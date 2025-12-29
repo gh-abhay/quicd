@@ -60,9 +60,9 @@ pub fn validate_resource_limits(config: &ServerConfig) -> Result<(), Vec<String>
     if warnings.is_empty() {
         Ok(())
     } else {
-        // These are warnings, not errors - print to stderr but don't fail
+        // These are warnings, not errors - log them but don't fail
         for warning in &warnings {
-            eprintln!("⚠ {}", warning);
+            tracing::warn!("{}", warning);
         }
         Ok(())
     }

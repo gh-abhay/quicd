@@ -144,7 +144,7 @@ impl NetworkConfig {
 
         // Port 0 is valid (OS assigns random port) but warn
         if self.port == 0 {
-            eprintln!("Warning: port=0 will bind to a random port assigned by the OS");
+            tracing::warn!("port=0 will bind to a random port assigned by the OS");
         }
 
         if errors.is_empty() {

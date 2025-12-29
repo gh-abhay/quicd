@@ -35,6 +35,9 @@ pub mod global;
 pub mod loader;
 pub mod validation;
 
+#[cfg(test)]
+mod tests;
+
 pub use application::ApplicationConfig;
 pub use global::{GlobalConfig, RuntimeConfig};
 pub use loader::load_config;
@@ -147,7 +150,7 @@ impl ServerConfig {
             if warning.contains("File descriptor limit") {
                 errors.push(format!("CRITICAL: {}", warning));
             } else {
-                eprintln!("WARNING: {}", warning);
+                tracing::warn!("{}", warning);
             }
         }
 

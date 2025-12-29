@@ -118,7 +118,7 @@ fn main() -> anyhow::Result<()> {
 
     tokio_runtime.spawn(async move {
         if let Err(e) = tokio::signal::ctrl_c().await {
-            eprintln!("Failed to install Ctrl+C handler: {}", e);
+            tracing::error!(error = ?e, "Failed to install Ctrl+C handler");
             return;
         }
         info!("Shutdown signal received");

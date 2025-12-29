@@ -92,9 +92,9 @@ fn load_config_file(path: &str) -> Result<ServerConfig> {
 
     // If file doesn't exist, use default config
     if !path_obj.exists() {
-        eprintln!(
-            "Warning: Configuration file '{}' not found, using defaults",
-            path
+        tracing::warn!(
+            config_path = %path,
+            "Configuration file not found, using defaults"
         );
         return Ok(ServerConfig::default());
     }
@@ -149,7 +149,7 @@ fn apply_cli_overrides(config: &mut ServerConfig, cli: &CliArgs) {
         if let Ok(level) = level_str.parse() {
             config.global.logging.level = level;
         } else {
-            eprintln!("Warning: Invalid log level '{}', ignoring", level_str);
+            tracing::warn!(level = %level_str, "Invalid log level specified, ignoring");
         }
     }
 }

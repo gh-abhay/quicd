@@ -81,12 +81,12 @@ fn default_stream_egress_capacity() -> usize {
 
 impl Default for ChannelConfig {
     fn default() -> Self {
-        // Default values without querying system resources
+        // Use same values as serde defaults for consistency
         Self {
-            worker_egress_capacity: 256,
-            connection_ingress_capacity: 128,
-            stream_ingress_capacity: 64,
-            stream_egress_capacity: 64,
+            worker_egress_capacity: default_worker_egress_capacity(),
+            connection_ingress_capacity: default_connection_ingress_capacity(),
+            stream_ingress_capacity: default_stream_ingress_capacity(),
+            stream_egress_capacity: default_stream_egress_capacity(),
         }
     }
 }
