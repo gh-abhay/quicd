@@ -5,7 +5,6 @@
 #![forbid(unsafe_code)]
 
 use crate::types::{Instant, PacketNumber, PacketNumberSpace};
-use core::time::Duration;
 
 /// Packet Sent Information
 ///
@@ -29,44 +28,6 @@ pub struct PacketSentInfo {
 
     /// Whether packet is in flight (counts toward bytes_in_flight)
     pub in_flight: bool,
-}
-
-/// Loss Detector Trait
-///
-/// Detects packet loss based on time and packet number thresholds.
-/// RFC 9002 Section 6: Declares packets lost when:
-/// - Larger packet number acknowledged + threshold (packet reordering)
-/// - Time since sent exceeds threshold (timeout)
-pub trait LossDetector: Send {
-    /// Record packet sent
-    fn on_packet_sent(&mut self, info: PacketSentInfo);
-
-    /// Process ACK frame
-    ///
-    /// Marks acknowledged packets and detects losses.
-    ///
-    /// **Returns**: List of lost packet numbers
-    fn on_ack_received(
-        &mut self,
-        space: PacketNumberSpace,
-        largest_acked: PacketNumber,
-        ack_delay: Duration,
-        now: Instant,
-    ) -> Vec<PacketNumber>;
-
-    /// Check for loss by timeout (PTO)
-    ///
-    /// Called when PTO timer expires. Returns lost packets.
-    fn detect_lost_packets(&mut self, space: PacketNumberSpace, now: Instant) -> Vec<PacketNumber>;
-
-    /// Get next timeout (PTO or loss detection timer)
-    fn loss_detection_timer(&self) -> Option<Instant>;
-
-    /// Get PTO count for exponential backoff
-    fn pto_count(&self, space: PacketNumberSpace) -> u32;
-
-    /// Reset PTO count after receiving ACK
-    fn reset_pto_count(&mut self, space: PacketNumberSpace);
 }
 
 /// Recovery State (Per-Connection)

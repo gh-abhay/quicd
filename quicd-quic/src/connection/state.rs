@@ -410,6 +410,10 @@ pub struct QuicConnection {
     /// Connection close pending (error_code, reason)
     pending_close: Option<(u64, alloc::vec::Vec<u8>)>,
 
+    /// Pending MAX_DATA frame to send (RFC 9000 Section 4.2)
+    /// Value is the new maximum data limit to advertise
+    pending_max_data: Option<u64>,
+
     /// Handshake complete flag
     handshake_complete: bool,
 
@@ -551,6 +555,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -603,6 +608,7 @@ impl QuicConnection {
                         pending_stream_writes: alloc::vec::Vec::new(),
                         pending_stream_resets: alloc::vec::Vec::new(),
                         pending_close: None,
+                    pending_max_data: None,
                         handshake_complete: false,
                         last_activity: None,
                         closing_timeout: None,
@@ -652,6 +658,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -699,6 +706,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -747,6 +755,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -793,6 +802,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -841,6 +851,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -886,6 +897,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -942,6 +954,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -991,6 +1004,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -1039,6 +1053,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -1088,6 +1103,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -1136,6 +1152,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -1184,6 +1201,7 @@ impl QuicConnection {
                     pending_stream_writes: alloc::vec::Vec::new(),
                     pending_stream_resets: alloc::vec::Vec::new(),
                     pending_close: None,
+                    pending_max_data: None,
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
@@ -1232,6 +1250,7 @@ impl QuicConnection {
                         pending_stream_writes: alloc::vec::Vec::new(),
                         pending_stream_resets: alloc::vec::Vec::new(),
                         pending_close: None,
+                    pending_max_data: None,
                         handshake_complete: false,
                         last_activity: None,
                         closing_timeout: None,
@@ -1276,6 +1295,7 @@ impl QuicConnection {
                         pending_stream_writes: alloc::vec::Vec::new(),
                         pending_stream_resets: alloc::vec::Vec::new(),
                         pending_close: None,
+                    pending_max_data: None,
                         handshake_complete: false,
                         last_activity: None,
                         closing_timeout: None,
@@ -1331,6 +1351,7 @@ impl QuicConnection {
                         pending_stream_writes: alloc::vec::Vec::new(),
                         pending_stream_resets: alloc::vec::Vec::new(),
                         pending_close: None,
+                    pending_max_data: None,
                         handshake_complete: false,
                         last_activity: None,
                         closing_timeout: None,
@@ -1375,6 +1396,7 @@ impl QuicConnection {
                         pending_stream_writes: alloc::vec::Vec::new(),
                         pending_stream_resets: alloc::vec::Vec::new(),
                         pending_close: None,
+                    pending_max_data: None,
                         handshake_complete: false,
                         last_activity: None,
                         closing_timeout: None,
@@ -1461,6 +1483,7 @@ impl QuicConnection {
                             pending_stream_writes: alloc::vec::Vec::new(),
                             pending_stream_resets: alloc::vec::Vec::new(),
                             pending_close: None,
+                    pending_max_data: None,
                             handshake_complete: false,
                             last_activity: None,
                             closing_timeout: None,
@@ -1504,6 +1527,7 @@ impl QuicConnection {
                             pending_stream_writes: alloc::vec::Vec::new(),
                             pending_stream_resets: alloc::vec::Vec::new(),
                             pending_close: None,
+                    pending_max_data: None,
                             handshake_complete: false,
                             last_activity: None,
                             closing_timeout: None,
@@ -1559,6 +1583,7 @@ impl QuicConnection {
             pending_stream_writes: alloc::vec::Vec::new(),
             pending_stream_resets: alloc::vec::Vec::new(),
             pending_close: None,
+                    pending_max_data: None,
             handshake_complete: false,
             last_activity: None,
             closing_timeout: None,
@@ -1595,6 +1620,9 @@ impl QuicConnection {
         match frame {
             Frame::Stream(stream_frame) => {
                 let stream_id = stream_frame.stream_id;
+
+                // Validate stream ID against limits (RFC 9000 Section 4.6)
+                self.streams.validate_stream_id(stream_id)?;
 
                 // Check if this is a new stream (first data received)
                 // For peer-initiated streams, we need to emit StreamOpened event
@@ -1743,6 +1771,26 @@ impl QuicConnection {
 
             Frame::Padding => {
                 // No-op
+                Ok(())
+            }
+
+            Frame::MaxStreamsBidi(max_streams) => {
+                // Peer increased bidirectional stream limit (RFC 9000 §19.11)
+                use crate::types::StreamDirection;
+                self.streams.update_peer_max_streams(
+                    StreamDirection::Bidirectional,
+                    max_streams.maximum_streams,
+                );
+                Ok(())
+            }
+
+            Frame::MaxStreamsUni(max_streams) => {
+                // Peer increased unidirectional stream limit (RFC 9000 §19.11)
+                use crate::types::StreamDirection;
+                self.streams.update_peer_max_streams(
+                    StreamDirection::Unidirectional,
+                    max_streams.maximum_streams,
+                );
                 Ok(())
             }
 
@@ -3976,6 +4024,104 @@ impl Connection for QuicConnection {
         }
 
         // ═══════════════════════════════════════════════════════════════════
+        // MAX_DATA FRAME SENDING (RFC 9000 Section 4.2)
+        // ═══════════════════════════════════════════════════════════════════
+        // Send MAX_DATA to expand peer's flow control window when needed
+        if self.handshake_complete
+            && self.one_rtt_write_keys.aead.is_some()
+            && self.pending_max_data.is_some()
+        {
+            if let Some(max_data_value) = self.pending_max_data.take() {
+                use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
+                let serializer = DefaultFrameSerializer;
+                let mut frame_buf = BytesMut::new();
+
+                // Build MAX_DATA frame
+                let max_data_frame = Frame::MaxData(crate::frames::MaxDataFrame {
+                    maximum_data: max_data_value,
+                });
+
+                if serializer
+                    .serialize_frame(&max_data_frame, &mut frame_buf)
+                    .is_ok()
+                {
+                    let plaintext = frame_buf.freeze();
+                    let write_keys = &mut self.one_rtt_write_keys;
+                    let pn = write_keys.packet_number;
+                    write_keys.packet_number += 1;
+
+                    // Short header packet
+                    let pn_len: usize = 1;
+                    let pn_bytes: Vec<u8> = vec![(pn & 0xff) as u8];
+                    let dcid_bytes = self.dcid.as_bytes();
+
+                    let Some(aead) = write_keys.aead.as_ref() else { return None };
+                    let key = &write_keys.key;
+                    let iv = &write_keys.iv;
+                    let tag_len = aead.tag_len();
+
+                    buf.clear();
+                    buf.reserve(1500);
+
+                    let first_byte = 0x40 | ((pn_len - 1) as u8);
+                    buf.put_u8(first_byte);
+                    buf.put_slice(dcid_bytes);
+                    buf.put_slice(&pn_bytes);
+
+                    let header_len = buf.len();
+                    let header_for_aead = &buf[..];
+                    let mut encrypted_buf = vec![0u8; plaintext.len() + tag_len];
+                    let encrypted_len = match aead.seal(
+                        key,
+                        iv,
+                        pn,
+                        header_for_aead,
+                        &plaintext,
+                        &mut encrypted_buf,
+                    ) {
+                        Ok(len) => len,
+                        Err(_) => return None,
+                    };
+
+                    buf.put_slice(&encrypted_buf[..encrypted_len]);
+
+                    // Apply header protection
+                    let hp_key = &write_keys.hp_key;
+                    let pn_start = header_len - pn_len;
+                    let sample_offset = pn_start + 4;
+                    if buf.len() >= sample_offset + 16 {
+                        let sample = &buf[sample_offset..sample_offset + 16];
+                        let mut mask = vec![0u8; 5];
+                        let Some(hp) = write_keys.hp.as_ref() else { return None };
+                        if hp.build_mask(hp_key, sample, &mut mask).is_ok() {
+                            buf[0] ^= mask[0] & 0x1f;
+                            for i in 0..pn_len {
+                                buf[pn_start + i] ^= mask[1 + i];
+                            }
+                        }
+                    }
+
+                    eprintln!(
+                        "DEBUG: Generated MAX_DATA frame, new_max={}",
+                        max_data_value
+                    );
+
+                    let pn_space = crate::types::PacketNumberSpace::ApplicationData;
+                    self.loss_detector.on_packet_sent(pn_space, pn, buf.len(), true, now);
+                    self.congestion_controller.on_packet_sent(pn, pn_space, buf.len(), true, now);
+                    self.stats.packets_sent += 1;
+                    self.stats.bytes_sent += buf.len() as u64;
+
+                    let data_out = buf.split();
+                    return Some(DatagramOutput {
+                        data: data_out,
+                        send_time: Some(now),
+                    });
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
         // STREAM FRAME SENDING (1-RTT packets)
         // ═══════════════════════════════════════════════════════════════════
         // If handshake is complete and we have 1-RTT keys, send queued stream data
@@ -4233,7 +4379,22 @@ impl Connection for QuicConnection {
         if self.pending_events.is_empty() {
             None
         } else {
-            Some(self.pending_events.remove(0))
+            let event = self.pending_events.remove(0);
+            
+            // RFC 9000 Section 4.2: When application consumes stream data,
+            // update flow control and check if MAX_DATA update is needed
+            if let ConnectionEvent::StreamData { ref data, .. } = event {
+                let bytes_consumed = data.len() as u64;
+                self.flow_control.recv.consume(bytes_consumed);
+                
+                // Check if we should send MAX_DATA update
+                if self.flow_control.recv.should_send_max_data_update() {
+                    let new_max = self.flow_control.recv.new_max_data();
+                    self.pending_max_data = Some(new_max);
+                }
+            }
+            
+            Some(event)
         }
     }
 

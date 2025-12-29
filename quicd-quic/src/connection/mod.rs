@@ -3,8 +3,6 @@
 //! Top-level connection management with event-driven interface.
 
 pub mod cid_manager;
-// TODO: facade module is incomplete design doc, not yet functional
-// pub mod facade;
 pub mod state;
 
 #[cfg(test)]
