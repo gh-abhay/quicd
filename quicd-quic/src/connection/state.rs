@@ -15,7 +15,7 @@ use crate::frames::Frame;
 use crate::packet::PacketParserTrait;
 use crate::recovery::{CongestionController, LossDetector};
 use crate::recovery::loss::{DefaultLossDetector, LossDetectionConfig};
-use crate::stream::StreamManager;
+use crate::stream::{ReceiveBuffer, StreamManager};
 use crate::transport::{
     TransportParameters, TP_ACK_DELAY_EXPONENT, TP_ACTIVE_CONNECTION_ID_LIMIT, TP_INITIAL_MAX_DATA,
     TP_INITIAL_MAX_STREAMS_BIDI, TP_INITIAL_MAX_STREAMS_UNI, TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
@@ -451,6 +451,20 @@ pub struct QuicConnection {
 
     /// Track which streams have been opened (to emit StreamOpened event only once)
     opened_streams: alloc::collections::BTreeSet<StreamId>,
+
+    /// Per-stream receive buffers for deduplication and ordered delivery (RFC 9000 §2.2)
+    ///
+    /// QUIC provides a reliable, ordered byte-stream abstraction. This means:
+    /// - Duplicate data from retransmissions must be deduplicated
+    /// - Out-of-order data must be reassembled before delivery
+    /// - Only new contiguous data should be delivered to the application
+    stream_recv_buffers: BTreeMap<StreamId, ReceiveBuffer>,
+
+    /// Per-stream send offsets (RFC 9000 §2.2)
+    ///
+    /// Tracks the next byte offset to use when sending data on each stream.
+    /// This is required for segmenting large writes into MTU-sized STREAM frames.
+    stream_send_offsets: BTreeMap<StreamId, u64>,
 }
 
 impl QuicConnection {
@@ -567,6 +581,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 };
             }
             (Side::Client, _) => &dcid,
@@ -615,6 +631,8 @@ impl QuicConnection {
                         crypto_buffers: BTreeMap::new(),
                         handshake_done_sent: false,
                         opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                     };
                 }
             };
@@ -660,6 +678,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 };
             }
         };
@@ -703,6 +723,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 };
             }
         };
@@ -747,6 +769,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 };
             }
         };
@@ -789,6 +813,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 };
             }
         };
@@ -833,6 +859,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 }
             }
         };
@@ -874,6 +902,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 }
             }
         };
@@ -926,6 +956,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 }
             }
         };
@@ -971,6 +1003,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 }
             }
         };
@@ -1015,6 +1049,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 }
             }
         };
@@ -1060,6 +1096,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 }
             }
         };
@@ -1104,6 +1142,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 }
             }
         };
@@ -1148,6 +1188,8 @@ impl QuicConnection {
                     crypto_buffers: BTreeMap::new(),
                     handshake_done_sent: false,
                     opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                 }
             }
         };
@@ -1192,6 +1234,8 @@ impl QuicConnection {
                         crypto_buffers: BTreeMap::new(),
                         handshake_done_sent: false,
                         opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                     }
                 }
             };
@@ -1232,6 +1276,8 @@ impl QuicConnection {
                         crypto_buffers: BTreeMap::new(),
                         handshake_done_sent: false,
                         opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                     }
                 }
             };
@@ -1283,6 +1329,8 @@ impl QuicConnection {
                         crypto_buffers: BTreeMap::new(),
                         handshake_done_sent: false,
                         opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                     }
                 }
             };
@@ -1323,6 +1371,8 @@ impl QuicConnection {
                         crypto_buffers: BTreeMap::new(),
                         handshake_done_sent: false,
                         opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                     }
                 }
             };
@@ -1405,6 +1455,8 @@ impl QuicConnection {
                             crypto_buffers: BTreeMap::new(),
                             handshake_done_sent: false,
                             opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                         };
                     }
                     // Set transport parameters on TLS session
@@ -1444,6 +1496,8 @@ impl QuicConnection {
                             crypto_buffers: BTreeMap::new(),
                             handshake_done_sent: false,
                             opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
                         };
                     }
                     Some(session)
@@ -1495,6 +1549,8 @@ impl QuicConnection {
             crypto_buffers: BTreeMap::new(),
             handshake_done_sent: false,
             opened_streams: alloc::collections::BTreeSet::new(),
+                    stream_recv_buffers: BTreeMap::new(),
+                    stream_send_offsets: BTreeMap::new(),
         }
     }
 
@@ -1528,21 +1584,75 @@ impl QuicConnection {
                 }
 
                 eprintln!(
-                    "DEBUG: Processing STREAM frame: stream_id={:?}, data_len={}, fin={}",
+                    "DEBUG: Processing STREAM frame: stream_id={:?}, offset={}, data_len={}, fin={}",
                     stream_id,
+                    stream_frame.offset,
                     stream_frame.data.len(),
                     stream_frame.fin
                 );
 
-                // Update stream data, check flow control, enqueue event
-                self.flow_control
-                    .recv
-                    .on_data_received(stream_frame.data.len() as u64)?;
-                self.pending_events.push(ConnectionEvent::StreamData {
-                    stream_id,
-                    data: Bytes::copy_from_slice(stream_frame.data),
-                    fin: stream_frame.fin,
-                });
+                // Get or create receive buffer for this stream (RFC 9000 §2.2)
+                // This provides:
+                // 1. Deduplication of retransmitted data
+                // 2. Reassembly of out-of-order data
+                // 3. Ordered delivery to application
+                let recv_buffer = self.stream_recv_buffers
+                    .entry(stream_id)
+                    .or_insert_with(|| ReceiveBuffer::new(1024 * 1024)); // 1MB per stream
+
+                // Record the read offset before inserting new data
+                let prev_read_offset = recv_buffer.read_offset();
+
+                // Insert data into receive buffer (handles duplicates and reordering)
+                recv_buffer.insert(
+                    stream_frame.offset,
+                    Bytes::copy_from_slice(stream_frame.data),
+                    stream_frame.fin,
+                )?;
+
+                // Read any newly available contiguous data
+                // Only emit events for data we haven't delivered yet
+                let mut total_new_bytes = 0u64;
+                while let Some(chunk) = recv_buffer.read(64 * 1024) {
+                    if !chunk.is_empty() {
+                        total_new_bytes += chunk.len() as u64;
+                        self.pending_events.push(ConnectionEvent::StreamData {
+                            stream_id,
+                            data: chunk,
+                            fin: false, // FIN handled separately
+                        });
+                    }
+                }
+
+                // Check if stream is complete (all data received and FIN processed)
+                let is_complete = recv_buffer.is_complete();
+
+                // If we have new data or stream just completed, update flow control
+                if total_new_bytes > 0 {
+                    self.flow_control
+                        .recv
+                        .on_data_received(total_new_bytes)?;
+                }
+
+                // Emit final StreamData with fin=true when stream is complete
+                if is_complete {
+                    self.pending_events.push(ConnectionEvent::StreamData {
+                        stream_id,
+                        data: Bytes::new(),
+                        fin: true,
+                    });
+                    // Clean up the receive buffer for completed stream
+                    self.stream_recv_buffers.remove(&stream_id);
+                }
+
+                eprintln!(
+                    "DEBUG: After STREAM processing: prev_offset={}, new_read_offset={}, delivered={} bytes, complete={}",
+                    prev_read_offset,
+                    self.stream_recv_buffers.get(&stream_id).map(|b| b.read_offset()).unwrap_or(0),
+                    total_new_bytes,
+                    is_complete
+                );
+
                 Ok(())
             }
 
@@ -3972,6 +4082,7 @@ impl Connection for QuicConnection {
         // STREAM FRAME SENDING (1-RTT packets)
         // ═══════════════════════════════════════════════════════════════════
         // If handshake is complete and we have 1-RTT keys, send queued stream data
+        // RFC 9000 Section 2.2: STREAM frames carry data in MTU-sized segments
         if self.handshake_complete
             && self.one_rtt_write_keys.aead.is_some()
             && !self.pending_stream_writes.is_empty()
@@ -3981,19 +4092,49 @@ impl Connection for QuicConnection {
                 self.pending_stream_writes.len()
             );
 
-            // Pop first pending write
-            if let Some((stream_id, data, fin)) = self.pending_stream_writes.pop() {
+            // Pop first pending write (FIFO order - use remove(0) not pop())
+            if !self.pending_stream_writes.is_empty() {
+                let (stream_id, data, fin) = self.pending_stream_writes.remove(0);
                 use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
                 use crate::frames::Frame;
                 let serializer = DefaultFrameSerializer;
                 let mut frame_buf = BytesMut::new();
 
-                // Build STREAM frame
+                // Get the current send offset for this stream
+                let current_offset = *self.stream_send_offsets.get(&stream_id).unwrap_or(&0);
+
+                // Calculate max payload size for this segment
+                // Overhead: short header (1) + DCID (8) + PN (1-4) + AEAD tag (16) = ~26 bytes
+                // STREAM frame header: type (1) + stream_id (8) + offset (8) + length (2) = ~19 bytes
+                // Total overhead: ~45 bytes. Use conservative limit of 1100 bytes for payload.
+                const MAX_STREAM_PAYLOAD: usize = 1100;
+
+                let chunk_size = core::cmp::min(data.len(), MAX_STREAM_PAYLOAD);
+                let chunk = data.slice(0..chunk_size);
+                let is_last_chunk = chunk_size == data.len();
+                let chunk_fin = fin && is_last_chunk;
+
+                eprintln!(
+                    "DEBUG: Sending stream {:?} chunk: offset={}, len={}, fin={}, remaining={}",
+                    stream_id, current_offset, chunk_size, chunk_fin, data.len() - chunk_size
+                );
+
+                // If there's more data, push remaining back to queue (front, to maintain order)
+                if !is_last_chunk {
+                    let remaining = data.slice(chunk_size..);
+                    // Insert at front so we continue sending this stream's data
+                    self.pending_stream_writes.insert(0, (stream_id, remaining, fin));
+                }
+
+                // Update the send offset for this stream
+                self.stream_send_offsets.insert(stream_id, current_offset + chunk_size as u64);
+
+                // Build STREAM frame with correct offset
                 let stream_frame = Frame::Stream(crate::frames::StreamFrame {
                     stream_id,
-                    offset: 0, // TODO: Track actual offset per stream
-                    data: &data,
-                    fin,
+                    offset: current_offset,
+                    data: &chunk,
+                    fin: chunk_fin,
                 });
 
                 // Serialize STREAM frame

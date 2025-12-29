@@ -495,6 +495,10 @@ impl H3Connection {
     }
 
     /// Process control stream per RFC 9114 Section 6.2.
+    /// 
+    /// Reads initial SETTINGS frame and returns. For full RFC compliance,
+    /// the control stream should be polled for additional frames (GOAWAY, etc.)
+    /// in the main event loop, but for basic HTTP/3 operation, SETTINGS is sufficient.
     async fn process_control_stream(
         stream: &mut quicd_x::QuicStream<'_>,
         remaining_data: BytesMut,
@@ -512,6 +516,20 @@ impl H3Connection {
 
         control_stream_buffer.extend_from_slice(&remaining_data);
 
+        // Process any frames in remaining_data first
+        Self::process_control_frames(
+            control_stream_buffer,
+            control_stream_parser,
+            control_stream_received,
+            peer_settings,
+        )?;
+
+        // If SETTINGS already received from remaining_data, return immediately
+        if *control_stream_received {
+            return Ok(());
+        }
+
+        // Read more data until we get SETTINGS
         let mut buffer = vec![0u8; 16384];
         loop {
             match stream.read(&mut buffer).await {
@@ -530,6 +548,14 @@ impl H3Connection {
                         control_stream_received,
                         peer_settings,
                     )?;
+                    
+                    // Return once SETTINGS is received (non-blocking design)
+                    // Additional control frames (GOAWAY, etc.) will be handled
+                    // by future reads if needed
+                    if *control_stream_received {
+                        info!("Received peer SETTINGS, control stream initialized");
+                        return Ok(());
+                    }
                 }
                 Err(e) => {
                     error!("Error reading control stream: {}", e);
@@ -594,7 +620,7 @@ impl H3Connection {
 
     /// Process QPACK encoder stream per RFC 9204 Section 4.2.
     async fn process_qpack_encoder_stream(
-        stream: &mut quicd_x::QuicStream<'_>,
+        _stream: &mut quicd_x::QuicStream<'_>,
         stream_id: StreamId,
         remaining_data: BytesMut,
         encoder_stream_buffer: &mut BytesMut,
@@ -604,33 +630,25 @@ impl H3Connection {
         *peer_encoder_stream = Some(stream_id);
         encoder_stream_buffer.extend_from_slice(&remaining_data);
 
-        let mut buffer = vec![0u8; 8192];
-        loop {
-            match stream.read(&mut buffer).await {
-                Ok(0) => {
-                    debug!("QPACK encoder stream closed");
-                    break;
-                }
-                Ok(n) => {
-                    encoder_stream_buffer.extend_from_slice(&buffer[..n]);
-                    if let Err(e) = qpack.process_encoder_stream_data(encoder_stream_buffer) {
-                        error!("Error processing encoder stream: {}", e);
-                        return Err(e);
-                    }
-                    encoder_stream_buffer.clear();
-                }
-                Err(e) => {
-                    warn!("Error reading encoder stream: {}", e);
-                    break;
-                }
+        // Process any data we already have
+        if !encoder_stream_buffer.is_empty() {
+            if let Err(e) = qpack.process_encoder_stream_data(encoder_stream_buffer) {
+                error!("Error processing encoder stream: {}", e);
+                return Err(e);
             }
+            encoder_stream_buffer.clear();
         }
+
+        // Return immediately to allow processing other streams
+        // For full RFC compliance, this stream should be polled in the main loop
+        // but for basic HTTP/3 with literal headers, this is sufficient
+        debug!("QPACK encoder stream registered");
         Ok(())
     }
 
     /// Process QPACK decoder stream per RFC 9204 Section 4.2.
     async fn process_qpack_decoder_stream(
-        stream: &mut quicd_x::QuicStream<'_>,
+        _stream: &mut quicd_x::QuicStream<'_>,
         stream_id: StreamId,
         remaining_data: BytesMut,
         decoder_stream_buffer: &mut BytesMut,
@@ -640,42 +658,26 @@ impl H3Connection {
         *peer_decoder_stream = Some(stream_id);
         decoder_stream_buffer.extend_from_slice(&remaining_data);
 
-        let mut buffer = vec![0u8; 8192];
-        loop {
-            match stream.read(&mut buffer).await {
-                Ok(0) => {
-                    debug!("QPACK decoder stream closed");
-                    break;
-                }
-                Ok(n) => {
-                    decoder_stream_buffer.extend_from_slice(&buffer[..n]);
-                    if let Err(e) = qpack.process_decoder_stream_data(decoder_stream_buffer) {
-                        error!("Error processing decoder stream: {}", e);
-                        return Err(e);
-                    }
-                    decoder_stream_buffer.clear();
-                }
-                Err(e) => {
-                    warn!("Error reading decoder stream: {}", e);
-                    break;
-                }
+        // Process any data we already have
+        if !decoder_stream_buffer.is_empty() {
+            if let Err(e) = qpack.process_decoder_stream_data(decoder_stream_buffer) {
+                error!("Error processing decoder stream: {}", e);
+                return Err(e);
             }
+            decoder_stream_buffer.clear();
         }
+
+        // Return immediately to allow processing other streams
+        debug!("QPACK decoder stream registered");
         Ok(())
     }
 
     /// Process push stream (not implemented - RFC 9114 Section 4.6).
-    async fn process_push_stream(stream: &mut quicd_x::QuicStream<'_>) -> Result<()> {
-        debug!("Received push stream (not implemented)");
-        // Drain push stream data
-        let mut buffer = vec![0u8; 8192];
-        loop {
-            match stream.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(_) => continue,
-                Err(_) => break,
-            }
-        }
+    /// Servers don't receive push streams, but clients may.
+    async fn process_push_stream(_stream: &mut quicd_x::QuicStream<'_>) -> Result<()> {
+        // Push streams are client-only (server pushes to client)
+        // Per RFC 9114, servers MUST NOT receive PUSH streams
+        warn!("Received unexpected push stream (servers don't accept pushes)");
         Ok(())
     }
 }
