@@ -2,6 +2,9 @@ pub mod cid_generator;
 pub mod router;
 pub mod routing;
 
+#[cfg(test)]
+mod tests;
+
 pub use cid_generator::RoutingConnectionIdGenerator;
 pub use router::{
     get_worker_cookie, is_valid_worker_cookie, load_ebpf, setup_rlimit, ConnectionId, Cookie,

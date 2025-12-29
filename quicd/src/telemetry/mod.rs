@@ -21,11 +21,11 @@
 //!
 //! ## Usage
 //!
-//! ```rust
+//! ```ignore
 //! use quicd::telemetry::{init_telemetry, record_metric, MetricsEvent};
 //!
 //! // Initialize telemetry at startup
-//! init_telemetry(&config.telemetry).await?;
+//! init_telemetry(&config.telemetry, &runtime_handle).await?;
 //!
 //! // Record metrics in hot paths (fire-and-forget)
 //! record_metric(MetricsEvent::PacketReceived { bytes: 1200 });

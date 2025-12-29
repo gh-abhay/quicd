@@ -66,7 +66,9 @@ fn extract_cookie(ctx: &SkMsgContext) -> Option<u16> {
     let first_byte = unsafe { *data };
 
     if first_byte & 0x80 == 0 {
-        // Short header packet: 1 byte flags + 8 byte DCID
+        // Short header packet: 1 byte flags + DCID (variable length, negotiated)
+        // Cookie is at bytes 6-7 of the DCID, so we need at least 8 bytes of DCID
+        // Total offset: 1 (header) + 6 (prefix) + 2 (cookie) = 9 bytes minimum
         if unsafe { data.add(1 + 8) } > data_end {
             return None;
         }
@@ -84,12 +86,13 @@ fn extract_cookie(ctx: &SkMsgContext) -> Option<u16> {
         // Read DCID length (byte 5)
         let dcid_len = unsafe { *data.add(5) } as usize;
 
-        // We expect 8-byte DCID
-        if dcid_len != 8 {
+        // Cookie is at bytes 6-7 of the DCID, so we need at least 8 bytes
+        // RFC 9000 Section 17.2: DCID length MUST NOT exceed 20 bytes
+        if dcid_len < 8 || dcid_len > 20 {
             return None;
         }
 
-        // Check if we have the full DCID
+        // Check if we have the full DCID (or at least the first 8 bytes for cookie)
         if unsafe { data.add(6 + 8) } > data_end {
             return None;
         }

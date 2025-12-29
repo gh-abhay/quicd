@@ -26,9 +26,9 @@ const ROUTER_PROGRAM_NAME: &str = "quicd_ebpf_router";
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```ignore
 /// use std::net::UdpSocket;
-/// use quicd_ebpf_router::{Router, ConnectionId};
+/// use quicd::routing::router::{Router, ConnectionId};
 ///
 /// fn main() -> anyhow::Result<()> {
 ///     // Initialise logging/rlimits and load the eBPF router program
@@ -149,8 +149,8 @@ impl Router {
 ///
 /// # Example Usage
 ///
-/// ```no_run
-/// use quicd_ebpf_router::{ConnectionId, Cookie};
+/// ```
+/// use quicd::routing::router::{ConnectionId, Cookie};
 ///
 /// // When receiving a client Initial packet without a valid cookie:
 /// let worker_idx = 42u8; // This socket's worker index
@@ -200,8 +200,8 @@ impl ConnectionId {
     /// A 20-byte array representing the Connection ID, or an error if randomness fails
     ///
     /// # Example
-    /// ```no_run
-    /// use quicd_ebpf_router::ConnectionId;
+    /// ```
+    /// use quicd::routing::router::ConnectionId;
     ///
     /// let cid = ConnectionId::generate(0, 42).unwrap();
     /// assert_eq!(cid.len(), 20);
@@ -227,7 +227,7 @@ impl ConnectionId {
     ///
     /// # Example
     /// ```
-    /// use quicd_ebpf_router::ConnectionId;
+    /// use quicd::routing::router::ConnectionId;
     ///
     /// let entropy = [0xAAu8; 17]; // In production, use real random data
     /// let cid = ConnectionId::generate_with_entropy(0, 42, entropy);

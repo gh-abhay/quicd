@@ -61,6 +61,10 @@ criterion = { workspace = true }
 name = "netio_buffer"
 harness = false
 
+[[bench]]
+name = "routing_benchmark"
+harness = false
+
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

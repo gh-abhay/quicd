@@ -4,7 +4,7 @@
 //! connection affinity, using the eBPF-based routing system.
 
 use super::router;
-use quicd_quic::cid::{ConnectionId, ConnectionIdGenerator, MAX_CID_LENGTH};
+use quicd_quic::cid::{ConnectionId, ConnectionIdGenerator};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// CID generator that embeds eBPF routing cookies.
@@ -52,11 +52,9 @@ impl RoutingConnectionIdGenerator {
 }
 
 impl ConnectionIdGenerator for RoutingConnectionIdGenerator {
-    fn generate(&self, requested_len: usize) -> ConnectionId {
+    fn generate(&self, _requested_len: usize) -> ConnectionId {
         // Use router::CID_LENGTH (20 bytes) regardless of requested length
         // The router requires a fixed-length CID with embedded routing cookie
-        let length = router::CID_LENGTH;
-
         let generation = self.generation.load(Ordering::Relaxed);
 
         // Generate entropy for the CID (6 + 11 = 17 bytes)
