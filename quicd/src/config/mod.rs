@@ -115,7 +115,10 @@ impl ServerConfig {
         for (name, app) in &self.applications {
             for alpn in &app.alpn {
                 if !seen_alpns.insert(alpn) {
-                    errors.push(format!("Duplicate ALPN identifier '{}' in application '{}'", alpn, name));
+                    errors.push(format!(
+                        "Duplicate ALPN identifier '{}' in application '{}'",
+                        alpn, name
+                    ));
                 }
             }
         }
@@ -192,7 +195,7 @@ mod tests {
     fn test_duplicate_alpn_detection() {
         let mut config = ServerConfig::default();
         let mut apps = std::collections::HashMap::new();
-        
+
         apps.insert(
             "http3_1".to_string(),
             ApplicationConfig {
@@ -202,7 +205,7 @@ mod tests {
                 config: ApplicationTypeConfig::Http3(Http3Config::default()),
             },
         );
-        
+
         apps.insert(
             "http3_2".to_string(),
             ApplicationConfig {
@@ -212,9 +215,9 @@ mod tests {
                 config: ApplicationTypeConfig::Http3(Http3Config::default()),
             },
         );
-        
+
         config.applications = apps;
-        
+
         let result = config.validate();
         assert!(result.is_err());
         let errors = result.unwrap_err();
@@ -224,15 +227,15 @@ mod tests {
     #[test]
     fn test_valid_config_with_multiple_alpns() {
         use std::path::PathBuf;
-        
+
         let mut config = ServerConfig::default();
-        
+
         // Set required TLS config
         config.global.tls.cert_path = Some(PathBuf::from("certs/cert.crt"));
         config.global.tls.key_path = Some(PathBuf::from("certs/key.key"));
-        
+
         let mut apps = std::collections::HashMap::new();
-        
+
         apps.insert(
             "http3".to_string(),
             ApplicationConfig {
@@ -242,15 +245,23 @@ mod tests {
                 config: ApplicationTypeConfig::Http3(Http3Config::default()),
             },
         );
-        
+
         config.applications = apps;
-        
+
         let result = config.validate();
         if let Err(errors) = &result {
             eprintln!("Validation errors: {:?}", errors);
         }
-        // Note: This may still fail if the cert files don't exist, 
+        // Note: This may still fail if the cert files don't exist,
         // but the application config structure is valid
-        assert!(result.is_ok() || result.as_ref().err().unwrap().iter().all(|e| e.contains("cert") || e.contains("key")));
+        assert!(
+            result.is_ok()
+                || result
+                    .as_ref()
+                    .err()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.contains("cert") || e.contains("key"))
+        );
     }
 }

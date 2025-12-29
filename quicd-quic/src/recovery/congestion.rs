@@ -74,16 +74,10 @@ pub trait CongestionController: Send {
 #[derive(Debug, Clone, Copy)]
 pub enum CongestionEvent {
     /// Packet acknowledged
-    PacketAcked {
-        sent_time: Instant,
-        bytes: usize,
-    },
+    PacketAcked { sent_time: Instant, bytes: usize },
 
     /// Packet declared lost
-    PacketLost {
-        sent_time: Instant,
-        bytes: usize,
-    },
+    PacketLost { sent_time: Instant, bytes: usize },
 
     /// Explicit congestion notification (ECN-CE mark received)
     EcnCe { now: Instant },
@@ -270,7 +264,7 @@ impl CongestionController for NewRenoCongestionController {
     ) {
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(sent_bytes);
         self.on_ack_received(sent_bytes);
-        
+
         // Check if we can exit recovery
         self.maybe_exit_recovery(now);
     }
@@ -353,7 +347,7 @@ mod tests {
     #[test]
     fn test_initial_state() {
         let cc = create_controller();
-        
+
         assert_eq!(cc.congestion_window(), INITIAL_WINDOW);
         assert_eq!(cc.bytes_in_flight(), 0);
         assert_eq!(cc.state, CongestionState::SlowStart);
@@ -366,11 +360,22 @@ mod tests {
         let now = Instant::from_nanos(0);
 
         // Send packet
-        cc.on_packet_sent(1, PacketNumberSpace::ApplicationData, MAX_DATAGRAM_SIZE, true, now);
+        cc.on_packet_sent(
+            1,
+            PacketNumberSpace::ApplicationData,
+            MAX_DATAGRAM_SIZE,
+            true,
+            now,
+        );
         assert_eq!(cc.bytes_in_flight(), MAX_DATAGRAM_SIZE);
 
         // ACK packet - slow start doubles cwnd
-        cc.on_packet_acked(1, PacketNumberSpace::ApplicationData, MAX_DATAGRAM_SIZE, now);
+        cc.on_packet_acked(
+            1,
+            PacketNumberSpace::ApplicationData,
+            MAX_DATAGRAM_SIZE,
+            now,
+        );
         assert_eq!(cc.bytes_in_flight(), 0);
         assert_eq!(cc.congestion_window(), INITIAL_WINDOW + MAX_DATAGRAM_SIZE);
     }
@@ -396,7 +401,7 @@ mod tests {
         cc.congestion_window = 20000;
 
         let initial_cwnd = cc.congestion_window();
-        
+
         // ACK one MSS - should grow by (MSS * MSS) / cwnd
         cc.on_ack_received(MAX_DATAGRAM_SIZE);
 
@@ -430,7 +435,7 @@ mod tests {
         // Second loss in same RTT (same timestamp) should not decrease again
         cc.on_loss_detected(now);
         assert_eq!(cc.congestion_window(), cwnd_after_first_loss);
-        
+
         // Third loss also at same timestamp
         cc.on_loss_detected(now);
         assert_eq!(cc.congestion_window(), cwnd_after_first_loss);

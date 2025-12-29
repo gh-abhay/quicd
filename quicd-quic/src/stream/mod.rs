@@ -2,11 +2,11 @@
 //!
 //! Stream states, reassembly buffers, and zero-copy data access.
 
-pub mod manager;
 pub mod buffer;
+pub mod manager;
 
-pub use manager::{StreamController, StreamEvent, StreamManager, StreamState};
 pub use buffer::{ReceiveBuffer, SendBuffer, StreamData};
+pub use manager::{StreamController, StreamEvent, StreamManager, StreamState};
 
 // Re-export StreamId from types module
 pub use crate::types::StreamId;

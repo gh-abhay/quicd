@@ -483,7 +483,7 @@ impl WorkerBuffer {
         // Get the actual capacity and use that as the length
         // This way we use all available space for receiving
         let actual_capacity = inner.capacity();
-        
+
         // Resize to actual capacity for recvmsg
         // SAFETY: We are passing this buffer to the kernel to fill via recvmsg.
         // We do not read the uninitialized bytes before the kernel writes to them.
@@ -553,10 +553,10 @@ mod tests {
     fn test_consume_buffer_pop_front() {
         let mut buf = ConsumeBuffer::from_vec(vec![1, 2, 3, 4, 5]);
         assert_eq!(&buf[..], &[1, 2, 3, 4, 5]);
-        
+
         buf.pop_front(2);
         assert_eq!(&buf[..], &[3, 4, 5]);
-        
+
         buf.pop_front(3);
         assert_eq!(&buf[..], &[] as &[u8]);
     }
@@ -566,10 +566,10 @@ mod tests {
         let mut buf = ConsumeBuffer::from_vec(vec![0, 0, 3, 4, 5]);
         buf.pop_front(2); // Creates space at head
         assert_eq!(&buf[..], &[3, 4, 5]);
-        
+
         assert!(buf.add_prefix(&[1, 2]));
         assert_eq!(&buf[..], &[1, 2, 3, 4, 5]);
-        
+
         // Not enough space for larger prefix
         assert!(!buf.add_prefix(&[9, 8, 7]));
     }
@@ -586,7 +586,7 @@ mod tests {
         let buf1 = pool.take();
         let buf2 = pool.take();
         let buf3 = pool.take();
-        
+
         let ptr1 = buf1.as_ptr();
         let ptr2 = buf2.as_ptr();
         let ptr3 = buf3.as_ptr();

@@ -64,11 +64,7 @@ impl QpackManager {
     ///
     /// Returns the encoded field section bytes.
     /// May generate encoder stream instructions that should be sent on the encoder stream.
-    pub fn encode_field_section(
-        &mut self,
-        stream_id: u64,
-        fields: &[FieldLine],
-    ) -> Result<Bytes> {
+    pub fn encode_field_section(&mut self, stream_id: u64, fields: &[FieldLine]) -> Result<Bytes> {
         let (encoded, _encoder_instructions) = self
             .encoder
             .encode_field_section(stream_id, fields)
@@ -190,7 +186,7 @@ mod tests {
 
         let decoded = mgr.decode_field_section(0, &encoded).unwrap();
         assert_eq!(decoded.len(), fields.len());
-        
+
         for (original, decoded) in fields.iter().zip(decoded.iter()) {
             assert_eq!(original.name, decoded.name);
             assert_eq!(original.value, decoded.value);

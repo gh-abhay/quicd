@@ -16,10 +16,8 @@ pub trait FileHandler: Send + Sync {
     /// Handle a request for the given path.
     ///
     /// Returns the file content as bytes, or an error.
-    fn handle_request(
-        &self,
-        path: &str,
-    ) -> impl std::future::Future<Output = Result<Bytes>> + Send;
+    fn handle_request(&self, path: &str)
+        -> impl std::future::Future<Output = Result<Bytes>> + Send;
 }
 
 /// Default static file handler.

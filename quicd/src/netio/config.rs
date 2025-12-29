@@ -115,7 +115,7 @@ impl Default for NetIoConfig {
             workers: num_cpus::get(), // Default to number of CPUs
             reuse_port: true,
             pin_to_cpu: true,
-            uring_entries: 1024, // Default value
+            uring_entries: 1024,                        // Default value
             socket_recv_buffer_size: Some(1024 * 1024), // 1MB default
             socket_send_buffer_size: Some(1024 * 1024), // 1MB default
             buffer_pool: BufferPoolConfig::default(),

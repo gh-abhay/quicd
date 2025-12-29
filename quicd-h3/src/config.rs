@@ -10,8 +10,7 @@ use std::path::PathBuf;
 ///
 /// This configuration is specific to the HTTP/3 protocol and can be
 /// customized per-application in the quicd.toml configuration file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct H3Config {
     /// QPACK configuration.
     #[serde(default)]
@@ -29,7 +28,6 @@ pub struct H3Config {
     #[serde(default)]
     pub limits: LimitsConfig,
 }
-
 
 impl H3Config {
     /// Validate the configuration.

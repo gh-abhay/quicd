@@ -28,7 +28,6 @@ pub struct GlobalConfig {
 
     // QUIC transport configuration removed
     // pub quic: quicd_x::QuicTransportConfig,
-
     /// Network I/O configuration
     pub netio: crate::netio::NetIoConfig,
 
@@ -204,11 +203,15 @@ impl TlsConfig {
 
         // Both cert and key are REQUIRED
         if self.cert_path.is_none() {
-            errors.push("cert_path is required - self-signed certificates are not supported".to_string());
+            errors.push(
+                "cert_path is required - self-signed certificates are not supported".to_string(),
+            );
         }
 
         if self.key_path.is_none() {
-            errors.push("key_path is required - self-signed certificates are not supported".to_string());
+            errors.push(
+                "key_path is required - self-signed certificates are not supported".to_string(),
+            );
         }
 
         // Validate files exist if provided

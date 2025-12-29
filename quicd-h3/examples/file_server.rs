@@ -23,7 +23,7 @@ use std::path::PathBuf;
 fn main() {
     // Configure the HTTP/3 application
     let mut config = H3Config::default();
-    
+
     // File serving configuration
     config.handler.file_root = PathBuf::from("./www");
     config.handler.file_serving_enabled = true;
@@ -31,19 +31,19 @@ fn main() {
     config.handler.compression_enabled = true;
     config.handler.compression_algorithms = vec!["gzip".to_string(), "br".to_string()];
     config.handler.index_files = vec!["index.html".to_string(), "index.htm".to_string()];
-    
+
     // QPACK configuration
     config.qpack.max_table_capacity = 4096;
     config.qpack.blocked_streams = 100;
-    
+
     // Connection limits
     config.limits.max_field_section_size = 16384;
     config.limits.max_concurrent_streams = 100;
     config.limits.idle_timeout_secs = 30;
-    
+
     // Server push (optional)
     config.push.enabled = false;
-    
+
     // Validate configuration
     let errors = config.validate();
     if !errors.is_empty() {
@@ -53,14 +53,20 @@ fn main() {
         }
         std::process::exit(1);
     }
-    
+
     // Create the application
     let app = H3Application::new(config);
-    
+
     println!("HTTP/3 file server configured");
     println!("  Serving files from: {:?}", app.config().handler.file_root);
-    println!("  QPACK table capacity: {} bytes", app.config().qpack.max_table_capacity);
-    println!("  Max concurrent streams: {}", app.config().limits.max_concurrent_streams);
+    println!(
+        "  QPACK table capacity: {} bytes",
+        app.config().qpack.max_table_capacity
+    );
+    println!(
+        "  Max concurrent streams: {}",
+        app.config().limits.max_concurrent_streams
+    );
     println!();
     println!("To use this application, register it with quicd:");
     println!("  1. Add to quicd.toml:");

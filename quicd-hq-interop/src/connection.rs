@@ -30,10 +30,7 @@ impl HqInteropApplication {
         // Validate configuration
         let errors = config.validate();
         if !errors.is_empty() {
-            panic!(
-                "Invalid hq-interop configuration: {}",
-                errors.join(", ")
-            );
+            panic!("Invalid hq-interop configuration: {}", errors.join(", "));
         }
 
         Self {
@@ -92,12 +89,18 @@ impl QuicdApplication for HqInteropApplication {
 
                                             // Send response (raw file content, no headers)
                                             if let Err(e) = stream.write_all(&content).await {
-                                                warn!("hq-interop: Failed to write response: {}", e);
+                                                warn!(
+                                                    "hq-interop: Failed to write response: {}",
+                                                    e
+                                                );
                                             }
 
                                             // Close stream
                                             if let Err(e) = stream.shutdown().await {
-                                                warn!("hq-interop: Failed to shutdown stream: {}", e);
+                                                warn!(
+                                                    "hq-interop: Failed to shutdown stream: {}",
+                                                    e
+                                                );
                                             }
                                         }
                                         Err(e) => {

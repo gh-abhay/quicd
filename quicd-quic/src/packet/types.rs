@@ -4,8 +4,8 @@
 
 extern crate alloc;
 
-use crate::types::*;
 use crate::error::*;
+use crate::types::*;
 use bytes::Bytes;
 
 /// QUIC Protocol Version (RFC 9000 Section 15)
@@ -65,10 +65,7 @@ impl PacketType {
 
     /// Returns true if this packet type carries an ACK-eliciting payload
     pub fn is_ack_eliciting_type(&self) -> bool {
-        !matches!(
-            self,
-            PacketType::Retry | PacketType::VersionNegotiation
-        )
+        !matches!(self, PacketType::Retry | PacketType::VersionNegotiation)
     }
 
     /// Get the packet number space for this packet type
@@ -76,9 +73,7 @@ impl PacketType {
         match self {
             PacketType::Initial => Some(PacketNumberSpace::Initial),
             PacketType::Handshake => Some(PacketNumberSpace::Handshake),
-            PacketType::ZeroRtt | PacketType::OneRtt => {
-                Some(PacketNumberSpace::ApplicationData)
-            }
+            PacketType::ZeroRtt | PacketType::OneRtt => Some(PacketNumberSpace::ApplicationData),
             PacketType::Retry | PacketType::VersionNegotiation => None,
         }
     }
@@ -91,27 +86,27 @@ impl PacketType {
 pub struct LongHeader {
     /// Packet type
     pub packet_type: PacketType,
-    
+
     /// QUIC version
     pub version: Version,
-    
+
     /// Destination Connection ID
     pub dcid: ConnectionId,
-    
+
     /// Source Connection ID
     pub scid: ConnectionId,
-    
+
     /// Packet number (not present in Retry packets)
     ///
     /// This is the decoded packet number after header protection removal.
     pub packet_number: Option<PacketNumber>,
-    
+
     /// Packet number length (1-4 bytes)
     pub pn_length: Option<u8>,
-    
+
     /// Token (only for Initial packets)
     pub token: Option<Token>,
-    
+
     /// Length field (payload + packet number)
     pub length: VarInt,
 }
@@ -123,18 +118,18 @@ pub struct LongHeader {
 pub struct ShortHeader {
     /// Spin bit (RFC 9000 Section 17.3.1)
     pub spin_bit: bool,
-    
+
     /// Key phase bit (RFC 9001 Section 6)
     pub key_phase: bool,
-    
+
     /// Destination Connection ID
     pub dcid: ConnectionId,
-    
+
     /// Packet number
     ///
     /// This is the decoded packet number after header protection removal.
     pub packet_number: PacketNumber,
-    
+
     /// Packet number length (1-4 bytes)
     pub pn_length: u8,
 }
@@ -144,10 +139,10 @@ pub struct ShortHeader {
 pub enum PacketHeader {
     /// Long header packet
     Long(LongHeader),
-    
+
     /// Short header packet
     Short(ShortHeader),
-    
+
     /// Version Negotiation packet (no version negotiation in v1)
     VersionNegotiation {
         dcid: ConnectionId,
@@ -165,7 +160,7 @@ impl PacketHeader {
             PacketHeader::VersionNegotiation { dcid, .. } => dcid,
         }
     }
-    
+
     /// Get the source connection ID (if present)
     pub fn scid(&self) -> Option<&ConnectionId> {
         match self {
@@ -174,7 +169,7 @@ impl PacketHeader {
             PacketHeader::VersionNegotiation { scid, .. } => Some(scid),
         }
     }
-    
+
     /// Get the packet number (if present)
     pub fn packet_number(&self) -> Option<PacketNumber> {
         match self {
@@ -183,7 +178,7 @@ impl PacketHeader {
             PacketHeader::VersionNegotiation { .. } => None,
         }
     }
-    
+
     /// Get the packet number space (if applicable)
     pub fn packet_number_space(&self) -> Option<PacketNumberSpace> {
         match self {
@@ -201,14 +196,14 @@ impl PacketHeader {
 pub struct ParsedPacket<'a> {
     /// Packet header
     pub header: PacketHeader,
-    
+
     /// Encrypted payload (frames + authentication tag)
     ///
     /// For Initial/Handshake/1-RTT packets, this is AEAD-protected.
     /// For 0-RTT packets, this is 0-RTT protected.
     /// For Retry packets, this includes the retry token and integrity tag.
     pub payload: &'a [u8],
-    
+
     /// Header length in bytes
     pub header_len: usize,
 }
@@ -219,7 +214,7 @@ pub struct ParsedPacket<'a> {
 pub struct DatagramInput {
     /// Raw UDP payload (may contain multiple QUIC packets)
     pub data: Bytes,
-    
+
     /// Reception timestamp
     pub recv_time: Instant,
 }
@@ -230,7 +225,7 @@ pub struct DatagramInput {
 pub struct DatagramOutput {
     /// Serialized packet bytes
     pub data: Bytes,
-    
+
     /// Transmission timestamp (for RTT calculation)
     pub send_time: Instant,
 }

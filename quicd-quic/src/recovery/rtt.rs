@@ -89,7 +89,8 @@ impl RttEstimator {
 
     /// Calculate PTO (Probe Timeout) duration (RFC 9002 Section 6.2)
     pub fn pto(&self, max_ack_delay: Duration, pto_count: u32) -> Duration {
-        let pto = self.smoothed_rtt + Duration::max(4 * self.rtt_var, Duration::from_millis(1))
+        let pto = self.smoothed_rtt
+            + Duration::max(4 * self.rtt_var, Duration::from_millis(1))
             + max_ack_delay;
         pto * (1 << pto_count)
     }
@@ -105,7 +106,9 @@ pub struct RttSample {
 impl RttSample {
     /// Calculate RTT from sample
     pub fn rtt(&self) -> Duration {
-        self.ack_time.duration_since(self.sent_time).unwrap_or(Duration::from_secs(0))
+        self.ack_time
+            .duration_since(self.sent_time)
+            .unwrap_or(Duration::from_secs(0))
     }
 }
 
@@ -155,7 +158,7 @@ mod tests {
         // rttvar_sample = abs(smoothed_rtt - rtt_sample) = abs(100 - 120) = 20
         // rtt_var = (rtt_var * 3 + rttvar_sample) / 4 = (50 * 3 + 20) / 4 = 42.5
         // smoothed_rtt = (smoothed_rtt * 7 + rtt_sample) / 8 = (100 * 7 + 120) / 8 = 102.5
-        
+
         let expected_srtt = Duration::from_nanos(102_500_000); // 102.5 ms
         let expected_rttvar = Duration::from_nanos(42_500_000); // 42.5 ms
 
@@ -184,7 +187,7 @@ mod tests {
         estimator.update(Duration::from_millis(100));
 
         let max_ack_delay = Duration::from_millis(25);
-        
+
         // RFC 9002 Section 6.2:
         // PTO = smoothed_rtt + max(4 * rtt_var, 1ms) + max_ack_delay
         // PTO = 100 + max(4 * 50, 1) + 25 = 100 + 200 + 25 = 325 ms
@@ -198,7 +201,7 @@ mod tests {
         estimator.update(Duration::from_millis(100));
 
         let max_ack_delay = Duration::from_millis(25);
-        
+
         // PTO count 0: 325 ms (from previous test)
         let pto0 = estimator.pto(max_ack_delay, 0);
         assert_eq!(pto0, Duration::from_millis(325));
@@ -219,7 +222,7 @@ mod tests {
         estimator.update(Duration::from_millis(10)); // Very stable RTT
 
         let max_ack_delay = Duration::from_millis(0);
-        
+
         // RFC 9002: max(4 * rtt_var, 1ms) ensures minimum variance
         // Even with rtt_var approaching 0, PTO should include at least 1ms
         let pto = estimator.pto(max_ack_delay, 0);
@@ -231,7 +234,10 @@ mod tests {
         let sent_time = Instant::from_nanos(1_000_000_000); // 1 second
         let ack_time = Instant::from_nanos(1_050_000_000); // 1.05 seconds
 
-        let sample = RttSample { sent_time, ack_time };
+        let sample = RttSample {
+            sent_time,
+            ack_time,
+        };
         assert_eq!(sample.rtt(), Duration::from_millis(50));
     }
 

@@ -15,8 +15,8 @@ use tokio::fs;
 use tokio::io::AsyncReadExt;
 
 use crate::config::HandlerConfig;
-use crate::message::{HttpRequest, HttpResponse};
 use crate::error::Result;
+use crate::message::{HttpRequest, HttpResponse};
 
 /// Default file-serving HTTP handler.
 pub struct FileHandler {
@@ -36,16 +36,18 @@ impl FileHandler {
     pub async fn handle_request(&self, request: &HttpRequest) -> Result<HttpResponse> {
         // Only handle GET and HEAD methods
         if request.method != Method::GET && request.method != Method::HEAD {
-            return Ok(HttpResponse::new(StatusCode::METHOD_NOT_ALLOWED, Bytes::new())
-                .with_header("allow", "GET, HEAD"));
+            return Ok(
+                HttpResponse::new(StatusCode::METHOD_NOT_ALLOWED, Bytes::new())
+                    .with_header("allow", "GET, HEAD"),
+            );
         }
 
         // Extract path from URI
         let uri_path = request.uri.path();
-        
+
         // Security: prevent path traversal
         let safe_path = self.sanitize_path(uri_path)?;
-        
+
         // Resolve to file system path
         let file_path = self.config.file_root.join(safe_path);
 
@@ -60,14 +62,15 @@ impl FileHandler {
         }
 
         // Serve file
-        self.serve_file(&file_path, request.method == Method::HEAD).await
+        self.serve_file(&file_path, request.method == Method::HEAD)
+            .await
     }
 
     /// Sanitize request path to prevent directory traversal.
     fn sanitize_path(&self, uri_path: &str) -> Result<PathBuf> {
         // Remove leading slash
         let path_str = uri_path.trim_start_matches('/');
-        
+
         // Decode percent-encoding and build path
         let decoded = percent_decode(path_str);
         let path = PathBuf::from(decoded);
@@ -113,9 +116,7 @@ impl FileHandler {
         let file_size = metadata.len();
 
         // Determine content type
-        let content_type = from_path(file_path)
-            .first_or_octet_stream()
-            .to_string();
+        let content_type = from_path(file_path).first_or_octet_stream().to_string();
 
         // Read file content (if not HEAD request)
         let body = if head_only {
@@ -136,11 +137,8 @@ impl FileHandler {
 
     /// Generate 404 Not Found response.
     fn not_found_response(&self) -> HttpResponse {
-        HttpResponse::new(
-            StatusCode::NOT_FOUND,
-            Bytes::from_static(b"404 Not Found"),
-        )
-        .with_header("content-type", "text/plain")
+        HttpResponse::new(StatusCode::NOT_FOUND, Bytes::from_static(b"404 Not Found"))
+            .with_header("content-type", "text/plain")
     }
 
     /// Generate 500 Internal Server Error response.

@@ -106,8 +106,9 @@ pub fn parse_request_pseudo_headers(fields: &[FieldLine]) -> Result<(Method, Uri
                 ));
             }
 
-            let value = std::str::from_utf8(&field.value)
-                .map_err(|_| Error::protocol(ErrorCode::MessageError, "invalid field value encoding"))?;
+            let value = std::str::from_utf8(&field.value).map_err(|_| {
+                Error::protocol(ErrorCode::MessageError, "invalid field value encoding")
+            })?;
 
             match name {
                 ":method" => {
@@ -161,21 +162,18 @@ pub fn parse_request_pseudo_headers(fields: &[FieldLine]) -> Result<(Method, Uri
     }
 
     // Validate required pseudo-headers
-    let method_str = method.ok_or_else(|| {
-        Error::protocol(ErrorCode::MessageError, "missing :method pseudo-header")
-    })?;
+    let method_str = method
+        .ok_or_else(|| Error::protocol(ErrorCode::MessageError, "missing :method pseudo-header"))?;
 
-    let scheme_str = scheme.ok_or_else(|| {
-        Error::protocol(ErrorCode::MessageError, "missing :scheme pseudo-header")
-    })?;
+    let scheme_str = scheme
+        .ok_or_else(|| Error::protocol(ErrorCode::MessageError, "missing :scheme pseudo-header"))?;
 
     let authority_str = authority.ok_or_else(|| {
         Error::protocol(ErrorCode::MessageError, "missing :authority pseudo-header")
     })?;
 
-    let path_str = path.ok_or_else(|| {
-        Error::protocol(ErrorCode::MessageError, "missing :path pseudo-header")
-    })?;
+    let path_str = path
+        .ok_or_else(|| Error::protocol(ErrorCode::MessageError, "missing :path pseudo-header"))?;
 
     // Parse method
     let method = Method::from_str(&method_str).map_err(|_| {
@@ -187,12 +185,8 @@ pub fn parse_request_pseudo_headers(fields: &[FieldLine]) -> Result<(Method, Uri
 
     // Construct URI from components
     let uri_str = format!("{}://{}{}", scheme_str, authority_str, path_str);
-    let uri = Uri::from_str(&uri_str).map_err(|e| {
-        Error::protocol(
-            ErrorCode::MessageError,
-            format!("invalid URI: {}", e),
-        )
-    })?;
+    let uri = Uri::from_str(&uri_str)
+        .map_err(|e| Error::protocol(ErrorCode::MessageError, format!("invalid URI: {}", e)))?;
 
     Ok((method, uri, regular_headers))
 }
@@ -222,8 +216,9 @@ pub fn parse_response_pseudo_headers(fields: &[FieldLine]) -> Result<(StatusCode
                 ));
             }
 
-            let value = std::str::from_utf8(&field.value)
-                .map_err(|_| Error::protocol(ErrorCode::MessageError, "invalid field value encoding"))?;
+            let value = std::str::from_utf8(&field.value).map_err(|_| {
+                Error::protocol(ErrorCode::MessageError, "invalid field value encoding")
+            })?;
 
             match name {
                 ":status" => {
@@ -262,9 +257,8 @@ pub fn parse_response_pseudo_headers(fields: &[FieldLine]) -> Result<(StatusCode
         }
     }
 
-    let status = status.ok_or_else(|| {
-        Error::protocol(ErrorCode::MessageError, "missing :status pseudo-header")
-    })?;
+    let status = status
+        .ok_or_else(|| Error::protocol(ErrorCode::MessageError, "missing :status pseudo-header"))?;
 
     Ok((status, regular_headers))
 }
@@ -283,13 +277,7 @@ pub fn request_to_field_lines(request: &HttpRequest) -> Vec<FieldLine> {
     ));
     fields.push(FieldLine::new(
         Bytes::from_static(b":scheme"),
-        Bytes::copy_from_slice(
-            request
-                .uri
-                .scheme_str()
-                .unwrap_or("https")
-                .as_bytes(),
-        ),
+        Bytes::copy_from_slice(request.uri.scheme_str().unwrap_or("https").as_bytes()),
     ));
     fields.push(FieldLine::new(
         Bytes::from_static(b":authority"),

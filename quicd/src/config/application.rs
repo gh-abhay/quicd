@@ -68,7 +68,10 @@ impl ApplicationConfig {
             }
 
             if alpn.len() > 255 {
-                errors.push(format!("ALPN identifier '{}' too long (max 255 bytes)", alpn));
+                errors.push(format!(
+                    "ALPN identifier '{}' too long (max 255 bytes)",
+                    alpn
+                ));
             }
         }
 
@@ -97,12 +100,18 @@ impl ApplicationConfig {
                 "http3" => Ok(ApplicationType::Http3),
                 "hq-interop" => Ok(ApplicationType::HqInterop),
                 "moq" => Ok(ApplicationType::Moq),
-                _ => Err(format!("Unknown builtin application type: {}", builtin_name)),
+                _ => Err(format!(
+                    "Unknown builtin application type: {}",
+                    builtin_name
+                )),
             }
         } else if self.app_type == "plugin" {
             Ok(ApplicationType::Plugin)
         } else {
-            Err(format!("Invalid application type format: {}. Expected 'builtin:<name>' or 'plugin'", self.app_type))
+            Err(format!(
+                "Invalid application type format: {}. Expected 'builtin:<name>' or 'plugin'",
+                self.app_type
+            ))
         }
     }
 }
@@ -162,28 +171,39 @@ impl ApplicationTypeConfig {
                 if type_str == "builtin:http3" {
                     cfg.validate().map_err(|e| vec![e])
                 } else {
-                    Err(vec![format!("Type mismatch: expected '{}' but got Http3 config", type_str)])
+                    Err(vec![format!(
+                        "Type mismatch: expected '{}' but got Http3 config",
+                        type_str
+                    )])
                 }
             }
             ApplicationTypeConfig::HqInterop(cfg) => {
                 if type_str == "builtin:hq-interop" {
                     cfg.validate().map_err(|e| vec![e])
                 } else {
-                    Err(vec![format!("Type mismatch: expected '{}' but got HqInterop config", type_str)])
+                    Err(vec![format!(
+                        "Type mismatch: expected '{}' but got HqInterop config",
+                        type_str
+                    )])
                 }
             }
             ApplicationTypeConfig::Moq(cfg) => {
                 if type_str == "builtin:moq" {
                     cfg.validate().map_err(|e| vec![e])
                 } else {
-                    Err(vec![format!("Type mismatch: expected '{}' but got MOQ config", type_str)])
+                    Err(vec![format!(
+                        "Type mismatch: expected '{}' but got MOQ config",
+                        type_str
+                    )])
                 }
             }
             ApplicationTypeConfig::Plugin(cfg) => {
                 if type_str == "plugin" {
                     cfg.validate().map_err(|e| vec![e])
                 } else {
-                    Err(vec![format!("Type mismatch: expected 'plugin' but got Plugin config")])
+                    Err(vec![format!(
+                        "Type mismatch: expected 'plugin' but got Plugin config"
+                    )])
                 }
             }
             ApplicationTypeConfig::Empty(_) => Ok(()),
@@ -396,12 +416,16 @@ impl Http3Config {
 
         // Validate push settings
         if self.push.enabled && self.push.max_concurrent == 0 {
-            return Err("Push max_concurrent must be greater than 0 when push is enabled".to_string());
+            return Err(
+                "Push max_concurrent must be greater than 0 when push is enabled".to_string(),
+            );
         }
 
         // Validate handler settings
         if self.handler.file_serving_enabled && self.handler.file_root.is_empty() {
-            return Err("Handler file_root cannot be empty when file serving is enabled".to_string());
+            return Err(
+                "Handler file_root cannot be empty when file serving is enabled".to_string(),
+            );
         }
 
         // Validate limits
@@ -559,11 +583,17 @@ impl PluginConfig {
         // Check if the file exists
         let path = std::path::Path::new(&self.plugin.library_path);
         if !path.exists() {
-            return Err(format!("Plugin library not found: {}", self.plugin.library_path));
+            return Err(format!(
+                "Plugin library not found: {}",
+                self.plugin.library_path
+            ));
         }
 
         if !path.is_file() {
-            return Err(format!("Plugin path is not a file: {}", self.plugin.library_path));
+            return Err(format!(
+                "Plugin path is not a file: {}",
+                self.plugin.library_path
+            ));
         }
 
         Ok(())

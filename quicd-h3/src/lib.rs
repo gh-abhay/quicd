@@ -69,9 +69,9 @@
 pub mod config;
 pub mod error;
 pub mod frame;
+pub mod message;
 pub mod stream_type;
 pub mod varint;
-pub mod message;
 
 // Core implementation modules
 mod connection;
@@ -79,11 +79,11 @@ mod handler;
 mod qpack_mgr;
 
 // Re-export main types
-pub use config::{H3Config, QpackConfig, PushConfig, HandlerConfig, LimitsConfig};
+pub use config::{H3Config, HandlerConfig, LimitsConfig, PushConfig, QpackConfig};
 pub use connection::H3Application;
 pub use error::{Error, ErrorCode, Result};
-pub use message::{HttpRequest, HttpResponse};
 pub use handler::FileHandler;
+pub use message::{HttpRequest, HttpResponse};
 
 // Re-export QuicdApplication trait for convenience
 pub use quicd_x::QuicdApplication;

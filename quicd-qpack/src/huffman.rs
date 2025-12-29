@@ -28,8 +28,8 @@ struct DecodeNode {
     #[allow(dead_code)]
     symbol: u16,
     // Next nodes in the tree (for non-leaf nodes)
-    left: u16,   // bit 0
-    right: u16,  // bit 1
+    left: u16,  // bit 0
+    right: u16, // bit 1
 }
 
 const NOT_LEAF: u16 = 257;
@@ -41,17 +41,24 @@ static DECODE_TREE: OnceLock<Vec<DecodeNode>> = OnceLock::new();
 
 fn get_decode_tree() -> &'static [DecodeNode] {
     DECODE_TREE.get_or_init(|| {
-        let mut tree = vec![DecodeNode { symbol: NOT_LEAF, left: 0, right: 0 }; 512];
+        let mut tree = vec![
+            DecodeNode {
+                symbol: NOT_LEAF,
+                left: 0,
+                right: 0
+            };
+            512
+        ];
         let mut next_node = 1u16;
-        
+
         // Insert each symbol into the tree
         for sym in 0..257 {
             let entry = &ENCODE_TABLE[sym];
             let mut node_idx = 0usize;
-            
+
             for bit_idx in 0..entry.len {
                 let bit = (entry.code >> (entry.len - bit_idx - 1)) & 1;
-                
+
                 if bit_idx == entry.len - 1 {
                     // Last bit - create leaf (store symbol value directly: 0-256)
                     if bit == 0 {
@@ -66,7 +73,7 @@ fn get_decode_tree() -> &'static [DecodeNode] {
                     } else {
                         tree[node_idx].right
                     };
-                    
+
                     if next_idx == 0 {
                         // Create new internal node (encode as NODE_OFFSET + index)
                         let new_node_val = NODE_OFFSET + next_node;
@@ -76,7 +83,7 @@ fn get_decode_tree() -> &'static [DecodeNode] {
                             right: 0,
                         };
                         next_node += 1;
-                        
+
                         if bit == 0 {
                             tree[node_idx].left = new_node_val;
                         } else {
@@ -90,7 +97,7 @@ fn get_decode_tree() -> &'static [DecodeNode] {
                 }
             }
         }
-        
+
         tree
     })
 }
@@ -154,9 +161,9 @@ pub fn decode(data: &[u8], output: &mut Vec<u8>) -> Result<usize> {
         for bit_pos in (0..8).rev() {
             let bit = (byte >> bit_pos) & 1;
             let node = tree[node_idx];
-            
+
             let next = if bit == 0 { node.left } else { node.right };
-            
+
             if next <= 256 {
                 // Leaf node - emit symbol (values 0-256)
                 if next == 256 {
@@ -180,13 +187,13 @@ pub fn decode(data: &[u8], output: &mut Vec<u8>) -> Result<usize> {
     // If we're not at root, verify padding leads to EOS
     if node_idx != 0 {
         let mut test_node = node_idx;
-        
+
         // Follow right (1-bit) edges until we reach a leaf
         // This represents continuing with all-1 padding bits
         loop {
             let node = tree[test_node];
             let next = node.right;
-            
+
             if next == 0 {
                 // Dead end - padding doesn't lead to valid symbol
                 return Err(Error::HuffmanError("invalid padding".into()));
@@ -208,7 +215,6 @@ pub fn decode(data: &[u8], output: &mut Vec<u8>) -> Result<usize> {
 
     Ok(output.len() - initial_len)
 }
-
 
 /// Returns the encoded size for the given data.
 ///
@@ -268,7 +274,7 @@ mod tests {
         let data = b"test data";
         let mut encoded = Vec::new();
         encode(data, &mut encoded);
-        
+
         assert_eq!(encoded_size(data), encoded.len());
     }
 
@@ -278,10 +284,10 @@ mod tests {
             let data = [byte];
             let mut encoded = Vec::new();
             encode(&data, &mut encoded);
-            
+
             let mut decoded = Vec::new();
             decode(&encoded, &mut decoded).unwrap();
-            
+
             assert_eq!(decoded, &data[..], "Failed for byte {}", byte);
         }
     }
@@ -300,10 +306,10 @@ mod tests {
         for data in test_strings {
             let mut encoded = Vec::new();
             encode(data, &mut encoded);
-            
+
             let mut decoded = Vec::new();
             decode(&encoded, &mut decoded).unwrap();
-            
+
             assert_eq!(decoded, data);
         }
     }

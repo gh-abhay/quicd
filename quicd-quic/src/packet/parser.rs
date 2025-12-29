@@ -6,10 +6,10 @@
 
 extern crate alloc;
 
-use crate::types::*;
 use crate::error::*;
-use crate::packet::types::*;
 use crate::packet::header::HeaderForm;
+use crate::packet::types::*;
+use crate::types::*;
 use bytes::BytesMut;
 
 /// Zero-Copy Packet Parser Trait
@@ -34,12 +34,12 @@ pub trait PacketParser: Send + Sync {
     /// - `FrameEncodingError`: Malformed packet header
     /// - `ProtocolViolation`: Invalid packet structure
     fn parse_packet<'a>(&self, buf: &'a [u8]) -> Result<(ParsedPacket<'a>, usize)>;
-    
+
     /// Parse the first byte to determine packet type
     ///
     /// This is used for fast dispatch without full parsing.
     fn parse_first_byte(&self, first_byte: u8) -> Result<HeaderForm>;
-    
+
     /// Parse only the destination connection ID
     ///
     /// Used for demultiplexing before full packet parsing.
@@ -78,7 +78,7 @@ pub trait HeaderProtectionRemover {
         pn_offset: usize,
         sample_offset: usize,
     ) -> Result<(PacketNumber, u8)>;
-    
+
     /// Remove header protection from a short header packet
     ///
     /// Same as long header but also extracts the key phase bit.
@@ -145,7 +145,7 @@ pub trait PacketSerializer {
         header: &LongHeader,
         payload: &[u8],
     ) -> Result<usize>;
-    
+
     /// Serialize a short header packet
     fn serialize_short_header(
         &mut self,
@@ -153,7 +153,7 @@ pub trait PacketSerializer {
         header: &ShortHeader,
         payload: &[u8],
     ) -> Result<usize>;
-    
+
     /// Serialize a Version Negotiation packet
     fn serialize_version_negotiation(
         &mut self,
@@ -174,7 +174,7 @@ pub trait PacketCoalescer {
     /// Returns a vector of parsed packets. The lifetime 'a is bound to the
     /// input buffer.
     fn parse_coalesced<'a>(&self, buf: &'a [u8]) -> Result<alloc::vec::Vec<ParsedPacket<'a>>>;
-    
+
     /// Check if a buffer has room for additional packets
     ///
     /// Returns the remaining capacity after the current packet.
@@ -199,12 +199,12 @@ impl PacketParser for DefaultPacketParser {
         // TODO: Implement packet parsing
         Err(Error::Transport(TransportError::ProtocolViolation))
     }
-    
+
     fn parse_first_byte(&self, _first_byte: u8) -> Result<HeaderForm> {
         // TODO: Implement first byte parsing
         Err(Error::Transport(TransportError::ProtocolViolation))
     }
-    
+
     fn parse_dcid<'a>(&self, _buf: &'a [u8]) -> Result<(ConnectionId, usize)> {
         // TODO: Implement DCID extraction
         Err(Error::Transport(TransportError::ProtocolViolation))

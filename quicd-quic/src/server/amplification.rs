@@ -21,10 +21,10 @@ pub type AddressKey = [u8; 16];
 pub struct AmplificationLimiter {
     /// Per-address byte counters
     limits: HashMap<AddressKey, AddressLimit>,
-    
+
     /// Cleanup interval
     cleanup_interval: core::time::Duration,
-    
+
     /// Last cleanup time
     last_cleanup: Option<Instant>,
 }
@@ -34,13 +34,13 @@ pub struct AmplificationLimiter {
 struct AddressLimit {
     /// Bytes received from this address
     bytes_received: usize,
-    
+
     /// Bytes sent to this address  
     bytes_sent: usize,
-    
+
     /// Address validated (can send unlimited)
     validated: bool,
-    
+
     /// Last activity time (for cleanup)
     last_activity: Instant,
 }
@@ -54,7 +54,7 @@ impl AmplificationLimiter {
             last_cleanup: None,
         }
     }
-    
+
     /// Record bytes received from address
     pub fn record_received(&mut self, addr: &AddressKey, bytes: usize, now: Instant) {
         let limit = self.limits.entry(*addr).or_insert_with(|| AddressLimit {
@@ -63,11 +63,11 @@ impl AmplificationLimiter {
             validated: false,
             last_activity: now,
         });
-        
+
         limit.bytes_received = limit.bytes_received.saturating_add(bytes);
         limit.last_activity = now;
     }
-    
+
     /// Record bytes sent to address
     pub fn record_sent(&mut self, addr: &AddressKey, bytes: usize, now: Instant) {
         if let Some(limit) = self.limits.get_mut(addr) {
@@ -75,7 +75,7 @@ impl AmplificationLimiter {
             limit.last_activity = now;
         }
     }
-    
+
     /// Check if sending would exceed amplification limit
     ///
     /// Returns Ok(()) if allowed, Err with available budget otherwise.
@@ -84,23 +84,23 @@ impl AmplificationLimiter {
             Some(l) => l,
             None => return Ok(()), // No limits yet
         };
-        
+
         // Validated addresses have no limit
         if limit.validated {
             return Ok(());
         }
-        
+
         // RFC 9000 Section 8.1: 3x amplification limit
         let max_allowed = limit.bytes_received.saturating_mul(3);
         let available = max_allowed.saturating_sub(limit.bytes_sent);
-        
+
         if bytes <= available {
             Ok(())
         } else {
             Err(available)
         }
     }
-    
+
     /// Mark address as validated (removes limits)
     ///
     /// **RFC 9000 Section 8.1**: After address validation (handshake complete
@@ -110,7 +110,7 @@ impl AmplificationLimiter {
             limit.validated = true;
         }
     }
-    
+
     /// Periodic cleanup of old address entries
     pub fn cleanup(&mut self, now: Instant) {
         if let Some(last) = self.last_cleanup {
@@ -119,19 +119,21 @@ impl AmplificationLimiter {
                 return;
             }
         }
-        
+
         // Remove entries older than 5 minutes
         let cutoff = now.checked_sub(core::time::Duration::from_secs(300));
         if let Some(cutoff) = cutoff {
             self.limits.retain(|_, limit| limit.last_activity >= cutoff);
         }
-        
+
         self.last_cleanup = Some(now);
     }
-    
+
     /// Get current statistics for address
     pub fn get_stats(&self, addr: &AddressKey) -> Option<(usize, usize, bool)> {
-        self.limits.get(addr).map(|l| (l.bytes_received, l.bytes_sent, l.validated))
+        self.limits
+            .get(addr)
+            .map(|l| (l.bytes_received, l.bytes_sent, l.validated))
     }
 }
 
@@ -144,45 +146,45 @@ impl Default for AmplificationLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     fn test_addr() -> AddressKey {
         [1u8; 16]
     }
-    
+
     fn now() -> Instant {
         Instant::from_nanos(0)
     }
-    
+
     #[test]
     fn test_amplification_limit() {
         let mut limiter = AmplificationLimiter::new();
         let addr = test_addr();
         let t = now();
-        
+
         // Receive 100 bytes
         limiter.record_received(&addr, 100, t);
-        
+
         // Can send up to 300 bytes (3x)
         assert!(limiter.check_send(&addr, 300).is_ok());
         assert!(limiter.check_send(&addr, 301).is_err());
-        
+
         // Send 150 bytes
         limiter.record_sent(&addr, 150, t);
-        
+
         // Can send 150 more
         assert!(limiter.check_send(&addr, 150).is_ok());
         assert!(limiter.check_send(&addr, 151).is_err());
     }
-    
+
     #[test]
     fn test_validation_removes_limit() {
         let mut limiter = AmplificationLimiter::new();
         let addr = test_addr();
         let t = now();
-        
+
         limiter.record_received(&addr, 100, t);
         assert!(limiter.check_send(&addr, 500).is_err());
-        
+
         limiter.mark_validated(&addr);
         assert!(limiter.check_send(&addr, 100000).is_ok());
     }

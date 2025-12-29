@@ -20,31 +20,29 @@
 //! All packet parsing returns references to the original buffer with lifetime
 //! parameters. This enables processing without memory allocation.
 
+pub mod api;
 pub mod header;
 pub mod number;
-pub mod space;
-pub mod types;
 pub mod parser;
 pub mod protection;
-pub mod api;
+pub mod space;
+pub mod types;
 
 // Re-export specific types to avoid ambiguity
-pub use header::{Header, HeaderForm, LongHeader as LongHeaderDetail, ShortHeader as ShortHeaderDetail};
+pub use api::{Packet, PacketHeaderWrapper, ParseContext};
+pub use header::{
+    Header, HeaderForm, LongHeader as LongHeaderDetail, ShortHeader as ShortHeaderDetail,
+};
 pub use number::PacketNumberLen;
 pub use space::PacketNumberSpaceState;
 pub use types::{
-    LongHeader, ShortHeader, PacketType, ParsedPacket, DatagramInput, DatagramOutput,
-    Token, VERSION_1, VERSION_NEGOTIATION, PacketHeader,
+    DatagramInput, DatagramOutput, LongHeader, PacketHeader, PacketType, ParsedPacket, ShortHeader,
+    Token, VERSION_1, VERSION_NEGOTIATION,
 };
-pub use api::{Packet, ParseContext, PacketHeaderWrapper};
 
 // Parser traits - use qualified names to avoid conflict
 pub use parser::{
-    PacketParser as PacketParserTrait,
-    PacketSerializer,
-    PacketCoalescer,
-    PacketNumberDecoder as PnDecoder,
-    PacketNumberEncoder as PnEncoder,
-    HeaderProtectionRemover as HpRemover,
+    HeaderProtectionRemover as HpRemover, PacketCoalescer, PacketNumberDecoder as PnDecoder,
+    PacketNumberEncoder as PnEncoder, PacketParser as PacketParserTrait, PacketSerializer,
 };
 pub use protection::{HeaderProtectionProvider, InPlaceHeaderProtectionRemover};

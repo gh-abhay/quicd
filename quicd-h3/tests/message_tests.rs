@@ -27,7 +27,9 @@ fn test_parse_request_pseudo_headers_valid() {
 
 #[test]
 fn test_parse_request_all_methods() {
-    let methods = vec!["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "CONNECT", "PATCH"];
+    let methods = vec![
+        "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "CONNECT", "PATCH",
+    ];
 
     for method in methods {
         let fields = vec![
@@ -38,7 +40,10 @@ fn test_parse_request_all_methods() {
         ];
 
         let (parsed_method, _, _) = parse_request_pseudo_headers(&fields).unwrap();
-        assert_eq!(parsed_method, Method::from_bytes(method.as_bytes()).unwrap());
+        assert_eq!(
+            parsed_method,
+            Method::from_bytes(method.as_bytes()).unwrap()
+        );
     }
 }
 
@@ -154,9 +159,7 @@ fn test_parse_response_all_status_codes() {
 
 #[test]
 fn test_parse_response_missing_status() {
-    let fields = vec![
-        FieldLine::new("content-type", "text/html"),
-    ];
+    let fields = vec![FieldLine::new("content-type", "text/html")];
 
     let result = parse_response_pseudo_headers(&fields);
     assert!(result.is_err());

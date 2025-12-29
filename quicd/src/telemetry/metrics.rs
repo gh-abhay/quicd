@@ -622,7 +622,7 @@ pub async fn start_metrics_task(
             Err(e) => {
                 // This is expected if OTLP collector is not running - don't spam errors
                 tracing::warn!(
-                    error = ?e, 
+                    error = ?e,
                     "Failed to flush final metrics (OTLP collector may not be available)"
                 );
             }

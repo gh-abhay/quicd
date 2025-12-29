@@ -8,7 +8,7 @@ extern crate alloc;
 
 use super::types::*;
 use crate::error::{Error, Result, TransportError};
-use crate::types::{VarIntCodec, StreamId};
+use crate::types::{StreamId, VarIntCodec};
 use bytes::BytesMut;
 
 /// Frame Parser Trait
@@ -86,8 +86,8 @@ impl FrameParser for DefaultFrameParser {
             return Err(Error::Transport(TransportError::FrameEncodingError));
         }
 
-        let (frame_type, mut consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (frame_type, mut consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
 
         // PADDING frame special case - can be repeated
         if frame_type == FRAME_TYPE_PADDING {
@@ -220,7 +220,11 @@ impl FrameParser for DefaultFrameParser {
 
 impl DefaultFrameParser {
     /// Parse STREAM frame (RFC 9000 Section 19.8)
-    fn parse_stream_frame<'a>(&self, frame_type: u64, buf: &'a [u8]) -> Result<(StreamFrame<'a>, usize)> {
+    fn parse_stream_frame<'a>(
+        &self,
+        frame_type: u64,
+        buf: &'a [u8],
+    ) -> Result<(StreamFrame<'a>, usize)> {
         let has_offset = (frame_type & STREAM_FRAME_BIT_OFF) != 0;
         let has_length = (frame_type & STREAM_FRAME_BIT_LEN) != 0;
         let fin = (frame_type & STREAM_FRAME_BIT_FIN) != 0;
@@ -228,8 +232,8 @@ impl DefaultFrameParser {
         let mut offset = 0;
 
         // Parse Stream ID
-        let (stream_id, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (stream_id, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
         offset += consumed;
 
         // Parse Offset (if present)
@@ -272,14 +276,14 @@ impl DefaultFrameParser {
     }
 
     /// Parse ACK frame (RFC 9000 Section 19.3)
-    /// 
+    ///
     /// ACK ranges are gap-encoded and MUST be parsed carefully to avoid allocation
     fn parse_ack_frame<'a>(&self, buf: &'a [u8], _has_ecn: bool) -> Result<(AckFrame<'a>, usize)> {
         let mut offset = 0;
 
         // Largest Acknowledged
-        let (largest_acked, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (largest_acked, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
         offset += consumed;
 
         // ACK Delay
@@ -305,7 +309,9 @@ impl DefaultFrameParser {
         // Parse additional ACK ranges (gap, ack_range) pairs
         // Zero-allocation strategy: Store as slice reference
         let ranges_start = offset;
-        let mut current_packet = largest_acked.saturating_sub(first_ack_range).saturating_sub(1);
+        let mut current_packet = largest_acked
+            .saturating_sub(first_ack_range)
+            .saturating_sub(1);
 
         for _ in 0..ack_range_count {
             // Parse Gap
@@ -377,8 +383,8 @@ impl DefaultFrameParser {
         let mut offset = 0;
 
         // Parse Offset
-        let (crypto_offset, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (crypto_offset, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
         offset += consumed;
 
         // Parse Length
@@ -393,15 +399,21 @@ impl DefaultFrameParser {
         let data = &buf[offset..offset + length as usize];
         offset += length as usize;
 
-        Ok((CryptoFrame { offset: crypto_offset, data }, offset))
+        Ok((
+            CryptoFrame {
+                offset: crypto_offset,
+                data,
+            },
+            offset,
+        ))
     }
 
     /// Parse RESET_STREAM frame (RFC 9000 Section 19.4)
     fn parse_reset_stream_frame(buf: &[u8]) -> Result<(ResetStreamFrame, usize)> {
         let mut offset = 0;
 
-        let (stream_id, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (stream_id, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
         offset += consumed;
 
         let (error_code, consumed) = VarIntCodec::decode(&buf[offset..])
@@ -426,8 +438,8 @@ impl DefaultFrameParser {
     fn parse_stop_sending_frame(buf: &[u8]) -> Result<(StopSendingFrame, usize)> {
         let mut offset = 0;
 
-        let (stream_id, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (stream_id, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
         offset += consumed;
 
         let (error_code, consumed) = VarIntCodec::decode(&buf[offset..])
@@ -447,8 +459,8 @@ impl DefaultFrameParser {
     fn parse_new_token_frame<'a>(buf: &'a [u8]) -> Result<(NewTokenFrame<'a>, usize)> {
         let mut offset = 0;
 
-        let (token_length, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (token_length, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
         offset += consumed;
 
         if token_length > (buf.len() - offset) as u64 {
@@ -463,8 +475,8 @@ impl DefaultFrameParser {
 
     /// Parse MAX_DATA frame (RFC 9000 Section 19.9)
     fn parse_max_data_frame(buf: &[u8]) -> Result<(MaxDataFrame, usize)> {
-        let (maximum_data, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (maximum_data, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
 
         Ok((MaxDataFrame { maximum_data }, consumed))
     }
@@ -473,8 +485,8 @@ impl DefaultFrameParser {
     fn parse_max_stream_data_frame(buf: &[u8]) -> Result<(MaxStreamDataFrame, usize)> {
         let mut offset = 0;
 
-        let (stream_id, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (stream_id, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
         offset += consumed;
 
         let (maximum_stream_data, consumed) = VarIntCodec::decode(&buf[offset..])
@@ -492,16 +504,16 @@ impl DefaultFrameParser {
 
     /// Parse MAX_STREAMS frame (RFC 9000 Section 19.11)
     fn parse_max_streams_frame(buf: &[u8]) -> Result<(MaxStreamsFrame, usize)> {
-        let (maximum_streams, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (maximum_streams, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
 
         Ok((MaxStreamsFrame { maximum_streams }, consumed))
     }
 
     /// Parse DATA_BLOCKED frame (RFC 9000 Section 19.12)
     fn parse_data_blocked_frame(buf: &[u8]) -> Result<(DataBlockedFrame, usize)> {
-        let (maximum_data, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (maximum_data, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
 
         Ok((DataBlockedFrame { maximum_data }, consumed))
     }
@@ -510,8 +522,8 @@ impl DefaultFrameParser {
     fn parse_stream_data_blocked_frame(buf: &[u8]) -> Result<(StreamDataBlockedFrame, usize)> {
         let mut offset = 0;
 
-        let (stream_id, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (stream_id, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
         offset += consumed;
 
         let (maximum_stream_data, consumed) = VarIntCodec::decode(&buf[offset..])
@@ -529,18 +541,20 @@ impl DefaultFrameParser {
 
     /// Parse STREAMS_BLOCKED frame (RFC 9000 Section 19.14)
     fn parse_streams_blocked_frame(buf: &[u8]) -> Result<(StreamsBlockedFrame, usize)> {
-        let (maximum_streams, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (maximum_streams, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
 
         Ok((StreamsBlockedFrame { maximum_streams }, consumed))
     }
 
     /// Parse NEW_CONNECTION_ID frame (RFC 9000 Section 19.15)
-    fn parse_new_connection_id_frame<'a>(buf: &'a [u8]) -> Result<(NewConnectionIdFrame<'a>, usize)> {
+    fn parse_new_connection_id_frame<'a>(
+        buf: &'a [u8],
+    ) -> Result<(NewConnectionIdFrame<'a>, usize)> {
         let mut offset = 0;
 
-        let (sequence_number, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (sequence_number, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
         offset += consumed;
 
         let (retire_prior_to, consumed) = VarIntCodec::decode(&buf[offset..])
@@ -583,8 +597,8 @@ impl DefaultFrameParser {
 
     /// Parse RETIRE_CONNECTION_ID frame (RFC 9000 Section 19.16)
     fn parse_retire_connection_id_frame(buf: &[u8]) -> Result<(RetireConnectionIdFrame, usize)> {
-        let (sequence_number, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (sequence_number, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
 
         Ok((RetireConnectionIdFrame { sequence_number }, consumed))
     }
@@ -619,8 +633,8 @@ impl DefaultFrameParser {
     ) -> Result<(ConnectionCloseTransportFrame<'a>, usize)> {
         let mut offset = 0;
 
-        let (error_code_raw, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (error_code_raw, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
         offset += consumed;
 
         let error_code = match error_code_raw {
@@ -675,8 +689,8 @@ impl DefaultFrameParser {
     ) -> Result<(ConnectionCloseApplicationFrame<'a>, usize)> {
         let mut offset = 0;
 
-        let (error_code_raw, consumed) = VarIntCodec::decode(buf)
-            .ok_or(Error::Transport(TransportError::FrameEncodingError))?;
+        let (error_code_raw, consumed) =
+            VarIntCodec::decode(buf).ok_or(Error::Transport(TransportError::FrameEncodingError))?;
         offset += consumed;
 
         let (reason_length, consumed) = VarIntCodec::decode(&buf[offset..])
@@ -896,12 +910,20 @@ impl FrameSerializer for DefaultFrameSerializer {
             Frame::Stream(stream) => {
                 let frame_type = FRAME_TYPE_STREAM
                     | (if stream.fin { STREAM_FRAME_BIT_FIN } else { 0 })
-                    | (if stream.offset > 0 { STREAM_FRAME_BIT_OFF } else { 0 })
+                    | (if stream.offset > 0 {
+                        STREAM_FRAME_BIT_OFF
+                    } else {
+                        0
+                    })
                     | STREAM_FRAME_BIT_LEN;
-                
+
                 VarIntCodec::size(frame_type)
                     + VarIntCodec::size(stream.stream_id.value())
-                    + if stream.offset > 0 { VarIntCodec::size(stream.offset) } else { 0 }
+                    + if stream.offset > 0 {
+                        VarIntCodec::size(stream.offset)
+                    } else {
+                        0
+                    }
                     + VarIntCodec::size(stream.data.len() as u64)
                     + stream.data.len()
             }
@@ -918,28 +940,32 @@ impl DefaultFrameSerializer {
     /// Helper to serialize ACK frame
     fn serialize_ack_frame(ack: &AckFrame, buf: &mut BytesMut, with_ecn: bool) -> Result<()> {
         let mut tmp = [0u8; 8];
-        let frame_type = if with_ecn { FRAME_TYPE_ACK_ECN } else { FRAME_TYPE_ACK };
-        
+        let frame_type = if with_ecn {
+            FRAME_TYPE_ACK_ECN
+        } else {
+            FRAME_TYPE_ACK
+        };
+
         let len = VarIntCodec::encode(frame_type, &mut tmp)
             .ok_or(Error::Transport(TransportError::InternalError))?;
         buf.extend_from_slice(&tmp[..len]);
-        
+
         let len = VarIntCodec::encode(ack.largest_acked, &mut tmp)
             .ok_or(Error::Transport(TransportError::InternalError))?;
         buf.extend_from_slice(&tmp[..len]);
-        
+
         let len = VarIntCodec::encode(ack.ack_delay, &mut tmp)
             .ok_or(Error::Transport(TransportError::InternalError))?;
         buf.extend_from_slice(&tmp[..len]);
-        
+
         let len = VarIntCodec::encode(ack.ack_range_count, &mut tmp)
             .ok_or(Error::Transport(TransportError::InternalError))?;
         buf.extend_from_slice(&tmp[..len]);
-        
+
         let len = VarIntCodec::encode(ack.first_ack_range, &mut tmp)
             .ok_or(Error::Transport(TransportError::InternalError))?;
         buf.extend_from_slice(&tmp[..len]);
-        
+
         Ok(())
     }
 
@@ -948,29 +974,33 @@ impl DefaultFrameSerializer {
         let mut tmp = [0u8; 8];
         let frame_type = FRAME_TYPE_STREAM
             | (if stream.fin { STREAM_FRAME_BIT_FIN } else { 0 })
-            | (if stream.offset > 0 { STREAM_FRAME_BIT_OFF } else { 0 })
+            | (if stream.offset > 0 {
+                STREAM_FRAME_BIT_OFF
+            } else {
+                0
+            })
             | STREAM_FRAME_BIT_LEN;
-        
+
         let len = VarIntCodec::encode(frame_type, &mut tmp)
             .ok_or(Error::Transport(TransportError::InternalError))?;
         buf.extend_from_slice(&tmp[..len]);
-        
+
         let len = VarIntCodec::encode(stream.stream_id.value(), &mut tmp)
             .ok_or(Error::Transport(TransportError::InternalError))?;
         buf.extend_from_slice(&tmp[..len]);
-        
+
         if stream.offset > 0 {
             let len = VarIntCodec::encode(stream.offset, &mut tmp)
                 .ok_or(Error::Transport(TransportError::InternalError))?;
             buf.extend_from_slice(&tmp[..len]);
         }
-        
+
         let len = VarIntCodec::encode(stream.data.len() as u64, &mut tmp)
             .ok_or(Error::Transport(TransportError::InternalError))?;
         buf.extend_from_slice(&tmp[..len]);
-        
+
         buf.extend_from_slice(stream.data);
-        
+
         Ok(())
     }
 }
@@ -987,7 +1017,7 @@ mod tests {
     fn test_parse_padding_frame() {
         let parser = DefaultFrameParser;
         let buf = [0x00, 0x00, 0x00, 0x01]; // 3 PADDING bytes + PING
-        
+
         let (frame, consumed) = parser.parse_frame(&buf).unwrap();
         assert!(matches!(frame, Frame::Padding));
         assert_eq!(consumed, 3); // All PADDING bytes consumed
@@ -997,7 +1027,7 @@ mod tests {
     fn test_parse_ping_frame() {
         let parser = DefaultFrameParser;
         let buf = [0x01]; // PING frame
-        
+
         let (frame, consumed) = parser.parse_frame(&buf).unwrap();
         assert!(matches!(frame, Frame::Ping));
         assert_eq!(consumed, 1);
@@ -1015,7 +1045,7 @@ mod tests {
             0x05, // Length = 5
             b'h', b'e', b'l', b'l', b'o',
         ];
-        
+
         let (frame, consumed) = parser.parse_frame(&buf).unwrap();
         match frame {
             Frame::Stream(s) => {
@@ -1040,7 +1070,7 @@ mod tests {
             0x00, // ACK Range Count = 0
             0x05, // First ACK Range = 5
         ];
-        
+
         let (frame, consumed) = parser.parse_frame(&buf).unwrap();
         match frame {
             Frame::Ack(ack) => {
@@ -1064,7 +1094,7 @@ mod tests {
             0x04, // Length = 4
             0x01, 0x02, 0x03, 0x04, // Data
         ];
-        
+
         let (frame, consumed) = parser.parse_frame(&buf).unwrap();
         match frame {
             Frame::Crypto(crypto) => {
@@ -1080,7 +1110,7 @@ mod tests {
     fn test_parse_max_data_frame() {
         let parser = DefaultFrameParser;
         let buf = [0x10, 0x40, 0x64]; // MAX_DATA, value=100
-        
+
         let (frame, consumed) = parser.parse_frame(&buf).unwrap();
         match frame {
             Frame::MaxData(max_data) => {
@@ -1095,7 +1125,7 @@ mod tests {
     fn test_parse_handshake_done() {
         let parser = DefaultFrameParser;
         let buf = [0x1e]; // HANDSHAKE_DONE
-        
+
         let (frame, consumed) = parser.parse_frame(&buf).unwrap();
         assert!(matches!(frame, Frame::HandshakeDone));
         assert_eq!(consumed, 1);
@@ -1105,7 +1135,7 @@ mod tests {
     fn test_parse_invalid_frame_type() {
         let parser = DefaultFrameParser;
         let buf = [0xff]; // Invalid frame type
-        
+
         assert!(parser.parse_frame(&buf).is_err());
     }
 
@@ -1113,10 +1143,10 @@ mod tests {
     fn test_serialize_ping_frame() {
         let serializer = DefaultFrameSerializer;
         let mut buf = BytesMut::new();
-        
+
         let frame = Frame::Ping;
         let written = serializer.serialize_frame(&frame, &mut buf).unwrap();
-        
+
         assert_eq!(written, 1);
         assert_eq!(&buf[..], &[0x01]);
     }
@@ -1125,7 +1155,7 @@ mod tests {
     fn test_serialize_stream_frame() {
         let serializer = DefaultFrameSerializer;
         let mut buf = BytesMut::new();
-        
+
         let stream = StreamFrame {
             stream_id: StreamId::new(4),
             offset: 0,
@@ -1133,13 +1163,13 @@ mod tests {
             data: b"test",
         };
         let frame = Frame::Stream(stream);
-        
+
         serializer.serialize_frame(&frame, &mut buf).unwrap();
-        
+
         // Verify it can be parsed back
         let parser = DefaultFrameParser;
         let (parsed_frame, _) = parser.parse_frame(&buf).unwrap();
-        
+
         match parsed_frame {
             Frame::Stream(s) => {
                 assert_eq!(s.stream_id, StreamId::new(4));
@@ -1156,18 +1186,18 @@ mod tests {
         let parser = DefaultFrameParser;
         // Multiple frames: PING + PADDING + PING
         let buf = [0x01, 0x00, 0x01];
-        
+
         let mut iter = parser.iter_frames(&buf);
-        
+
         let frame1 = iter.next().unwrap().unwrap();
         assert!(matches!(frame1, Frame::Ping));
-        
+
         let frame2 = iter.next().unwrap().unwrap();
         assert!(matches!(frame2, Frame::Padding));
-        
+
         let frame3 = iter.next().unwrap().unwrap();
         assert!(matches!(frame3, Frame::Ping));
-        
+
         assert!(iter.next().is_none());
     }
 
@@ -1175,7 +1205,7 @@ mod tests {
     fn test_ack_eliciting() {
         assert!(Frame::Ping.is_ack_eliciting());
         assert!(!Frame::Padding.is_ack_eliciting());
-        
+
         let ack = AckFrame {
             largest_acked: 10,
             ack_delay: 0,

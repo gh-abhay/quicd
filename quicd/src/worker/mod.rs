@@ -16,10 +16,9 @@
 //! - **Event-driven**: io_uring wait → process completions → submit new ops → repeat
 //! - **Thread-local data only** (no locks, no mutexes, no atomic contention)
 
-pub mod io_state;
 pub mod connection_manager;
 pub mod context;
-
+pub mod io_state;
 
 use crate::netio::{
     buffer::{create_worker_pool, WorkerBufPool, WorkerBuffer},
@@ -27,8 +26,8 @@ use crate::netio::{
     socket::create_udp_socket,
 };
 use crate::telemetry::{record_metric, MetricsEvent};
-use crate::worker::io_state::{RecvOpState, SendOpState};
 use crate::worker::connection_manager::ConnectionManager;
+use crate::worker::io_state::{RecvOpState, SendOpState};
 use anyhow::{Context, Result};
 use io_uring::{opcode, types, IoUring};
 use quicd_quic::ConnectionConfig;
@@ -38,9 +37,9 @@ use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// User data for io_uring operations.
@@ -120,8 +119,8 @@ impl NetworkWorker {
         let socket_fd = socket.as_raw_fd();
 
         // Register socket with eBPF router (mandatory for connection affinity)
-        let routing_cookie = crate::routing::register_worker_socket(id, &socket)
-            .with_context(|| {
+        let routing_cookie =
+            crate::routing::register_worker_socket(id, &socket).with_context(|| {
                 format!(
                     "failed to register worker {id} socket with eBPF router - eBPF is mandatory"
                 )
@@ -298,18 +297,20 @@ impl NetworkWorker {
         // Unbounded allows high-throughput signaling without blocking application tasks
         // All app tasks for this worker share the same sender
         let (egress_tx, egress_rx) = crossbeam_channel::unbounded();
-        
+
         // Create connection config with TLS certificate data (already in memory, no disk I/O)
         let mut conn_config = ConnectionConfig::default();
         conn_config.cert_data = Some(self.cert_data.clone());
         conn_config.key_data = Some(self.key_data.clone());
-        
+
         // Collect all ALPN protocols from registered applications (RFC 9001 Section 8.1)
-        conn_config.alpn_protocols = self.app_registry.get_all_alpn_protocols()
+        conn_config.alpn_protocols = self
+            .app_registry
+            .get_all_alpn_protocols()
             .into_iter()
             .map(|alpn| alpn.as_bytes().to_vec())
             .collect();
-        
+
         // Create connection manager for this worker (with routing-aware CID generator)
         let mut conn_manager = ConnectionManager::new(
             conn_config,
@@ -387,25 +388,26 @@ impl NetworkWorker {
             // - O(1) next timeout lookup from ConnectionManager
             // ═══════════════════════════════════════════════════════════════════
             let now = std::time::Instant::now();
-            let quic_timeout = conn_manager.next_timeout(now)
+            let quic_timeout = conn_manager
+                .next_timeout(now)
                 .unwrap_or(max_timeout_interval);
-            
+
             let should_check_timeouts = now.duration_since(last_timeout_check) >= quic_timeout;
 
             if should_check_timeouts {
                 // Process QUIC timeouts via connection manager
                 let timeout_packets = conn_manager.poll_timeouts();
-                
+
                 // Send timeout-generated packets
                 for (dest, packet_data) in timeout_packets {
                     // Convert to WorkerBuffer (data is already copied by from_slice)
                     let _buf = WorkerBuffer::from_slice(&packet_data, &buffer_pool);
-                    
+
                     // Submit send operation to io_uring
                     // TODO: Complete send operation submission
                     debug!(worker_id, dest_addr = %dest, packet_len = packet_data.len(), "Generated timeout packet");
                 }
-                
+
                 last_timeout_check = now;
             }
 
@@ -417,7 +419,7 @@ impl NetworkWorker {
             //
             // Commands include:
             // - WriteData: Send data on stream
-            // - OpenStream: Open new bidirectional/unidirectional stream  
+            // - OpenStream: Open new bidirectional/unidirectional stream
             // - CloseStream: Close stream gracefully
             // - SendDatagram: Send unreliable datagram
             // - CloseConnection: Close connection with error code
@@ -555,7 +557,7 @@ impl NetworkWorker {
                     } else {
                         // Successfully received packet
                         let bytes_read = result as usize;
-                        
+
                         // Set received length on buffer (unwrap because we know it's there)
                         if let Some(buffer) = state.buffer.as_mut() {
                             buffer.set_received_len(bytes_read);
@@ -572,10 +574,11 @@ impl NetworkWorker {
                         // Take buffer from state to pass to QUIC layer
                         if let Some(buffer) = state.take_buffer() {
                             // Pass packet to connection manager for processing
-                            let response_packets = conn_manager.handle_packet(buffer, peer_addr, Instant::now());
+                            let response_packets =
+                                conn_manager.handle_packet(buffer, peer_addr, Instant::now());
                             outgoing_packets.extend(response_packets);
                         }
-                        
+
                         // Return state to pool (buffer is gone, but state structure is reused)
                         recv_op_pool.push(state);
                     }
@@ -591,12 +594,13 @@ impl NetworkWorker {
             // This allows sending multiple QUIC packets in a single sendmsg call
             // using multiple iovecs, without copying data.
             // ═══════════════════════════════════════════════════════════════════
-            
+
             // Combine egress packets and QUIC response packets
             outgoing_packets.extend(egress_packets);
-            
+
             // Group packets by destination
-            let mut by_dest: std::collections::HashMap<std::net::SocketAddr, Vec<Vec<u8>>> = std::collections::HashMap::new();
+            let mut by_dest: std::collections::HashMap<std::net::SocketAddr, Vec<Vec<u8>>> =
+                std::collections::HashMap::new();
             for (dest, packet_data) in outgoing_packets {
                 by_dest.entry(dest).or_default().push(packet_data);
             }
@@ -607,25 +611,29 @@ impl NetworkWorker {
             let mut send_sq_full = false;
             for (dest, packets) in by_dest {
                 eprintln!("worker: Sending {} packets to {}", packets.len(), dest);
-                
+
                 // Separate long and short header packets
                 // Short header: bit 7 = 0, Long header: bit 7 = 1
                 let mut long_header_packets = Vec::new();
                 let mut short_header_packets = Vec::new();
-                
+
                 for data in packets {
                     if data.is_empty() {
                         warn!(worker_id, "Empty packet data, skipping");
                         continue;
                     }
-                    
+
                     if data.len() > 2048 {
                         warn!(worker_id, "Packet too large: {} bytes", data.len());
                         continue;
                     }
-                    
-                    eprintln!("worker: Packet size: {} bytes, first byte: 0x{:02x}", data.len(), data[0]);
-                    
+
+                    eprintln!(
+                        "worker: Packet size: {} bytes, first byte: 0x{:02x}",
+                        data.len(),
+                        data[0]
+                    );
+
                     // Check bit 7 of first byte (0x80)
                     if (data[0] & 0x80) != 0 {
                         // Long header packet - can be coalesced
@@ -635,25 +643,28 @@ impl NetworkWorker {
                         short_header_packets.push(data);
                     }
                 }
-                
+
                 // Send all long header packets together (coalesced), respecting MTU
                 // RFC 9000 §14: Server MUST NOT send datagrams larger than 1200 bytes initially
                 const MAX_DATAGRAM_SIZE: usize = 1200;
-                
+
                 if !long_header_packets.is_empty() {
                     // Split into datagrams respecting MTU limit
                     let mut current_datagram: Vec<WorkerBuffer> = Vec::new();
                     let mut current_size = 0usize;
-                    
+
                     for data in long_header_packets {
                         let packet_len = data.len();
-                        
+
                         // If single packet exceeds MTU, send it alone (shouldn't happen with proper packet construction)
                         if packet_len > MAX_DATAGRAM_SIZE {
                             // First, send any accumulated packets
                             if !current_datagram.is_empty() {
-                                eprintln!("worker: Sending {} coalesced long header packets ({} bytes)", 
-                                         current_datagram.len(), current_size);
+                                eprintln!(
+                                    "worker: Sending {} coalesced long header packets ({} bytes)",
+                                    current_datagram.len(),
+                                    current_size
+                                );
                                 let _ = submit_send_op(
                                     &mut ring,
                                     socket_fd,
@@ -666,7 +677,10 @@ impl NetworkWorker {
                                 current_size = 0;
                             }
                             // Send the oversized packet alone
-                            eprintln!("worker: Sending 1 oversized long header packet ({} bytes)", packet_len);
+                            eprintln!(
+                                "worker: Sending 1 oversized long header packet ({} bytes)",
+                                packet_len
+                            );
                             let buffer = WorkerBuffer::from_vec(data, &buffer_pool);
                             let _ = submit_send_op(
                                 &mut ring,
@@ -679,12 +693,17 @@ impl NetworkWorker {
                             );
                             continue;
                         }
-                        
+
                         // Check if adding this packet would exceed MTU
-                        if current_size + packet_len > MAX_DATAGRAM_SIZE && !current_datagram.is_empty() {
+                        if current_size + packet_len > MAX_DATAGRAM_SIZE
+                            && !current_datagram.is_empty()
+                        {
                             // Send current datagram and start a new one
-                            eprintln!("worker: Sending {} coalesced long header packets ({} bytes)", 
-                                     current_datagram.len(), current_size);
+                            eprintln!(
+                                "worker: Sending {} coalesced long header packets ({} bytes)",
+                                current_datagram.len(),
+                                current_size
+                            );
                             let _ = submit_send_op(
                                 &mut ring,
                                 socket_fd,
@@ -696,17 +715,20 @@ impl NetworkWorker {
                             );
                             current_size = 0;
                         }
-                        
+
                         // Add packet to current datagram
                         let buffer = WorkerBuffer::from_vec(data, &buffer_pool);
                         current_datagram.push(buffer);
                         current_size += packet_len;
                     }
-                    
+
                     // Send remaining packets
                     if !current_datagram.is_empty() {
-                        eprintln!("worker: Sending {} coalesced long header packets ({} bytes)", 
-                                 current_datagram.len(), current_size);
+                        eprintln!(
+                            "worker: Sending {} coalesced long header packets ({} bytes)",
+                            current_datagram.len(),
+                            current_size
+                        );
                         match submit_send_op(
                             &mut ring,
                             socket_fd,
@@ -717,10 +739,13 @@ impl NetworkWorker {
                             &mut send_op_pool,
                         ) {
                             Ok(()) => {
-                                eprintln!("worker: Successfully submitted coalesced long header packets");
+                                eprintln!(
+                                    "worker: Successfully submitted coalesced long header packets"
+                                );
                             }
-                            Err(e) if e.kind() == io::ErrorKind::Other
-                                && e.to_string().contains("submission queue full") =>
+                            Err(e)
+                                if e.kind() == io::ErrorKind::Other
+                                    && e.to_string().contains("submission queue full") =>
                             {
                                 send_sq_full = true;
                                 warn!(
@@ -737,14 +762,14 @@ impl NetworkWorker {
                         }
                     }
                 }
-                
+
                 // Send each short header packet SEPARATELY (not coalesced)
                 for data in short_header_packets {
                     let buffer = WorkerBuffer::from_vec(data, &buffer_pool);
                     let buffers = vec![buffer];
-                    
+
                     eprintln!("worker: Sending 1 short header packet (not coalesced)");
-                    
+
                     match submit_send_op(
                         &mut ring,
                         socket_fd,
@@ -757,8 +782,9 @@ impl NetworkWorker {
                         Ok(()) => {
                             eprintln!("worker: Successfully submitted short header packet");
                         }
-                        Err(e) if e.kind() == io::ErrorKind::Other
-                            && e.to_string().contains("submission queue full") =>
+                        Err(e)
+                            if e.kind() == io::ErrorKind::Other
+                                && e.to_string().contains("submission queue full") =>
                         {
                             send_sq_full = true;
                             warn!(
@@ -919,7 +945,7 @@ impl NetworkWorker {
 
         // Step 2: Gracefully close all active QUIC connections per RFC 9000 Section 10
         let shutdown_packets: Vec<(std::net::SocketAddr, Vec<u8>)> = Vec::new();
-        
+
         // Generate CONNECTION_CLOSE frames for all connections
         // This is handled via connection_manager - it would iterate through all
         // connections and send CONNECTION_CLOSE with error code 0x00 (NO_ERROR)
@@ -1147,9 +1173,6 @@ fn submit_recv_op(
 /// 1. Group packets by destination address
 /// 2. For each destination, combine packets into datagrams up to MTU size
 /// 3. Common QUIC scenario: Initial + Handshake packets can be coalesced
-
-
-
 
 /// Submit a send operation to io_uring.
 ///

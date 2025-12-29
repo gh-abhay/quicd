@@ -4,7 +4,7 @@
 //! per RFC 9204 Sections 4.3 and 4.4.
 
 use crate::error::{Error, Result};
-use crate::{integer, huffman};
+use crate::{huffman, integer};
 use bytes::Bytes;
 
 /// Encoder stream instructions (Section 4.3).
@@ -12,7 +12,7 @@ use bytes::Bytes;
 pub enum EncoderInstruction {
     /// Set Dynamic Table Capacity (Section 4.3.1).
     SetCapacity { capacity: u64 },
-    
+
     /// Insert with Name Reference (Section 4.3.2).
     InsertWithNameRef {
         is_static: bool,
@@ -20,7 +20,7 @@ pub enum EncoderInstruction {
         value: Bytes,
         huffman_value: bool,
     },
-    
+
     /// Insert with Literal Name (Section 4.3.3).
     InsertWithLiteralName {
         name: Bytes,
@@ -28,7 +28,7 @@ pub enum EncoderInstruction {
         value: Bytes,
         huffman_value: bool,
     },
-    
+
     /// Duplicate (Section 4.3.4).
     Duplicate { index: u64 },
 }
@@ -38,24 +38,35 @@ pub enum EncoderInstruction {
 pub enum DecoderInstruction {
     /// Section Acknowledgment (Section 4.4.1).
     SectionAck { stream_id: u64 },
-    
+
     /// Stream Cancellation (Section 4.4.2).
     StreamCancel { stream_id: u64 },
-    
+
     /// Insert Count Increment (Section 4.4.3).
     InsertCountIncrement { increment: u64 },
 }
 
 /// Encodes a string literal (RFC 7541 Section 5.2 / RFC 9204 Section 4.1.2).
-fn encode_string(data: &[u8], huffman: bool, prefix_bits: u8, prefix_mask: u8, buf: &mut Vec<u8>) -> usize {
+fn encode_string(
+    data: &[u8],
+    huffman: bool,
+    prefix_bits: u8,
+    prefix_mask: u8,
+    buf: &mut Vec<u8>,
+) -> usize {
     let start = buf.len();
-    
+
     if huffman {
         let mut encoded = Vec::new();
         huffman::encode(data, &mut encoded);
-        
+
         let mut temp = [0u8; 16];
-        let n = integer::encode(encoded.len() as u64, prefix_bits - 1, prefix_mask | 0x80, &mut temp);
+        let n = integer::encode(
+            encoded.len() as u64,
+            prefix_bits - 1,
+            prefix_mask | 0x80,
+            &mut temp,
+        );
         buf.extend_from_slice(&temp[..n]);
         buf.extend_from_slice(&encoded);
     } else {
@@ -64,7 +75,7 @@ fn encode_string(data: &[u8], huffman: bool, prefix_bits: u8, prefix_mask: u8, b
         buf.extend_from_slice(&temp[..n]);
         buf.extend_from_slice(data);
     }
-    
+
     buf.len() - start
 }
 
@@ -73,15 +84,15 @@ fn decode_string(prefix_bits: u8, data: &[u8]) -> Result<(Bytes, usize)> {
     if data.is_empty() {
         return Err(Error::Incomplete(1));
     }
-    
+
     let huffman = (data[0] & 0x80) != 0;
     let (len, consumed) = integer::decode(prefix_bits - 1, data)?;
     let len = len as usize;
-    
+
     if consumed + len > data.len() {
         return Err(Error::Incomplete(consumed + len - data.len()));
     }
-    
+
     let string_data = &data[consumed..consumed + len];
     let result = if huffman {
         let mut decoded = Vec::new();
@@ -90,7 +101,7 @@ fn decode_string(prefix_bits: u8, data: &[u8]) -> Result<(Bytes, usize)> {
     } else {
         Bytes::copy_from_slice(string_data)
     };
-    
+
     Ok((result, consumed + len))
 }
 
@@ -145,7 +156,7 @@ impl EncoderInstruction {
         }
 
         let first_byte = data[0];
-        
+
         if (first_byte & 0x80) != 0 {
             // 1Txxxxxx - Insert with Name Reference
             let is_static = (first_byte & 0x40) != 0;
@@ -153,13 +164,16 @@ impl EncoderInstruction {
             let (value, value_consumed) = decode_string(8, &data[consumed..])?;
             consumed += value_consumed;
             let huffman_value = (data[consumed - value_consumed] & 0x80) != 0;
-            
-            Ok((EncoderInstruction::InsertWithNameRef {
-                is_static,
-                name_index,
-                value,
-                huffman_value,
-            }, consumed))
+
+            Ok((
+                EncoderInstruction::InsertWithNameRef {
+                    is_static,
+                    name_index,
+                    value,
+                    huffman_value,
+                },
+                consumed,
+            ))
         } else if (first_byte & 0xC0) == 0x40 {
             // 01xxxxxx - Insert with Literal Name
             let (name, mut consumed) = decode_string(6, data)?;
@@ -167,13 +181,16 @@ impl EncoderInstruction {
             let (value, value_consumed) = decode_string(8, &data[consumed..])?;
             consumed += value_consumed;
             let huffman_value = (data[consumed - value_consumed] & 0x80) != 0;
-            
-            Ok((EncoderInstruction::InsertWithLiteralName {
-                name,
-                huffman_name,
-                value,
-                huffman_value,
-            }, consumed))
+
+            Ok((
+                EncoderInstruction::InsertWithLiteralName {
+                    name,
+                    huffman_name,
+                    value,
+                    huffman_value,
+                },
+                consumed,
+            ))
         } else if (first_byte & 0xE0) == 0x20 {
             // 001xxxxx - Set Dynamic Table Capacity
             let (capacity, consumed) = integer::decode(5, data)?;
@@ -183,7 +200,9 @@ impl EncoderInstruction {
             let (index, consumed) = integer::decode(5, data)?;
             Ok((EncoderInstruction::Duplicate { index }, consumed))
         } else {
-            Err(Error::EncoderStreamError("invalid instruction prefix".into()))
+            Err(Error::EncoderStreamError(
+                "invalid instruction prefix".into(),
+            ))
         }
     }
 }
@@ -222,7 +241,7 @@ impl DecoderInstruction {
         }
 
         let first_byte = data[0];
-        
+
         if (first_byte & 0x80) != 0 {
             // 1xxxxxxx - Section Acknowledgment
             let (stream_id, consumed) = integer::decode(7, data)?;
@@ -235,9 +254,14 @@ impl DecoderInstruction {
             // 00xxxxxx - Insert Count Increment
             let (increment, consumed) = integer::decode(6, data)?;
             if increment == 0 {
-                return Err(Error::DecoderStreamError("increment must be non-zero".into()));
+                return Err(Error::DecoderStreamError(
+                    "increment must be non-zero".into(),
+                ));
             }
-            Ok((DecoderInstruction::InsertCountIncrement { increment }, consumed))
+            Ok((
+                DecoderInstruction::InsertCountIncrement { increment },
+                consumed,
+            ))
         }
     }
 }
@@ -251,7 +275,7 @@ mod tests {
         let inst = EncoderInstruction::SetCapacity { capacity: 100 };
         let mut buf = Vec::new();
         inst.encode(&mut buf);
-        
+
         let (decoded, consumed) = EncoderInstruction::decode(&buf).unwrap();
         assert_eq!(decoded, inst);
         assert_eq!(consumed, buf.len());
@@ -267,7 +291,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         inst.encode(&mut buf);
-        
+
         let (decoded, consumed) = EncoderInstruction::decode(&buf).unwrap();
         assert_eq!(decoded, inst);
         assert_eq!(consumed, buf.len());
@@ -283,7 +307,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         inst.encode(&mut buf);
-        
+
         let (decoded, consumed) = EncoderInstruction::decode(&buf).unwrap();
         assert_eq!(decoded, inst);
         assert_eq!(consumed, buf.len());
@@ -294,7 +318,7 @@ mod tests {
         let inst = EncoderInstruction::Duplicate { index: 5 };
         let mut buf = Vec::new();
         inst.encode(&mut buf);
-        
+
         let (decoded, consumed) = EncoderInstruction::decode(&buf).unwrap();
         assert_eq!(decoded, inst);
         assert_eq!(consumed, buf.len());
@@ -305,7 +329,7 @@ mod tests {
         let inst = DecoderInstruction::SectionAck { stream_id: 4 };
         let mut buf = Vec::new();
         inst.encode(&mut buf);
-        
+
         let (decoded, consumed) = DecoderInstruction::decode(&buf).unwrap();
         assert_eq!(decoded, inst);
         assert_eq!(consumed, buf.len());
@@ -316,7 +340,7 @@ mod tests {
         let inst = DecoderInstruction::StreamCancel { stream_id: 8 };
         let mut buf = Vec::new();
         inst.encode(&mut buf);
-        
+
         let (decoded, consumed) = DecoderInstruction::decode(&buf).unwrap();
         assert_eq!(decoded, inst);
         assert_eq!(consumed, buf.len());
@@ -327,7 +351,7 @@ mod tests {
         let inst = DecoderInstruction::InsertCountIncrement { increment: 3 };
         let mut buf = Vec::new();
         inst.encode(&mut buf);
-        
+
         let (decoded, consumed) = DecoderInstruction::decode(&buf).unwrap();
         assert_eq!(decoded, inst);
         assert_eq!(consumed, buf.len());

@@ -14,7 +14,7 @@
 
 use ahash::AHashMap;
 use bytes::Bytes;
-use crossbeam_channel::{Sender, unbounded};
+use crossbeam_channel::{unbounded, Sender};
 use parking_lot::Mutex;
 use quicd_quic::{ConnectionConfig, QuicConnection, Side};
 use quicd_x::{Command, ConnectionId, Event, StreamId};
@@ -38,32 +38,29 @@ const INGRESS_CHANNEL_CAPACITY: usize = 64;
 pub struct ConnectionState {
     /// The quicd-quic state machine
     pub quic_conn: QuicConnection,
-    
+
     /// Bounded sender for events to application task
     /// When full, worker applies QUIC flow control
     pub ingress_tx: Option<mpsc::Sender<Event>>,
-    
+
     /// Remote peer address
     pub peer_addr: SocketAddr,
-    
+
     /// Connection creation time
     pub created_at: Instant,
-    
+
     /// ALPN negotiated protocol
     pub alpn: Option<String>,
-    
+
     /// Whether handshake is complete
     pub handshake_complete: bool,
-    
+
     /// Whether application task has been spawned
     pub app_spawned: bool,
 }
 
 impl ConnectionState {
-    pub fn new(
-        quic_conn: QuicConnection,
-        peer_addr: SocketAddr,
-    ) -> Self {
+    pub fn new(quic_conn: QuicConnection, peer_addr: SocketAddr) -> Self {
         Self {
             quic_conn,
             ingress_tx: None,
@@ -84,27 +81,27 @@ pub struct WorkerContext {
     /// Pre-allocated Slab for connection storage
     /// Index is used for O(1) lookup
     connections: Slab<ConnectionState>,
-    
+
     /// Mapping from ConnectionId to Slab index
     /// Uses AHashMap for fast lookups
     cid_to_index: AHashMap<u64, usize>,
-    
+
     /// Shared egress channel for all app tasks assigned to this worker
     /// Unbounded for high-throughput signaling
     egress_tx: Sender<Command>,
-    
+
     /// Egress channel receiver (worker polls this)
     egress_rx: crossbeam_channel::Receiver<Command>,
-    
+
     /// Tokio runtime handle for spawning application tasks
     runtime_handle: tokio::runtime::Handle,
-    
+
     /// Application registry (ALPN → factory)
     app_registry: Arc<crate::apps::AppRegistry>,
-    
+
     /// Worker ID for logging
     worker_id: usize,
-    
+
     /// Connection config template
     conn_config: ConnectionConfig,
 }
@@ -126,13 +123,12 @@ impl WorkerContext {
         conn_config: ConnectionConfig,
     ) -> Self {
         let (egress_tx, egress_rx) = unbounded();
-        
+
         info!(
             worker_id,
-            max_connections,
-            "Initializing worker context with Slab capacity"
+            max_connections, "Initializing worker context with Slab capacity"
         );
-        
+
         Self {
             connections: Slab::with_capacity(max_connections),
             cid_to_index: AHashMap::with_capacity(max_connections),
@@ -144,19 +140,19 @@ impl WorkerContext {
             conn_config,
         }
     }
-    
+
     /// Get a connection by ConnectionId.
     pub fn get_connection(&self, cid: &ConnectionId) -> Option<&ConnectionState> {
         let index = self.cid_to_index.get(&cid.0)?;
         self.connections.get(*index)
     }
-    
+
     /// Get a mutable connection by ConnectionId.
     pub fn get_connection_mut(&mut self, cid: &ConnectionId) -> Option<&mut ConnectionState> {
         let index = self.cid_to_index.get(&cid.0)?;
         self.connections.get_mut(*index)
     }
-    
+
     /// Insert a new connection.
     ///
     /// Returns the Slab index for the connection.
@@ -172,10 +168,10 @@ impl WorkerContext {
             );
             return Err("slab at capacity");
         }
-        
+
         let index = self.connections.insert(state);
         self.cid_to_index.insert(cid.0, index);
-        
+
         debug!(
             worker_id = self.worker_id,
             conn_id = cid.0,
@@ -183,15 +179,15 @@ impl WorkerContext {
             total_connections = self.connections.len(),
             "Inserted new connection into Slab"
         );
-        
+
         Ok(index)
     }
-    
+
     /// Remove a connection by ConnectionId.
     pub fn remove_connection(&mut self, cid: &ConnectionId) -> Option<ConnectionState> {
         let index = self.cid_to_index.remove(&cid.0)?;
         let state = self.connections.try_remove(index)?;
-        
+
         debug!(
             worker_id = self.worker_id,
             conn_id = cid.0,
@@ -199,35 +195,40 @@ impl WorkerContext {
             remaining_connections = self.connections.len(),
             "Removed connection from Slab"
         );
-        
+
         Some(state)
     }
-    
+
     /// Spawn application task for a connection.
     ///
     /// Called once handshake is complete and ALPN is negotiated.
     pub fn spawn_app_task(&mut self, cid: ConnectionId) -> Result<(), String> {
-        let index = self.cid_to_index.get(&cid.0)
+        let index = self
+            .cid_to_index
+            .get(&cid.0)
             .ok_or("connection not found")?;
-        
-        let conn_state = self.connections.get_mut(*index)
+
+        let conn_state = self
+            .connections
+            .get_mut(*index)
             .ok_or("invalid slab index")?;
-        
+
         if conn_state.app_spawned {
             return Ok(());
         }
-        
-        let alpn = conn_state.alpn.as_ref()
-            .ok_or("ALPN not negotiated")?;
-        
-        let app = self.app_registry.get(alpn)
+
+        let alpn = conn_state.alpn.as_ref().ok_or("ALPN not negotiated")?;
+
+        let app = self
+            .app_registry
+            .get(alpn)
             .ok_or_else(|| format!("no application registered for ALPN: {}", alpn))?;
-        
+
         // Create bounded ingress channel
         let (ingress_tx, ingress_rx) = mpsc::channel(INGRESS_CHANNEL_CAPACITY);
         conn_state.ingress_tx = Some(ingress_tx);
         conn_state.app_spawned = true;
-        
+
         // Create ConnectionHandle
         let handle = quicd_x::ConnectionHandle::new(
             cid,
@@ -235,34 +236,43 @@ impl WorkerContext {
             self.egress_tx.clone(),
             &self.runtime_handle,
         );
-        
+
         info!(
             worker_id = self.worker_id,
             conn_id = cid.0,
             alpn = %alpn,
             "Spawning application task"
         );
-        
+
         // Spawn on Tokio runtime
-        let app_instance = app();  // Call the factory to create application instance
+        let app_instance = app(); // Call the factory to create application instance
         self.runtime_handle.spawn(async move {
             app_instance.on_connection(handle).await;
         });
-        
+
         Ok(())
     }
-    
+
     /// Process a command from application task.
     pub fn handle_command(&mut self, cmd: Command) {
         match cmd {
             Command::OpenBiStream { conn_id } => {
-                trace!(worker_id = self.worker_id, conn_id = conn_id.0, "OpenBiStream");
+                trace!(
+                    worker_id = self.worker_id,
+                    conn_id = conn_id.0,
+                    "OpenBiStream"
+                );
                 if let Some(conn_state) = self.get_connection_mut(&conn_id) {
                     // TODO: Call quic_conn.open_stream(Bidirectional)
                     // Then send Event::StreamOpenedConfirm
                 }
             }
-            Command::WriteStreamData { conn_id, stream_id, data, fin } => {
+            Command::WriteStreamData {
+                conn_id,
+                stream_id,
+                data,
+                fin,
+            } => {
                 trace!(
                     worker_id = self.worker_id,
                     conn_id = conn_id.0,
@@ -277,7 +287,7 @@ impl WorkerContext {
                     if let Err(e) = conn_state.quic_conn.write_stream(
                         quicd_quic::types::StreamId(stream_id.0),
                         data,
-                        fin
+                        fin,
                     ) {
                         error!(
                             worker_id = self.worker_id,
@@ -289,7 +299,11 @@ impl WorkerContext {
                     }
                 }
             }
-            Command::CloseConnection { conn_id, error_code, reason } => {
+            Command::CloseConnection {
+                conn_id,
+                error_code,
+                reason,
+            } => {
                 info!(
                     worker_id = self.worker_id,
                     conn_id = conn_id.0,
@@ -307,19 +321,19 @@ impl WorkerContext {
             }
         }
     }
-    
+
     /// Try to receive commands from egress channel (non-blocking).
     pub fn poll_commands(&mut self) {
         while let Ok(cmd) = self.egress_rx.try_recv() {
             self.handle_command(cmd);
         }
     }
-    
+
     /// Get egress channel sender (for sharing with app tasks).
     pub fn egress_sender(&self) -> Sender<Command> {
         self.egress_tx.clone()
     }
-    
+
     /// Get number of active connections.
     pub fn connection_count(&self) -> usize {
         self.connections.len()

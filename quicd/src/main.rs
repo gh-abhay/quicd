@@ -69,9 +69,17 @@ fn main() -> anyhow::Result<()> {
     // TLS configuration: Read certificate and key files ONCE at startup
     // This avoids disk I/O contention when multiple worker threads initialize connections
     info!("Loading TLS configuration");
-    let cert_path = config.global.tls.cert_path.as_ref()
+    let cert_path = config
+        .global
+        .tls
+        .cert_path
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Missing certificate path"))?;
-    let key_path = config.global.tls.key_path.as_ref()
+    let key_path = config
+        .global
+        .tls
+        .key_path
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Missing private key path"))?;
 
     // Read certificate and key data into memory
@@ -79,9 +87,12 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("Failed to read certificate file: {}", cert_path.display()))?;
     let key_data = std::fs::read(key_path)
         .with_context(|| format!("Failed to read private key file: {}", key_path.display()))?;
-    
-    info!("TLS certificate ({} bytes) and key ({} bytes) loaded into memory", 
-          cert_data.len(), key_data.len());
+
+    info!(
+        "TLS certificate ({} bytes) and key ({} bytes) loaded into memory",
+        cert_data.len(),
+        key_data.len()
+    );
 
     // Spawn network workers as native threads (NOT on tokio runtime)
     info!("Spawning network worker threads");

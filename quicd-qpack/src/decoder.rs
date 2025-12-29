@@ -7,7 +7,7 @@ use crate::{
     error::{Error, Result},
     field_line::FieldLine,
     instructions::{DecoderInstruction, EncoderInstruction},
-    {integer, huffman, static_table},
+    {huffman, integer, static_table},
 };
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
@@ -25,7 +25,7 @@ pub struct Decoder {
     dynamic_table: DynamicTable,
     max_blocked_streams: usize,
     blocked_streams: VecDeque<BlockedStream>,
-    decoded_sections: HashMap<u64, u64>,  // stream_id -> required insert count
+    decoded_sections: HashMap<u64, u64>, // stream_id -> required insert count
 }
 
 impl Decoder {
@@ -48,11 +48,7 @@ impl Decoder {
     ///
     /// Returns the decoded field lines, or an error if decoding fails
     /// or the stream is blocked.
-    pub fn decode_field_section(
-        &mut self,
-        stream_id: u64,
-        data: &[u8],
-    ) -> Result<Vec<FieldLine>> {
+    pub fn decode_field_section(&mut self, stream_id: u64, data: &[u8]) -> Result<Vec<FieldLine>> {
         // Decode prefix
         let (required_insert_count, base, mut pos) = self.decode_prefix(data)?;
 
@@ -76,14 +72,16 @@ impl Decoder {
         // Decode field lines
         let mut fields = Vec::new();
         while pos < data.len() {
-            let (field, consumed) = self.decode_field_line(&data[pos..], base, required_insert_count)?;
+            let (field, consumed) =
+                self.decode_field_line(&data[pos..], base, required_insert_count)?;
             fields.push(field);
             pos += consumed;
         }
 
         // Track for acknowledgment
         if required_insert_count > 0 {
-            self.decoded_sections.insert(stream_id, required_insert_count);
+            self.decoded_sections
+                .insert(stream_id, required_insert_count);
         }
 
         Ok(fields)
@@ -97,7 +95,7 @@ impl Decoder {
 
         // Decode Required Insert Count
         let (enc_insert_count, mut pos) = integer::decode(8, data)?;
-        
+
         let max_entries = if self.dynamic_table.capacity() == 0 {
             0
         } else {
@@ -110,7 +108,7 @@ impl Decoder {
             let full_range = 2 * max_entries as u64;
             if enc_insert_count > full_range {
                 return Err(Error::DecompressionFailed(
-                    "encoded insert count exceeds full range".into()
+                    "encoded insert count exceeds full range".into(),
                 ));
             }
 
@@ -121,7 +119,7 @@ impl Decoder {
             if req_insert_count > max_value {
                 if req_insert_count <= full_range {
                     return Err(Error::DecompressionFailed(
-                        "invalid required insert count".into()
+                        "invalid required insert count".into(),
                     ));
                 }
                 req_insert_count -= full_range;
@@ -129,7 +127,7 @@ impl Decoder {
 
             if req_insert_count == 0 {
                 return Err(Error::DecompressionFailed(
-                    "required insert count cannot be zero when encoded as non-zero".into()
+                    "required insert count cannot be zero when encoded as non-zero".into(),
                 ));
             }
 
@@ -147,7 +145,9 @@ impl Decoder {
 
         let base = if sign {
             if delta_base >= required_insert_count {
-                return Err(Error::DecompressionFailed("invalid base calculation".into()));
+                return Err(Error::DecompressionFailed(
+                    "invalid base calculation".into(),
+                ));
             }
             required_insert_count - delta_base - 1
         } else {
@@ -158,7 +158,12 @@ impl Decoder {
     }
 
     /// Decodes a single field line representation.
-    fn decode_field_line(&self, data: &[u8], base: u64, required_insert_count: u64) -> Result<(FieldLine, usize)> {
+    fn decode_field_line(
+        &self,
+        data: &[u8],
+        base: u64,
+        required_insert_count: u64,
+    ) -> Result<(FieldLine, usize)> {
         if data.is_empty() {
             return Err(Error::Incomplete(1));
         }
@@ -177,16 +182,19 @@ impl Decoder {
                 Ok((FieldLine::new(entry.name, entry.value), consumed))
             } else {
                 // Dynamic table (relative indexing)
-                let absolute_index = base.checked_sub(index + 1)
+                let absolute_index = base
+                    .checked_sub(index + 1)
                     .ok_or_else(|| Error::DecompressionFailed("invalid relative index".into()))?;
-                
+
                 if absolute_index >= required_insert_count {
                     return Err(Error::DecompressionFailed(
-                        "reference exceeds required insert count".into()
+                        "reference exceeds required insert count".into(),
                     ));
                 }
 
-                let entry = self.dynamic_table.get_absolute(absolute_index)
+                let entry = self
+                    .dynamic_table
+                    .get_absolute(absolute_index)
                     .ok_or_else(|| Error::DecompressionFailed("invalid dynamic index".into()))?;
                 Ok((entry.clone(), consumed))
             }
@@ -197,11 +205,13 @@ impl Decoder {
 
             if absolute_index >= required_insert_count {
                 return Err(Error::DecompressionFailed(
-                    "post-base reference exceeds required insert count".into()
+                    "post-base reference exceeds required insert count".into(),
                 ));
             }
 
-            let entry = self.dynamic_table.get_absolute(absolute_index)
+            let entry = self
+                .dynamic_table
+                .get_absolute(absolute_index)
                 .ok_or_else(|| Error::DecompressionFailed("invalid post-base index".into()))?;
             Ok((entry.clone(), consumed))
         } else if (first_byte & 0xF0) == 0x00 {
@@ -209,7 +219,9 @@ impl Decoder {
             let (name_index, mut pos) = integer::decode(3, data)?;
             let absolute_index = base + name_index;
 
-            let name = self.dynamic_table.get_absolute(absolute_index)
+            let name = self
+                .dynamic_table
+                .get_absolute(absolute_index)
                 .map(|e| e.name.clone())
                 .ok_or_else(|| Error::DecompressionFailed("invalid post-base name index".into()))?;
 
@@ -227,11 +239,15 @@ impl Decoder {
                     .map(|e| Bytes::from(e.name))
                     .ok_or_else(|| Error::DecompressionFailed("invalid static name index".into()))?
             } else {
-                let absolute_index = base.checked_sub(name_index + 1)
-                    .ok_or_else(|| Error::DecompressionFailed("invalid relative name index".into()))?;
-                self.dynamic_table.get_absolute(absolute_index)
+                let absolute_index = base.checked_sub(name_index + 1).ok_or_else(|| {
+                    Error::DecompressionFailed("invalid relative name index".into())
+                })?;
+                self.dynamic_table
+                    .get_absolute(absolute_index)
                     .map(|e| e.name.clone())
-                    .ok_or_else(|| Error::DecompressionFailed("invalid dynamic name index".into()))?
+                    .ok_or_else(|| {
+                        Error::DecompressionFailed("invalid dynamic name index".into())
+                    })?
             };
 
             let (value, value_consumed) = decode_string(8, &data[pos..])?;
@@ -244,15 +260,15 @@ impl Decoder {
             if data.is_empty() {
                 return Err(Error::Incomplete(1));
             }
-            
+
             let huffman_name = (data[0] & 0x10) != 0; // Bit 4 is the N flag
             let (name_len, consumed) = integer::decode(3, data)?; // 3 bits for length (prefix_bits - 1)
             let name_len = name_len as usize;
-            
+
             if consumed + name_len > data.len() {
                 return Err(Error::Incomplete(consumed + name_len - data.len()));
             }
-            
+
             let name_data = &data[consumed..consumed + name_len];
             let name = if huffman_name {
                 let mut decoded = Vec::new();
@@ -261,9 +277,9 @@ impl Decoder {
             } else {
                 Bytes::copy_from_slice(name_data)
             };
-            
+
             let mut pos = consumed + name_len;
-            
+
             // Value uses standard string encoding with H bit at position 7
             let (value, value_consumed) = decode_string(8, &data[pos..])?;
             pos += value_consumed;
@@ -294,36 +310,42 @@ impl Decoder {
                 let name = if *is_static {
                     static_table::get(*name_index as usize)
                         .map(|e| Bytes::from(e.name))
-                        .ok_or_else(|| Error::EncoderStreamError("invalid static name reference".into()))?
+                        .ok_or_else(|| {
+                            Error::EncoderStreamError("invalid static name reference".into())
+                        })?
                 } else {
-                    self.dynamic_table.get_relative(*name_index, self.dynamic_table.insert_count())
+                    self.dynamic_table
+                        .get_relative(*name_index, self.dynamic_table.insert_count())
                         .map(|e| e.name.clone())
-                        .ok_or_else(|| Error::EncoderStreamError("invalid dynamic name reference".into()))?
+                        .ok_or_else(|| {
+                            Error::EncoderStreamError("invalid dynamic name reference".into())
+                        })?
                 };
 
                 let field = FieldLine::new(name, value.clone());
                 self.dynamic_table.insert(field)?;
 
                 // Generate insert count increment
-                decoder_instructions.push(DecoderInstruction::InsertCountIncrement { increment: 1 });
+                decoder_instructions
+                    .push(DecoderInstruction::InsertCountIncrement { increment: 1 });
             }
-            EncoderInstruction::InsertWithLiteralName {
-                name,
-                value,
-                ..
-            } => {
+            EncoderInstruction::InsertWithLiteralName { name, value, .. } => {
                 let field = FieldLine::new(name.clone(), value.clone());
                 self.dynamic_table.insert(field)?;
 
-                decoder_instructions.push(DecoderInstruction::InsertCountIncrement { increment: 1 });
+                decoder_instructions
+                    .push(DecoderInstruction::InsertCountIncrement { increment: 1 });
             }
             EncoderInstruction::Duplicate { index } => {
-                let field = self.dynamic_table.get_relative(*index, self.dynamic_table.insert_count())
+                let field = self
+                    .dynamic_table
+                    .get_relative(*index, self.dynamic_table.insert_count())
                     .ok_or_else(|| Error::EncoderStreamError("invalid duplicate index".into()))?
                     .clone();
                 self.dynamic_table.insert(field)?;
 
-                decoder_instructions.push(DecoderInstruction::InsertCountIncrement { increment: 1 });
+                decoder_instructions
+                    .push(DecoderInstruction::InsertCountIncrement { increment: 1 });
             }
         }
 
@@ -334,9 +356,12 @@ impl Decoder {
     }
 
     /// Tries to unblock any blocked streams that can now be decoded.
-    fn try_unblock_streams(&mut self, _decoder_instructions: &mut Vec<DecoderInstruction>) -> Result<()> {
+    fn try_unblock_streams(
+        &mut self,
+        _decoder_instructions: &mut Vec<DecoderInstruction>,
+    ) -> Result<()> {
         let mut unblocked = Vec::new();
-        
+
         for (idx, blocked) in self.blocked_streams.iter().enumerate() {
             if blocked.required_insert_count <= self.dynamic_table.insert_count() {
                 unblocked.push(idx);
@@ -353,9 +378,9 @@ impl Decoder {
 
     /// Generates a section acknowledgment for the given stream.
     pub fn acknowledge_section(&mut self, stream_id: u64) -> Option<DecoderInstruction> {
-        self.decoded_sections.remove(&stream_id).map(|_| {
-            DecoderInstruction::SectionAck { stream_id }
-        })
+        self.decoded_sections
+            .remove(&stream_id)
+            .map(|_| DecoderInstruction::SectionAck { stream_id })
     }
 
     /// Cancels a stream, removing it from the blocked streams list.
@@ -375,15 +400,15 @@ fn decode_string(prefix_bits: u8, data: &[u8]) -> Result<(Bytes, usize)> {
     if data.is_empty() {
         return Err(Error::Incomplete(1));
     }
-    
+
     let huffman = (data[0] & 0x80) != 0;
     let (len, consumed) = integer::decode(prefix_bits - 1, data)?;
     let len = len as usize;
-    
+
     if consumed + len > data.len() {
         return Err(Error::Incomplete(consumed + len - data.len()));
     }
-    
+
     let string_data = &data[consumed..consumed + len];
     let result = if huffman {
         let mut decoded = Vec::new();
@@ -392,7 +417,7 @@ fn decode_string(prefix_bits: u8, data: &[u8]) -> Result<(Bytes, usize)> {
     } else {
         Bytes::copy_from_slice(string_data)
     };
-    
+
     Ok((result, consumed + len))
 }
 
@@ -409,7 +434,7 @@ mod tests {
     #[test]
     fn test_decode_static_indexed() {
         let mut decoder = Decoder::new(4096, 100);
-        
+
         // Encode :method GET (static index 17, 0xC0 | 17 = 0xD1)
         // Prefix: RIC=0, Base=0
         let data = vec![
@@ -427,7 +452,7 @@ mod tests {
     #[test]
     fn test_decode_literal() {
         let mut decoder = Decoder::new(4096, 100);
-        
+
         // Literal with literal name: 001N + name + value
         // Name: "test" (4 bytes)
         // Value: "value" (5 bytes)
@@ -435,8 +460,7 @@ mod tests {
             0x00, // Required Insert Count = 0
             0x00, // Delta Base = 0
             0x24, // Literal with literal name, name length = 4
-            b't', b'e', b's', b't',
-            0x05, // Value length = 5
+            b't', b'e', b's', b't', 0x05, // Value length = 5
             b'v', b'a', b'l', b'u', b'e',
         ];
 

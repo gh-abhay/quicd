@@ -2,10 +2,10 @@ use crate::crypto::backend::{CryptoLevel, TlsEvent, TlsSession};
 use crate::error::{CryptoError, Error, Result};
 use boring::ssl::{Ssl, SslContext, SslMethod, SslVersion};
 use boring_sys as ffi;
+use foreign_types::ForeignType;
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
-use std::collections::VecDeque;
-use foreign_types::ForeignType;
 
 static mut EX_DATA_INDEX: i32 = -1;
 static EX_DATA_INDEX_INIT: std::sync::Once = std::sync::Once::new();
@@ -13,7 +13,8 @@ static EX_DATA_INDEX_INIT: std::sync::Once = std::sync::Once::new();
 fn get_ex_data_index() -> i32 {
     unsafe {
         EX_DATA_INDEX_INIT.call_once(|| {
-            EX_DATA_INDEX = ffi::SSL_get_ex_new_index(0, ptr::null_mut(), ptr::null_mut(), None, None);
+            EX_DATA_INDEX =
+                ffi::SSL_get_ex_new_index(0, ptr::null_mut(), ptr::null_mut(), None, None);
         });
         EX_DATA_INDEX
     }
@@ -30,13 +31,16 @@ pub struct BoringTlsSession {
 }
 
 impl BoringTlsSession {
-    pub fn new_client(server_name: Option<&str>, alpn_protocols: &[&[u8]]) -> Result<Box<dyn TlsSession>> {
+    pub fn new_client(
+        server_name: Option<&str>,
+        alpn_protocols: &[&[u8]],
+    ) -> Result<Box<dyn TlsSession>> {
         let mut ctx = SslContext::builder(SslMethod::tls_client())
             .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
-        
+
         ctx.set_min_proto_version(Some(SslVersion::TLS1_3))
             .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
-        
+
         ctx.set_max_proto_version(Some(SslVersion::TLS1_3))
             .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
 
@@ -52,8 +56,7 @@ impl BoringTlsSession {
         }
 
         let ctx = ctx.build();
-        let mut ssl = Ssl::new(&ctx)
-            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+        let mut ssl = Ssl::new(&ctx).map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
 
         if let Some(name) = server_name {
             ssl.set_hostname(name)
@@ -79,19 +82,18 @@ impl BoringTlsSession {
     ) -> Result<Box<dyn TlsSession>> {
         eprintln!("DEBUG: BoringTlsSession::new_server called: cert_data={:?}, key_data={:?}, alpn_protocols={:?}", 
                  cert_data.map(|d| d.len()), key_data.map(|d| d.len()), alpn_protocols);
-        
-        let mut ctx = SslContext::builder(SslMethod::tls_server())
-            .map_err(|e| {
-                eprintln!("DEBUG: Failed to create SSL context builder: {:?}", e);
-                Error::Crypto(CryptoError { code: 0x0150 })
-            })?;
-        
+
+        let mut ctx = SslContext::builder(SslMethod::tls_server()).map_err(|e| {
+            eprintln!("DEBUG: Failed to create SSL context builder: {:?}", e);
+            Error::Crypto(CryptoError { code: 0x0150 })
+        })?;
+
         ctx.set_min_proto_version(Some(SslVersion::TLS1_3))
             .map_err(|e| {
                 eprintln!("DEBUG: Failed to set min proto version: {:?}", e);
                 Error::Crypto(CryptoError { code: 0x0150 })
             })?;
-        
+
         ctx.set_max_proto_version(Some(SslVersion::TLS1_3))
             .map_err(|e| {
                 eprintln!("DEBUG: Failed to set max proto version: {:?}", e);
@@ -101,51 +103,53 @@ impl BoringTlsSession {
         // Load certificate and private key from memory
         match (cert_data, key_data) {
             (Some(cert_bytes), Some(key_bytes)) => {
-                eprintln!("DEBUG: Loading certificate ({} bytes) and key ({} bytes)", cert_bytes.len(), key_bytes.len());
-                
+                eprintln!(
+                    "DEBUG: Loading certificate ({} bytes) and key ({} bytes)",
+                    cert_bytes.len(),
+                    key_bytes.len()
+                );
+
                 // Parse certificate chain from PEM
                 use boring::x509::X509;
-                let cert = X509::from_pem(cert_bytes)
-                    .map_err(|e| {
-                        eprintln!("DEBUG: Failed to parse certificate PEM: {:?}", e);
-                        Error::Crypto(CryptoError { code: 0x0150 })
-                    })?;
-                
+                let cert = X509::from_pem(cert_bytes).map_err(|e| {
+                    eprintln!("DEBUG: Failed to parse certificate PEM: {:?}", e);
+                    Error::Crypto(CryptoError { code: 0x0150 })
+                })?;
+
                 eprintln!("DEBUG: Certificate parsed successfully");
-                
+
                 // Set certificate
-                ctx.set_certificate(&cert)
-                    .map_err(|e| {
-                        eprintln!("DEBUG: Failed to set certificate: {:?}", e);
-                        Error::Crypto(CryptoError { code: 0x0150 })
-                    })?;
-                
+                ctx.set_certificate(&cert).map_err(|e| {
+                    eprintln!("DEBUG: Failed to set certificate: {:?}", e);
+                    Error::Crypto(CryptoError { code: 0x0150 })
+                })?;
+
                 eprintln!("DEBUG: Certificate set successfully");
-                
+
                 // Parse private key from PEM
                 use boring::pkey::PKey;
-                let key = PKey::private_key_from_pem(key_bytes)
-                    .map_err(|e| {
-                        eprintln!("DEBUG: Failed to parse private key PEM: {:?}", e);
-                        Error::Crypto(CryptoError { code: 0x0150 })
-                    })?;
-                
+                let key = PKey::private_key_from_pem(key_bytes).map_err(|e| {
+                    eprintln!("DEBUG: Failed to parse private key PEM: {:?}", e);
+                    Error::Crypto(CryptoError { code: 0x0150 })
+                })?;
+
                 eprintln!("DEBUG: Private key parsed successfully");
-                
+
                 // Set private key
-                ctx.set_private_key(&key)
-                    .map_err(|e| {
-                        eprintln!("DEBUG: Failed to set private key: {:?}", e);
-                        Error::Crypto(CryptoError { code: 0x0150 })
-                    })?;
-                
+                ctx.set_private_key(&key).map_err(|e| {
+                    eprintln!("DEBUG: Failed to set private key: {:?}", e);
+                    Error::Crypto(CryptoError { code: 0x0150 })
+                })?;
+
                 eprintln!("DEBUG: Private key set successfully");
             }
             (None, None) => {
                 eprintln!("DEBUG: WARNING: No certificate or key data provided!");
             }
             _ => {
-                eprintln!("DEBUG: ERROR: Certificate and key must both be provided or both be None");
+                eprintln!(
+                    "DEBUG: ERROR: Certificate and key must both be provided or both be None"
+                );
                 return Err(Error::Crypto(CryptoError { code: 0x0150 }));
             }
         }
@@ -158,7 +162,7 @@ impl BoringTlsSession {
                 protos_flat.push(p.len() as u8);
                 protos_flat.extend_from_slice(p);
             }
-            
+
             ctx.set_alpn_select_callback(move |_, client_protos| {
                 // Debug: Log client ALPN protocols
                 eprintln!("DEBUG: Client offered ALPN protocols:");
@@ -173,7 +177,7 @@ impl BoringTlsSession {
                     eprintln!("  - {:?}", String::from_utf8_lossy(proto));
                     debug_idx += len;
                 }
-                
+
                 eprintln!("DEBUG: Server supports ALPN protocols:");
                 let mut debug_server_idx = 0;
                 while debug_server_idx < protos_flat.len() {
@@ -186,7 +190,7 @@ impl BoringTlsSession {
                     eprintln!("  - {:?}", String::from_utf8_lossy(sproto));
                     debug_server_idx += slen;
                 }
-                
+
                 // Iterate through CLIENT protocols first (client preference, RFC 7301)
                 let mut client_idx = 0;
                 while client_idx < client_protos.len() {
@@ -196,7 +200,7 @@ impl BoringTlsSession {
                         break;
                     }
                     let proto = &client_protos[client_idx..client_idx + len];
-                    
+
                     // Check if this client protocol is in server's list
                     let mut server_idx = 0;
                     while server_idx < protos_flat.len() {
@@ -212,7 +216,7 @@ impl BoringTlsSession {
                         }
                         server_idx += slen;
                     }
-                    
+
                     client_idx += len;
                 }
                 eprintln!("DEBUG: No matching ALPN found - returning NOACK");
@@ -221,8 +225,7 @@ impl BoringTlsSession {
         }
 
         let ctx = ctx.build();
-        let ssl = Ssl::new(&ctx)
-            .map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
+        let ssl = Ssl::new(&ctx).map_err(|_| Error::Crypto(CryptoError { code: 0x0150 }))?;
 
         unsafe {
             ffi::SSL_set_accept_state(ssl.as_ptr());
@@ -251,14 +254,14 @@ impl TlsSession for BoringTlsSession {
         };
 
         unsafe {
-            ffi::SSL_set_ex_data(self.ssl.as_ptr(), get_ex_data_index(), &mut ex_data as *mut ExData as *mut c_void);
-
-            let provide_result = ffi::SSL_provide_quic_data(
+            ffi::SSL_set_ex_data(
                 self.ssl.as_ptr(),
-                level_int,
-                data.as_ptr(),
-                data.len(),
+                get_ex_data_index(),
+                &mut ex_data as *mut ExData as *mut c_void,
             );
+
+            let provide_result =
+                ffi::SSL_provide_quic_data(self.ssl.as_ptr(), level_int, data.as_ptr(), data.len());
             if provide_result != 1 {
                 let ssl_error = unsafe { ffi::SSL_get_error(self.ssl.as_ptr(), provide_result) };
                 let error_code = unsafe { ffi::ERR_get_error() };
@@ -271,11 +274,15 @@ impl TlsSession for BoringTlsSession {
             let handshake_result = ffi::SSL_do_handshake(self.ssl.as_ptr());
             let err = ffi::SSL_get_error(self.ssl.as_ptr(), handshake_result);
             ffi::SSL_set_ex_data(self.ssl.as_ptr(), get_ex_data_index(), ptr::null_mut());
-            
+
             // Check if handshake completed
             if handshake_result == 1 {
                 // Handshake completed successfully
-                if !self.events.iter().any(|e| matches!(e, TlsEvent::HandshakeComplete)) {
+                if !self
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, TlsEvent::HandshakeComplete))
+                {
                     self.events.push_back(TlsEvent::HandshakeComplete);
                 }
             } else {
@@ -297,27 +304,33 @@ impl TlsSession for BoringTlsSession {
                     }
                     _ => {}
                 }
-                
+
                 // Error occurred - get details
                 let error_code = unsafe { ffi::ERR_get_error() };
-                        
-                        // Get error string from BoringSSL
-                        let mut err_buf = [0u8; 256];
-                        unsafe {
-                            ffi::ERR_error_string_n(error_code, err_buf.as_mut_ptr() as *mut i8, err_buf.len());
-                        }
-                        let err_str = std::ffi::CStr::from_bytes_until_nul(&err_buf)
-                            .ok()
-                            .and_then(|c| c.to_str().ok())
-                            .unwrap_or("unknown error");
-                        
-                        eprintln!("DEBUG: SSL_do_handshake failed: handshake_result={}, ssl_error={:?}, error_code={:x}", 
+
+                // Get error string from BoringSSL
+                let mut err_buf = [0u8; 256];
+                unsafe {
+                    ffi::ERR_error_string_n(
+                        error_code,
+                        err_buf.as_mut_ptr() as *mut i8,
+                        err_buf.len(),
+                    );
+                }
+                let err_str = std::ffi::CStr::from_bytes_until_nul(&err_buf)
+                    .ok()
+                    .and_then(|c| c.to_str().ok())
+                    .unwrap_or("unknown error");
+
+                eprintln!("DEBUG: SSL_do_handshake failed: handshake_result={}, ssl_error={:?}, error_code={:x}", 
                                  handshake_result, err, error_code);
-                        eprintln!("DEBUG: BoringSSL error string: {}", err_str);
-                        return Err(Error::Crypto(CryptoError { code: error_code as u64 }));
+                eprintln!("DEBUG: BoringSSL error string: {}", err_str);
+                return Err(Error::Crypto(CryptoError {
+                    code: error_code as u64,
+                }));
             }
         }
-        
+
         Ok(())
     }
 
@@ -353,11 +366,9 @@ impl TlsSession for BoringTlsSession {
     fn set_transport_params(&mut self, params: &[u8]) -> Result<()> {
         eprintln!("DEBUG: Setting transport params: len={}", params.len());
         unsafe {
-            if ffi::SSL_set_quic_transport_params(
-                self.ssl.as_ptr(),
-                params.as_ptr(),
-                params.len(),
-            ) != 1 {
+            if ffi::SSL_set_quic_transport_params(self.ssl.as_ptr(), params.as_ptr(), params.len())
+                != 1
+            {
                 eprintln!("DEBUG: SSL_set_quic_transport_params FAILED");
                 return Err(Error::Crypto(CryptoError { code: 0x0150 }));
             }
@@ -410,7 +421,9 @@ unsafe extern "C" fn set_read_secret(
         0x1301 // Default to TLS_AES_128_GCM_SHA256 if cipher is null
     };
 
-    ex_data.events.push_back(TlsEvent::ReadSecret(crypto_level, vec, cipher_suite));
+    ex_data
+        .events
+        .push_back(TlsEvent::ReadSecret(crypto_level, vec, cipher_suite));
     1
 }
 
@@ -446,7 +459,9 @@ unsafe extern "C" fn set_write_secret(
         0x1301 // Default to TLS_AES_128_GCM_SHA256 if cipher is null
     };
 
-    ex_data.events.push_back(TlsEvent::WriteSecret(crypto_level, vec, cipher_suite));
+    ex_data
+        .events
+        .push_back(TlsEvent::WriteSecret(crypto_level, vec, cipher_suite));
     1
 }
 
@@ -461,10 +476,10 @@ unsafe extern "C" fn add_handshake_data(
         return 0;
     }
     let ex_data = &mut *ex_data_ptr;
-    
+
     let slice = std::slice::from_raw_parts(data, len);
     let vec = slice.to_vec();
-    
+
     let crypto_level = match level {
         ffi::ssl_encryption_level_t::ssl_encryption_initial => CryptoLevel::Initial,
         ffi::ssl_encryption_level_t::ssl_encryption_early_data => CryptoLevel::ZeroRTT,
@@ -472,8 +487,10 @@ unsafe extern "C" fn add_handshake_data(
         ffi::ssl_encryption_level_t::ssl_encryption_application => CryptoLevel::OneRTT,
         _ => return 0,
     };
-    
-    ex_data.events.push_back(TlsEvent::WriteData(crypto_level, vec));
+
+    ex_data
+        .events
+        .push_back(TlsEvent::WriteData(crypto_level, vec));
     1
 }
 
