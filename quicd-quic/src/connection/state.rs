@@ -4824,11 +4824,48 @@ impl Connection for QuicConnection {
                     fin: chunk_fin,
                 });
 
-                // Serialize STREAM frame
+                // RFC 9000 §13.2.1: ACK frames SHOULD be coalesced with other frames
+                // Check if we need to send an ACK and coalesce it with the STREAM frame
+                let app_space = self.pn_spaces.get(crate::types::PacketNumberSpace::ApplicationData);
+                let pending_ack = if let Some(largest_acked) = app_space.largest_pn_received {
+                    let already_acked = app_space.largest_pn_acked_by_us.unwrap_or(0);
+                    if largest_acked > already_acked {
+                        let first_ack_range = app_space.received_tracker.first_ack_range();
+                        eprintln!("DEBUG: Coalescing ACK with STREAM: acking {} through {}", 
+                                 largest_acked - first_ack_range, largest_acked);
+                        Some((largest_acked, first_ack_range))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Serialize ACK frame first if pending (ACK before STREAM per convention)
+                if let Some((largest_acked, first_ack_range)) = pending_ack {
+                    let ack_frame = Frame::Ack(crate::frames::AckFrame {
+                        largest_acked,
+                        ack_delay: 0,
+                        ack_range_count: 0,
+                        first_ack_range,
+                        ack_ranges: &[],
+                    });
+                    if serializer.serialize_frame(&ack_frame, &mut frame_buf).is_err() {
+                        eprintln!("DEBUG: Failed to serialize ACK frame for coalescing");
+                    }
+                }
+
+                // Serialize STREAM frame after ACK
                 if serializer
                     .serialize_frame(&stream_frame, &mut frame_buf)
                     .is_ok()
                 {
+                    // Mark ACK as sent if we coalesced one
+                    if let Some((largest_acked, _)) = pending_ack {
+                        self.pn_spaces.get_mut(crate::types::PacketNumberSpace::ApplicationData)
+                            .on_ack_sent(largest_acked);
+                    }
+                    
                     let plaintext = frame_buf.freeze();
                     let write_keys = &mut self.one_rtt_write_keys;
                     let pn = write_keys.packet_number;
