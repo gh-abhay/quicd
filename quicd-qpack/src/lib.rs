@@ -82,3 +82,4 @@ pub use decoder::Decoder;
 pub use encoder::Encoder;
 pub use error::{Error, Result};
 pub use field_line::FieldLine;
+pub use instructions::{DecoderInstruction, EncoderInstruction};

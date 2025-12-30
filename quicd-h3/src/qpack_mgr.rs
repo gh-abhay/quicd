@@ -101,20 +101,66 @@ impl QpackManager {
     /// Process data received on the peer's encoder stream.
     ///
     /// The decoder processes these instructions to update its dynamic table.
-    pub fn process_encoder_stream_data(&mut self, _data: &[u8]) -> Result<()> {
-        // Feed encoder stream data to decoder
-        // Note: quicd-qpack API may need method for this
-        // For now, this is a placeholder
+    pub fn process_encoder_stream_data(&mut self, data: &[u8]) -> Result<()> {
+        use quicd_qpack::EncoderInstruction;
+
+        let mut pos = 0;
+        while pos < data.len() {
+            // Parse encoder instruction
+            let (instruction, consumed) =
+                EncoderInstruction::decode(&data[pos..]).map_err(|e| Error::Qpack(e))?;
+
+            tracing::debug!(
+                "QPACK: Processing encoder instruction: {:?}, consumed {} bytes",
+                instruction,
+                consumed
+            );
+
+            // Process the instruction - this updates the dynamic table
+            let decoder_instructions = self
+                .decoder
+                .process_encoder_instruction(&instruction)
+                .map_err(|e| Error::Qpack(e))?;
+
+            // Serialize any decoder instructions we need to send back
+            for instr in decoder_instructions {
+                let mut buf = Vec::new();
+                instr.encode(&mut buf);
+                self.decoder_instructions_buffer.extend_from_slice(&buf);
+            }
+
+            pos += consumed;
+        }
+
         Ok(())
     }
 
     /// Process data received on the peer's decoder stream.
     ///
     /// The encoder processes these instructions (acknowledgments, etc.).
-    pub fn process_decoder_stream_data(&mut self, _data: &[u8]) -> Result<()> {
-        // Feed decoder stream data to encoder
-        // Note: quicd-qpack API may need method for this
-        // For now, this is a placeholder
+    pub fn process_decoder_stream_data(&mut self, data: &[u8]) -> Result<()> {
+        use quicd_qpack::DecoderInstruction;
+
+        let mut pos = 0;
+        while pos < data.len() {
+            // Parse decoder instruction
+            let (instruction, consumed) =
+                DecoderInstruction::decode(&data[pos..]).map_err(|e| Error::Qpack(e))?;
+
+            tracing::debug!(
+                "QPACK: Processing decoder instruction: {:?}, consumed {} bytes",
+                instruction,
+                consumed
+            );
+
+            // Process the instruction - this updates encoder's known insert count
+            self.encoder
+                .process_decoder_instruction(&instruction)
+                .map_err(|e| Error::Qpack(e))?;
+
+            pos += consumed;
+        }
+
         Ok(())
     }
 

@@ -651,6 +651,26 @@ impl ConnectionHandle {
     pub fn is_closed(&self) -> bool {
         self.state.lock().closed
     }
+
+    /// Get a stream handle for a known stream ID.
+    ///
+    /// This allows reading from a stream whose ID is already known (e.g., from
+    /// a previous accept operation). Useful for long-lived unidirectional streams
+    /// like QPACK encoder/decoder streams that need to be polled continuously.
+    ///
+    /// # Parameters
+    /// - `stream_id`: The stream ID to get a handle for
+    /// - `is_bidirectional`: Whether the stream is bidirectional
+    pub fn get_stream(&self, stream_id: StreamId, is_bidirectional: bool) -> QuicStream<'_> {
+        QuicStream {
+            conn_id: self.conn_id,
+            stream_id,
+            egress_tx: self.egress_tx.clone(),
+            handle: self,
+            is_bidirectional,
+            bytes_read: 0,
+        }
+    }
 }
 
 /// QUIC stream handle implementing tokio AsyncRead/AsyncWrite.

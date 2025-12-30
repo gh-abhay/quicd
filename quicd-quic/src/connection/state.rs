@@ -1987,16 +1987,15 @@ impl QuicConnection {
 
                 // Handle acknowledged packets - notify congestion controller (RFC 9002 §7)
                 let (acked_packets, lost_packets) = result;
-                for pn in acked_packets {
-                    // Note: sent_bytes should come from sent packet tracking
-                    // Using default packet size for now
-                    self.congestion_controller.on_packet_acked(pn, pn_space, 1200, now);
+                for (pn, size) in acked_packets {
+                    // Use actual packet size from sent packet tracking
+                    self.congestion_controller.on_packet_acked(pn, pn_space, size, now);
                     self.stats.packets_acked += 1;
                 }
 
                 // Handle lost packets - notify congestion controller and mark for retransmission
-                for pn in lost_packets {
-                    self.congestion_controller.on_packet_lost(pn, pn_space, 1200, now);
+                for (pn, size) in lost_packets {
+                    self.congestion_controller.on_packet_lost(pn, pn_space, size, now);
                     self.stats.packets_lost += 1;
                     // TODO: Mark frames from lost packets for retransmission
                 }
@@ -2893,6 +2892,14 @@ impl QuicConnection {
             "DEBUG: Parsing frames from decrypted payload: len={}",
             payload.len()
         );
+        if payload.len() > 0 && payload.len() < 20 {
+            eprint!("DEBUG: Payload bytes: [");
+            for (i, b) in payload.iter().enumerate() {
+                if i > 0 { eprint!(", "); }
+                eprint!("{:02x}", b);
+            }
+            eprintln!("]");
+        }
         while offset < payload.len() {
             let frame_result = parser.parse_frame(&payload[offset..]);
 
@@ -4663,7 +4670,9 @@ impl Connection for QuicConnection {
                     buf.clear();
                     buf.reserve(1500);
 
-                    let first_byte = 0x40 | ((pn_len - 1) as u8);
+                    // RFC 9001 §6: Key Phase bit (bit 2, 0x04) indicates current key phase
+                    let key_phase_bit = if self.current_write_key_phase { 0x04 } else { 0 };
+                    let first_byte = 0x40 | key_phase_bit | ((pn_len - 1) as u8);
                     buf.put_u8(first_byte);
                     buf.put_slice(dcid_bytes);
                     buf.put_slice(&pn_bytes);
@@ -4938,7 +4947,6 @@ impl Connection for QuicConnection {
             if let Some(largest_acked) = app_space.largest_pn_received {
                 let already_acked = app_space.largest_pn_acked_by_us.unwrap_or(0);
                 if largest_acked > already_acked {
-                    eprintln!("DEBUG: Need to send 1-RTT ACK for PN {}", largest_acked);
                     
                     // Use proper first_ack_range from received packet tracker
                     let first_ack_range = app_space.received_tracker.first_ack_range();
@@ -4979,8 +4987,10 @@ impl Connection for QuicConnection {
                         buf.clear();
                         buf.reserve(1500);
 
-                        // First byte: 0x40 (short header)
-                        let first_byte = 0x40 | ((pn_len - 1) as u8);
+                        // First byte: 0x40 (short header) with key phase bit
+                        // RFC 9001 §6: Key Phase bit (bit 2, 0x04) indicates current key phase
+                        let key_phase_bit = if self.current_write_key_phase { 0x04 } else { 0 };
+                        let first_byte = 0x40 | key_phase_bit | ((pn_len - 1) as u8);
                         buf.put_u8(first_byte);
 
                         // DCID (RFC 9000 §17.3: Short header includes DCID)

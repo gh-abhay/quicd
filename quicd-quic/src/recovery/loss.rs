@@ -20,7 +20,7 @@ pub trait LossDetector: Send {
     /// Updates sent packet tracking and detects newly acknowledged
     /// and lost packets.
     ///
-    /// Returns (newly_acked, newly_lost)
+    /// Returns (newly_acked, newly_lost) where each entry is (packet_number, size)
     fn on_ack_received(
         &mut self,
         space: PacketNumberSpace,
@@ -28,7 +28,7 @@ pub trait LossDetector: Send {
         ack_delay: Duration,
         ack_ranges: &[(PacketNumber, PacketNumber)],
         recv_time: Instant,
-    ) -> Result<(alloc::vec::Vec<PacketNumber>, alloc::vec::Vec<PacketNumber>)>;
+    ) -> Result<(alloc::vec::Vec<(PacketNumber, usize)>, alloc::vec::Vec<(PacketNumber, usize)>)>;
 
     /// Check for loss due to time threshold
     ///
@@ -422,7 +422,7 @@ impl LossDetector for DefaultLossDetector {
         _ack_delay: core::time::Duration,
         _ack_ranges: &[(PacketNumber, PacketNumber)],
         recv_time: Instant,
-    ) -> Result<(Vec<PacketNumber>, Vec<PacketNumber>)> {
+    ) -> Result<(Vec<(PacketNumber, usize)>, Vec<(PacketNumber, usize)>)> {
         let idx = Self::space_index(space);
 
         // Update largest acknowledged
@@ -431,7 +431,12 @@ impl LossDetector for DefaultLossDetector {
 
         // Detect lost packets FIRST (before marking as acked)
         let mut newly_lost = Vec::new();
-        newly_lost.extend(self.detect_by_packet_threshold(space, largest_acked));
+        let lost_pns = self.detect_by_packet_threshold(space, largest_acked);
+        for pn in lost_pns {
+            if let Some(info) = self.sent_packets[idx].get(&pn) {
+                newly_lost.push((pn, info.size));
+            }
+        }
 
         // Find newly acknowledged packets
         let mut newly_acked = Vec::new();
@@ -441,7 +446,7 @@ impl LossDetector for DefaultLossDetector {
         for (&pn, info) in &mut self.sent_packets[idx] {
             if pn <= largest_acked && !info.acked && !info.lost {
                 info.acked = true;
-                newly_acked.push(pn);
+                newly_acked.push((pn, info.size));
 
                 // Update RTT if this is the largest acked
                 if pn == largest_acked && info.is_retransmittable {
@@ -453,7 +458,7 @@ impl LossDetector for DefaultLossDetector {
         }
 
         // Mark packets as lost
-        for &pn in &newly_lost {
+        for &(pn, _) in &newly_lost {
             if let Some(info) = self.sent_packets[idx].get_mut(&pn) {
                 info.lost = true;
             }
