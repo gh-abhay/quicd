@@ -423,6 +423,10 @@ pub struct QuicConnection {
     /// Draining/closing timeout
     closing_timeout: Option<Instant>,
 
+    /// Pending PTO probe to send (RFC 9002 Section 6.2)
+    /// Contains (packet_number_space, probe_count)
+    pending_pto_probe: Option<(crate::types::PacketNumberSpace, u32)>,
+
     /// Initial encryption keys (read: decrypt client Initial, write: encrypt server Initial)
     initial_read_keys: EncryptionKeys,
     initial_write_keys: EncryptionKeys,
@@ -608,6 +612,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -671,6 +676,7 @@ impl QuicConnection {
                         handshake_complete: false,
                         last_activity: None,
                         closing_timeout: None,
+                    pending_pto_probe: None,
                         initial_read_keys: EncryptionKeys::empty(),
                         initial_write_keys: EncryptionKeys::empty(),
                         handshake_read_keys: EncryptionKeys::empty(),
@@ -731,6 +737,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -789,6 +796,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -848,6 +856,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -905,6 +914,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -964,6 +974,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -1020,6 +1031,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -1087,6 +1099,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -1147,6 +1160,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -1206,6 +1220,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -1266,6 +1281,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -1325,6 +1341,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -1384,6 +1401,7 @@ impl QuicConnection {
                     handshake_complete: false,
                     last_activity: None,
                     closing_timeout: None,
+                    pending_pto_probe: None,
                     initial_read_keys: EncryptionKeys::empty(),
                     initial_write_keys: EncryptionKeys::empty(),
                     handshake_read_keys: EncryptionKeys::empty(),
@@ -1443,6 +1461,7 @@ impl QuicConnection {
                         handshake_complete: false,
                         last_activity: None,
                         closing_timeout: None,
+                    pending_pto_probe: None,
                         initial_read_keys: EncryptionKeys::empty(),
                         initial_write_keys: EncryptionKeys::empty(),
                         handshake_read_keys: EncryptionKeys::empty(),
@@ -1498,6 +1517,7 @@ impl QuicConnection {
                         handshake_complete: false,
                         last_activity: None,
                         closing_timeout: None,
+                    pending_pto_probe: None,
                         initial_read_keys: EncryptionKeys::empty(),
                         initial_write_keys: EncryptionKeys::empty(),
                         handshake_read_keys: EncryptionKeys::empty(),
@@ -1564,6 +1584,7 @@ impl QuicConnection {
                         handshake_complete: false,
                         last_activity: None,
                         closing_timeout: None,
+                    pending_pto_probe: None,
                         initial_read_keys: EncryptionKeys::empty(),
                         initial_write_keys: EncryptionKeys::empty(),
                         handshake_read_keys: EncryptionKeys::empty(),
@@ -1619,6 +1640,7 @@ impl QuicConnection {
                         handshake_complete: false,
                         last_activity: None,
                         closing_timeout: None,
+                    pending_pto_probe: None,
                         initial_read_keys: EncryptionKeys::empty(),
                         initial_write_keys: EncryptionKeys::empty(),
                         handshake_read_keys: EncryptionKeys::empty(),
@@ -1716,6 +1738,7 @@ impl QuicConnection {
                             handshake_complete: false,
                             last_activity: None,
                             closing_timeout: None,
+                    pending_pto_probe: None,
                             initial_read_keys: EncryptionKeys::empty(),
                             initial_write_keys: EncryptionKeys::empty(),
                             handshake_read_keys: EncryptionKeys::empty(),
@@ -1770,6 +1793,7 @@ impl QuicConnection {
                             handshake_complete: false,
                             last_activity: None,
                             closing_timeout: None,
+                    pending_pto_probe: None,
                             initial_read_keys: EncryptionKeys::empty(),
                             initial_write_keys: EncryptionKeys::empty(),
                             handshake_read_keys: EncryptionKeys::empty(),
@@ -1836,6 +1860,7 @@ impl QuicConnection {
             handshake_complete: false,
             last_activity: None,
             closing_timeout: None,
+                    pending_pto_probe: None,
             initial_read_keys,
             initial_write_keys,
             handshake_read_keys: EncryptionKeys::empty(),
@@ -3232,7 +3257,7 @@ impl Connection for QuicConnection {
     }
 
     fn process_timeout(&mut self, now: Instant) -> Result<()> {
-        // Phase 7: Complete timeout handling
+        // Phase 7: Complete timeout handling (RFC 9002)
 
         // 1. Check idle timeout
         if let Some(last_activity) = self.last_activity {
@@ -3254,18 +3279,31 @@ impl Connection for QuicConnection {
             }
         }
 
-        // 3. Check loss detection timeout (PTO)
-        let spaces = [
-            crate::types::PacketNumberSpace::Initial,
-            crate::types::PacketNumberSpace::Handshake,
-            crate::types::PacketNumberSpace::ApplicationData,
-        ];
-
-        for space in &spaces {
-            let lost_packets = self.loss_detector.detect_lost_packets(*space, now);
-            for _pn in lost_packets {
-                self.stats.packets_lost += 1;
-                // TODO: Mark frames for retransmission
+        // 3. Handle loss detection timeout (RFC 9002 Section 6.2)
+        // First, check if the loss detection timer has expired
+        if let Some(loss_timer) = self.loss_detector.get_loss_detection_timer() {
+            if now.as_nanos() >= loss_timer.as_nanos() {
+                // Timer expired - handle the timeout
+                use crate::recovery::loss::LossDetectionAction;
+                let action = self.loss_detector.on_loss_detection_timeout(now);
+                
+                match action {
+                    LossDetectionAction::SendProbe { space, count } => {
+                        // RFC 9002 Section 6.2.4: PTO has fired, must send a probe
+                        // Set the pending probe flag so poll_send() generates a PING
+                        eprintln!("DEBUG: PTO fired! Scheduling probe: space={:?}, count={}", space, count);
+                        self.pending_pto_probe = Some((space, count));
+                    }
+                    LossDetectionAction::CheckLoss { space } => {
+                        // Check for lost packets in this space
+                        let lost_packets = self.loss_detector.detect_lost_packets(space, now);
+                        for _pn in lost_packets {
+                            self.stats.packets_lost += 1;
+                            // TODO: Mark frames for retransmission
+                        }
+                    }
+                    LossDetectionAction::None => {}
+                }
             }
         }
 
@@ -3425,9 +3463,108 @@ impl Connection for QuicConnection {
             });
         }
 
-        // Check congestion window
-        if !self.congestion_controller.can_send(1200) {
-            return None;
+        // NOTE: We do NOT check congestion control here because:
+        // - RFC 9000 Section 13.2.1: ACK-only packets are NOT congestion controlled
+        // - ACK frames MUST be able to be sent even when congestion window is full
+        // - Congestion control is checked specifically for STREAM frames below
+
+        // ═══════════════════════════════════════════════════════════════════
+        // PTO PROBE (RFC 9002 Section 6.2.4)
+        // ═══════════════════════════════════════════════════════════════════
+        // When PTO fires, we MUST send at least one ACK-eliciting packet (PING)
+        // PTO probes are NOT congestion controlled (RFC 9002 §6.2.4)
+        if let Some((space, _count)) = self.pending_pto_probe.take() {
+            eprintln!("DEBUG: Generating PTO probe for space={:?}", space);
+            
+            // Only send probe if we have the appropriate keys
+            if self.handshake_complete && self.one_rtt_write_keys.aead.is_some() {
+                // Build a PING frame (0x01) - simplest ACK-eliciting frame
+                use crate::frames::parse::{DefaultFrameSerializer, FrameSerializer};
+                let serializer = DefaultFrameSerializer;
+                let mut frame_buf = BytesMut::new();
+                let ping_frame = Frame::Ping;
+                
+                if serializer.serialize_frame(&ping_frame, &mut frame_buf).is_ok() {
+                    let plaintext = frame_buf.freeze();
+                    let write_keys = &mut self.one_rtt_write_keys;
+                    let pn = write_keys.packet_number;
+                    write_keys.packet_number += 1;
+                    
+                    let pn_len: usize = 1;
+                    let pn_bytes: Vec<u8> = vec![(pn & 0xff) as u8];
+                    
+                    let Some(aead) = write_keys.aead.as_ref() else { return None };
+                    let key = &write_keys.key;
+                    let iv = &write_keys.iv;
+                    let tag_len = aead.tag_len();
+                    
+                    buf.clear();
+                    buf.reserve(1500);
+                    
+                    // Short header with key phase
+                    let key_phase_bit = if self.current_write_key_phase { 0x04 } else { 0 };
+                    let first_byte = 0x40 | key_phase_bit | ((pn_len - 1) as u8);
+                    buf.put_u8(first_byte);
+                    buf.put_slice(self.dcid.as_bytes());
+                    buf.put_slice(&pn_bytes);
+                    
+                    // Encrypt
+                    let header_len = buf.len();
+                    let mut encrypted_buf = vec![0u8; plaintext.len() + tag_len];
+                    let encrypted_len = match aead.seal(
+                        key,
+                        iv,
+                        pn,
+                        &buf[..],
+                        &plaintext,
+                        &mut encrypted_buf,
+                    ) {
+                        Ok(len) => len,
+                        Err(_) => {
+                            eprintln!("DEBUG: Failed to encrypt PTO PING frame");
+                            return None;
+                        }
+                    };
+                    
+                    buf.put_slice(&encrypted_buf[..encrypted_len]);
+                    
+                    // Apply header protection
+                    let hp_key = &write_keys.hp_key;
+                    let pn_start = header_len - pn_len;
+                    let sample_offset = pn_start + 4;
+                    if buf.len() >= sample_offset + 16 {
+                        let sample = &buf[sample_offset..sample_offset + 16];
+                        let mut mask = vec![0u8; 5];
+                        let Some(hp) = write_keys.hp.as_ref() else { return None };
+                        if hp.build_mask(hp_key, sample, &mut mask).is_ok() {
+                            buf[0] ^= mask[0] & 0x1f;
+                            for i in 0..pn_len {
+                                buf[pn_start + i] ^= mask[1 + i];
+                            }
+                        }
+                    }
+                    
+                    eprintln!("DEBUG: Successfully generated PTO PING probe, len={}", buf.len());
+                    
+                    // Record packet as sent for loss detection
+                    self.loss_detector.on_packet_sent(
+                        space,
+                        pn,
+                        buf.len(),
+                        true, // PING is ACK-eliciting, retransmittable
+                        now,
+                    );
+                    
+                    self.stats.packets_sent += 1;
+                    self.stats.bytes_sent += buf.len() as u64;
+                    
+                    let data_out = buf.split();
+                    return Some(DatagramOutput {
+                        data: data_out,
+                        send_time: Some(now),
+                    });
+                }
+            }
         }
 
         // Priority: Send CRYPTO frames first (handshake data)
@@ -4735,9 +4872,11 @@ impl Connection for QuicConnection {
         // ═══════════════════════════════════════════════════════════════════
         // If handshake is complete and we have 1-RTT keys, send queued stream data
         // RFC 9000 Section 2.2: STREAM frames carry data in MTU-sized segments
+        // RFC 9002: STREAM frames ARE congestion controlled - check here, not earlier
         if self.handshake_complete
             && self.one_rtt_write_keys.aead.is_some()
             && !self.pending_stream_writes.is_empty()
+            && self.congestion_controller.can_send(1200)  // Congestion check for STREAM only
         {
             eprintln!(
                 "DEBUG: Attempting to send STREAM frames, pending_writes={}",

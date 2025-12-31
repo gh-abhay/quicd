@@ -481,9 +481,14 @@ impl LossDetector for DefaultLossDetector {
     }
 
     fn get_loss_detection_timer(&self) -> Option<Instant> {
-        // Find earliest loss time or PTO time
+        // RFC 9002 Section 6.2: Loss Detection Timer
+        // Returns the earliest of:
+        // 1. Loss time (time-based loss detection)
+        // 2. PTO time (probe timeout)
+        
         let mut earliest: Option<Instant> = None;
 
+        // Check loss times first
         for state in &self.loss_state {
             if let Some(loss_time) = state.loss_time {
                 earliest = Some(match earliest {
@@ -491,6 +496,34 @@ impl LossDetector for DefaultLossDetector {
                     Some(e) => e,
                     None => loss_time,
                 });
+            }
+        }
+
+        // If there's a loss time, it takes precedence
+        if earliest.is_some() {
+            return earliest;
+        }
+
+        // Calculate PTO timer (RFC 9002 §6.2.1)
+        // PTO fires when no ACK is received for sent packets
+        for (idx, state) in self.loss_state.iter().enumerate() {
+            if let Some(last_sent_time) = state.time_of_last_sent_packet {
+                let space = match idx {
+                    0 => PacketNumberSpace::Initial,
+                    1 => PacketNumberSpace::Handshake,
+                    _ => PacketNumberSpace::ApplicationData,
+                };
+                
+                let pto_duration = self.calculate_pto_for_space(space, state.pto_count);
+                
+                // PTO timeout = time_of_last_sent_packet + PTO
+                if let Some(pto_time) = last_sent_time.checked_add(pto_duration) {
+                    earliest = Some(match earliest {
+                        Some(e) if pto_time.as_nanos() < e.as_nanos() => pto_time,
+                        Some(e) => e,
+                        None => pto_time,
+                    });
+                }
             }
         }
 
